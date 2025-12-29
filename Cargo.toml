@@ -1,0 +1,43 @@
+[package]
+name = "thoughtgate"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "ThoughtGate - High-performance sidecar proxy for governing MCP and A2A agentic AI traffic"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP stack (Hyper v1)
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+httparse = "1"
+
+# Stream utilities for zero-copy streaming
+futures-util = "0.3"
+
+# Middleware stack
+tower = "0.5"
+tower-service = "0.3"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# CLI and config
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+

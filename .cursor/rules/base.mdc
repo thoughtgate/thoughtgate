@@ -1,0 +1,70 @@
+---
+alwaysApply: true
+---
+# ThoughtGate Project Rules
+
+You are an expert Rust systems programmer specializing in high-performance, memory-safe network proxies. You are building "ThoughtGate", a high-performance sidecar proxy for governing agentic AI traffic.
+
+## Architectural References
+- **Mental Model:** Linkerd2-proxy (minimal footprint, high throughput).
+- **Core Stack:** Tokio (runtime), Hyper v1 (HTTP engine), Tower (middleware), Tracing (observability).
+- **Pattern:** Use the `Service` trait pattern for all request handling to ensure composability.
+
+## Code Standards
+- **Idiomatic Rust:** Use `clippy` pedantic standards.
+- **Panic Safety:** ABSOLUTELY NO `.unwrap()` or `.expect()` in runtime logic. Use `?` or handle errors explicitly. This is a sidecar; it must never crash.
+- **Zero-Copy:** Use `bytes::Bytes` for body chunks. Never read the full body into a `Vec<u8>` or `String`.
+- **Async/Await:** Use `tokio::select!` for graceful shutdowns. Avoid `std::sync::Mutex` in async hot paths; use `tokio::sync::Mutex` or strict message passing.
+- **Error Handling:** Use `thiserror` for library/module errors. `anyhow` is permitted ONLY in `main.rs` or tests.
+
+## Comment Standards (Strict)
+1. **Public API (RFC 1574):**
+    - Use `///` doc comments for all public types/functions.
+    - **Must** include `# Errors` section if the function returns `Result`.
+    - **Must** include `# Panics` section if the function can crash.
+    - **Must** include `# Safety` section if the function is `unsafe`.
+
+2. **Safety Invariants:**
+    - Any `unsafe` block MUST be preceded by a `// SAFETY:` comment explaining why it is sound.
+    - Critical protocol logic (e.g., header parsing) should use `// INVARIANT:` to document state assumptions.
+    
+3. **AI Hints & Todos:**
+    - Use `// TODO(scope): description` for future work.
+    - Use `// HACK(reason): description` for temporary workarounds.
+    - Use `// PERF(latency): description` where code is optimized for TTFB.
+
+## Critical Technical Constraints (Strict)
+1.  **Hyper 1.0 Semantics:** - **No Legacy Code:** Do NOT generate Hyper 0.14 code (e.g., avoid `make_service_fn`).
+    - **Connectors:** Use `hyper_util::server::conn::auto` and `hyper_util::rt::TokioExecutor`.
+    - **Service:** Use `hyper::service::service_fn` for simple closures or implement `Service` trait manually.
+    - **Body:** Use `http_body_util` for combinators (e.g., `BodyExt::collect` is widely deprecated in favor of util traits).
+2.  **Tower Complexity:**
+    - To avoid generic hell, use `tower::util::BoxCloneService` for dynamic layers where type erasure is acceptable for ergonomics.
+    - Prefer Type Aliases for complex Service futures.
+3.  **Streaming & Backpressure:** - This proxy handles LLM traffic (SSE/JSON-lines).
+    - **Never** await the full response body. 
+    - Implement pass-through streaming immediately to lower Time-To-First-Byte (TTFB).
+
+## Observability & Security
+- **Tracing:** Use `tracing` with structured fields (JSON). Log `http.method`, `http.uri`, `http.status_code`, and `latency_ms`.
+- **Redaction:** NEVER log headers containing keys (e.g., `Authorization`, `x-api-key`, `cookie`) or body payloads.
+- **Sanitization:** Treat all upstream inputs as untrusted.
+
+## Project Structure
+- `src/main.rs`: Entry point, CLI args parsing, runtime initialization.
+- `src/proxy/`: Core proxy logic (Hyper service impls).
+- `src/middleware/`: Custom Tower layers (auth, logging).
+- `tests/`: Integration tests using `wiremock`.
+
+## MVP Scope: "The Dumb Pipe"
+1.  Listens on `127.0.0.1:3000`.
+2.  Proxies requests to a target defined via CLI args (e.g., `--upstream-url`).
+3.  Supports `CONNECT` tunneling for HTTPS.
+4.  Gracefully handles `SIGINT`/`SIGTERM`.
+
+## Workflow
+- **Step-by-Step:** Implementation should be broken into small, testable chunks.
+- **Testing:** Create an integration test using `wiremock` to verify the proxy handles streaming correctly without buffering.
+- **Dependencies:** Ask before adding anything other than: `tokio`, `hyper`, `hyper-util`, `tower`, `http-body-util`, `bytes`, `tracing`, `tracing-subscriber`, `clap`, `thiserror`, `pin-project-lite`.
+
+Always prioritize minimal latency over convenience features.
