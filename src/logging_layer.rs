@@ -57,17 +57,24 @@ where
         let start = Instant::now();
         let method = req.method().clone();
         let uri = req.uri().clone();
-        let version = req.version();
-        let headers = sanitize_headers(req.headers());
 
         info!(
             method = %method,
             uri = %uri,
-            version = ?version,
-            headers = ?headers,
             direction = "inbound",
             "Request received"
         );
+
+        // PERF(latency): Only sanitize headers at DEBUG level to avoid allocation overhead
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let version = req.version();
+            let headers = sanitize_headers(req.headers());
+            tracing::debug!(
+                version = ?version,
+                headers = ?headers,
+                "Request details"
+            );
+        }
 
         let fut = self.inner.call(req);
 
@@ -78,21 +85,28 @@ where
             match &result {
                 Ok(res) => {
                     let status = res.status();
-                    let res_version = res.version();
-                    let res_headers = sanitize_headers(res.headers());
-                    let body_info = get_body_info(res.headers());
 
                     info!(
                         method = %method,
                         uri = %uri,
                         status = %status.as_u16(),
-                        version = ?res_version,
-                        headers = ?res_headers,
-                        body_info = %body_info,
                         latency_ms = elapsed.as_millis(),
                         direction = "outbound",
                         "Response sent"
                     );
+
+                    // PERF(latency): Only sanitize headers and extract body info at DEBUG level
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        let res_version = res.version();
+                        let res_headers = sanitize_headers(res.headers());
+                        let body_info = get_body_info(res.headers());
+                        tracing::debug!(
+                            version = ?res_version,
+                            headers = ?res_headers,
+                            body_info = %body_info,
+                            "Response details"
+                        );
+                    }
                 }
                 Err(_e) => {
                     warn!(
@@ -176,4 +190,6 @@ impl<'a> fmt::Display for BodyInfo<'a> {
 fn get_body_info(headers: &HeaderMap) -> BodyInfo<'_> {
     BodyInfo(headers)
 }
+
+
 

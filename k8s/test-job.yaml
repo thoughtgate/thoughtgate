@@ -114,7 +114,7 @@ spec:
           lifecycle:
             preStop:
               exec:
-                command: ["/bin/sh", "-c", "sleep 1"]
+                command: ["/bin/sh", "-c", "sleep 10"]
         
         # 3. Busybox sidecar for file extraction (sleeps indefinitely)
         - name: file-extractor

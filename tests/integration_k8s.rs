@@ -33,6 +33,28 @@ struct BenchExport {
     value: f64 
 }
 
+// --- Helper Functions ---
+
+/// Calculate P95 percentile from a vector of f64 values.
+/// Returns None if the input is empty.
+/// Filters out NaN values and sorts using total_cmp for panic-free comparison.
+fn calculate_p95(mut values: Vec<f64>) -> Option<f64> {
+    // Filter out NaN values to ensure safe sorting
+    values.retain(|v| !v.is_nan());
+    
+    if values.is_empty() {
+        return None;
+    }
+    
+    // Sort using total_cmp (Rust 1.62+) to avoid panics on special float values
+    values.sort_by(|a, b| a.total_cmp(b));
+    
+    let idx = (values.len() as f64 * 0.95) as usize;
+    let bounded_idx = idx.min(values.len() - 1);
+    
+    Some(values[bounded_idx])
+}
+
 // --- Test Context (RAII) ---
 struct TestContext { 
     client: Client, 
@@ -211,22 +233,8 @@ impl TestContext {
         }
         
         // Calculate p95 from collected values
-        waiting_values.sort_by(|a, b| a.total_cmp(b));
-        duration_values.sort_by(|a, b| a.total_cmp(b));
-        
-        let waiting_p95 = if !waiting_values.is_empty() {
-            let idx = (waiting_values.len() as f64 * 0.95) as usize;
-            waiting_values[idx.min(waiting_values.len() - 1)]
-        } else {
-            0.0
-        };
-        
-        let duration_p95 = if !duration_values.is_empty() {
-            let idx = (duration_values.len() as f64 * 0.95) as usize;
-            duration_values[idx.min(duration_values.len() - 1)]
-        } else {
-            0.0
-        };
+        let waiting_p95 = calculate_p95(waiting_values).unwrap_or(0.0);
+        let duration_p95 = calculate_p95(duration_values).unwrap_or(0.0);
         
         if waiting_p95 == 0.0 || duration_p95 == 0.0 {
             println!("Waiting values count: {}, Duration values count: {}", waiting_values.len(), duration_values.len());

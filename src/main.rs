@@ -101,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_service = Arc::new(ProxyService::new_with_upstream(config.upstream_url.clone()));
     let service_stack = ServiceBuilder::new()
         .layer(LoggingLayer)
+        .timeout(Duration::from_secs(300))
         .service(proxy_service.as_ref().clone());
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -144,6 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer_addr)) => {
+                        // Disable Nagle's algorithm for low-latency streaming
+                        if let Err(e) = stream.set_nodelay(true) {
+                            error!(error = %e, "Failed to set TCP_NODELAY");
+                        }
+                        
                         let service_stack = service_stack.clone();
                         let mut conn_shutdown_rx = shutdown_tx.subscribe();
                         let tracker = connection_tracker.clone();
