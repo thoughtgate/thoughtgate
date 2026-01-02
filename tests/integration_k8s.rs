@@ -9,6 +9,7 @@ use tokio::time::{sleep, timeout, Duration};
 use tokio::process::Command;
 use anyhow::{Context, Result, bail};
 use serial_test::serial;
+use uuid::Uuid;
 
 // --- Data Structures for K6 NDJSON output ---
 #[derive(Deserialize, Debug)] 
@@ -66,15 +67,9 @@ impl TestContext {
         let client = Client::try_default().await
             .context("Failed to create K8s client - is kubectl configured?")?;
         
-        let suffix: String = rand::Rng::sample_iter(
-            rand::thread_rng(), 
-            &rand::distributions::Alphanumeric
-        )
-        .take(6)
-        .map(char::from)
-        .collect();
-        
-        let ns_name = format!("thoughtgate-test-{}", suffix.to_lowercase());
+        // Use UUID for guaranteed uniqueness across test runs
+        let uuid = Uuid::new_v4();
+        let ns_name = format!("thoughtgate-test-{}", uuid);
         
         let api: Api<Namespace> = Api::all(client.clone());
         api.create(&PostParams::default(), &Namespace {
@@ -117,6 +112,81 @@ impl TestContext {
         Ok(())
     }
 
+    /// Dump container logs on failure for debugging
+    async fn dump_logs_on_failure(&self) {
+        eprintln!("\n🚨 === FAILURE DETECTED - DUMPING LOGS ===\n");
+        
+        // Find the pod name
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pod_name = match pods.list(&ListParams::default().labels("job-name=perf-test")).await {
+            Ok(list) => {
+                if let Some(pod) = list.items.first() {
+                    pod.metadata.name.clone().unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    eprintln!("⚠️  No pods found for perf-test job");
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️  Failed to list pods: {}", e);
+                return;
+            }
+        };
+        
+        // Dump ThoughtGate logs
+        eprintln!("📋 ThoughtGate Container Logs:");
+        eprintln!("================================");
+        match Command::new("kubectl")
+            .args(&["logs", "-n", &self.namespace, &pod_name, "-c", "thoughtgate"])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+                if !output.stderr.is_empty() {
+                    eprintln!("STDERR: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+            Err(e) => eprintln!("⚠️  Failed to get thoughtgate logs: {}", e),
+        }
+        
+        // Dump K6 logs
+        eprintln!("\n📋 K6 Container Logs:");
+        eprintln!("================================");
+        match Command::new("kubectl")
+            .args(&["logs", "-n", &self.namespace, &pod_name, "-c", "k6"])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+                if !output.stderr.is_empty() {
+                    eprintln!("STDERR: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+            Err(e) => eprintln!("⚠️  Failed to get k6 logs: {}", e),
+        }
+        
+        // Try to get mock-llm logs (from the separate mock-llm-pod)
+        eprintln!("\n📋 Mock LLM Container Logs:");
+        eprintln!("================================");
+        match Command::new("kubectl")
+            .args(&["logs", "-n", &self.namespace, "mock-llm-pod", "-c", "server"])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+                if !output.stderr.is_empty() {
+                    eprintln!("STDERR: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+            Err(e) => eprintln!("⚠️  Failed to get mock-llm logs: {}", e),
+        }
+        
+        eprintln!("\n🚨 === END OF LOG DUMP ===\n");
+    }
+
     async fn run_test(&self) -> Result<(f64, f64)> {
         // Deploy ConfigMap & Job
         self.kubectl(&["create", "configmap", "k6-script", "--from-file=tests/benchmark.js"])
@@ -127,14 +197,57 @@ impl TestContext {
             .await
             .context("Failed to apply test-job.yaml")?;
 
-        // Wait for K6 container to complete (max 90s)
+        // Wait for K6 container to complete (max 300s to allow for image pulls in slow environments)
         // Note: We check the K6 container status directly since ThoughtGate runs as a sidecar
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
         let start = tokio::time::Instant::now();
+        let timeout_duration = Duration::from_secs(300);
         
+        println!("⏳ Waiting for test pod to become ready...");
+        
+        // Smart polling: Wait for all containers to be ready before checking K6 completion
+        let pod_name = loop {
+            if start.elapsed() > timeout_duration {
+                // Dump logs on timeout for debugging
+                self.dump_logs_on_failure().await;
+                bail!("Test setup timed out after 300s waiting for pods to be ready");
+            }
+            
+            if let Ok(list) = pods.list(&ListParams::default().labels("job-name=perf-test")).await {
+                if let Some(pod) = list.items.first() {
+                    let pod_name_ref = pod.metadata.name.as_ref();
+                    
+                    if let Some(status) = &pod.status {
+                        // Check if pod phase is Running
+                        if let Some(phase) = &status.phase {
+                            if phase == "Running" {
+                                // Check if all containers are ready
+                                if let Some(container_statuses) = &status.container_statuses {
+                                    let all_ready = container_statuses.iter().all(|cs| cs.ready);
+                                    if all_ready {
+                                        println!("✅ All containers ready in pod: {}", pod_name_ref.unwrap());
+                                        break pod_name_ref.unwrap().clone();
+                                    } else {
+                                        println!("⏳ Waiting for containers to be ready... (elapsed: {:?})", start.elapsed());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            sleep(Duration::from_millis(500)).await;
+        };
+        
+        println!("⏳ Waiting for K6 container to complete...");
+        
+        // Now wait for K6 to complete
         loop {
-            if start.elapsed() > Duration::from_secs(90) { 
-                bail!("Benchmark timed out after 90s"); 
+            if start.elapsed() > timeout_duration {
+                // Dump logs on timeout for debugging
+                self.dump_logs_on_failure().await;
+                bail!("Benchmark timed out after 300s");
             }
             
             if let Ok(list) = pods.list(&ListParams::default().labels("job-name=perf-test")).await {
@@ -147,6 +260,8 @@ impl TestContext {
                                     println!("✅ K6 container completed successfully");
                                     break;
                                 } else {
+                                    // Dump logs on failure
+                                    self.dump_logs_on_failure().await;
                                     bail!("K6 container failed with exit code: {}", terminated.exit_code);
                                 }
                             }
@@ -155,7 +270,7 @@ impl TestContext {
                 }
             }
             
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_millis(500)).await;
         }
 
         // Extract Results with Timeout
@@ -233,11 +348,14 @@ impl TestContext {
         }
         
         // Calculate p95 from collected values
+        let waiting_count = waiting_values.len();
+        let duration_count = duration_values.len();
+        
         let waiting_p95 = calculate_p95(waiting_values).unwrap_or(0.0);
         let duration_p95 = calculate_p95(duration_values).unwrap_or(0.0);
         
         if waiting_p95 == 0.0 || duration_p95 == 0.0 {
-            println!("Waiting values count: {}, Duration values count: {}", waiting_values.len(), duration_values.len());
+            println!("Waiting values count: {}, Duration values count: {}", waiting_count, duration_count);
             bail!("Failed to extract metrics from K6 output");
         }
         

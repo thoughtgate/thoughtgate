@@ -101,7 +101,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_service = Arc::new(ProxyService::new_with_upstream(config.upstream_url.clone()));
     let service_stack = ServiceBuilder::new()
         .layer(LoggingLayer)
-        .timeout(Duration::from_secs(300))
         .service(proxy_service.as_ref().clone());
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);

@@ -1,8 +1,8 @@
 //! Core proxy service implementation.
 
 use crate::error::{ProxyError, ProxyResult};
-use http::{StatusCode, Uri};
-use http_body_util::{BodyStream, StreamBody, Full};
+use http::Uri;
+use http_body_util::{BodyStream, StreamBody};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -11,7 +11,7 @@ use hyper_util::rt::TokioExecutor;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use tower::Service;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Type alias for the client's streaming body type.
 type ClientBody = http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
@@ -41,6 +41,9 @@ impl ProxyService {
 
     /// Create a new proxy service with optional upstream URL for reverse proxy mode.
     pub fn new_with_upstream(upstream_url: Option<String>) -> Self {
+        // Install default crypto provider for rustls (required for TLS to work)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        
         // Build HTTPS connector with native OS certificate store
         let https_connector = HttpsConnectorBuilder::new()
             .with_native_roots()
@@ -225,6 +228,199 @@ fn extract_port(uri: &Uri) -> ProxyResult<u16> {
             _ => Err(ProxyError::InvalidUri(
                 "Cannot determine port from URI".to_string(),
             )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::{Method, Version, HeaderMap, HeaderValue};
+
+    /// Test URI extraction in reverse proxy mode
+    #[test]
+    fn test_uri_extraction_reverse_proxy() {
+        let service = ProxyService::new_with_upstream(Some("https://api.example.com".to_string()));
+        
+        // Create a test request
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("host", "localhost:3000")
+            .header("content-type", "application/json")
+            .body(())
+            .unwrap();
+        
+        let target_uri = service.extract_target_uri(&req).unwrap();
+        
+        assert_eq!(target_uri.to_string(), "https://api.example.com/v1/chat/completions");
+    }
+
+    /// Test URI extraction in forward proxy mode
+    #[test]
+    fn test_uri_extraction_forward_proxy() {
+        let service = ProxyService::new();
+        
+        // Test with absolute URI
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/path")
+            .body(())
+            .unwrap();
+        
+        let target_uri = service.extract_target_uri(&req).unwrap();
+        
+        assert_eq!(target_uri.to_string(), "https://example.com/path");
+    }
+
+    /// Test URI extraction with Host header
+    #[test]
+    fn test_uri_extraction_with_host_header() {
+        let service = ProxyService::new();
+        
+        // Test with relative URI + Host header
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/endpoint")
+            .header("host", "api.example.com")
+            .body(())
+            .unwrap();
+        
+        let target_uri = service.extract_target_uri(&req).unwrap();
+        
+        assert_eq!(target_uri.to_string(), "http://api.example.com/api/endpoint");
+    }
+
+    /// Test hop-by-hop header filtering
+    #[test]
+    fn test_hop_by_hop_headers() {
+        assert!(is_hop_by_hop_header("connection"));
+        assert!(is_hop_by_hop_header("Connection"));
+        assert!(is_hop_by_hop_header("keep-alive"));
+        assert!(is_hop_by_hop_header("proxy-authorization"));
+        assert!(is_hop_by_hop_header("transfer-encoding"));
+        assert!(is_hop_by_hop_header("upgrade"));
+        
+        assert!(!is_hop_by_hop_header("content-type"));
+        assert!(!is_hop_by_hop_header("authorization"));
+        assert!(!is_hop_by_hop_header("user-agent"));
+    }
+
+    /// Snapshot test: Verify request transformation logic
+    #[test]
+    fn test_integrity_snapshot() {
+        use serde_json::json;
+        
+        // Test Case 1: Reverse proxy mode with complex headers
+        let service = ProxyService::new_with_upstream(Some("https://upstream.example.com".to_string()));
+        
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions?param=value")
+            .version(Version::HTTP_11)
+            .header("host", "localhost:3000")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret-token")
+            .header("user-agent", "test-client/1.0")
+            .header("x-custom-header", "custom-value")
+            .header("connection", "keep-alive")  // Should be filtered
+            .header("transfer-encoding", "chunked")  // Should be filtered
+            .body(())
+            .unwrap();
+        
+        let target_uri = service.extract_target_uri(&req).unwrap();
+        
+        // Collect headers that would be forwarded (excluding hop-by-hop)
+        let mut forwarded_headers = HeaderMap::new();
+        for (name_opt, value) in req.headers() {
+            if let Some(name) = name_opt {
+                if !is_hop_by_hop_header(name.as_str()) {
+                    forwarded_headers.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        
+        let snapshot_data = json!({
+            "test_case": "reverse_proxy_with_filtering",
+            "method": req.method().to_string(),
+            "version": format!("{:?}", req.version()),
+            "target_uri": target_uri.to_string(),
+            "forwarded_headers": forwarded_headers.iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect::<std::collections::HashMap<_, _>>(),
+        });
+        
+        insta::assert_json_snapshot!(snapshot_data);
+        
+        // Test Case 2: Forward proxy mode with absolute URI
+        let service_forward = ProxyService::new();
+        
+        let req_forward = Request::builder()
+            .method(Method::GET)
+            .uri("https://api.openai.com/v1/models")
+            .header("authorization", "Bearer token")
+            .header("proxy-authorization", "Basic xyz")  // Should be filtered
+            .body(())
+            .unwrap();
+        
+        let target_uri_forward = service_forward.extract_target_uri(&req_forward).unwrap();
+        
+        let mut forwarded_headers_forward = HeaderMap::new();
+        for (name_opt, value) in req_forward.headers() {
+            if let Some(name) = name_opt {
+                if !is_hop_by_hop_header(name.as_str()) {
+                    forwarded_headers_forward.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        
+        let snapshot_data_forward = json!({
+            "test_case": "forward_proxy_absolute_uri",
+            "method": req_forward.method().to_string(),
+            "version": format!("{:?}", req_forward.version()),
+            "target_uri": target_uri_forward.to_string(),
+            "forwarded_headers": forwarded_headers_forward.iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect::<std::collections::HashMap<_, _>>(),
+        });
+        
+        insta::assert_json_snapshot!(snapshot_data_forward);
+    }
+
+    /// Test URI extraction with path and query parameters
+    #[test]
+    fn test_uri_with_query_params() {
+        let service = ProxyService::new_with_upstream(Some("https://api.example.com".to_string()));
+        
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/search?q=test&limit=10")
+            .body(())
+            .unwrap();
+        
+        let target_uri = service.extract_target_uri(&req).unwrap();
+        
+        assert_eq!(target_uri.to_string(), "https://api.example.com/search?q=test&limit=10");
+    }
+
+    /// Test error handling for missing URI information
+    #[test]
+    fn test_uri_extraction_error() {
+        let service = ProxyService::new();
+        
+        // Request with no absolute URI and no Host header
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/relative/path")
+            .body(())
+            .unwrap();
+        
+        let result = service.extract_target_uri(&req);
+        
+        assert!(result.is_err());
+        match result {
+            Err(ProxyError::InvalidUri(_)) => {}, // Expected
+            _ => panic!("Expected InvalidUri error"),
         }
     }
 }

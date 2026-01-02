@@ -27,18 +27,20 @@ spec:
         - containerPort: 8080
       # SAFETY: Readiness probe ensures pod is ready before receiving traffic
       readinessProbe:
-        tcpSocket:
+        httpGet:
+          path: /health
           port: 8080
-        initialDelaySeconds: 2
-        periodSeconds: 2
+        initialDelaySeconds: 0
+        periodSeconds: 1
+        failureThreshold: 3
       # SAFETY: Resource limits prevent OOM
       resources:
         limits: 
-          cpu: "500m"
-          memory: "128Mi"
-        requests: 
-          cpu: "100m"
+          cpu: "200m"
           memory: "64Mi"
+        requests: 
+          cpu: "50m"
+          memory: "32Mi"
 ---
 # Test Job
 apiVersion: batch/v1
@@ -62,11 +64,13 @@ spec:
           args:
             - |
               echo "Waiting for ThoughtGate proxy to start..."
-              until wget --spider -q http://127.0.0.1:4141 2>/dev/null; do
-                echo "Proxy not ready yet, retrying..."
-                sleep 1
+              for i in $(seq 1 30); do
+                if wget -q -O- --timeout=1 http://127.0.0.1:4141 2>/dev/null; then
+                  echo "ThoughtGate proxy is ready!"
+                  break
+                fi
+                sleep 0.1
               done
-              echo "ThoughtGate proxy is ready!"
               echo "Starting K6 tests..."
               k6 run /scripts/benchmark.js --out json=/results/results.json
               EXIT_CODE=$?
@@ -86,11 +90,11 @@ spec:
               mountPath: /results
           resources:
             limits: 
-              cpu: "300m"
-              memory: "128Mi"
+              cpu: "200m"
+              memory: "64Mi"
             requests:
               cpu: "50m"
-              memory: "64Mi"
+              memory: "32Mi"
 
         # 2. ThoughtGate Proxy (sidecar - will be terminated by K6)
         - name: thoughtgate
@@ -101,12 +105,13 @@ spec:
           readinessProbe:
             tcpSocket:
               port: 4141
-            initialDelaySeconds: 1
-            periodSeconds: 2
+            initialDelaySeconds: 0
+            periodSeconds: 1
+            failureThreshold: 3
           resources:
             limits: 
-              cpu: "300m"
-              memory: "128Mi"
+              cpu: "200m"
+              memory: "64Mi"
             requests: 
               cpu: "50m"
               memory: "32Mi"
