@@ -43,7 +43,7 @@ async fn test_bidirectional_stream() {
     let mut client = TcpStream::connect(echo_addr).await.unwrap();
 
     // Send 5 chunks with delays, measure time-to-echo for each
-    let chunks = vec![
+    let chunks = [
         b"chunk1".to_vec(),
         b"chunk2".to_vec(),
         b"chunk3".to_vec(),
@@ -96,10 +96,8 @@ async fn test_chunked_encoding_preserved() {
     // 3. Upstream sends chunked response
     // 4. Proxy forwards chunks immediately to client
 
-    assert!(
-        true,
-        "Transfer-Encoding preservation verified in proxy_service.rs"
-    );
+    // Transfer-Encoding preservation verified in proxy_service.rs
+    // (See is_hop_by_hop_header function and associated tests)
 }
 
 /// Test early connection closure (EOF) is propagated immediately

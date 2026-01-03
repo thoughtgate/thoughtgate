@@ -153,7 +153,7 @@ impl TestContext {
         eprintln!("📋 ThoughtGate Container Logs:");
         eprintln!("================================");
         match Command::new("kubectl")
-            .args(&[
+            .args([
                 "logs",
                 "-n",
                 &self.namespace,
@@ -177,7 +177,7 @@ impl TestContext {
         eprintln!("\n📋 K6 Container Logs:");
         eprintln!("================================");
         match Command::new("kubectl")
-            .args(&["logs", "-n", &self.namespace, &pod_name, "-c", "k6"])
+            .args(["logs", "-n", &self.namespace, &pod_name, "-c", "k6"])
             .output()
             .await
         {
@@ -194,7 +194,7 @@ impl TestContext {
         eprintln!("\n📋 Mock LLM Container Logs:");
         eprintln!("================================");
         match Command::new("kubectl")
-            .args(&[
+            .args([
                 "logs",
                 "-n",
                 &self.namespace,
@@ -241,7 +241,7 @@ impl TestContext {
         println!("⏳ Waiting for test pod to become ready...");
 
         // Smart polling: Wait for all containers to be ready before checking K6 completion
-        let pod_name = loop {
+        let _pod_name = loop {
             if start.elapsed() > timeout_duration {
                 // Dump logs on timeout for debugging
                 self.dump_logs_on_failure().await;
@@ -349,7 +349,7 @@ impl TestContext {
         let output = timeout(
             Duration::from_secs(10),
             Command::new("kubectl")
-                .args(&[
+                .args([
                     "exec",
                     "-n",
                     &self.namespace,
