@@ -9,14 +9,39 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+bytes = "1"
 
 [dependencies.thoughtgate]
 path = ".."
+features = ["fuzzing"]
 
 # Prevent this from interfering with normal builds
 [[bin]]
 name = "peeking_fuzz"
 path = "fuzz_targets/peeking_fuzz.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_uri_parsing"
+path = "fuzz_targets/fuzz_uri_parsing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_header_redaction"
+path = "fuzz_targets/fuzz_header_redaction.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_full_request"
+path = "fuzz_targets/fuzz_full_request.rs"
 test = false
 doc = false
 

@@ -150,7 +150,18 @@ impl ProxyService {
     }
 
     /// Extract target URI from request.
+    // Made public for fuzzing to test URI extraction logic
+    #[cfg(feature = "fuzzing")]
+    pub fn extract_target_uri<B>(&self, req: &Request<B>) -> ProxyResult<Uri> {
+        self.extract_target_uri_impl(req)
+    }
+    
+    #[cfg(not(feature = "fuzzing"))]
     fn extract_target_uri<B>(&self, req: &Request<B>) -> ProxyResult<Uri> {
+        self.extract_target_uri_impl(req)
+    }
+    
+    fn extract_target_uri_impl<B>(&self, req: &Request<B>) -> ProxyResult<Uri> {
         // If upstream URL is configured (reverse proxy mode), use it
         if let Some(upstream) = &self.upstream_url {
             let path = req
@@ -227,7 +238,17 @@ impl Service<Request<Incoming>> for ProxyService {
 ///
 /// # Traceability
 /// - Implements: REQ-CORE-001 F-003 (Transparency - preserve Transfer-Encoding)
+#[cfg(feature = "fuzzing")]
+pub fn is_hop_by_hop_header(name: &str) -> bool {
+    is_hop_by_hop_header_impl(name)
+}
+
+#[cfg(not(feature = "fuzzing"))]
 fn is_hop_by_hop_header(name: &str) -> bool {
+    is_hop_by_hop_header_impl(name)
+}
+
+fn is_hop_by_hop_header_impl(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
         "connection"

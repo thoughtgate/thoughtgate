@@ -13,6 +13,17 @@ use tracing::{info, warn};
 ///
 /// # Traceability
 /// - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy - security)
+#[cfg(feature = "fuzzing")]
+pub const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "x-api-key",
+    "x-auth-token",
+    "proxy-authorization",
+    "set-cookie",
+];
+
+#[cfg(not(feature = "fuzzing"))]
 const SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -142,6 +153,10 @@ where
 }
 
 /// Zero-allocation wrapper for sanitized headers.
+#[cfg(feature = "fuzzing")]
+pub struct SanitizedHeaders<'a>(pub &'a HeaderMap);
+
+#[cfg(not(feature = "fuzzing"))]
 struct SanitizedHeaders<'a>(&'a HeaderMap);
 
 impl<'a> fmt::Debug for SanitizedHeaders<'a> {
@@ -165,6 +180,13 @@ impl<'a> fmt::Debug for SanitizedHeaders<'a> {
 
 /// Create a zero-allocation sanitized headers wrapper.
 #[inline]
+#[cfg(feature = "fuzzing")]
+pub fn sanitize_headers(headers: &HeaderMap) -> SanitizedHeaders<'_> {
+    SanitizedHeaders(headers)
+}
+
+#[inline]
+#[cfg(not(feature = "fuzzing"))]
 fn sanitize_headers(headers: &HeaderMap) -> SanitizedHeaders<'_> {
     SanitizedHeaders(headers)
 }
