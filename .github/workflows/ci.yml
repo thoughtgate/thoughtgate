@@ -15,9 +15,9 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Stage 1: Build & Unit Tests
-  build-and-test:
-    name: Build and Test
+  # Stage 1a: Quick Checks (fast-fail)
+  quick-checks:
+    name: Format & Lint
     runs-on: ubuntu-latest
     
     steps:
@@ -29,9 +29,10 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Cache cargo registry and build artifacts
+      - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
+          shared-key: "checks"
           cache-on-failure: true
 
       - name: Check formatting
@@ -40,26 +41,29 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build release binary
-        run: cargo build --release --bin thoughtgate
+  # Stage 1b: Build Binaries
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    needs: quick-checks
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Build mock_llm binary
-        run: cargo build --release --bin mock_llm --features mock
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Run unit tests
-        run: cargo test --lib -- --nocapture
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build"
+          cache-on-failure: true
 
-      - name: Run integration tests - streaming
-        run: cargo test --test integration_streaming -- --nocapture
-
-      - name: Run integration tests - unit peeking
-        run: cargo test --test unit_peeking -- --nocapture
-
-      - name: Run integration tests - memory profile
-        run: cargo test --test memory_profile -- --nocapture
-
-      - name: Run benchmarks
-        run: cargo bench --bench ttfb --no-fail-fast
+      - name: Build release binaries
+        run: |
+          cargo build --release --bin thoughtgate
+          cargo build --release --bin mock_llm --features mock
 
       - name: Upload binaries as artifact
         uses: actions/upload-artifact@v4
@@ -70,11 +74,70 @@ jobs:
             target/release/mock_llm
           retention-days: 7
 
+  # Stage 1c: Test Suite (parallel execution)
+  test:
+    name: Test (${{ matrix.test-name }})
+    runs-on: ubuntu-latest
+    needs: quick-checks
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - test-name: "unit"
+            test-cmd: "cargo test --lib -- --nocapture"
+          - test-name: "streaming"
+            test-cmd: "cargo test --test integration_streaming -- --nocapture"
+          - test-name: "peeking"
+            test-cmd: "cargo test --test unit_peeking -- --nocapture"
+          - test-name: "memory"
+            test-cmd: "cargo test --test memory_profile -- --nocapture"
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "test-${{ matrix.test-name }}"
+          cache-on-failure: true
+
+      - name: Run ${{ matrix.test-name }} tests
+        run: ${{ matrix.test-cmd }}
+
+  # Stage 1d: Benchmarks (can run in parallel with tests)
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    needs: quick-checks
+    # Skip benchmarks on pull requests to save time
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "bench"
+          cache-on-failure: true
+
+      - name: Run benchmarks
+        run: cargo bench --bench ttfb --no-fail-fast
+
   # Stage 2: Build Container Image
   build-container:
     name: Build Container Image
     runs-on: ubuntu-latest
-    needs: build-and-test
+    needs: [build, test]
     
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}

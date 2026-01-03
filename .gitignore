@@ -2,7 +2,7 @@
 /target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+# Note: Cargo.lock is committed for binary crates to ensure reproducible builds
 
 # IDE
 .idea/

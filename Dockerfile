@@ -1,4 +1,4 @@
-FROM rust:1.92 as builder
+FROM rust:1.92 AS builder
 WORKDIR /app
 
 # Copy only dependency manifests first (for caching)
@@ -9,7 +9,7 @@ RUN mkdir -p src/bin && \
     echo "fn main() {}" > src/main.rs && \
     echo "fn main() {}" > src/bin/mock_llm.rs && \
     mkdir -p src && \
-    echo "pub mod proxy_service; pub mod error; pub mod logging_layer;" > src/lib.rs && \
+    echo "pub mod error; pub mod logging_layer; pub mod proxy_service;" > src/lib.rs && \
     echo "pub struct ProxyService;" > src/proxy_service.rs && \
     echo "pub enum ProxyError {}" > src/error.rs && \
     echo "pub struct LoggingLayer;" > src/logging_layer.rs
