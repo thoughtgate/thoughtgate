@@ -7,6 +7,11 @@
 //! # Traceability
 //! - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy)
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use clap::Parser;
 use hyper::body::Incoming;
 use hyper::{Request, Response};

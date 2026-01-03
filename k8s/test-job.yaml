@@ -101,6 +101,11 @@ spec:
           image: thoughtgate:test
           imagePullPolicy: Never
           args: ["--port", "4141", "--bind", "0.0.0.0", "--upstream-url", "http://mock-llm"]
+          # Set high file descriptor limit for connection handling
+          securityContext:
+            capabilities:
+              add:
+                - SYS_RESOURCE
           # SAFETY: Readiness probe signals when proxy is ready
           readinessProbe:
             tcpSocket:

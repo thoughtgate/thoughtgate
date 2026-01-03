@@ -36,4 +36,8 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 COPY --from=builder /app/target/release/thoughtgate /
 COPY --from=builder /app/target/release/mock_llm /
 
-ENTRYPOINT ["/thoughtgate"]
+# Create entrypoint wrapper that sets ulimits
+RUN echo '#!/bin/sh\nulimit -n 65535\nexec "$@"' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh", "/thoughtgate"]

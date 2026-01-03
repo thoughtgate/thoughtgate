@@ -39,6 +39,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # Error handling
 thiserror = "2"
 
+# Memory allocator (reduces fragmentation under load)
+mimalloc = "0.1"
+
 # Mock server framework (only needed for mock_llm test binary)
 # Marked as optional to avoid including in main thoughtgate binary
 axum = { version = "0.7", optional = true }
