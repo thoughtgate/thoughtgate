@@ -63,6 +63,9 @@ fuzzing = []
 kube = { version = "2.0", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.26", features = ["v1_30"] }
 
+# TLS support for kube client (must match main dependency)
+rustls = { version = "0.23", features = ["ring"] }
+
 # Async utilities
 futures = "0.3"
 anyhow = "1.0"

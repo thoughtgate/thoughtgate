@@ -41,6 +41,12 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Security audit
+        uses: actions-rust-lang/audit@v1
+        with:
+          # Deny warnings to fail CI on vulnerabilities
+          denyWarnings: true
+
   # Stage 1b: Build Binaries
   build:
     name: Build Binaries
@@ -178,13 +184,13 @@ jobs:
           echo "🔬 Reproduce with: cargo +nightly fuzz run ${{ matrix.target }} <crash-file>"
           exit 1
 
-  # Stage 1e: Benchmarks (can run in parallel with tests)
+  # Stage 1e: Benchmarks (TTFB Performance Tracking)
   bench:
-    name: Benchmarks
+    name: Benchmarks (TTFB)
     runs-on: ubuntu-latest
     needs: quick-checks
-    # Skip benchmarks on pull requests to save time
-    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write  # Needed to push benchmark results to gh-pages
     
     steps:
       - name: Checkout code
@@ -200,7 +206,86 @@ jobs:
           cache-on-failure: true
 
       - name: Run benchmarks
-        run: cargo bench --bench ttfb --no-fail-fast
+        run: cargo bench --bench ttfb -- --save-baseline ci-benchmark
+          
+      - name: Parse criterion output
+        run: |
+          echo "Extracting criterion benchmark results..."
+          python3 << 'PYEOF'
+          import json
+          from pathlib import Path
+          
+          # Find all criterion benchmark results
+          criterion_dir = Path("target/criterion")
+          results = []
+          
+          if not criterion_dir.exists():
+              print("Warning: target/criterion not found, creating empty results")
+              with open("benchmark_results.json", "w") as f:
+                  json.dump([], f)
+              exit(0)
+          
+          for bench_dir in criterion_dir.iterdir():
+              if not bench_dir.is_dir() or bench_dir.name == "report":
+                  continue
+                  
+              # Try to find estimates.json in the baseline directory
+              estimates_file = bench_dir / "ci-benchmark" / "estimates.json"
+              if not estimates_file.exists():
+                  print(f"Warning: {estimates_file} not found, skipping {bench_dir.name}")
+                  continue
+              
+              try:
+                  with open(estimates_file) as f:
+                      data = json.load(f)
+                      # Extract mean time in nanoseconds
+                      mean_ns = data["mean"]["point_estimate"]
+                      results.append({
+                          "name": bench_dir.name,
+                          "value": mean_ns,
+                          "unit": "ns"
+                      })
+                      print(f"✓ {bench_dir.name}: {mean_ns:.2f} ns")
+              except (KeyError, json.JSONDecodeError) as e:
+                  print(f"Error parsing {estimates_file}: {e}")
+                  continue
+          
+          # Write results in benchmark-action customSmallerIsBetter format
+          with open("benchmark_results.json", "w") as f:
+              json.dump(results, f, indent=2)
+          
+          print(f"\nExtracted {len(results)} benchmark results to benchmark_results.json")
+          PYEOF
+          
+          echo "Benchmark results:"
+          cat benchmark_results.json
+
+      - name: Store benchmark result (Push to main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'customSmallerIsBetter'
+          output-file-path: benchmark_results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          # Alert on 110% performance regression (slower)
+          alert-threshold: '110%'
+          comment-on-alert: true
+          fail-on-alert: false
+          alert-comment-cc-users: '@${{ github.repository_owner }}'
+
+      - name: Compare benchmark result (Pull Requests)
+        if: github.event_name == 'pull_request'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'customSmallerIsBetter'
+          output-file-path: benchmark_results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: false
+          # Comment with comparison on PRs
+          comment-always: true
+          alert-threshold: '110%'
+          fail-on-alert: true
 
   # Stage 2: Build Container Image
   build-container:
