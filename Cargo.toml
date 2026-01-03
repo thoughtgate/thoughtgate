@@ -76,7 +76,7 @@ insta = { version = "1.34", features = ["json"] }
 proptest = "1.0"
 
 # Benchmarking (REQ-CORE-001 Section 5 - TTFB verification)
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [[bench]]
 name = "ttfb"
