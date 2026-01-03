@@ -155,12 +155,12 @@ impl ProxyService {
     pub fn extract_target_uri<B>(&self, req: &Request<B>) -> ProxyResult<Uri> {
         self.extract_target_uri_impl(req)
     }
-    
+
     #[cfg(not(feature = "fuzzing"))]
     fn extract_target_uri<B>(&self, req: &Request<B>) -> ProxyResult<Uri> {
         self.extract_target_uri_impl(req)
     }
-    
+
     fn extract_target_uri_impl<B>(&self, req: &Request<B>) -> ProxyResult<Uri> {
         // If upstream URL is configured (reverse proxy mode), use it
         if let Some(upstream) = &self.upstream_url {
