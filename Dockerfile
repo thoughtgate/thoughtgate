@@ -28,7 +28,7 @@ RUN rm -rf target/release/thoughtgate target/release/mock_llm target/release/dep
 RUN cargo build --release --bin thoughtgate && \
     cargo build --release --bin mock_llm --features mock
 
-FROM debian:12-slim
+FROM debian:13-slim
 # Install CA certificates for HTTPS connections
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
