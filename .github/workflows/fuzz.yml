@@ -1,0 +1,109 @@
+name: Fuzzing (Hybrid Strategy)
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    # Run nightly at 02:00 UTC (deep soak mode)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzz duration in seconds'
+        required: false
+        default: '60'
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - peeking_fuzz
+          - fuzz_uri_parsing
+          - fuzz_header_redaction
+          - fuzz_full_request
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Determine fuzz duration
+        id: duration
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            # Nightly: 1 hour deep soak
+            echo "seconds=3600" >> $GITHUB_OUTPUT
+            echo "mode=deep-soak" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Manual trigger: use input
+            echo "seconds=${{ github.event.inputs.duration }}" >> $GITHUB_OUTPUT
+            echo "mode=manual" >> $GITHUB_OUTPUT
+          else
+            # PR/Push: 60 second smoke test
+            echo "seconds=60" >> $GITHUB_OUTPUT
+            echo "mode=smoke-test" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Restore fuzz corpus cache
+        uses: actions/cache@v5
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run fuzz target
+        run: |
+          echo "🔍 Fuzzing ${{ matrix.target }} in ${{ steps.duration.outputs.mode }} mode"
+          echo "⏱️  Duration: ${{ steps.duration.outputs.seconds }}s"
+          
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            -- \
+            -max_total_time=${{ steps.duration.outputs.seconds }} \
+            -rss_limit_mb=2048 \
+            -timeout=30
+        continue-on-error: false
+
+      - name: Save corpus (even on failure)
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Fail if crashes found
+        if: failure()
+        run: |
+          echo "❌ Fuzzing found crashes in ${{ matrix.target }}"
+          echo "📦 Crash inputs uploaded as artifacts"
+          echo "🔬 Reproduce with: cargo +nightly fuzz run ${{ matrix.target }} <crash-file>"
+          exit 1
+
