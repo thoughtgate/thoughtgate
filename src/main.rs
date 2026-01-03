@@ -29,7 +29,6 @@ use tokio::time::sleep;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
 
-
 /// Configuration for the proxy server.
 ///
 /// # Traceability
@@ -107,7 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ThoughtGate Proxy starting"
     );
 
-    let proxy_service = Arc::new(ProxyService::new_with_upstream(config.upstream_url.clone())?);
+    let proxy_service = Arc::new(ProxyService::new_with_upstream(
+        config.upstream_url.clone(),
+    )?);
     let service_stack = ServiceBuilder::new()
         .layer(LoggingLayer)
         .service(proxy_service.as_ref().clone());
@@ -158,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e) = stream.set_nodelay(true) {
                             error!(error = %e, "Failed to set TCP_NODELAY");
                         }
-                        
+
                         let service_stack = service_stack.clone();
                         let mut conn_shutdown_rx = shutdown_tx.subscribe();
                         let tracker = connection_tracker.clone();
@@ -241,11 +242,8 @@ async fn handle_connection<S>(
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> Result<(), ProxyError>
 where
-    S: tower::Service<
-            Request<Incoming>,
-            Response = Response<Incoming>,
-            Error = ProxyError,
-        > + Clone
+    S: tower::Service<Request<Incoming>, Response = Response<Incoming>, Error = ProxyError>
+        + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
@@ -256,9 +254,9 @@ where
     if let Ok(n) = stream.peek(&mut peek_buf).await {
         if n >= 7 && &peek_buf[..7] == b"CONNECT" {
             use tokio::io::AsyncWriteExt;
-            
+
             warn!("Rejected CONNECT request - ThoughtGate is a termination proxy");
-            
+
             let body = "405 Method Not Allowed\n\n\
                  ThoughtGate is a termination proxy for AI governance.\n\
                  It requires visibility into request headers and bodies.\n\n\
@@ -273,14 +271,14 @@ where
                  {}",
                 content_length, body
             );
-            
+
             let _ = stream.write_all(response.as_bytes()).await;
             return Ok(());
         }
     }
-    
+
     let io = TokioIo::new(stream);
-    
+
     let svc_fn = hyper::service::service_fn(move |req| {
         let mut svc = service.clone();
         async move {

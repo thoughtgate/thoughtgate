@@ -34,7 +34,7 @@ pub enum ProxyError {
     #[error("Timeout: {0}")]
     #[allow(dead_code)]
     Timeout(String),
-    
+
     /// Client error from hyper_util
     #[error("Client error: {0}")]
     #[allow(dead_code)]
@@ -43,4 +43,3 @@ pub enum ProxyError {
 
 /// Result type alias for proxy operations.
 pub type ProxyResult<T> = Result<T, ProxyError>;
-

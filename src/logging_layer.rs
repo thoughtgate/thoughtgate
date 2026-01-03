@@ -147,18 +147,18 @@ struct SanitizedHeaders<'a>(&'a HeaderMap);
 impl<'a> fmt::Debug for SanitizedHeaders<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut map = f.debug_map();
-        
+
         for (name, value) in self.0.iter() {
             let name_str = name.as_str();
             let is_sensitive = SENSITIVE_HEADERS.contains(&name_str);
-            
+
             if is_sensitive {
                 map.entry(&name_str, &"[REDACTED]");
             } else if let Ok(val_str) = value.to_str() {
                 map.entry(&name_str, &val_str);
             }
         }
-        
+
         map.finish()
     }
 }
@@ -205,6 +205,3 @@ impl<'a> fmt::Display for BodyInfo<'a> {
 fn get_body_info(headers: &HeaderMap) -> BodyInfo<'_> {
     BodyInfo(headers)
 }
-
-
-
