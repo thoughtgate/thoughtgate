@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1767526912714,
+  "lastUpdate": 1767527851285,
   "repoUrl": "https://github.com/olegmukhin/thoughtgate",
   "entries": {
     "Benchmark": [
@@ -101,6 +101,40 @@ window.BENCHMARK_DATA = {
           {
             "name": "ttfb/proxied/with_relay",
             "value": 11366306.38,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "committer": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "distinct": true,
+          "id": "ae76348d58c6a43f2a13766990e6594e2b777eb7",
+          "message": "chore: update dependencies and remove unused packages\n\n- Removed obsolete dependencies from Cargo.lock and Cargo.toml, including aws-lc-rs, aws-lc-sys, cmake, dunce, fs_extra, and jobserver.\n- Updated hyper-rustls and rustls configurations to disable default features and include specific features for improved performance and security.\n\nThese changes help streamline the dependency tree and enhance the overall project configuration.",
+          "timestamp": "2026-01-04T11:54:38Z",
+          "tree_id": "4634c40fb0ca14e25073af9201a98680a546e9a3",
+          "url": "https://github.com/olegmukhin/thoughtgate/commit/ae76348d58c6a43f2a13766990e6594e2b777eb7"
+        },
+        "date": 1767527850883,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "ttfb/direct/baseline",
+            "value": 139242.0134312134,
+            "unit": "ns"
+          },
+          {
+            "name": "ttfb/proxied/with_relay",
+            "value": 11345661.565555556,
             "unit": "ns"
           }
         ]
