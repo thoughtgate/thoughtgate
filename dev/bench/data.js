@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1767523021861,
+  "lastUpdate": 1767526912714,
   "repoUrl": "https://github.com/olegmukhin/thoughtgate",
   "entries": {
     "Benchmark": [
@@ -67,6 +67,40 @@ window.BENCHMARK_DATA = {
           {
             "name": "ttfb/proxied/with_relay",
             "value": 11379650.08333333,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "committer": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "distinct": true,
+          "id": "33bdeaf5a2ef7a6cbc70c01fa561534db59c5056",
+          "message": "refactor: streamline header sanitization logic in fuzz test\n\n- Consolidated header name and value creation to reduce redundancy.\n- Enhanced sensitive header detection to ensure proper redaction patterns are checked.\n- Improved assertions for verifying that sensitive headers are not leaked and are correctly redacted.\n\nThis refactor aims to improve code clarity and maintainability while ensuring robust security checks for sensitive headers.",
+          "timestamp": "2026-01-04T11:39:37Z",
+          "tree_id": "42297936c89bf09d3554d3f0cf1b13bf4793e710",
+          "url": "https://github.com/olegmukhin/thoughtgate/commit/33bdeaf5a2ef7a6cbc70c01fa561534db59c5056"
+        },
+        "date": 1767526911878,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "ttfb/direct/baseline",
+            "value": 128714.0174946416,
+            "unit": "ns"
+          },
+          {
+            "name": "ttfb/proxied/with_relay",
+            "value": 11366306.38,
             "unit": "ns"
           }
         ]
