@@ -163,8 +163,18 @@ impl<'a> fmt::Debug for SanitizedHeaders<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut map = f.debug_map();
 
-        for (name, value) in self.0.iter() {
+        // Limit header count to prevent DoS via excessive formatting
+        const MAX_HEADERS_TO_LOG: usize = 50;
+
+        for (idx, (name, value)) in self.0.iter().enumerate() {
+            // Safety: prevent unbounded formatting
+            if idx >= MAX_HEADERS_TO_LOG {
+                map.entry(&"...", &format!("({} more headers)", self.0.len() - idx));
+                break;
+            }
+
             let name_str = name.as_str();
+            
             // SAFETY: HTTP header names are case-insensitive (RFC 7230 Section 3.2)
             // Use zero-allocation case-insensitive comparison to prevent header value leakage
             let is_sensitive = SENSITIVE_HEADERS
@@ -172,9 +182,25 @@ impl<'a> fmt::Debug for SanitizedHeaders<'a> {
                 .any(|&sensitive| name_str.eq_ignore_ascii_case(sensitive));
 
             if is_sensitive {
+                // Redact sensitive headers
                 map.entry(&name_str, &"[REDACTED]");
-            } else if let Ok(val_str) = value.to_str() {
-                map.entry(&name_str, &val_str);
+            } else {
+                // Handle both UTF-8 and non-UTF-8 header values
+                match value.to_str() {
+                    Ok(val_str) => {
+                        // Limit individual header value length
+                        const MAX_VALUE_LEN: usize = 1024;
+                        if val_str.len() <= MAX_VALUE_LEN {
+                            map.entry(&name_str, &val_str);
+                        } else {
+                            map.entry(&name_str, &format!("{}... ({} bytes)", &val_str[..MAX_VALUE_LEN], val_str.len()));
+                        }
+                    }
+                    Err(_) => {
+                        // Header contains non-UTF8 bytes, show as binary
+                        map.entry(&name_str, &format!("<binary: {} bytes>", value.len()));
+                    }
+                }
             }
         }
 
