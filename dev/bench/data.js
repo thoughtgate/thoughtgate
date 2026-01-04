@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1767522118971,
+  "lastUpdate": 1767523021861,
   "repoUrl": "https://github.com/olegmukhin/thoughtgate",
   "entries": {
     "Benchmark": [
@@ -33,6 +33,40 @@ window.BENCHMARK_DATA = {
           {
             "name": "ttfb/proxied/with_relay",
             "value": 11398889.061111115,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "committer": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "distinct": true,
+          "id": "ce3c78ca992b2e7e5fd3be8c77958bea1fd23200",
+          "message": "Formatting fixes",
+          "timestamp": "2026-01-04T10:34:42Z",
+          "tree_id": "83cbecd8d145870c3f49bff2d51c3fb5f2fcad8c",
+          "url": "https://github.com/olegmukhin/thoughtgate/commit/ce3c78ca992b2e7e5fd3be8c77958bea1fd23200"
+        },
+        "date": 1767523021118,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "ttfb/direct/baseline",
+            "value": 95455.66009773948,
+            "unit": "ns"
+          },
+          {
+            "name": "ttfb/proxied/with_relay",
+            "value": 11379650.08333333,
             "unit": "ns"
           }
         ]
