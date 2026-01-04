@@ -318,6 +318,39 @@ jobs:
           echo "=== Final benchmark results ==="
           cat benchmark_results.json
 
+      - name: Create gh-pages branch if needed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # Check if gh-pages branch exists remotely
+          if ! git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "📝 gh-pages branch does not exist, creating..."
+            
+            # Create orphan branch (no commit history)
+            git checkout --orphan gh-pages
+            git reset --hard
+            
+            # Create initial commit with README
+            cat > README.md << 'EOF'
+          # Benchmark Results
+          
+          This branch contains automated benchmark results.
+          
+          View the dashboard at: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/dev/bench/
+          EOF
+            
+            git add README.md
+            git config user.name "github-action-benchmark"
+            git config user.email "github@users.noreply.github.com"
+            git commit -m "Initialize gh-pages for benchmark results"
+            git push origin gh-pages
+            
+            # Switch back to main
+            git checkout main
+            echo "✅ gh-pages branch created"
+          else
+            echo "✅ gh-pages branch already exists"
+          fi
+
       - name: Store benchmark result (Push to main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: benchmark-action/github-action-benchmark@v1

@@ -166,9 +166,10 @@ impl<'a> fmt::Debug for SanitizedHeaders<'a> {
         for (name, value) in self.0.iter() {
             let name_str = name.as_str();
             // SAFETY: HTTP header names are case-insensitive (RFC 7230 Section 3.2)
-            // Must use case-insensitive comparison to prevent header value leakage
-            let name_lower = name_str.to_lowercase();
-            let is_sensitive = SENSITIVE_HEADERS.contains(&name_lower.as_str());
+            // Use zero-allocation case-insensitive comparison to prevent header value leakage
+            let is_sensitive = SENSITIVE_HEADERS
+                .iter()
+                .any(|&sensitive| name_str.eq_ignore_ascii_case(sensitive));
 
             if is_sensitive {
                 map.entry(&name_str, &"[REDACTED]");
