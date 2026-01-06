@@ -81,11 +81,13 @@ where
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = &mut *self;
 
-        // Start total timeout on first poll
+        // Start total timeout and chunk timeout on first poll
         if !this.started {
             this.started = true;
-            let deadline = tokio::time::Instant::now() + this.config.total_timeout;
-            this.total_timeout.as_mut().reset(deadline);
+            let total_deadline = tokio::time::Instant::now() + this.config.total_timeout;
+            this.total_timeout.as_mut().reset(total_deadline);
+            let chunk_deadline = tokio::time::Instant::now() + this.config.chunk_timeout;
+            this.chunk_timeout.as_mut().reset(chunk_deadline);
         }
 
         // Check total timeout first
@@ -98,25 +100,27 @@ where
             .into())));
         }
 
-        // Reset chunk timeout for this poll
-        let chunk_deadline = tokio::time::Instant::now() + this.config.chunk_timeout;
-        this.chunk_timeout.as_mut().reset(chunk_deadline);
+        // Check chunk timeout BEFORE polling inner body
+        if this.chunk_timeout.as_mut().poll(cx).is_ready() {
+            let timeout_duration = this.config.chunk_timeout;
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Chunk timeout exceeded ({:?})", timeout_duration),
+            )
+            .into())));
+        }
 
-        // Poll inner body with chunk timeout
+        // Poll inner body
         match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(result) => Poll::Ready(result.map(|r| r.map_err(|e| e.into()))),
+            Poll::Ready(result) => {
+                // Reset chunk timeout for next chunk
+                let chunk_deadline = tokio::time::Instant::now() + this.config.chunk_timeout;
+                this.chunk_timeout.as_mut().reset(chunk_deadline);
+                Poll::Ready(result.map(|r| r.map_err(|e| e.into())))
+            }
             Poll::Pending => {
-                // Check if chunk timeout expired
-                if this.chunk_timeout.as_mut().poll(cx).is_ready() {
-                    let timeout_duration = this.config.chunk_timeout;
-                    Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("Chunk timeout exceeded ({:?})", timeout_duration),
-                    )
-                    .into())))
-                } else {
-                    Poll::Pending
-                }
+                // Chunk timeout already checked above, just return Pending
+                Poll::Pending
             }
         }
     }
@@ -156,5 +160,131 @@ mod tests {
         let config = TimeoutConfig::new(Duration::from_secs(5), Duration::from_secs(60));
         assert_eq!(config.chunk_timeout, Duration::from_secs(5));
         assert_eq!(config.total_timeout, Duration::from_secs(60));
+    }
+
+    // Test slow-drip chunk timeout detection
+    #[tokio::test]
+    async fn test_chunk_timeout_detection() {
+        use http_body::Frame;
+        use std::task::Poll;
+
+        // Create a body that delays before returning data
+        struct SlowBody {
+            delay: Duration,
+            yielded: bool,
+        }
+
+        impl Body for SlowBody {
+            type Data = Bytes;
+            type Error = std::io::Error;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                if self.yielded {
+                    return Poll::Ready(None);
+                }
+
+                // Simulate slow network by sleeping
+                let mut sleep = Box::pin(tokio::time::sleep(self.delay));
+                match sleep.as_mut().poll(cx) {
+                    Poll::Ready(_) => {
+                        self.yielded = true;
+                        Poll::Ready(Some(Ok(Frame::data(Bytes::from("delayed data")))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        let slow_body = SlowBody {
+            delay: Duration::from_millis(200),
+            yielded: false,
+        };
+
+        // Set chunk timeout shorter than the delay
+        let config = TimeoutConfig::new(Duration::from_millis(100), Duration::from_secs(5));
+        let timeout_body = TimeoutBody::new(slow_body, config);
+
+        // Should timeout
+        let result = timeout_body.collect().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Chunk timeout exceeded"),
+            "Expected chunk timeout error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_total_timeout_detection() {
+        use http_body::Frame;
+        use std::task::Poll;
+
+        // Create a body that returns chunks slowly
+        struct TrickleBody {
+            chunks_sent: usize,
+            total_chunks: usize,
+            delay_per_chunk: Duration,
+            sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        }
+
+        impl Body for TrickleBody {
+            type Data = Bytes;
+            type Error = std::io::Error;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                if self.chunks_sent >= self.total_chunks {
+                    return Poll::Ready(None);
+                }
+
+                // Initialize sleep if needed
+                if self.sleep.is_none() {
+                    self.sleep = Some(Box::pin(tokio::time::sleep(self.delay_per_chunk)));
+                }
+
+                // Check if sleep is done
+                if let Some(sleep) = &mut self.sleep {
+                    match sleep.as_mut().poll(cx) {
+                        Poll::Ready(_) => {
+                            self.chunks_sent += 1;
+                            self.sleep = None; // Reset for next chunk
+                            Poll::Ready(Some(Ok(Frame::data(Bytes::from("chunk")))))
+                        }
+                        Poll::Pending => Poll::Pending,
+                    }
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        let trickle_body = TrickleBody {
+            chunks_sent: 0,
+            total_chunks: 10,
+            delay_per_chunk: Duration::from_millis(50),
+            sleep: None,
+        };
+
+        // Set total timeout shorter than time to send all chunks (10 * 50ms = 500ms)
+        let config = TimeoutConfig::new(Duration::from_secs(1), Duration::from_millis(200));
+        let timeout_body = TimeoutBody::new(trickle_body, config);
+
+        // Should timeout on total timeout
+        let result = timeout_body.collect().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Total stream timeout exceeded"),
+            "Expected total timeout error, got: {}",
+            err_msg
+        );
     }
 }

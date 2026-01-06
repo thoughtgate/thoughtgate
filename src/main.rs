@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use thoughtgate::metrics;
 
         let exporter = opentelemetry_prometheus::exporter()
-            .with_registry(prometheus::Registry::new())
+            .with_registry(prometheus::default_registry().clone())
             .build()?;
 
         let provider = SdkMeterProvider::builder().with_reader(exporter).build();

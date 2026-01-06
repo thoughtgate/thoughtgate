@@ -30,6 +30,14 @@ cargo install cargo-nextest --locked
 echo "  - cargo-watch (auto-rebuild)..."
 cargo install cargo-watch
 
+# cargo-audit (security vulnerability scanning)
+echo "  - cargo-audit (security auditing)..."
+cargo install cargo-audit --locked
+
+# cargo-insta (snapshot testing)
+echo "  - cargo-insta (snapshot testing)..."
+cargo install cargo-insta --locked
+
 # mantra (L1 Verification - Traceability)
 echo "  - mantra (traceability checking)..."
 cargo install mantra || echo "⚠️  mantra installation failed (known issue, will retry later)"
@@ -65,6 +73,8 @@ echo "Nightly: $(rustup toolchain list | grep nightly || echo 'not installed')"
 echo "cargo-fuzz: $(cargo fuzz --version 2>&1 | head -1 || echo 'not installed')"
 echo "cargo-nextest: $(cargo nextest --version 2>&1 || echo 'not installed')"
 echo "cargo-watch: $(cargo watch --version 2>&1 || echo 'not installed')"
+echo "cargo-audit: $(cargo audit --version 2>&1 || echo 'not installed')"
+echo "cargo-insta: $(cargo insta --version 2>&1 || echo 'not installed')"
 echo "mantra: $(mantra --version 2>&1 || echo 'not installed')"
 echo ""
 echo "Verification Hierarchy Available:"

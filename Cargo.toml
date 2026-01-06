@@ -53,10 +53,10 @@ async-trait = "0.1"
 mimalloc = "0.1"
 
 # OpenTelemetry + Prometheus (REQ-CORE-001 NFR-001)
-opentelemetry = { version = "0.22", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
-opentelemetry-prometheus = "0.15"
-prometheus = "0.13"
+opentelemetry = { version = "0.31", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-prometheus = "0.31"
+prometheus = "0.14"
 once_cell = "1.19"
 
 # Mock server framework and metrics endpoint

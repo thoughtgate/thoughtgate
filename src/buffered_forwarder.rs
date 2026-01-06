@@ -159,7 +159,7 @@ impl BufferedForwarder {
         debug!("Acquired Amber Path permit, processing request");
 
         // Split request into parts and body
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
 
         // 2. Wrap entire operation in timeout
         let result = timeout(self.config.buffer_timeout, async {
@@ -174,7 +174,15 @@ impl BufferedForwarder {
                 if let Some(t) = timer {
                     t.finish_success(buffered_body.len() as u64);
                 }
-                // 3. Reconstruct request with buffered body
+
+                // 3. Update Content-Length if body was modified
+                // (Inspectors may have changed the body size)
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                parts
+                    .headers
+                    .insert(http::header::CONTENT_LENGTH, buffered_body.len().into());
+
+                // 4. Reconstruct request with buffered body
                 Ok(Request::from_parts(parts, Full::new(buffered_body)))
             }
             Ok(Err(e)) => {

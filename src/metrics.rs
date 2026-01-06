@@ -44,20 +44,20 @@ impl GreenPathMetrics {
             bytes_total: meter
                 .u64_counter("green_path_bytes_total")
                 .with_description("Total bytes transferred through green path")
-                .init(),
+                .build(),
             streams_active: Arc::new(AtomicI64::new(0)),
             streams_total: meter
                 .u64_counter("green_path_streams_total")
                 .with_description("Total number of streams")
-                .init(),
+                .build(),
             ttfb_seconds: meter
                 .f64_histogram("green_path_ttfb_seconds")
                 .with_description("Time to first byte in seconds")
-                .init(),
+                .build(),
             chunk_size_bytes: meter
                 .u64_histogram("green_path_chunk_size_bytes")
                 .with_description("Size of chunks in bytes")
-                .init(),
+                .build(),
         }
     }
 
@@ -141,23 +141,23 @@ impl AmberPathMetrics {
             buffer_size_bytes: meter
                 .u64_histogram("amber_path_buffer_size_bytes")
                 .with_description("Size of buffered payloads in bytes")
-                .init(),
+                .build(),
             duration_seconds: meter
                 .f64_histogram("amber_path_duration_seconds")
                 .with_description("Total duration of Amber Path operations in seconds")
-                .init(),
+                .build(),
             inspector_duration_seconds: meter
                 .f64_histogram("amber_inspector_duration_seconds")
                 .with_description("Duration of individual inspector executions in seconds")
-                .init(),
+                .build(),
             inspections_total: meter
                 .u64_counter("amber_path_inspections_total")
                 .with_description("Total number of inspections by decision type")
-                .init(),
+                .build(),
             errors_total: meter
                 .u64_counter("amber_path_errors_total")
                 .with_description("Total number of Amber Path errors by type")
-                .init(),
+                .build(),
             buffers_active: Arc::new(AtomicI64::new(0)),
         }
     }

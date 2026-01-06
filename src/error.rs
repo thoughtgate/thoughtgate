@@ -159,7 +159,8 @@ impl ProxyError {
                 "400 Bad Request\n\nInvalid request URI.",
             ),
             ProxyError::ClientDisconnect => {
-                // Client disconnect should not generate a response
+                // Client has disconnected - return 400 for consistency, though
+                // in practice this response won't be sent since the client is gone
                 (
                     StatusCode::BAD_REQUEST,
                     "400 Bad Request\n\nClient disconnected.",
