@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1767527851285,
+  "lastUpdate": 1767696336446,
   "repoUrl": "https://github.com/olegmukhin/thoughtgate",
   "entries": {
     "Benchmark": [
@@ -135,6 +135,40 @@ window.BENCHMARK_DATA = {
           {
             "name": "ttfb/proxied/with_relay",
             "value": 11345661.565555556,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "committer": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "distinct": true,
+          "id": "533021825a8ee950e6773d4f8665aef6a18c524d",
+          "message": "fix(fuzz): handle header truncation in redaction test\n\nThe fuzz test was incorrectly failing when sensitive headers were\ntruncated due to MAX_HEADERS_TO_LOG=50 defense-in-depth limit.\n\nBefore: Test asserted ALL sensitive headers must appear as redacted\nAfter: Skip validation for headers that don't appear (truncated)\n\nOnly validate redaction for headers actually present in output.",
+          "timestamp": "2026-01-06T10:43:39Z",
+          "tree_id": "03e2d26f4ce5c4c68d8506d7a4213b45bd279b60",
+          "url": "https://github.com/olegmukhin/thoughtgate/commit/533021825a8ee950e6773d4f8665aef6a18c524d"
+        },
+        "date": 1767696335959,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "ttfb/direct/baseline",
+            "value": 130352.5170348292,
+            "unit": "ns"
+          },
+          {
+            "name": "ttfb/proxied/with_relay",
+            "value": 11351371.344444443,
             "unit": "ns"
           }
         ]
