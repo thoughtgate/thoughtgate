@@ -1,7 +1,7 @@
 [package]
 name = "thoughtgate"
 version = "0.1.0"
-edition = "2026"
+edition = "2024"
 authors = ["Oleg Mukhin <oleg.v.mukhin@gmail.com>"]
 description = "ThoughtGate - High-performance sidecar proxy for governing MCP and A2A agentic AI traffic"
 license = "Apache-2.0"
