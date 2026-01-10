@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1767997037182,
+  "lastUpdate": 1768084699581,
   "repoUrl": "https://github.com/olegmukhin/thoughtgate",
   "entries": {
     "Benchmark": [
@@ -203,6 +203,40 @@ window.BENCHMARK_DATA = {
           {
             "name": "ttfb/proxied/with_relay",
             "value": 11448396.460000003,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8e6ee03e4f2d05b1d3235b29d941e50dffaaba1c",
+          "message": "Merge pull request #14 from olegmukhin/refactor\n\nRemoved unused files and added CLAUDE.md",
+          "timestamp": "2026-01-10T22:35:41Z",
+          "tree_id": "0ea6adbfdfe17154359d6d04782f83426dd37890",
+          "url": "https://github.com/olegmukhin/thoughtgate/commit/8e6ee03e4f2d05b1d3235b29d941e50dffaaba1c"
+        },
+        "date": 1768084699302,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "ttfb/direct/baseline",
+            "value": 138279.4339354855,
+            "unit": "ns"
+          },
+          {
+            "name": "ttfb/proxied/with_relay",
+            "value": 11375513.813333333,
             "unit": "ns"
           }
         ]
