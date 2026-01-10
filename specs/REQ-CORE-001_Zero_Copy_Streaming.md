@@ -5,7 +5,7 @@
 | **ID** | `REQ-CORE-001` |
 | **Title** | Zero-Copy Streaming (Green Path) |
 | **Type** | Core Mechanic |
-| **Status** | Implemented (Partial) |
+| **Status** | Draft |
 | **Priority** | **Critical** |
 | **Tags** | `#proxy` `#streaming` `#performance` `#latency` `#zero-copy` |
 
@@ -60,8 +60,7 @@ The system must:
 - Concurrency limiting via semaphore
 - Backpressure propagation
 - HTTP trailer forwarding
-- Protocol upgrade handling (WebSocket)
-- Per-chunk and total stream timeouts
+- Connection-level stream timeouts
 - Client disconnect detection and upstream cancellation
 
 ### 4.2 Out of Scope
@@ -69,6 +68,7 @@ The system must:
 - Policy evaluation (REQ-POL-001)
 - Error response formatting (REQ-CORE-004)
 - MCP-specific routing (REQ-CORE-003)
+- Protocol upgrades / WebSocket (deferred to v0.2 - MCP uses HTTP+SSE)
 
 ## 5. Constraints
 
@@ -119,7 +119,6 @@ The implementation MUST correctly propagate backpressure:
 
 - Preserve `Content-Length` and `Transfer-Encoding` exactly
 - Do not manually strip hop-by-hop headers (hyper handles this)
-- Support WebSocket and HTTP/2 upgrades via `CONNECT`
 
 ## 6. Interfaces
 
@@ -253,22 +252,47 @@ where
 - **F-003.2:** Handle `poll_frame` returning trailer frames after data frames
 - **F-003.3:** Preserve trailer headers exactly
 
-### F-004: Protocol Upgrade Handling
+### ~~F-004: Protocol Upgrade Handling~~ (Deferred to v0.2)
 
-- **F-004.1:** Detect upgrade via `Connection: Upgrade` header
-- **F-004.2:** Forward request and response normally
-- **F-004.3:** On `101 Switching Protocols`, extract underlying IO via `hyper::upgrade::on()`
-- **F-004.4:** Switch to `tokio::io::copy_bidirectional` for opaque TCP pipe
-- **F-004.5:** Record metric with `upgrade_type="websocket"`
+Protocol upgrades (WebSocket, HTTP/2) are not required for v0.1. MCP uses HTTP + SSE which does not require upgrade handling. Hyper's default behavior is sufficient.
 
-### F-005: Timeout Handling
+**Rationale:** MCP's Streamable HTTP transport uses standard HTTP POST with SSE responses. WebSocket transport is uncommon in MCP deployments.
 
-- **F-005.1:** Enforce per-chunk read/write timeouts
-- **F-005.2:** If chunk timeout exceeded → abort with `504`
-- **F-005.3:** Wrap entire stream in `tokio::time::timeout(total_timeout)`
-- **F-005.4:** If total timeout exceeded → abort to prevent resource leaks
+### F-004: Connection-Level Timeout (Slow-Read Protection)
 
-### F-006: Concurrency Limiting
+**Problem:** Without timeouts, a misbehaving or malicious upstream can hold connections indefinitely (slow-read attack), exhausting proxy resources.
+
+**Solution:** Wrap the entire upstream request/response cycle in `tokio::time::timeout`. This provides protection without per-chunk allocation overhead.
+
+```rust
+/// Implements: REQ-CORE-001/F-004
+/// 
+/// Connection-level timeout protects against slow-read attacks.
+/// Unlike per-chunk TimeoutBody wrappers, this approach:
+/// - Zero allocation overhead (no Box<dyn Body>)
+/// - Catches slow connection establishment
+/// - Catches slow header delivery
+/// - Catches slow body streaming
+pub async fn forward_with_timeout(
+    upstream: &UpstreamClient,
+    request: Request<Body>,
+    timeout_duration: Duration,
+) -> Result<Response<Body>, ThoughtGateError> {
+    tokio::time::timeout(timeout_duration, upstream.forward(request))
+        .await
+        .map_err(|_| ThoughtGateError::UpstreamTimeout {
+            url: upstream.base_url().to_string(),
+            timeout_secs: timeout_duration.as_secs(),
+        })?
+}
+```
+
+- **F-004.1:** Wrap `upstream.forward()` in `tokio::time::timeout()`
+- **F-004.2:** Use `THOUGHTGATE_STREAM_TOTAL_TIMEOUT_SECS` (default: 3600s)
+- **F-004.3:** On timeout, return `ThoughtGateError::UpstreamTimeout`
+- **F-004.4:** Log timeout events at `WARN` level with upstream URL
+
+### F-005: Concurrency Limiting
 
 - **F-006.1:** Use global `tokio::sync::Semaphore` for stream limit
 - **F-006.2:** Acquire permit before starting stream
@@ -283,16 +307,17 @@ where
 - Emit OTel span `green_path.stream` with attributes:
   - `stream_duration_ms`
   - `bytes_transferred`
-  - `upgrade_type`
   - `error_kind`
+  - `timed_out` (boolean)
 
 **Metrics:**
 ```
 green_path_bytes_total{direction="upload|download"}
 green_path_streams_active
-green_path_streams_total{outcome="success|error|upgrade"}
+green_path_streams_total{outcome="success|error|timeout"}
 green_path_ttfb_seconds (histogram, buckets: .001, .005, .01, .05, .1)
 green_path_chunk_size_bytes (histogram)
+green_path_timeouts_total
 ```
 
 ### NFR-002: Performance
@@ -319,13 +344,13 @@ green_path_chunk_size_bytes (histogram)
 | Trailers present | Forward chunks → Forward trailers → Close | EC-GRN-001 |
 | Client disconnect | Detect EOF, close upstream < 10ms | EC-GRN-002 |
 | Upstream RST | Propagate 502 to client immediately | EC-GRN-003 |
-| WebSocket upgrade | Switch to opaque TCP pipe, bidirectional flow | EC-GRN-004 |
-| Slow reader (backpressure) | Upstream read pauses until client consumes | EC-GRN-005 |
-| No-body response (204) | Forward headers, yield no frames, finish | EC-GRN-006 |
-| Large chunk (16MB) | Forward without splitting or buffering | EC-GRN-007 |
-| Concurrent stream limit | 10,000 OK; 10,001st gets 503 | EC-GRN-008 |
-| Invalid chunk from upstream | Detect error, close connection, log | EC-GRN-009 |
-| Total timeout exceeded | Stream cut off at configured timeout | EC-GRN-010 |
+| Slow reader (backpressure) | Upstream read pauses until client consumes | EC-GRN-004 |
+| No-body response (204) | Forward headers, yield no frames, finish | EC-GRN-005 |
+| Large chunk (16MB) | Forward without splitting or buffering | EC-GRN-006 |
+| Concurrent stream limit | 10,000 OK; 10,001st gets 503 | EC-GRN-007 |
+| Invalid chunk from upstream | Detect error, close connection, log | EC-GRN-008 |
+| Connection timeout exceeded | Return UpstreamTimeout error, log at WARN | EC-GRN-009 |
+| Slow upstream (near timeout) | Complete successfully if within timeout | EC-GRN-010 |
 
 ### 9.2 Assertions
 
@@ -333,11 +358,12 @@ green_path_chunk_size_bytes (histogram)
 - `test_proxy_body_no_buffering` — Memory stays flat (O(1)) for 100MB stream
 - `test_cancellation_on_client_disconnect` — Upstream cancelled within 10ms
 - `test_trailer_forwarding` — Trailers arrive at client
+- `test_connection_timeout` — UpstreamTimeout returned when timeout exceeded
 
 **Integration Tests:**
 - `test_bidirectional_backpressure` — Pause downstream → upstream pauses
-- `test_websocket_upgrade` — Full bidirectional data flow after 101
 - `test_concurrent_stream_limit` — 503 returned when limit exceeded
+- `test_slow_upstream_succeeds` — Completes if within timeout threshold
 
 **Benchmarks:**
 - `bench_ttfb_overhead` — P99 < 2ms
@@ -355,34 +381,26 @@ green_path_chunk_size_bytes (histogram)
 - [x] Backpressure verified
 - [x] Prometheus metrics and OTel spans
 
-### 10.2 Partial Implementation
+### 10.2 v0.1 Implementation Required
 
-**F-004: Protocol Upgrade Handling**
-- ✅ Upgrade requests detected via `is_upgrade_request()`
-- ✅ Upgrade headers preserved
-- ✅ 101 responses logged
-- ❌ Explicit `hyper::upgrade::on()` not implemented
-- ❌ Manual `tokio::io::copy_bidirectional()` not implemented
+**F-004: Connection-Level Timeout**
+- [ ] Wrap `upstream.forward()` in `tokio::time::timeout()`
+- [ ] Use `THOUGHTGATE_STREAM_TOTAL_TIMEOUT_SECS` configuration
+- [ ] Return `ThoughtGateError::UpstreamTimeout` on timeout
+- [ ] Add `green_path_timeouts_total` metric
 
-**Reason:** Current architecture uses `hyper_util::client::legacy::Client` which abstracts the underlying connection. Full upgrade handling requires custom connection pooling.
+**Implementation Note:** This is a small change (~10 lines) that wraps the existing forward call. No architectural changes required.
 
-**Impact:** For most WebSocket/HTTP/2 upgrades, hyper's internal handling is sufficient. Gap is in strict "opaque TCP pipe" control.
+### 10.3 Deferred to v0.2
 
-**F-005: Timeout Handling**
-- ✅ `TimeoutBody` wrapper exists
-- ✅ Configuration values loaded
-- ❌ Wrappers not applied to Green Path responses
-- ❌ Per-chunk timeouts not enforced on streaming responses
+**Protocol Upgrades (WebSocket/HTTP2)**
+- Not required for MCP's HTTP+SSE transport
+- Hyper's default handling sufficient for v0.1
+- Will implement explicit `hyper::upgrade::on()` in v0.2 if needed
 
-**Reason:** Applying wrappers changes return type, requiring `BoxBody` type erasure which adds allocation overhead.
-
-**Impact:** Green Path vulnerable to slow-read attacks from misbehaving upstreams.
-
-### 10.3 Pending
+### 10.4 Pending (Non-Blocking for v0.1)
 - [ ] Memory leak test (Valgrind/ASAN)
-- [ ] Performance benchmarks
-- [ ] Full upgrade handling
-- [ ] Timeout wrapper integration
+- [ ] Performance benchmarks (TTFB < 2ms verification)
 
 ## 11. Anti-Patterns to Avoid
 
@@ -397,9 +415,8 @@ green_path_chunk_size_bytes (histogram)
 - [x] `ProxyBody` wrapper implemented complying with `http_body::Body`
 - [x] `TCP_NODELAY` & `SO_KEEPALIVE` configured via `socket2`
 - [x] Concurrency limit (Semaphore) enforced and tested
-- [~] Upgrade/WebSocket handling (PARTIAL)
 - [x] Backpressure verified
-- [~] Timeout handling (PARTIAL)
+- [ ] Connection-level timeout implemented (F-004)
 - [x] Prometheus metrics and OTel spans
 - [ ] Memory leak test passed
 - [ ] Performance benchmarks passed (TTFB < 2ms, Memory O(1))
