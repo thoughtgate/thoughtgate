@@ -45,6 +45,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Error handling
 thiserror = "2"
+uuid = { version = "1.11", features = ["v4"] }
 
 # Async trait support (REQ-CORE-002 Inspector interface)
 async-trait = "0.1"
