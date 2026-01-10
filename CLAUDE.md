@@ -45,6 +45,42 @@ Traffic flows through exactly ONE path:
 
 ## Code Standards
 
+### Git Commit Messages (Conventional Commits)
+
+**Format:** `<type>(<scope>): <subject>`
+
+**Types:**
+- `feat` - New feature
+- `fix` - Bug fix
+- `docs` - Documentation only
+- `style` - Code style (formatting, missing semicolons, etc)
+- `refactor` - Code change that neither fixes a bug nor adds a feature
+- `test` - Adding or updating tests
+- `chore` - Maintenance tasks (dependencies, build config, etc)
+
+**Rules:**
+- Subject: Imperative mood ("add" not "added"), lowercase, no period at end
+- Body: Wrapped at 72 characters, explaining **why** vs. how
+- Footer: Reference issues/requirements (e.g., `Implements: REQ-CORE-004`)
+
+**Examples:**
+```
+feat(error): add JSON-RPC 2.0 error handling
+
+Implement comprehensive error types for MCP transport layer with
+standard and custom error codes. All errors map to JSON-RPC 2.0
+compliant responses with security-safe details.
+
+Implements: REQ-CORE-004
+Refs: specs/REQ-CORE-004_Error_Handling.md
+```
+
+```
+fix(proxy): prevent connection leak on timeout
+
+test(k8s): mark integration tests as ignored by default
+```
+
 ### Safety Rules (ENFORCED)
 ```rust
 // ❌ NEVER in runtime code
