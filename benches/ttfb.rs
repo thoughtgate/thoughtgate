@@ -3,7 +3,7 @@
 //! # Traceability
 //! - Implements: REQ-CORE-001 Section 5 (Benchmark - P95 TTFB < 10ms)
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

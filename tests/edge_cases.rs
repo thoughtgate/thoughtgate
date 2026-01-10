@@ -8,7 +8,7 @@ use http::{HeaderValue, Method, StatusCode};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
 /// Test EC-001: Trailers Present
 ///

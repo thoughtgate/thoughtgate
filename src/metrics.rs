@@ -9,10 +9,10 @@
 //! - Implements: REQ-CORE-001 NFR-001 (Observability)
 //! - Implements: REQ-CORE-002 NFR-001 (Observability)
 
-use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::KeyValue;
-use std::sync::atomic::{AtomicI64, Ordering};
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
 // ─────────────────────────────────────────────────────────────────────────────

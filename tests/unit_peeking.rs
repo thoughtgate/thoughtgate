@@ -3,8 +3,8 @@
 //! # Traceability
 //! - Implements: REQ-CORE-001 Section 5 (Verification Plan)
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 

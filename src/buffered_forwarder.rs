@@ -22,7 +22,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures_util::{stream, FutureExt};
+use futures_util::{FutureExt, stream};
 use http::{HeaderMap, Request, Response};
 use http_body::Frame;
 use http_body_util::{BodyExt, LengthLimitError, Limited, StreamBody};
@@ -34,7 +34,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::config::ProxyConfig;
 use crate::error::{ProxyError, ProxyResult};
 use crate::inspector::{Decision, InspectionContext, Inspector};
-use crate::metrics::{get_amber_metrics, AmberPathTimer, InspectorTimer};
+use crate::metrics::{AmberPathTimer, InspectorTimer, get_amber_metrics};
 
 /// Helper type alias for bodies that may include trailers.
 ///

@@ -1,8 +1,8 @@
 use axum::{
+    Router,
     extract::{Json, State},
     response::sse::{Event, Sse},
     routing::{get, post},
-    Router,
 };
 use futures_util::stream::{self, Stream};
 use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};

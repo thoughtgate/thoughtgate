@@ -226,19 +226,25 @@ mod tests {
         // Test 2: Environment variable override (test in isolation)
         // Note: from_env() may be affected by global env state in parallel tests
         // So we only test the override behavior here
-        std::env::set_var("THOUGHTGATE_MAX_CONCURRENT_STREAMS", "5000");
+        unsafe {
+            std::env::set_var("THOUGHTGATE_MAX_CONCURRENT_STREAMS", "5000");
+        }
         let config_with_override = ProxyConfig::from_env();
         assert_eq!(config_with_override.max_concurrent_streams, 5000);
-        std::env::remove_var("THOUGHTGATE_MAX_CONCURRENT_STREAMS");
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_MAX_CONCURRENT_STREAMS");
+        }
     }
 
     #[test]
     fn test_amber_path_env_loading() {
         // Test Amber Path configuration from environment variables
-        std::env::set_var("THOUGHTGATE_MAX_CONCURRENT_BUFFERS", "50");
-        std::env::set_var("THOUGHTGATE_REQ_BUFFER_MAX", "1048576"); // 1 MB
-        std::env::set_var("THOUGHTGATE_RESP_BUFFER_MAX", "5242880"); // 5 MB
-        std::env::set_var("THOUGHTGATE_BUFFER_TIMEOUT_SECS", "60");
+        unsafe {
+            std::env::set_var("THOUGHTGATE_MAX_CONCURRENT_BUFFERS", "50");
+            std::env::set_var("THOUGHTGATE_REQ_BUFFER_MAX", "1048576"); // 1 MB
+            std::env::set_var("THOUGHTGATE_RESP_BUFFER_MAX", "5242880"); // 5 MB
+            std::env::set_var("THOUGHTGATE_BUFFER_TIMEOUT_SECS", "60");
+        }
 
         let config = ProxyConfig::from_env();
 
@@ -248,9 +254,11 @@ mod tests {
         assert_eq!(config.buffer_timeout, Duration::from_secs(60));
 
         // Clean up
-        std::env::remove_var("THOUGHTGATE_MAX_CONCURRENT_BUFFERS");
-        std::env::remove_var("THOUGHTGATE_REQ_BUFFER_MAX");
-        std::env::remove_var("THOUGHTGATE_RESP_BUFFER_MAX");
-        std::env::remove_var("THOUGHTGATE_BUFFER_TIMEOUT_SECS");
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_MAX_CONCURRENT_BUFFERS");
+            std::env::remove_var("THOUGHTGATE_REQ_BUFFER_MAX");
+            std::env::remove_var("THOUGHTGATE_RESP_BUFFER_MAX");
+            std::env::remove_var("THOUGHTGATE_BUFFER_TIMEOUT_SECS");
+        }
     }
 }

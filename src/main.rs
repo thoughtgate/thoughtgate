@@ -19,15 +19,15 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thoughtgate::config::ProxyConfig;
 use thoughtgate::error::ProxyError;
 use thoughtgate::logging_layer::LoggingLayer;
 use thoughtgate::proxy_service::ProxyService;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::{Semaphore, broadcast};
 use tokio::time::sleep;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
@@ -335,30 +335,31 @@ where
     // Peek to detect CONNECT method and reject it immediately
     // PERF(latency): Zero-copy peek avoids buffering overhead
     let mut peek_buf = [0u8; 7];
-    if let Ok(n) = stream.peek(&mut peek_buf).await {
-        if n >= 7 && &peek_buf[..7] == b"CONNECT" {
-            use tokio::io::AsyncWriteExt;
+    if let Ok(n) = stream.peek(&mut peek_buf).await
+        && n >= 7
+        && &peek_buf[..7] == b"CONNECT"
+    {
+        use tokio::io::AsyncWriteExt;
 
-            warn!("Rejected CONNECT request - ThoughtGate is a termination proxy");
+        warn!("Rejected CONNECT request - ThoughtGate is a termination proxy");
 
-            let body = "405 Method Not Allowed\n\n\
+        let body = "405 Method Not Allowed\n\n\
                  ThoughtGate is a termination proxy for AI governance.\n\
                  It requires visibility into request headers and bodies.\n\n\
                  Send plain HTTP requests to http://127.0.0.1:4141 instead.";
-            let content_length = body.len();
-            let response = format!(
-                "HTTP/1.1 405 Method Not Allowed\r\n\
+        let content_length = body.len();
+        let response = format!(
+            "HTTP/1.1 405 Method Not Allowed\r\n\
                  Content-Type: text/plain\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\
                  \r\n\
                  {}",
-                content_length, body
-            );
+            content_length, body
+        );
 
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Ok(());
-        }
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Ok(());
     }
 
     let io = TokioIo::new(stream);
@@ -466,7 +467,7 @@ async fn send_503_response(mut stream: TcpStream) -> std::io::Result<()> {
 /// - Implements: REQ-CORE-001 NFR-001 (Observability - Metrics Endpoint)
 #[cfg(feature = "metrics")]
 async fn serve_metrics(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    use axum::{response::IntoResponse, routing::get, Router};
+    use axum::{Router, response::IntoResponse, routing::get};
 
     async fn metrics_handler() -> impl IntoResponse {
         use prometheus::{Encoder, TextEncoder};

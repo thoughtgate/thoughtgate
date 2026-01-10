@@ -233,26 +233,24 @@ struct BodyInfo<'a>(&'a HeaderMap);
 
 impl<'a> fmt::Display for BodyInfo<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(content_length) = self.0.get("content-length") {
-            if let Ok(len_str) = content_length.to_str() {
-                return write!(f, "{} bytes", len_str);
-            }
+        if let Some(content_length) = self.0.get("content-length")
+            && let Ok(len_str) = content_length.to_str()
+        {
+            return write!(f, "{} bytes", len_str);
         }
 
-        if let Some(te) = self.0.get("transfer-encoding") {
-            if let Ok(te_str) = te.to_str() {
-                if te_str.contains("chunked") {
-                    return f.write_str("chunked/streaming");
-                }
-            }
+        if let Some(te) = self.0.get("transfer-encoding")
+            && let Ok(te_str) = te.to_str()
+            && te_str.contains("chunked")
+        {
+            return f.write_str("chunked/streaming");
         }
 
-        if let Some(ct) = self.0.get("content-type") {
-            if let Ok(ct_str) = ct.to_str() {
-                if ct_str.contains("text/event-stream") {
-                    return f.write_str("SSE/streaming");
-                }
-            }
+        if let Some(ct) = self.0.get("content-type")
+            && let Ok(ct_str) = ct.to_str()
+            && ct_str.contains("text/event-stream")
+        {
+            return f.write_str("SSE/streaming");
         }
 
         f.write_str("unknown")

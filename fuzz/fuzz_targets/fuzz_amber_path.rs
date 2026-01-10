@@ -80,13 +80,16 @@ impl Inspector for FuzzInspector {
     }
 }
 
-/// Panicking inspector for panic safety testing
-struct PanicInspector;
+/// Error-returning inspector for error path testing
+/// 
+/// Note: Actual panic safety is tested in unit tests (tests/amber_path_panic_safety.rs)
+/// Fuzz tests should find unexpected panics, not test intentional ones.
+struct ErrorInspector;
 
 #[async_trait::async_trait]
-impl Inspector for PanicInspector {
+impl Inspector for ErrorInspector {
     fn name(&self) -> &'static str {
-        "panic-inspector"
+        "error-inspector"
     }
 
     async fn inspect(
@@ -94,9 +97,12 @@ impl Inspector for PanicInspector {
         body: &[u8],
         _ctx: InspectionContext<'_>,
     ) -> Result<Decision, ProxyError> {
-        // Panic on specific byte patterns to test panic safety
+        // Return error on specific byte patterns to test error handling
         if body.len() > 3 && body[0] == 0xDE && body[1] == 0xAD {
-            panic!("Intentional panic for fuzz testing");
+            return Err(ProxyError::InspectorError(
+                "error-inspector".to_string(),
+                "Intentional error for fuzz testing".to_string(),
+            ));
         }
         Ok(Decision::Approve)
     }
@@ -136,9 +142,9 @@ async fn fuzz_amber_path(input: FuzzAmberInput) {
         forwarder.add_inspector(Arc::new(inspector));
     }
 
-    // Add panic inspector occasionally to test panic safety
+    // Add error inspector occasionally to test error handling
     if input.body_bytes.len() % 7 == 0 {
-        forwarder.add_inspector(Arc::new(PanicInspector));
+        forwarder.add_inspector(Arc::new(ErrorInspector));
     }
 
     // Limit body size to prevent OOM in fuzzer

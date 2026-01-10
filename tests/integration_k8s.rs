@@ -1,15 +1,15 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::{
+    Client,
     api::{Api, DeleteParams, ListParams, PostParams},
     core::ObjectMeta,
-    Client,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
 // --- Data Structures for K6 NDJSON output ---
@@ -251,27 +251,29 @@ impl TestContext {
             if let Ok(list) = pods
                 .list(&ListParams::default().labels("job-name=perf-test"))
                 .await
+                && let Some(pod) = list.items.first()
             {
-                if let Some(pod) = list.items.first() {
-                    let pod_name_ref = pod.metadata.name.as_ref();
+                let pod_name_ref = pod.metadata.name.as_ref();
 
-                    if let Some(status) = &pod.status {
-                        // Check if pod phase is Running
-                        if let Some(phase) = &status.phase {
-                            if phase == "Running" {
-                                // Check if all containers are ready
-                                if let Some(container_statuses) = &status.container_statuses {
-                                    let all_ready = container_statuses.iter().all(|cs| cs.ready);
-                                    if all_ready {
-                                        println!(
-                                            "✅ All containers ready in pod: {}",
-                                            pod_name_ref.unwrap()
-                                        );
-                                        break pod_name_ref.unwrap().clone();
-                                    } else {
-                                        println!("⏳ Waiting for containers to be ready... (elapsed: {:?})", start.elapsed());
-                                    }
-                                }
+                if let Some(status) = &pod.status {
+                    // Check if pod phase is Running
+                    if let Some(phase) = &status.phase
+                        && phase == "Running"
+                    {
+                        // Check if all containers are ready
+                        if let Some(container_statuses) = &status.container_statuses {
+                            let all_ready = container_statuses.iter().all(|cs| cs.ready);
+                            if all_ready {
+                                println!(
+                                    "✅ All containers ready in pod: {}",
+                                    pod_name_ref.unwrap()
+                                );
+                                break pod_name_ref.unwrap().clone();
+                            } else {
+                                println!(
+                                    "⏳ Waiting for containers to be ready... (elapsed: {:?})",
+                                    start.elapsed()
+                                );
                             }
                         }
                     }
@@ -294,33 +296,27 @@ impl TestContext {
             if let Ok(list) = pods
                 .list(&ListParams::default().labels("job-name=perf-test"))
                 .await
+                && let Some(pod) = list.items.first()
+                && let Some(container_statuses) = &pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.container_statuses.as_ref())
             {
-                if let Some(pod) = list.items.first() {
-                    if let Some(container_statuses) = &pod
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.container_statuses.as_ref())
-                    {
-                        // Find K6 container status
-                        if let Some(k6_status) =
-                            container_statuses.iter().find(|cs| cs.name == "k6")
-                        {
-                            if let Some(terminated) =
-                                &k6_status.state.as_ref().and_then(|s| s.terminated.as_ref())
-                            {
-                                if terminated.exit_code == 0 {
-                                    println!("✅ K6 container completed successfully");
-                                    break;
-                                } else {
-                                    // Dump logs on failure
-                                    self.dump_logs_on_failure().await;
-                                    bail!(
-                                        "K6 container failed with exit code: {}",
-                                        terminated.exit_code
-                                    );
-                                }
-                            }
-                        }
+                // Find K6 container status
+                if let Some(k6_status) = container_statuses.iter().find(|cs| cs.name == "k6")
+                    && let Some(terminated) =
+                        &k6_status.state.as_ref().and_then(|s| s.terminated.as_ref())
+                {
+                    if terminated.exit_code == 0 {
+                        println!("✅ K6 container completed successfully");
+                        break;
+                    } else {
+                        // Dump logs on failure
+                        self.dump_logs_on_failure().await;
+                        bail!(
+                            "K6 container failed with exit code: {}",
+                            terminated.exit_code
+                        );
                     }
                 }
             }
@@ -393,18 +389,16 @@ impl TestContext {
             }
 
             // Try to parse as generic JSON value
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-                if json["type"] == "Point" {
-                    if let Some(metric_name) = json["metric"].as_str() {
-                        if let Some(value) = json["data"]["value"].as_f64() {
-                            // K6 outputs duration in milliseconds
-                            match metric_name {
-                                "http_req_waiting" => waiting_values.push(value),
-                                "http_req_duration" => duration_values.push(value),
-                                _ => {}
-                            }
-                        }
-                    }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line)
+                && json["type"] == "Point"
+                && let Some(metric_name) = json["metric"].as_str()
+                && let Some(value) = json["data"]["value"].as_f64()
+            {
+                // K6 outputs duration in milliseconds
+                match metric_name {
+                    "http_req_waiting" => waiting_values.push(value),
+                    "http_req_duration" => duration_values.push(value),
+                    _ => {}
                 }
             }
         }

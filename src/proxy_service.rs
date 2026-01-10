@@ -12,7 +12,7 @@ use http_body_util::{BodyStream, StreamBody};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use std::net::SocketAddr;
@@ -163,10 +163,10 @@ impl ProxyService {
             ProxyError::Connection("Request builder in invalid state".to_string())
         })?;
         for (name_opt, value) in parts.headers {
-            if let Some(name) = name_opt {
-                if !is_hop_by_hop_header(name.as_str()) {
-                    headers.insert(name, value);
-                }
+            if let Some(name) = name_opt
+                && !is_hop_by_hop_header(name.as_str())
+            {
+                headers.insert(name, value);
             }
         }
 
