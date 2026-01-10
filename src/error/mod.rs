@@ -297,9 +297,7 @@ impl ThoughtGateError {
     /// Implements: REQ-CORE-004/NFR-004 (Security - No Data Leaks)
     pub fn safe_details(&self) -> Option<serde_json::Value> {
         match self {
-            Self::MethodNotFound { method } => {
-                Some(serde_json::json!({ "method": method }))
-            }
+            Self::MethodNotFound { method } => Some(serde_json::json!({ "method": method })),
             Self::PolicyDenied { tool, reason } => {
                 let mut details = serde_json::json!({ "tool": tool });
                 if let Some(r) = reason {
@@ -311,9 +309,7 @@ impl ThoughtGateError {
             | Self::TaskExpired { task_id }
             | Self::TaskCancelled { task_id }
             | Self::PolicyDrift { task_id }
-            | Self::TransformDrift { task_id } => {
-                Some(serde_json::json!({ "task_id": task_id }))
-            }
+            | Self::TransformDrift { task_id } => Some(serde_json::json!({ "task_id": task_id })),
             Self::ApprovalRejected { tool, rejected_by } => {
                 let mut details = serde_json::json!({ "tool": tool });
                 if let Some(by) = rejected_by {
@@ -321,12 +317,10 @@ impl ThoughtGateError {
                 }
                 Some(details)
             }
-            Self::ApprovalTimeout { tool, timeout_secs } => {
-                Some(serde_json::json!({
-                    "tool": tool,
-                    "timeout_secs": timeout_secs
-                }))
-            }
+            Self::ApprovalTimeout { tool, timeout_secs } => Some(serde_json::json!({
+                "tool": tool,
+                "timeout_secs": timeout_secs
+            })),
             Self::InspectionFailed { inspector, .. } => {
                 // Don't expose full reason (may contain sensitive data)
                 Some(serde_json::json!({ "inspector": inspector }))

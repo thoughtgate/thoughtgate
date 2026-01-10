@@ -68,8 +68,14 @@ mod tests {
         let json = serde_json::to_value(&error).unwrap();
 
         assert_eq!(json["code"], -32003);
-        assert_eq!(json["message"], "Policy denied: Tool 'delete_user' is not permitted");
-        assert_eq!(json["data"]["correlation_id"], "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(
+            json["message"],
+            "Policy denied: Tool 'delete_user' is not permitted"
+        );
+        assert_eq!(
+            json["data"]["correlation_id"],
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
         assert_eq!(json["data"]["error_type"], "policy_denied");
         assert_eq!(json["data"]["details"]["tool"], "delete_user");
     }

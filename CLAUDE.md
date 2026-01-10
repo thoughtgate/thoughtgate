@@ -45,6 +45,15 @@ Traffic flows through exactly ONE path:
 
 ## Code Standards
 
+### Pre-Commit Checklist
+
+**ALWAYS run before committing:**
+```bash
+cargo fmt              # Format code (REQUIRED - CI will fail without this)
+cargo clippy -- -D warnings  # Lint code
+cargo test            # Run tests
+```
+
 ### Git Commit Messages (Conventional Commits)
 
 **Format:** `<type>(<scope>): <subject>`
@@ -59,6 +68,7 @@ Traffic flows through exactly ONE path:
 - `chore` - Maintenance tasks (dependencies, build config, etc)
 
 **Rules:**
+- **MUST run `cargo fmt` before every commit** (CI enforces this)
 - Subject: Imperative mood ("add" not "added"), lowercase, no period at end
 - Body: Wrapped at 72 characters, explaining **why** vs. how
 - Footer: Reference issues/requirements (e.g., `Implements: REQ-CORE-004`)
