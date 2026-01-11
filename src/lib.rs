@@ -41,6 +41,7 @@
 pub mod buffered_forwarder;
 pub mod config;
 pub mod error;
+pub mod governance;
 pub mod inspector;
 pub mod logging_layer;
 pub mod metrics;
