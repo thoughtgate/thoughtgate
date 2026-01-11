@@ -659,7 +659,7 @@ mod tests {
             "target_uri": target_uri.to_string(),
             "forwarded_headers": forwarded_headers.iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                .collect::<std::collections::HashMap<_, _>>(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
         });
 
         insta::assert_json_snapshot!(snapshot_data);
@@ -692,7 +692,7 @@ mod tests {
             "target_uri": target_uri_forward.to_string(),
             "forwarded_headers": forwarded_headers_forward.iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                .collect::<std::collections::HashMap<_, _>>(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
         });
 
         insta::assert_json_snapshot!(snapshot_data_forward);
