@@ -1,0 +1,633 @@
+//! Upstream MCP client with connection pooling.
+//!
+//! Implements: REQ-CORE-003/F-004 (Upstream Forwarding)
+//!
+//! This client maintains persistent connections to the upstream MCP server
+//! and handles request forwarding with timeout and error classification.
+//!
+//! # Connection Pooling
+//!
+//! The client uses reqwest's built-in connection pooling to maintain
+//! persistent connections to the upstream server. This reduces latency
+//! for subsequent requests by avoiding TCP handshake and TLS negotiation.
+//!
+//! # Error Classification
+//!
+//! Errors are classified into ThoughtGateError variants:
+//! - Timeout errors → UpstreamTimeout (-32001)
+//! - Connection errors → UpstreamConnectionFailed (-32000)
+//! - Other errors → UpstreamError (-32002)
+//!
+//! # Security
+//!
+//! - TLS certificate verification is enabled by default
+//! - TLS 1.2+ enforced by rustls (no TLS 1.0/1.1 support, preventing downgrade attacks)
+//! - No automatic retry (prevents duplicate side effects)
+
+use std::time::Duration;
+
+use reqwest::Client;
+use tracing::{debug, error, warn};
+
+use crate::error::ThoughtGateError;
+use crate::transport::jsonrpc::{JsonRpcResponse, McpRequest};
+
+/// Configuration for the upstream client.
+///
+/// Implements: REQ-CORE-003/§5.3 (Configuration)
+#[derive(Debug, Clone)]
+pub struct UpstreamConfig {
+    /// Base URL of the upstream MCP server (e.g., "http://localhost:3000")
+    pub base_url: String,
+    /// Request timeout (includes connection + response)
+    pub timeout: Duration,
+    /// Connection timeout (TCP + TLS handshake)
+    pub connect_timeout: Duration,
+    /// Maximum idle connections per host
+    pub pool_max_idle_per_host: usize,
+    /// Idle connection timeout
+    pub pool_idle_timeout: Duration,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(5),
+            pool_max_idle_per_host: 32,
+            pool_idle_timeout: Duration::from_secs(90),
+        }
+    }
+}
+
+impl UpstreamConfig {
+    /// Load configuration from environment variables.
+    ///
+    /// Implements: REQ-CORE-003/§5.3 (Configuration)
+    ///
+    /// # Environment Variables
+    ///
+    /// - `THOUGHTGATE_UPSTREAM` (required): Base URL of upstream MCP server
+    /// - `THOUGHTGATE_REQUEST_TIMEOUT_SECS` (default: 30): Request timeout
+    /// - `THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS` (default: 5): Connection timeout
+    ///
+    /// # Errors
+    ///
+    /// Returns `ThoughtGateError::InvalidParams` if:
+    /// - `THOUGHTGATE_UPSTREAM` is not set
+    /// - `THOUGHTGATE_REQUEST_TIMEOUT_SECS` is set but not a valid u64
+    /// - `THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS` is set but not a valid u64
+    pub fn from_env() -> Result<Self, ThoughtGateError> {
+        let base_url =
+            std::env::var("THOUGHTGATE_UPSTREAM").map_err(|_| ThoughtGateError::InvalidParams {
+                details: "THOUGHTGATE_UPSTREAM environment variable is required".to_string(),
+            })?;
+
+        let timeout_secs: u64 = match std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS") {
+            Ok(val) => val.parse().map_err(|_| ThoughtGateError::InvalidParams {
+                details: format!(
+                    "THOUGHTGATE_REQUEST_TIMEOUT_SECS must be a valid integer, got: '{}'",
+                    val
+                ),
+            })?,
+            Err(_) => 30, // Default when not set
+        };
+
+        let connect_timeout_secs: u64 = match std::env::var(
+            "THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS",
+        ) {
+            Ok(val) => val.parse().map_err(|_| ThoughtGateError::InvalidParams {
+                details: format!(
+                    "THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS must be a valid integer, got: '{}'",
+                    val
+                ),
+            })?,
+            Err(_) => 5, // Default when not set
+        };
+
+        Ok(Self {
+            base_url,
+            timeout: Duration::from_secs(timeout_secs),
+            connect_timeout: Duration::from_secs(connect_timeout_secs),
+            ..Default::default()
+        })
+    }
+
+    /// Create a new config with the specified base URL.
+    ///
+    /// Uses default values for all other settings.
+    ///
+    /// Implements: REQ-CORE-003/§5.3 (Configuration)
+    pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Upstream MCP client.
+///
+/// Implements: REQ-CORE-003/F-004 (Upstream Forwarding)
+/// Implements: REQ-CORE-003/§5.5 (Upstream Client)
+///
+/// # Thread Safety
+///
+/// The client is `Clone` and can be shared across tasks. The underlying
+/// reqwest client handles connection pooling internally.
+#[derive(Clone)]
+pub struct UpstreamClient {
+    client: Client,
+    config: UpstreamConfig,
+}
+
+impl UpstreamClient {
+    /// Create a new upstream client.
+    ///
+    /// Implements: REQ-CORE-003/F-004.1 (Connection Pool)
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Client configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `ThoughtGateError::InternalError` if:
+    /// - The base_url is empty or not a valid absolute URL
+    /// - The HTTP client cannot be built
+    pub fn new(config: UpstreamConfig) -> Result<Self, ThoughtGateError> {
+        // Validate base_url is non-empty and parseable
+        if config.base_url.is_empty() {
+            return Err(ThoughtGateError::InternalError {
+                correlation_id: "upstream-client-config-error: base_url is empty".to_string(),
+            });
+        }
+
+        // Validate URL is parseable (reqwest uses url::Url internally)
+        if let Err(e) = reqwest::Url::parse(&config.base_url) {
+            return Err(ThoughtGateError::InternalError {
+                correlation_id: format!(
+                    "upstream-client-config-error: invalid base_url '{}': {}",
+                    config.base_url, e
+                ),
+            });
+        }
+
+        let client = Client::builder()
+            .timeout(config.timeout)
+            .connect_timeout(config.connect_timeout)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
+            .pool_idle_timeout(config.pool_idle_timeout)
+            .tcp_nodelay(true)
+            .build()
+            .map_err(|e| ThoughtGateError::InternalError {
+                correlation_id: format!("upstream-client-build-error: {}", e),
+            })?;
+
+        Ok(Self { client, config })
+    }
+
+    /// Forward a single request to upstream.
+    ///
+    /// Implements: REQ-CORE-003/F-004 (Upstream Forwarding)
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The MCP request to forward
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(JsonRpcResponse)` - Response from upstream
+    /// * `Err(ThoughtGateError::UpstreamTimeout)` - Request timed out
+    /// * `Err(ThoughtGateError::UpstreamConnectionFailed)` - Failed to connect
+    /// * `Err(ThoughtGateError::UpstreamError)` - Other upstream errors
+    ///
+    /// # Handles
+    ///
+    /// - EC-MCP-009: Upstream timeout
+    /// - EC-MCP-010: Upstream connection refused
+    ///
+    /// # Note on Header Forwarding
+    ///
+    /// Currently only sets `Content-Type: application/json`. Header forwarding
+    /// (F-004.2) is not implemented as it requires security review - forwarding
+    /// Authorization headers to upstream could leak credentials. For MCP traffic,
+    /// the JSON-RPC body contains all necessary context.
+    pub async fn forward(&self, request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError> {
+        let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
+        let correlation_id = request.correlation_id.to_string();
+
+        debug!(
+            correlation_id = %correlation_id,
+            method = %request.method,
+            url = %url,
+            "Forwarding request to upstream"
+        );
+
+        // Build JSON-RPC request
+        let jsonrpc_request = request.to_jsonrpc_request();
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&jsonrpc_request)
+            .send()
+            .await
+            .map_err(|e| self.classify_error(e, &correlation_id))?;
+
+        // Check HTTP status
+        let status = response.status();
+
+        // Handle 204 No Content (notification response from upstream)
+        if status == reqwest::StatusCode::NO_CONTENT {
+            debug!(
+                correlation_id = %correlation_id,
+                "Upstream returned 204 No Content (notification acknowledged)"
+            );
+            // Return a synthetic success response for internal processing.
+            // Note: For notifications, request.id is None per JSON-RPC 2.0 spec.
+            // This synthetic response is only used internally by the routing layer
+            // and is NOT sent to the client (server.rs checks is_notification() and
+            // returns 204 No Content to the client without a response body).
+            return Ok(JsonRpcResponse::success(
+                request.id.clone(),
+                serde_json::Value::Null,
+            ));
+        }
+
+        if !status.is_success() {
+            warn!(
+                correlation_id = %correlation_id,
+                status = %status,
+                "Upstream returned error status"
+            );
+            return Err(ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: format!("Upstream returned HTTP {}", status),
+            });
+        }
+
+        // Parse response body
+        let body: JsonRpcResponse = response.json().await.map_err(|e| {
+            error!(
+                correlation_id = %correlation_id,
+                error = %e,
+                "Failed to parse upstream response"
+            );
+            ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: format!("Failed to parse upstream response: {}", e),
+            }
+        })?;
+
+        debug!(
+            correlation_id = %correlation_id,
+            has_error = body.error.is_some(),
+            "Received upstream response"
+        );
+
+        Ok(body)
+    }
+
+    /// Forward a batch of requests to upstream.
+    ///
+    /// Implements: REQ-CORE-003/F-007 (Batch Request Handling)
+    ///
+    /// # Arguments
+    ///
+    /// * `requests` - The MCP requests to forward as a batch (must be non-empty)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<JsonRpcResponse>)` - Responses from upstream
+    /// * `Err(ThoughtGateError::InvalidRequest)` - If the batch is empty
+    /// * `Err(ThoughtGateError)` - If the batch request failed
+    pub async fn forward_batch(
+        &self,
+        requests: &[McpRequest],
+    ) -> Result<Vec<JsonRpcResponse>, ThoughtGateError> {
+        // Reject empty batches - don't send [] to upstream
+        if requests.is_empty() {
+            return Err(ThoughtGateError::InvalidRequest {
+                details: "Empty batch requests are invalid".to_string(),
+            });
+        }
+
+        let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
+
+        debug!(
+            batch_size = requests.len(),
+            url = %url,
+            "Forwarding batch request to upstream"
+        );
+
+        // Build batch of JSON-RPC requests
+        let jsonrpc_requests: Vec<_> = requests.iter().map(|r| r.to_jsonrpc_request()).collect();
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&jsonrpc_requests)
+            .send()
+            .await
+            .map_err(|e| self.classify_error(e, "batch"))?;
+
+        let status = response.status();
+
+        // Handle 204 No Content (all requests were notifications)
+        if status == reqwest::StatusCode::NO_CONTENT {
+            debug!(
+                batch_size = requests.len(),
+                "Upstream returned 204 No Content (all notifications acknowledged)"
+            );
+            // Return empty response array - no responses expected for notification-only batches
+            return Ok(Vec::new());
+        }
+
+        if !status.is_success() {
+            return Err(ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: format!("Upstream returned HTTP {}", status),
+            });
+        }
+
+        let body: Vec<JsonRpcResponse> =
+            response
+                .json()
+                .await
+                .map_err(|e| ThoughtGateError::UpstreamError {
+                    code: -32002,
+                    message: format!("Failed to parse upstream batch response: {}", e),
+                })?;
+
+        debug!(
+            response_count = body.len(),
+            "Received upstream batch response"
+        );
+
+        Ok(body)
+    }
+
+    /// Classify a reqwest error into ThoughtGateError.
+    ///
+    /// Implements: REQ-CORE-003/§6.5 (Error handling)
+    ///
+    /// # Arguments
+    ///
+    /// * `error` - The reqwest error to classify
+    /// * `correlation_id` - Correlation ID for logging
+    ///
+    /// # Returns
+    ///
+    /// The appropriate ThoughtGateError variant.
+    fn classify_error(&self, error: reqwest::Error, correlation_id: &str) -> ThoughtGateError {
+        if error.is_timeout() {
+            warn!(
+                correlation_id = %correlation_id,
+                timeout_secs = self.config.timeout.as_secs(),
+                "Upstream request timed out"
+            );
+            ThoughtGateError::UpstreamTimeout {
+                url: self.config.base_url.clone(),
+                timeout_secs: self.config.timeout.as_secs(),
+            }
+        } else if error.is_connect() {
+            warn!(
+                correlation_id = %correlation_id,
+                url = %self.config.base_url,
+                "Failed to connect to upstream"
+            );
+            ThoughtGateError::UpstreamConnectionFailed {
+                url: self.config.base_url.clone(),
+                reason: error.to_string(),
+            }
+        } else {
+            error!(
+                correlation_id = %correlation_id,
+                error = %error,
+                "Upstream request failed"
+            );
+            ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: error.to_string(),
+            }
+        }
+    }
+}
+
+/// Trait for upstream client (enables mocking in tests).
+///
+/// This trait abstracts the upstream forwarding behavior, allowing tests
+/// to inject mock implementations without making actual HTTP requests.
+///
+/// Implements: REQ-CORE-003/F-004 (Upstream Forwarding)
+#[async_trait::async_trait]
+pub trait UpstreamForwarder: Send + Sync {
+    /// Forward a single request to upstream.
+    ///
+    /// Implements: REQ-CORE-003/F-004.4 (Return upstream response)
+    async fn forward(&self, request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError>;
+
+    /// Forward a batch of requests to upstream.
+    ///
+    /// Implements: REQ-CORE-003/F-007 (Batch Request Handling)
+    async fn forward_batch(
+        &self,
+        requests: &[McpRequest],
+    ) -> Result<Vec<JsonRpcResponse>, ThoughtGateError>;
+}
+
+#[async_trait::async_trait]
+impl UpstreamForwarder for UpstreamClient {
+    async fn forward(&self, request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError> {
+        self.forward(request).await
+    }
+
+    async fn forward_batch(
+        &self,
+        requests: &[McpRequest],
+    ) -> Result<Vec<JsonRpcResponse>, ThoughtGateError> {
+        self.forward_batch(requests).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// RAII guard for env var tests that saves and restores env var state.
+    struct EnvVarGuard {
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn new(var_names: &[&'static str]) -> Self {
+            let vars = var_names
+                .iter()
+                .map(|&name| (name, std::env::var(name).ok()))
+                .collect();
+            Self { vars }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (name, original) in &self.vars {
+                // SAFETY: We're in a single-threaded test context (enforced by #[serial])
+                unsafe {
+                    match original {
+                        Some(val) => std::env::set_var(name, val),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = UpstreamConfig::default();
+        assert_eq!(config.timeout, Duration::from_secs(30));
+        assert_eq!(config.connect_timeout, Duration::from_secs(5));
+        assert_eq!(config.pool_max_idle_per_host, 32);
+        assert_eq!(config.pool_idle_timeout, Duration::from_secs(90));
+        assert!(config.base_url.is_empty());
+    }
+
+    #[test]
+    fn test_config_with_base_url() {
+        let config = UpstreamConfig::with_base_url("http://localhost:3000");
+        assert_eq!(config.base_url, "http://localhost:3000");
+        assert_eq!(config.timeout, Duration::from_secs(30)); // Default
+    }
+
+    #[test]
+    fn test_upstream_client_creation() {
+        let config = UpstreamConfig::with_base_url("http://localhost:3000");
+        let client = UpstreamClient::new(config);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_upstream_client_empty_url() {
+        let config = UpstreamConfig::default(); // Empty base_url
+        let result = UpstreamClient::new(config);
+        assert!(matches!(
+            result,
+            Err(ThoughtGateError::InternalError { .. })
+        ));
+    }
+
+    #[test]
+    fn test_upstream_client_invalid_url() {
+        let config = UpstreamConfig::with_base_url("not-a-valid-url");
+        let result = UpstreamClient::new(config);
+        assert!(matches!(
+            result,
+            Err(ThoughtGateError::InternalError { .. })
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_from_env_missing_upstream() {
+        let _guard = EnvVarGuard::new(&[
+            "THOUGHTGATE_UPSTREAM",
+            "THOUGHTGATE_REQUEST_TIMEOUT_SECS",
+            "THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS",
+        ]);
+
+        // SAFETY: Test runs serially via #[serial], env var mutation is isolated
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_UPSTREAM");
+        }
+
+        let result = UpstreamConfig::from_env();
+        assert!(matches!(
+            result,
+            Err(ThoughtGateError::InvalidParams { .. })
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_from_env_with_upstream() {
+        let _guard = EnvVarGuard::new(&[
+            "THOUGHTGATE_UPSTREAM",
+            "THOUGHTGATE_REQUEST_TIMEOUT_SECS",
+            "THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS",
+        ]);
+
+        // SAFETY: Test runs serially via #[serial], env var mutation is isolated
+        unsafe {
+            std::env::set_var("THOUGHTGATE_UPSTREAM", "http://test:3000");
+            std::env::set_var("THOUGHTGATE_REQUEST_TIMEOUT_SECS", "60");
+            std::env::set_var("THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS", "10");
+        }
+
+        let result = UpstreamConfig::from_env();
+        assert!(result.is_ok());
+
+        let config = result.expect("should parse config");
+        assert_eq!(config.base_url, "http://test:3000");
+        assert_eq!(config.timeout, Duration::from_secs(60));
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        // EnvVarGuard restores original values on drop
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_from_env_invalid_timeout() {
+        let _guard = EnvVarGuard::new(&[
+            "THOUGHTGATE_UPSTREAM",
+            "THOUGHTGATE_REQUEST_TIMEOUT_SECS",
+            "THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS",
+        ]);
+
+        // SAFETY: Test runs serially via #[serial], env var mutation is isolated
+        unsafe {
+            std::env::set_var("THOUGHTGATE_UPSTREAM", "http://test:3000");
+            std::env::set_var("THOUGHTGATE_REQUEST_TIMEOUT_SECS", "not-a-number");
+        }
+
+        let result = UpstreamConfig::from_env();
+        assert!(matches!(
+            result,
+            Err(ThoughtGateError::InvalidParams { .. })
+        ));
+        if let Err(ThoughtGateError::InvalidParams { details }) = result {
+            assert!(details.contains("THOUGHTGATE_REQUEST_TIMEOUT_SECS"));
+            assert!(details.contains("not-a-number"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_from_env_invalid_connect_timeout() {
+        let _guard = EnvVarGuard::new(&[
+            "THOUGHTGATE_UPSTREAM",
+            "THOUGHTGATE_REQUEST_TIMEOUT_SECS",
+            "THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS",
+        ]);
+
+        // SAFETY: Test runs serially via #[serial], env var mutation is isolated
+        unsafe {
+            std::env::set_var("THOUGHTGATE_UPSTREAM", "http://test:3000");
+            std::env::set_var("THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS", "invalid");
+        }
+
+        let result = UpstreamConfig::from_env();
+        assert!(matches!(
+            result,
+            Err(ThoughtGateError::InvalidParams { .. })
+        ));
+        if let Err(ThoughtGateError::InvalidParams { details }) = result {
+            assert!(details.contains("THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS"));
+            assert!(details.contains("invalid"));
+        }
+    }
+}

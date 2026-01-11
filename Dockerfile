@@ -5,13 +5,13 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 
 # Create dummy source files to build dependencies
-RUN mkdir -p src/bin && \
+# Note: Must match real project module structure to avoid E0761 conflicts
+RUN mkdir -p src/bin src/error && \
     echo "fn main() {}" > src/main.rs && \
     echo "fn main() {}" > src/bin/mock_llm.rs && \
-    mkdir -p src && \
     echo "pub mod error; pub mod logging_layer; pub mod proxy_service;" > src/lib.rs && \
     echo "pub struct ProxyService;" > src/proxy_service.rs && \
-    echo "pub enum ProxyError {}" > src/error.rs && \
+    echo "pub enum ProxyError {}" > src/error/mod.rs && \
     echo "pub struct LoggingLayer;" > src/logging_layer.rs
 
 # Build dependencies (this layer will be cached unless Cargo.toml/Cargo.lock change)

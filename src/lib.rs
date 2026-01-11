@@ -12,9 +12,17 @@
 //! - **Approval Path (REQ-GOV-001/002/003):** Human-in-the-loop approval.
 //! - **Red Path (REQ-CORE-004):** Policy-denied requests.
 //!
+//! # MCP Transport
+//!
+//! The transport layer (REQ-CORE-003) handles:
+//! - JSON-RPC 2.0 parsing and validation
+//! - MCP method routing (tools/*, tasks/*, resources/*, prompts/*)
+//! - Upstream forwarding with connection pooling
+//!
 //! # Traceability
 //! - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy)
 //! - Implements: REQ-CORE-002 (Buffered Termination Strategy)
+//! - Implements: REQ-CORE-003 (MCP Transport & Routing)
 //! - Implements: REQ-POL-001 (Cedar Policy Engine)
 
 pub mod buffered_forwarder;
@@ -27,3 +35,4 @@ pub mod policy;
 pub mod proxy_body;
 pub mod proxy_service;
 pub mod timeout;
+pub mod transport;

@@ -38,8 +38,12 @@ jobs:
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
 
-      - name: Install cargo-audit (pre-built binary)
-        run: cargo binstall --no-confirm cargo-audit
+      - name: Install cargo-audit
+        run: |
+          # Force reinstall to handle cached but missing binaries
+          cargo binstall --no-confirm --force cargo-audit || cargo install --force cargo-audit
+          # Verify installation
+          cargo audit --version
 
       - name: Check formatting
         run: cargo fmt -- --check
