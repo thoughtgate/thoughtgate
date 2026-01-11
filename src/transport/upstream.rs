@@ -170,6 +170,13 @@ impl UpstreamClient {
     ///
     /// - EC-MCP-009: Upstream timeout
     /// - EC-MCP-010: Upstream connection refused
+    ///
+    /// # Note on Header Forwarding
+    ///
+    /// Currently only sets `Content-Type: application/json`. Header forwarding
+    /// (F-004.2) is not implemented as it requires security review - forwarding
+    /// Authorization headers to upstream could leak credentials. For MCP traffic,
+    /// the JSON-RPC body contains all necessary context.
     pub async fn forward(&self, request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError> {
         let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
         let correlation_id = request.correlation_id.to_string();
@@ -395,9 +402,15 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    // Note: These env var tests use unsafe because std::env::set_var/remove_var
+    // can cause data races in multi-threaded programs. In tests, this is acceptable
+    // when tests run serially (cargo test runs each test in sequence by default
+    // for the same crate). For true isolation, consider `serial_test` crate or
+    // test-specific env var prefixes.
+
     #[test]
     fn test_config_from_env_missing_upstream() {
-        // Ensure env var is not set
+        // SAFETY: Test runs in single-threaded context, env var mutation is isolated
         unsafe {
             std::env::remove_var("THOUGHTGATE_UPSTREAM");
         }
@@ -411,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_config_from_env_with_upstream() {
-        // Set required env var
+        // SAFETY: Test runs in single-threaded context, env var mutation is isolated
         unsafe {
             std::env::set_var("THOUGHTGATE_UPSTREAM", "http://test:3000");
             std::env::set_var("THOUGHTGATE_REQUEST_TIMEOUT_SECS", "60");
@@ -426,7 +439,7 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(60));
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
 
-        // Clean up
+        // SAFETY: Cleanup env vars set above
         unsafe {
             std::env::remove_var("THOUGHTGATE_UPSTREAM");
             std::env::remove_var("THOUGHTGATE_REQUEST_TIMEOUT_SECS");

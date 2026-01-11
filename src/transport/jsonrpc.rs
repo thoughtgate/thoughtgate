@@ -30,12 +30,21 @@ use crate::error::ThoughtGateError;
 ///
 /// - `Number(i64)` - Integer ID (e.g., `"id": 1`)
 /// - `String(String)` - String ID (e.g., `"id": "abc-123"`)
-/// - `Null` - Explicit null ID (unusual, but valid JSON-RPC)
+/// - `Null` - Explicit null ID for error responses when parsing fails
 ///
 /// # Important
 ///
 /// Never coerce between types! If the client sends `"id": 1`, respond with
 /// `"id": 1`, not `"id": "1"`.
+///
+/// # Note on Null IDs
+///
+/// When deserializing `Option<JsonRpcId>`, JSON `null` and missing field
+/// both become `None` (serde's default behavior). The `Null` variant is
+/// used for:
+/// 1. Explicit serialization of null in error responses (per JSON-RPC spec,
+///    errors for parse failures should have `"id": null`)
+/// 2. Direct deserialization when not wrapped in Option
 ///
 /// Implements: REQ-CORE-003/F-001.4 (Preserve ID type)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,7 +53,7 @@ pub enum JsonRpcId {
     Number(i64),
     /// String ID (e.g., `"id": "abc-123"`)
     String(String),
-    /// Explicit null ID (unusual, but we handle it gracefully)
+    /// Null ID - used for error responses when request ID is unknown
     Null,
 }
 
