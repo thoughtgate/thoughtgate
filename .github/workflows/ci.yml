@@ -40,8 +40,8 @@ jobs:
 
       - name: Install cargo-audit
         run: |
-          # Try binstall first (faster), fall back to cargo install if it fails
-          cargo binstall --no-confirm cargo-audit || cargo install cargo-audit
+          # Force reinstall to handle cached but missing binaries
+          cargo binstall --no-confirm --force cargo-audit || cargo install --force cargo-audit
           # Verify installation
           cargo audit --version
 
