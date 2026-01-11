@@ -365,6 +365,8 @@ pub fn parse_jsonrpc(bytes: &[u8]) -> Result<ParsedRequests, ThoughtGateError> {
 
 /// Parse a single JSON-RPC 2.0 request from a JSON value.
 ///
+/// Implements: REQ-CORE-003/F-001 (Parse JSON-RPC 2.0)
+///
 /// # Arguments
 ///
 /// * `value` - A JSON value that should be a request object
