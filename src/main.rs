@@ -109,11 +109,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Phase 3: Start health endpoint server
     // Implements: REQ-CORE-005/F-002, F-003
-    let health_port = cli_config.health_port.unwrap_or(cli_config.port + 1);
+    let health_port = cli_config.health_port.unwrap_or_else(|| {
+        // Validate that port + 1 won't overflow
+        if cli_config.port == 65535 {
+            warn!(
+                main_port = cli_config.port,
+                "Main port is 65535, health endpoint will use port 65534 instead of port+1"
+            );
+            65534
+        } else {
+            cli_config.port + 1
+        }
+    });
+    let health_bind = cli_config.bind.clone();
     let health_lifecycle = lifecycle.clone();
     let health_shutdown = lifecycle.shutdown_token();
     tokio::spawn(async move {
-        if let Err(e) = serve_health_endpoints(health_port, health_lifecycle, health_shutdown).await
+        if let Err(e) =
+            serve_health_endpoints(health_bind, health_port, health_lifecycle, health_shutdown)
+                .await
         {
             error!(error = %e, "Health server error");
         }
@@ -268,11 +282,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         DrainResult::Timeout { remaining } => {
-            warn!(
-                remaining_requests = remaining,
-                "Drain timeout exceeded, forcing shutdown"
-            );
-            std::process::exit(1);
+            // Return error instead of std::process::exit(1) to allow proper cleanup
+            // The caller (main) will convert this to an exit code
+            Err(format!(
+                "Drain timeout exceeded with {} remaining requests",
+                remaining
+            )
+            .into())
         }
     }
 }
@@ -325,12 +341,13 @@ fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<Life
 ///
 /// Implements: REQ-CORE-005/F-002, F-003
 async fn serve_health_endpoints(
+    bind: String,
     port: u16,
     lifecycle: Arc<LifecycleManager>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = health_router(lifecycle);
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("{}:{}", bind, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     axum::serve(listener, app)

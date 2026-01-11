@@ -210,8 +210,28 @@ impl UpstreamClient {
             }
         };
 
-        let host = url.host_str().unwrap_or("localhost");
-        let port = url.port_or_known_default().unwrap_or(80);
+        let host = match url.host_str() {
+            Some(h) => h,
+            None => {
+                warn!(
+                    url = %self.config.base_url,
+                    fallback = "localhost",
+                    "URL has no host, falling back to localhost for health check"
+                );
+                "localhost"
+            }
+        };
+        let port = match url.port_or_known_default() {
+            Some(p) => p,
+            None => {
+                warn!(
+                    url = %self.config.base_url,
+                    fallback = 80,
+                    "URL has no port and unknown scheme, falling back to port 80 for health check"
+                );
+                80
+            }
+        };
         let addr = format!("{}:{}", host, port);
 
         // TCP connect using configured connect_timeout for consistency
