@@ -30,7 +30,7 @@ use crate::error::ThoughtGateError;
 ///
 /// - `Number(i64)` - Integer ID (e.g., `"id": 1`)
 /// - `String(String)` - String ID (e.g., `"id": "abc-123"`)
-/// - `Null` - Explicit null ID for error responses when parsing fails
+/// - `Null` - Explicit null ID (e.g., `"id": null`)
 ///
 /// # Important
 ///
@@ -39,12 +39,9 @@ use crate::error::ThoughtGateError;
 ///
 /// # Note on Null IDs
 ///
-/// When deserializing `Option<JsonRpcId>`, JSON `null` and missing field
-/// both become `None` (serde's default behavior). The `Null` variant is
-/// used for:
-/// 1. Explicit serialization of null in error responses (per JSON-RPC spec,
-///    errors for parse failures should have `"id": null`)
-/// 2. Direct deserialization when not wrapped in Option
+/// Per JSON-RPC 2.0 spec, `"id": null` is valid (though unusual) and should
+/// be echoed back in responses. This is distinct from a missing `id` field,
+/// which indicates a notification that requires no response.
 ///
 /// Implements: REQ-CORE-003/F-001.4 (Preserve ID type)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,7 +50,7 @@ pub enum JsonRpcId {
     Number(i64),
     /// String ID (e.g., `"id": "abc-123"`)
     String(String),
-    /// Null ID - used for error responses when request ID is unknown
+    /// Explicit null ID (e.g., `"id": null`) - valid but unusual
     Null,
 }
 
@@ -89,6 +86,49 @@ impl<'de> Deserialize<'de> for JsonRpcId {
     }
 }
 
+/// Wrapper to distinguish between missing field and explicit null.
+/// - `Absent` - field was not present in JSON
+/// - `Null` - field was present with value `null`
+/// - `Present(T)` - field was present with a non-null value
+#[derive(Debug, Clone, Default)]
+enum MaybeNull<T> {
+    #[default]
+    Absent,
+    Null,
+    Present(T),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for MaybeNull<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Deserialize to serde_json::Value first to check for null
+        let value = Value::deserialize(deserializer)?;
+        if value.is_null() {
+            Ok(MaybeNull::Null)
+        } else {
+            // Try to deserialize the value as T
+            T::deserialize(value)
+                .map(MaybeNull::Present)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Deserializer that converts MaybeNull<JsonRpcId> to Option<JsonRpcId>
+/// where explicit null becomes Some(JsonRpcId::Null)
+fn deserialize_optional_id<'de, D>(deserializer: D) -> Result<Option<JsonRpcId>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match MaybeNull::deserialize(deserializer)? {
+        MaybeNull::Absent => Ok(None),
+        MaybeNull::Null => Ok(Some(JsonRpcId::Null)),
+        MaybeNull::Present(id) => Ok(Some(id)),
+    }
+}
+
 /// Raw JSON-RPC 2.0 request as received from the client.
 ///
 /// This struct handles the wire format before validation. All fields are
@@ -97,7 +137,8 @@ impl<'de> Deserialize<'de> for JsonRpcId {
 struct RawJsonRpcRequest {
     /// Must be "2.0"
     jsonrpc: Option<String>,
-    /// Request ID (absent for notifications)
+    /// Request ID (absent for notifications, Some(Null) for explicit null)
+    #[serde(default, deserialize_with = "deserialize_optional_id")]
     id: Option<JsonRpcId>,
     /// Method name
     method: Option<String>,
@@ -585,19 +626,33 @@ mod tests {
 
     #[test]
     fn test_null_id() {
-        // Per JSON-RPC 2.0 spec, `id: null` is treated the same as missing `id`
-        // (both are notifications). The JsonRpcId::Null variant exists for
-        // edge cases when we need to explicitly serialize a null id.
+        // Per JSON-RPC 2.0 spec, `"id": null` is a valid (though unusual) request
+        // that should have its null ID echoed back in the response.
+        // This is distinct from a missing `id` field (notification).
         let json = br#"{"jsonrpc":"2.0","id":null,"method":"test"}"#;
         let result = parse_jsonrpc(json);
 
         if let Ok(ParsedRequests::Single(req)) = result {
-            // serde treats `"id": null` as None (same as missing)
-            assert_eq!(req.id, None);
-            // This means it's treated as a notification
-            assert!(req.is_notification());
+            // Explicit null should be preserved as Some(JsonRpcId::Null)
+            assert_eq!(req.id, Some(JsonRpcId::Null));
+            // This is NOT a notification - it expects a response with id: null
+            assert!(!req.is_notification());
         } else {
             panic!("Expected request with null ID");
+        }
+    }
+
+    #[test]
+    fn test_missing_id_is_notification() {
+        // Missing id field = notification (no response expected)
+        let json = br#"{"jsonrpc":"2.0","method":"test"}"#;
+        let result = parse_jsonrpc(json);
+
+        if let Ok(ParsedRequests::Single(req)) = result {
+            assert_eq!(req.id, None);
+            assert!(req.is_notification());
+        } else {
+            panic!("Expected notification");
         }
     }
 
