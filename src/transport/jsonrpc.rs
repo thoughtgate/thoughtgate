@@ -415,6 +415,10 @@ fn parse_single_request(value: Value) -> Result<McpRequest, ThoughtGateError> {
     })
 }
 
+/// Maximum allowed TTL: 24 hours in milliseconds.
+/// This prevents unreasonably large values that could cause issues downstream.
+const MAX_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24 hours
+
 /// Extract SEP-1686 task metadata from params.
 ///
 /// Implements: REQ-CORE-003/F-003 (SEP-1686 Detection)
@@ -427,6 +431,11 @@ fn parse_single_request(value: Value) -> Result<McpRequest, ThoughtGateError> {
 ///
 /// * `Some(TaskMetadata)` if `params.task` exists
 /// * `None` otherwise
+///
+/// # TTL Validation
+///
+/// TTL values are clamped to MAX_TTL_MS (24 hours) to prevent issues with
+/// extremely large values.
 fn extract_task_metadata(params: &Option<Value>) -> Option<TaskMetadata> {
     let params = params.as_ref()?;
     let task = params.get("task")?;
@@ -434,7 +443,7 @@ fn extract_task_metadata(params: &Option<Value>) -> Option<TaskMetadata> {
     let ttl = task
         .get("ttl")
         .and_then(|v| v.as_u64())
-        .map(std::time::Duration::from_millis);
+        .map(|ms| std::time::Duration::from_millis(ms.min(MAX_TTL_MS)));
 
     Some(TaskMetadata { ttl })
 }

@@ -83,6 +83,8 @@ pub enum TaskMethod {
 
 impl TaskMethod {
     /// Returns the method name as a string.
+    ///
+    /// Implements: REQ-CORE-003/§6.4 (Internal: Routing Decision)
     pub fn as_str(&self) -> &'static str {
         match self {
             TaskMethod::Get => "tasks/get",
@@ -105,6 +107,8 @@ pub struct McpRouter;
 
 impl McpRouter {
     /// Create a new router.
+    ///
+    /// Implements: REQ-CORE-003/F-002 (Method Routing)
     pub fn new() -> Self {
         Self
     }

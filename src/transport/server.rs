@@ -322,11 +322,19 @@ async fn handle_single_request(state: &AppState, request: McpRequest) -> Respons
 /// # Returns
 ///
 /// HTTP response with JSON-RPC batch response or 204 No Content if all notifications.
+///
+/// # Design Note
+///
+/// Requests are processed sequentially rather than in parallel because:
+/// 1. F-007.5 requires that if ANY request needs approval, the entire batch
+///    becomes task-augmented - requests are not independent
+/// 2. Sequential processing simplifies response ordering guarantees
+/// 3. The upstream connection pool handles actual HTTP request parallelism
 async fn handle_batch_request(state: &AppState, requests: Vec<McpRequest>) -> Response {
     let mut responses: Vec<JsonRpcResponse> = Vec::new();
 
-    // Process each request
-    // Note: F-007.5 (batch approval) will be added with REQ-GOV implementation
+    // Process each request sequentially - see Design Note above
+    // F-007.5 (batch approval) will be added with REQ-GOV implementation
     for request in requests {
         let is_notification = request.is_notification();
         let id = request.id.clone();
