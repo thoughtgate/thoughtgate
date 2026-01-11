@@ -213,12 +213,13 @@ impl UpstreamClient {
         let host = match url.host_str() {
             Some(h) => h,
             None => {
-                warn!(
-                    url = %self.config.base_url,
-                    fallback = "localhost",
-                    "URL has no host, falling back to localhost for health check"
-                );
-                "localhost"
+                // No host means malformed URL - fail clearly rather than probing localhost
+                return Err(ThoughtGateError::InternalError {
+                    correlation_id: format!(
+                        "health-check-no-host: URL '{}' has no host component",
+                        self.config.base_url
+                    ),
+                });
             }
         };
         let port = match url.port_or_known_default() {

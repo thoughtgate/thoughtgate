@@ -142,8 +142,16 @@ impl LifecycleConfig {
         );
 
         // Validate drain_timeout < shutdown_timeout as documented
+        // Also enforce a minimum of 1 second to ensure some draining can occur
+        const MIN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
         let drain_timeout = if drain_timeout >= shutdown_timeout {
             let adjusted = Duration::from_secs(shutdown_timeout.as_secs().saturating_sub(5));
+            let adjusted = if adjusted < MIN_DRAIN_TIMEOUT {
+                MIN_DRAIN_TIMEOUT
+            } else {
+                adjusted
+            };
             warn!(
                 drain_timeout_secs = drain_timeout.as_secs(),
                 shutdown_timeout_secs = shutdown_timeout.as_secs(),
@@ -151,6 +159,13 @@ impl LifecycleConfig {
                 "drain_timeout must be less than shutdown_timeout, adjusting"
             );
             adjusted
+        } else if drain_timeout < MIN_DRAIN_TIMEOUT {
+            warn!(
+                drain_timeout_secs = drain_timeout.as_secs(),
+                min_drain_secs = MIN_DRAIN_TIMEOUT.as_secs(),
+                "drain_timeout below minimum, adjusting"
+            );
+            MIN_DRAIN_TIMEOUT
         } else {
             drain_timeout
         };

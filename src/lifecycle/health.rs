@@ -227,8 +227,15 @@ async fn readiness_handler(State(lifecycle): State<Arc<LifecycleManager>>) -> Re
             .into_response()
     } else {
         // F-003.2: Return 503 with failed checks
-        // Get the failure reason before moving checks into the response
-        let reason = checks.first_failure().map(|s| s.to_string());
+        // Determine reason: check individual checks first, then lifecycle state
+        let reason = if let Some(failed_check) = checks.first_failure() {
+            Some(failed_check.to_string())
+        } else if !lifecycle.is_ready() {
+            // All checks pass but lifecycle not ready (e.g., still starting up)
+            Some(format!("lifecycle_state: {}", lifecycle.state()))
+        } else {
+            None
+        };
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadinessResponse {
