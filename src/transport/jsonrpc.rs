@@ -182,12 +182,21 @@ impl JsonRpcRequest {
 /// JSON-RPC 2.0 response.
 ///
 /// Implements: REQ-CORE-003/§6.2 (Output: MCP Response)
+///
+/// # ID Serialization
+///
+/// Per JSON-RPC 2.0 spec, the `id` field is REQUIRED in responses and MUST be:
+/// - The same as the request's `id` for success/error responses
+/// - `null` if the request `id` could not be determined (e.g., parse error)
+///
+/// The `id` field always serializes: `None` becomes `"id": null` in JSON.
+/// This differs from `JsonRpcRequest` where `None` means "notification" and
+/// the field is omitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
     /// Always "2.0"
     pub jsonrpc: String,
-    /// Request ID (must match request, None for notifications)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Request ID - always serialized (None becomes null per JSON-RPC 2.0 spec)
     pub id: Option<JsonRpcId>,
     /// Result (mutually exclusive with error)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,7 +230,9 @@ impl JsonRpcResponse {
     ///
     /// # Arguments
     ///
-    /// * `id` - The request ID to echo back (may be None if parsing failed)
+    /// * `id` - The request ID to echo back. Pass `None` if the request ID
+    ///   could not be determined (e.g., parse error) - this serializes as
+    ///   `"id": null` per JSON-RPC 2.0 spec.
     /// * `error` - The JSON-RPC error object
     pub fn error(id: Option<JsonRpcId>, error: crate::error::jsonrpc::JsonRpcError) -> Self {
         Self {
@@ -783,5 +794,23 @@ mod tests {
         assert!(serialized.contains("\"error\""));
         assert!(serialized.contains("-32600"));
         assert!(!serialized.contains("\"result\""));
+    }
+
+    /// Verifies: JSON-RPC 2.0 spec - error response with unknown id serializes as null
+    #[test]
+    fn test_jsonrpc_response_error_unknown_id_serializes_as_null() {
+        let error = crate::error::jsonrpc::JsonRpcError {
+            code: -32700,
+            message: "Parse error".to_string(),
+            data: None,
+        };
+        // When we can't determine the request ID (e.g., parse error), pass None
+        let response = JsonRpcResponse::error(None, error);
+
+        let serialized = serde_json::to_string(&response).expect("should serialize");
+        // Per JSON-RPC 2.0 spec, id MUST be present and null when unknown
+        assert!(serialized.contains("\"id\":null"));
+        assert!(serialized.contains("\"error\""));
+        assert!(serialized.contains("-32700"));
     }
 }
