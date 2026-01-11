@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1768150753400,
+  "lastUpdate": 1768154533118,
   "repoUrl": "https://github.com/olegmukhin/thoughtgate",
   "entries": {
     "Benchmark": [
@@ -373,6 +373,40 @@ window.BENCHMARK_DATA = {
           {
             "name": "ttfb/proxied/with_relay",
             "value": 11357475.02,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "218646e2722dcc9885608e0d1c758562adb79c66",
+          "message": "feat(governance): add task lifecycle management for approval workflows (#18)\n\n* feat(governance): add task lifecycle management for approval workflows\n\nImplement REQ-GOV-001 task lifecycle for ThoughtGate's v0.1 blocking\nmode. Provides internal state tracking for approval workflows without\nexposing SEP-1686 task API (deferred to v0.2+).\n\nFeatures:\n- Task struct with all fields from spec §6.1 (id, status, requests,\n  principal, timing, approval records, results, failure info)\n- TaskStatus state machine (Working, InputRequired, Executing,\n  Completed, Failed, Rejected, Cancelled, Expired)\n- TaskStore with DashMap for lock-free concurrent access\n- Optimistic locking for state transitions (F-007)\n- Rate limiting per principal and global capacity limits (F-009)\n- TTL enforcement and expiration cleanup (F-008)\n- 27 unit tests covering all edge cases (EC-TASK-001 to EC-TASK-016)\n\nImplements: REQ-GOV-001\nRefs: specs/REQ-GOV-001_Task_Lifecycle.md\n\n* fix(governance): address task lifecycle code review feedback\n\n- Add rust-version = \"1.87\" to Cargo.toml for MSRV enforcement\n- Align uuid features between deps and dev-deps (add serde feature)\n- Add missing REQ-GOV-001 doc comments to public functions\n- Remove misleading TaskId::as_str() method (Display impl suffices)\n- Add Working -> Expired transition to state machine for TTL enforcement\n- Fix cancel() to return InvalidTransition for Executing state\n- Fix wait_for_terminal race condition with proper notify/check loop\n- Fix TTL conversion to clamp to 30 days instead of zero on overflow\n- Combine duplicate to_sep1686() match arms\n- Document non-atomic capacity check limitation for v0.1\n\nRefs: REQ-GOV-001\n\n* docs(governance): clarify request hash excludes mcp_request_id\n\nDocument that the hash_request function intentionally excludes the\nmcp_request_id field because the hash is for semantic content integrity\nverification, not request instance identification. The request ID is\ntransport-layer metadata for JSON-RPC correlation.\n\nRefs: REQ-GOV-001/F-002.3",
+          "timestamp": "2026-01-11T17:56:33Z",
+          "tree_id": "236bba44a9494208275ea16171bc8e23fd341da0",
+          "url": "https://github.com/olegmukhin/thoughtgate/commit/218646e2722dcc9885608e0d1c758562adb79c66"
+        },
+        "date": 1768154532720,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "ttfb/direct/baseline",
+            "value": 142087.69565956524,
+            "unit": "ns"
+          },
+          {
+            "name": "ttfb/proxied/with_relay",
+            "value": 11386984.62777778,
             "unit": "ns"
           }
         ]
