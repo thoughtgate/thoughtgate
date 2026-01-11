@@ -368,11 +368,21 @@ impl CedarEngine {
     }
 
     /// Get policy source information.
+    ///
+    /// Implements: REQ-POL-001/F-003 (Policy Loading)
+    ///
+    /// Returns information about where the currently loaded policies came from:
+    /// ConfigMap, Environment variable, or embedded defaults.
     pub fn policy_source(&self) -> PolicySource {
         (**self.source.load()).clone()
     }
 
     /// Get policy statistics.
+    ///
+    /// Implements: REQ-POL-001/F-005 (Hot-Reload)
+    ///
+    /// Returns runtime statistics including policy count, evaluation count,
+    /// reload count, and last reload timestamp.
     pub fn stats(&self) -> PolicyStats {
         let policies = self.policies.load();
 
