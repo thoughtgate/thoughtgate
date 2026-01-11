@@ -539,6 +539,13 @@ impl Task {
 /// Computes a SHA256 hash of the request for integrity verification.
 ///
 /// Implements: REQ-GOV-001/F-002.3
+///
+/// The hash includes only the tool name and arguments, intentionally excluding
+/// the `mcp_request_id`. This is because:
+/// - The request ID is transport-layer metadata for JSON-RPC correlation
+/// - The hash verifies the *semantic content* of what was approved
+/// - Two requests with identical tool+arguments perform the same action
+///   regardless of their request IDs
 fn hash_request(request: &ToolCallRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(request.name.as_bytes());
