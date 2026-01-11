@@ -188,6 +188,55 @@ impl UpstreamClient {
         Ok(Self { client, config })
     }
 
+    /// Perform a health check to verify upstream connectivity.
+    ///
+    /// Implements: REQ-CORE-005/F-007.3
+    ///
+    /// This performs a simple TCP connectivity check to the upstream server
+    /// without sending a full MCP request. Used for readiness probes.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if the connection can be established
+    /// - `Err(ThoughtGateError::UpstreamConnectionFailed)` if connection fails
+    /// - `Err(ThoughtGateError::UpstreamTimeout)` if connection times out
+    pub async fn health_check(&self) -> Result<(), ThoughtGateError> {
+        let url = match reqwest::Url::parse(&self.config.base_url) {
+            Ok(u) => u,
+            Err(e) => {
+                return Err(ThoughtGateError::InternalError {
+                    correlation_id: format!("health-check-url-parse-error: {}", e),
+                });
+            }
+        };
+
+        let host = url.host_str().unwrap_or("localhost");
+        let port = url.port_or_known_default().unwrap_or(80);
+        let addr = format!("{}:{}", host, port);
+
+        // TCP connect with short timeout (5s)
+        let connect_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(_stream)) => {
+                // Connection successful, drop stream immediately
+                Ok(())
+            }
+            Ok(Err(e)) => Err(ThoughtGateError::UpstreamConnectionFailed {
+                url: self.config.base_url.clone(),
+                reason: e.to_string(),
+            }),
+            Err(_timeout) => Err(ThoughtGateError::UpstreamTimeout {
+                url: self.config.base_url.clone(),
+                timeout_secs: 5,
+            }),
+        }
+    }
+
     /// Forward a single request to upstream.
     ///
     /// Implements: REQ-CORE-003/F-004 (Upstream Forwarding)

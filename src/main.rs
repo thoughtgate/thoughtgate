@@ -6,6 +6,7 @@
 //!
 //! # Traceability
 //! - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy)
+//! - Implements: REQ-CORE-005 (Operational Lifecycle)
 
 use mimalloc::MiMalloc;
 
@@ -20,15 +21,14 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thoughtgate::config::ProxyConfig;
 use thoughtgate::error::ProxyError;
+use thoughtgate::lifecycle::{DrainResult, LifecycleConfig, LifecycleManager, health_router};
 use thoughtgate::logging_layer::LoggingLayer;
 use thoughtgate::proxy_service::ProxyService;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast};
-use tokio::time::sleep;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
 
@@ -47,70 +47,22 @@ struct Config {
     #[arg(short, long, default_value = "127.0.0.1")]
     bind: String,
 
-    /// Graceful shutdown timeout in seconds (default: 30)
-    #[arg(long, env = "SHUTDOWN_TIMEOUT", default_value = "30")]
-    shutdown_timeout: u64,
-
     /// Optional upstream URL for reverse proxy mode (e.g., "http://backend:8080")
     /// When set, all requests are forwarded to this upstream instead of using the request's target
     #[arg(long, env = "UPSTREAM_URL")]
     upstream_url: Option<String>,
-}
 
-/// Connection tracker for graceful shutdown.
-///
-/// # Traceability
-/// - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy - connection management)
-#[derive(Clone)]
-struct ConnectionTracker {
-    active_connections: Arc<AtomicUsize>,
-}
-
-/// RAII guard that automatically decrements the connection counter when dropped.
-///
-/// This ensures the counter is decremented even if the task panics, preventing
-/// the graceful shutdown logic from waiting indefinitely for crashed connections.
-///
-/// # Traceability
-/// - Implements: REQ-CORE-001 (Connection Management Safety)
-struct ConnectionGuard {
-    tracker: ConnectionTracker,
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.tracker
-            .active_connections
-            .fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl ConnectionTracker {
-    fn new() -> Self {
-        Self {
-            active_connections: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// Increment the connection counter and return an RAII guard.
-    ///
-    /// The guard will automatically decrement the counter when dropped,
-    /// even if the task panics.
-    fn track_connection(&self) -> ConnectionGuard {
-        self.active_connections.fetch_add(1, Ordering::SeqCst);
-        ConnectionGuard {
-            tracker: self.clone(),
-        }
-    }
-
-    fn count(&self) -> usize {
-        self.active_connections.load(Ordering::SeqCst)
-    }
+    /// Health endpoint port (default: same as main port via separate listener)
+    #[arg(long, env = "THOUGHTGATE_HEALTH_PORT")]
+    health_port: Option<u16>,
 }
 
 /// Main entry point for the ThoughtGate proxy.
+///
+/// Implements: REQ-CORE-005/F-001 (Startup Sequencing)
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Phase 1: Initialize observability
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -121,6 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli_config = Config::parse();
     let proxy_config = ProxyConfig::from_env();
+
+    // Phase 2: Initialize lifecycle manager
+    // Implements: REQ-CORE-005/F-001
+    let lifecycle_config = LifecycleConfig::from_env();
+    let lifecycle = Arc::new(LifecycleManager::new(lifecycle_config));
 
     // Initialize OpenTelemetry metrics (REQ-CORE-001 NFR-001)
     #[cfg(feature = "metrics")]
@@ -150,13 +107,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(metrics_port = metrics_port, "Metrics endpoint started");
     }
 
+    // Phase 3: Start health endpoint server
+    // Implements: REQ-CORE-005/F-002, F-003
+    let health_port = cli_config.health_port.unwrap_or(cli_config.port + 1);
+    let health_lifecycle = lifecycle.clone();
+    let health_shutdown = lifecycle.shutdown_token();
+    tokio::spawn(async move {
+        if let Err(e) = serve_health_endpoints(health_port, health_lifecycle, health_shutdown).await
+        {
+            error!(error = %e, "Health server error");
+        }
+    });
+    info!(
+        health_port = health_port,
+        "Health endpoints started (/health, /ready)"
+    );
+
+    // Phase 4: Bind main listener
     let addr = format!("{}:{}", cli_config.bind, cli_config.port);
     let listener = TcpListener::bind(&addr).await?;
 
     info!(
         bind = %cli_config.bind,
         port = cli_config.port,
-        shutdown_timeout = cli_config.shutdown_timeout,
+        health_port = health_port,
+        drain_timeout_secs = lifecycle.config().drain_timeout.as_secs(),
         addr = %addr,
         tcp_nodelay = proxy_config.tcp_nodelay,
         tcp_keepalive_secs = proxy_config.tcp_keepalive_secs,
@@ -165,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ThoughtGate Proxy starting"
     );
 
+    // Phase 5: Create proxy service
     let proxy_service = Arc::new(ProxyService::new_with_config(
         cli_config.upstream_url.clone(),
         proxy_config.clone(),
@@ -173,51 +149,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(LoggingLayer)
         .service(proxy_service.as_ref().clone());
 
+    // Setup signal handlers
+    // Implements: REQ-CORE-005/F-004 (Signal Handling)
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let shutdown_tx_clone = shutdown_tx.clone();
-    let connection_tracker = ConnectionTracker::new();
-    let tracker_clone = connection_tracker.clone();
+    setup_signal_handlers(shutdown_tx.clone(), lifecycle.clone());
+
     let config_clone = proxy_config.clone();
 
     // Semaphore for concurrency limiting (REQ-CORE-001 Section 3.2)
     let semaphore = Arc::new(Semaphore::new(proxy_config.max_concurrent_streams));
 
-    tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
-                let _ = shutdown_tx_clone.send(());
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to listen for SIGINT");
-            }
-        }
-    });
-
-    #[cfg(unix)]
-    {
-        let shutdown_tx_sigterm = shutdown_tx.clone();
-        tokio::spawn(async move {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    sigterm.recv().await;
-                    info!("Received SIGTERM, initiating graceful shutdown");
-                    let _ = shutdown_tx_sigterm.send(());
-                }
-                Err(e) => {
-                    error!(error = %e, "Failed to listen for SIGTERM");
-                }
-            }
-        });
-    }
-
     let mut shutdown_rx = shutdown_tx.subscribe();
 
+    // Mark as ready
+    // Implements: REQ-CORE-005/F-001
+    lifecycle.mark_policies_loaded(); // Policies loaded (proxy mode)
+    lifecycle.mark_task_store_initialized(); // Task store ready (proxy mode)
+    lifecycle.update_upstream_health(true, None); // Assume healthy initially
+    lifecycle.mark_ready();
+
+    // Main accept loop
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer_addr)) => {
+                        // Check if shutting down - reject new connections
+                        // Implements: REQ-CORE-005/F-004.1, EC-OPS-006
+                        let request_guard = match lifecycle.track_request() {
+                            Some(guard) => guard,
+                            None => {
+                                // Shutting down, reject new connections
+                                warn!(peer = %peer_addr, "Rejected connection: shutting down");
+                                tokio::spawn(async move {
+                                    let _ = send_503_shutdown_response(stream).await;
+                                });
+                                continue;
+                            }
+                        };
+
                         // Try to acquire semaphore permit (REQ-CORE-001 Section 3.2)
                         let permit = match semaphore.clone().try_acquire_owned() {
                             Ok(p) => p,
@@ -228,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     max_streams = proxy_config.max_concurrent_streams,
                                     "Rejected connection: max concurrent streams reached"
                                 );
+                                drop(request_guard); // Release lifecycle tracking
                                 tokio::spawn(async move {
                                     let _ = send_503_response(stream).await;
                                 });
@@ -243,10 +214,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let service_stack = service_stack.clone();
                         let mut conn_shutdown_rx = shutdown_tx.subscribe();
-                        let tracker = connection_tracker.clone();
-
-                        // RAII guard ensures decrement is called even if the task panics
-                        let conn_guard = tracker.track_connection();
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(
@@ -261,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             // Explicit drops for clarity (both happen automatically at scope end)
-                            drop(conn_guard); // Decrements connection counter
+                            drop(request_guard); // Decrements lifecycle request counter
                             drop(permit); // Release semaphore permit
                         });
                     }
@@ -278,38 +245,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Graceful shutdown sequence
+    // Implements: REQ-CORE-005/F-004, F-005
     info!(
-        active_connections = tracker_clone.count(),
-        timeout_seconds = cli_config.shutdown_timeout,
-        "Waiting for active connections to drain"
+        active_requests = lifecycle.active_request_count(),
+        drain_timeout_secs = lifecycle.config().drain_timeout.as_secs(),
+        "Waiting for active requests to drain"
     );
 
-    let shutdown_deadline = Duration::from_secs(cli_config.shutdown_timeout);
-    let start = std::time::Instant::now();
+    // Drain requests
+    // Implements: REQ-CORE-005/F-005
+    let drain_result = lifecycle.drain_requests().await;
 
-    while tracker_clone.count() > 0 {
-        if start.elapsed() >= shutdown_deadline {
+    // Mark as stopped
+    lifecycle.mark_stopped();
+
+    // Exit with appropriate code
+    // Implements: REQ-CORE-005/F-004.6
+    match drain_result {
+        DrainResult::Complete => {
+            info!("All requests drained, shutting down cleanly");
+            Ok(())
+        }
+        DrainResult::Timeout { remaining } => {
             warn!(
-                active_connections = tracker_clone.count(),
-                "Shutdown timeout reached, forcing exit"
+                remaining_requests = remaining,
+                "Drain timeout exceeded, forcing shutdown"
             );
-            break;
-        }
-
-        sleep(Duration::from_millis(100)).await;
-
-        if start.elapsed().as_secs().is_multiple_of(5) {
-            info!(
-                active_connections = tracker_clone.count(),
-                elapsed_seconds = start.elapsed().as_secs(),
-                "Still draining connections..."
-            );
+            std::process::exit(1);
         }
     }
+}
 
-    if tracker_clone.count() == 0 {
-        info!("All connections drained, shutting down cleanly");
+/// Setup signal handlers for graceful shutdown.
+///
+/// Implements: REQ-CORE-005/§5.2 (Signal Handling)
+///
+/// - SIGINT (Ctrl+C): Begin graceful shutdown
+/// - SIGTERM: Begin graceful shutdown
+fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<LifecycleManager>) {
+    // SIGINT handler
+    let shutdown_tx_sigint = shutdown_tx.clone();
+    let lifecycle_sigint = lifecycle.clone();
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
+                lifecycle_sigint.begin_shutdown();
+                let _ = shutdown_tx_sigint.send(());
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to listen for SIGINT");
+            }
+        }
+    });
+
+    // SIGTERM handler (Unix only)
+    #[cfg(unix)]
+    {
+        let shutdown_tx_sigterm = shutdown_tx;
+        let lifecycle_sigterm = lifecycle;
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    sigterm.recv().await;
+                    info!("Received SIGTERM, initiating graceful shutdown");
+                    lifecycle_sigterm.begin_shutdown();
+                    let _ = shutdown_tx_sigterm.send(());
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to listen for SIGTERM");
+                }
+            }
+        });
     }
+}
+
+/// Serve health endpoints on a dedicated port.
+///
+/// Implements: REQ-CORE-005/F-002, F-003
+async fn serve_health_endpoints(
+    port: u16,
+    lifecycle: Arc<LifecycleManager>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let app = health_router(lifecycle);
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+        })
+        .await?;
 
     Ok(())
 }
@@ -461,6 +489,32 @@ async fn send_503_response(mut stream: TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Send a 503 Service Unavailable response during shutdown.
+///
+/// Implements: REQ-CORE-005/F-004.3
+async fn send_503_shutdown_response(mut stream: TcpStream) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let body = "503 Service Unavailable\n\n\
+                ThoughtGate is shutting down.\n\
+                Please retry your request on another instance.";
+    let content_length = body.len();
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Retry-After: 5\r\n\
+         \r\n\
+         {}",
+        content_length, body
+    );
+
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 /// Serve Prometheus metrics endpoint.
 ///
 /// # Traceability
@@ -508,72 +562,67 @@ async fn serve_metrics(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thoughtgate::lifecycle::LifecycleConfig;
 
     #[test]
-    fn test_connection_guard_increments_and_decrements() {
-        let tracker = ConnectionTracker::new();
-        assert_eq!(tracker.count(), 0);
+    fn test_lifecycle_integration() {
+        let lifecycle = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
+        assert!(!lifecycle.is_ready());
+        assert!(!lifecycle.is_shutting_down());
 
-        {
-            let _guard = tracker.track_connection();
-            assert_eq!(tracker.count(), 1);
-        }
+        lifecycle.mark_ready();
+        assert!(lifecycle.is_ready());
 
-        // Guard dropped, counter should be back to 0
-        assert_eq!(tracker.count(), 0);
+        // Can track requests when ready
+        let guard = lifecycle.track_request();
+        assert!(guard.is_some());
+        assert_eq!(lifecycle.active_request_count(), 1);
+        drop(guard);
+        assert_eq!(lifecycle.active_request_count(), 0);
+
+        // Begin shutdown
+        lifecycle.begin_shutdown();
+        assert!(lifecycle.is_shutting_down());
+
+        // Cannot track new requests during shutdown
+        let guard = lifecycle.track_request();
+        assert!(guard.is_none());
     }
 
     #[test]
-    fn test_connection_guard_multiple() {
-        let tracker = ConnectionTracker::new();
-        assert_eq!(tracker.count(), 0);
+    fn test_request_guard_panic_safety() {
+        use std::panic::AssertUnwindSafe;
 
-        let _guard1 = tracker.track_connection();
-        assert_eq!(tracker.count(), 1);
+        let lifecycle = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
+        lifecycle.mark_ready();
 
-        let _guard2 = tracker.track_connection();
-        assert_eq!(tracker.count(), 2);
+        assert_eq!(lifecycle.active_request_count(), 0);
 
-        let _guard3 = tracker.track_connection();
-        assert_eq!(tracker.count(), 3);
-
-        drop(_guard1);
-        assert_eq!(tracker.count(), 2);
-
-        drop(_guard2);
-        assert_eq!(tracker.count(), 1);
-
-        drop(_guard3);
-        assert_eq!(tracker.count(), 0);
-    }
-
-    #[test]
-    fn test_connection_guard_panic_safety() {
-        let tracker = ConnectionTracker::new();
-        assert_eq!(tracker.count(), 0);
-
-        // Simulate a panic in a spawned task
-        let result = std::panic::catch_unwind(|| {
-            let _guard = tracker.track_connection();
-            assert_eq!(tracker.count(), 1);
-            panic!("Simulated panic in connection handler");
-        });
+        // Simulate a panic in a request handler
+        let lifecycle_clone = Arc::clone(&lifecycle);
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = lifecycle_clone.track_request();
+            assert_eq!(lifecycle_clone.active_request_count(), 1);
+            panic!("Simulated panic in request handler");
+        }));
 
         assert!(result.is_err());
 
         // Even after panic, counter should be decremented
-        assert_eq!(tracker.count(), 0);
+        assert_eq!(lifecycle.active_request_count(), 0);
     }
 
     #[tokio::test]
-    async fn test_connection_guard_async_panic_safety() {
-        let tracker = ConnectionTracker::new();
-        assert_eq!(tracker.count(), 0);
+    async fn test_request_guard_async_panic_safety() {
+        let lifecycle = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
+        lifecycle.mark_ready();
+
+        assert_eq!(lifecycle.active_request_count(), 0);
 
         // Simulate what happens in the actual code: spawn a task that panics
-        let tracker_clone = tracker.clone();
+        let lifecycle_clone = lifecycle.clone();
         let handle = tokio::spawn(async move {
-            let _guard = tracker_clone.track_connection();
+            let _guard = lifecycle_clone.track_request();
             // Simulate some async work
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             panic!("Simulated async panic");
@@ -584,6 +633,6 @@ mod tests {
         assert!(result.is_err());
 
         // Counter should be back to 0 even after panic
-        assert_eq!(tracker.count(), 0);
+        assert_eq!(lifecycle.active_request_count(), 0);
     }
 }

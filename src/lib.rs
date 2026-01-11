@@ -43,6 +43,7 @@ pub mod config;
 pub mod error;
 pub mod governance;
 pub mod inspector;
+pub mod lifecycle;
 pub mod logging_layer;
 pub mod metrics;
 pub mod policy;
