@@ -206,6 +206,8 @@ pub enum FailureStage {
     UpstreamError,
     /// Service is shutting down
     ServiceShutdown,
+    /// Task in unexpected state for the requested operation
+    InvalidTaskState,
 }
 
 /// Information about why a task failed.
@@ -546,7 +548,8 @@ impl Task {
 /// - The hash verifies the *semantic content* of what was approved
 /// - Two requests with identical tool+arguments perform the same action
 ///   regardless of their request IDs
-fn hash_request(request: &ToolCallRequest) -> String {
+#[must_use]
+pub fn hash_request(request: &ToolCallRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(request.name.as_bytes());
     hasher.update(request.arguments.to_string().as_bytes());

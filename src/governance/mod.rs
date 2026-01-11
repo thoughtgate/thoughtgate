@@ -33,7 +33,7 @@ pub mod task;
 pub use task::{
     ApprovalDecision, ApprovalRecord, FailureInfo, FailureStage, JsonRpcId, Principal, Task,
     TaskError, TaskId, TaskStatus, TaskStore, TaskStoreConfig, TaskTransition, ToolCallRequest,
-    ToolCallResult,
+    ToolCallResult, hash_request,
 };
 
 // Re-export approval types

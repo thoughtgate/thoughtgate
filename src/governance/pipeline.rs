@@ -16,7 +16,6 @@
 //! the human sees exactly what will be executed.
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -33,6 +32,7 @@ use crate::transport::{JsonRpcId, McpRequest, UpstreamForwarder};
 
 use super::{
     ApprovalRecord, FailureStage, Principal, Task, TaskStatus, ToolCallRequest, ToolCallResult,
+    hash_request,
 };
 
 // ============================================================================
@@ -434,7 +434,7 @@ impl ApprovalPipeline {
                 "Task in unexpected state for execution"
             );
             return Err(PipelineResult::Failure {
-                stage: FailureStage::PreHitlInspection,
+                stage: FailureStage::InvalidTaskState,
                 reason: format!("Task in invalid state: {}", task.status),
                 retriable: false,
             });
@@ -705,24 +705,8 @@ impl ExecutionPipeline for ApprovalPipeline {
 // Helper Functions
 // ============================================================================
 
-/// Hash a ToolCallRequest for integrity verification.
-///
-/// Implements: REQ-GOV-002/§10 (Request Hashing)
-///
-/// Uses SHA256 hash of canonical JSON (name + arguments only, not mcp_request_id).
-#[must_use]
-pub fn hash_request(request: &ToolCallRequest) -> String {
-    // Canonical form: only name and arguments (not mcp_request_id)
-    let canonical = serde_json::json!({
-        "name": request.name,
-        "arguments": request.arguments,
-    });
-
-    // Safe: canonical JSON is always valid
-    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
-    let hash = Sha256::digest(&bytes);
-    hex::encode(hash)
-}
+// NOTE: hash_request is imported from super (task.rs) to ensure consistent
+// hashing between task creation and pipeline execution.
 
 /// Convert ToolCallRequest to McpRequest for upstream.
 fn to_mcp_request(request: &ToolCallRequest) -> McpRequest {
@@ -980,11 +964,6 @@ mod tests {
     /// Verifies: EC-PIP-004
     #[test]
     fn test_approval_expired() {
-        // Create a mock pipeline with no inspectors
-        let config = PipelineConfig::default();
-
-        // Create task and expired approval
-        let task = test_task(TaskStatus::Executing);
         let approval = expired_approval();
 
         // Manually validate (since we can't create full ApprovalPipeline in unit test easily)
