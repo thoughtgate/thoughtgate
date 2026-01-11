@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1768156766699,
+  "lastUpdate": 1768167185434,
   "repoUrl": "https://github.com/olegmukhin/thoughtgate",
   "entries": {
     "Benchmark": [
@@ -441,6 +441,40 @@ window.BENCHMARK_DATA = {
           {
             "name": "ttfb/proxied/with_relay",
             "value": 11366349.33,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "oleg.v.mukhin@gmail.com",
+            "name": "Oleg Mukhin",
+            "username": "olegmukhin"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ab7beb66a2e6e89020aff53a01f2f5e5d7f7d901",
+          "message": "feat(governance): implement REQ-GOV-002 Approval Execution Pipeline (#20)\n\n* feat(governance): implement REQ-GOV-002 Approval Execution Pipeline\n\nAdd multi-phase execution pipeline for approval-required requests:\n\n- Pre-Approval Amber: Transform/validate request through inspector chain\n  before showing to human reviewer\n- Post-Approval Amber: Re-validate after approval with transform drift\n  detection (strict/permissive modes)\n- Policy re-evaluation: Check policy with ApprovalGrant context to detect\n  policy drift between approval and execution\n- Upstream forwarding: Send approved requests to MCP server with timeout\n\nKey types:\n- ExecutionPipeline trait with pre_approval_amber() and execute_approved()\n- ApprovalPipeline implementation with configurable inspector chain\n- PipelineResult with detailed FailureStage attribution\n- PipelineConfig with env var support\n\nEdge cases covered:\n- EC-PIP-001 to EC-PIP-014: All pipeline failure scenarios including\n  approval expiry, policy drift, transform drift, upstream errors\n\nNFR-001 (metrics) and NFR-002 (benchmarks) deferred as non-blocking.\n\nImplements: REQ-GOV-002\nRefs: specs/REQ-GOV-002_Execution_Pipeline.md\n\n* fix(governance): address code review findings for REQ-GOV-002\n\n- Unify hash_request: Export from task.rs and import in pipeline.rs to\n  ensure consistent hashing between task creation and execution\n- Add InvalidTaskState failure stage: Better describes task state\n  validation failures during execution (was using PreHitlInspection)\n- Remove unused test locals: Clean up test_approval_expired\n- Remove duplicate hash_request: Eliminates algorithm mismatch that\n  would cause false transform drift detection\n\nRefs: REQ-GOV-002",
+          "timestamp": "2026-01-11T21:30:29Z",
+          "tree_id": "893a78b6c120fb9bb37623c44b4487cc8957580e",
+          "url": "https://github.com/olegmukhin/thoughtgate/commit/ab7beb66a2e6e89020aff53a01f2f5e5d7f7d901"
+        },
+        "date": 1768167184590,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "ttfb/direct/baseline",
+            "value": 131558.16262931126,
+            "unit": "ns"
+          },
+          {
+            "name": "ttfb/proxied/with_relay",
+            "value": 11356819.873333333,
             "unit": "ns"
           }
         ]
