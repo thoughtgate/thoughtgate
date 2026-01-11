@@ -43,6 +43,8 @@ pub struct SlackConfig {
     pub reject_reaction: String,
     /// Request timeout for Slack API calls
     pub api_timeout: Duration,
+    /// Initial poll interval (should match PollingConfig::base_interval)
+    pub initial_poll_interval: Duration,
 }
 
 impl SlackConfig {
@@ -62,6 +64,7 @@ impl SlackConfig {
             approve_reaction: "+1".to_string(),
             reject_reaction: "-1".to_string(),
             api_timeout: Duration::from_secs(10),
+            initial_poll_interval: Duration::from_secs(5),
         }
     }
 
@@ -82,6 +85,12 @@ impl SlackConfig {
     pub fn from_env() -> Result<Self, AdapterError> {
         let bot_token = std::env::var("SLACK_BOT_TOKEN").map_err(|_| AdapterError::InvalidToken)?;
 
+        let initial_poll_interval = std::env::var("THOUGHTGATE_APPROVAL_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(5));
+
         Ok(Self {
             bot_token,
             channel: std::env::var("SLACK_CHANNEL").unwrap_or_else(|_| "#approvals".to_string()),
@@ -90,6 +99,7 @@ impl SlackConfig {
             reject_reaction: std::env::var("SLACK_REJECT_REACTION")
                 .unwrap_or_else(|_| "-1".to_string()),
             api_timeout: Duration::from_secs(10),
+            initial_poll_interval,
         })
     }
 
@@ -111,6 +121,13 @@ impl SlackConfig {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.api_timeout = timeout;
+        self
+    }
+
+    /// Set the initial poll interval.
+    #[must_use]
+    pub fn with_initial_poll_interval(mut self, interval: Duration) -> Self {
+        self.initial_poll_interval = interval;
         self
     }
 }
@@ -444,7 +461,7 @@ impl ApprovalAdapter for SlackAdapter {
             external_id: ts,
             channel,
             posted_at: Utc::now(),
-            next_poll_at: Instant::now() + Duration::from_secs(5),
+            next_poll_at: Instant::now() + self.config.initial_poll_interval,
             poll_count: 0,
         })
     }
@@ -499,7 +516,18 @@ impl ApprovalAdapter for SlackAdapter {
         let reactions = body.message.and_then(|m| m.reactions);
 
         if let Some((decision, user_id, emoji)) = self.check_reactions(&reactions) {
-            let display_name = self.get_user_display_name(&user_id).await?;
+            // Best-effort lookup: fall back to user_id if lookup fails
+            let display_name = match self.get_user_display_name(&user_id).await {
+                Ok(name) => name,
+                Err(e) => {
+                    warn!(
+                        user_id = %user_id,
+                        error = %e,
+                        "Failed to lookup user display name, using user_id"
+                    );
+                    user_id.clone()
+                }
+            };
 
             info!(
                 task_id = %reference.task_id,

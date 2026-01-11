@@ -33,7 +33,7 @@ use uuid::Uuid;
 /// Unique identifier for a task.
 ///
 /// Implements: REQ-GOV-001/F-002.1
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub Uuid);
 
 impl TaskId {

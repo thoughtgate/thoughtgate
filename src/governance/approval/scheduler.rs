@@ -40,9 +40,9 @@ pub struct PollingScheduler {
     /// Task store for recording decisions
     task_store: Arc<TaskStore>,
 
-    /// Priority queue: (next_poll_at, task_id)
-    /// Using BTreeMap for efficient ordering by poll time
-    pending: Mutex<BTreeMap<Instant, TaskId>>,
+    /// Priority queue: (next_poll_at, task_id) -> ()
+    /// Using composite key to handle multiple tasks with same poll time
+    pending: Mutex<BTreeMap<(Instant, TaskId), ()>>,
 
     /// Task ID -> ApprovalReference mapping
     references: DashMap<TaskId, ApprovalReference>,
@@ -85,6 +85,14 @@ impl PollingScheduler {
         }
     }
 
+    /// Returns the polling configuration.
+    ///
+    /// Used by adapters to get the base interval for initial poll timing.
+    #[must_use]
+    pub fn config(&self) -> &PollingConfig {
+        &self.config
+    }
+
     /// Submit a new task for approval polling.
     ///
     /// Implements: REQ-GOV-003/F-001
@@ -121,7 +129,7 @@ impl PollingScheduler {
 
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(next_poll_at, task_id.clone());
+            pending.insert((next_poll_at, task_id.clone()), ());
         }
 
         info!(
@@ -254,8 +262,9 @@ impl PollingScheduler {
     async fn get_next_due(&self) -> Option<(TaskId, ApprovalReference)> {
         let mut pending = self.pending.lock().await;
 
-        // Get the first entry (lowest next_poll_at)
-        let (&next_poll_at, task_id) = pending.iter().next()?;
+        // Get the first entry (lowest next_poll_at, then by task_id)
+        let (&(next_poll_at, ref task_id), _) = pending.iter().next()?;
+        let task_id = task_id.clone();
 
         // Wait until it's due
         let now = Instant::now();
@@ -269,8 +278,7 @@ impl PollingScheduler {
         }
 
         // Remove from queue
-        let task_id = task_id.clone();
-        pending.remove(&next_poll_at);
+        pending.remove(&(next_poll_at, task_id.clone()));
         drop(pending);
 
         // Get reference
@@ -348,7 +356,7 @@ impl PollingScheduler {
         self.references.insert(task_id.clone(), reference);
 
         let mut pending = self.pending.lock().await;
-        pending.insert(next_poll_at, task_id);
+        pending.insert((next_poll_at, task_id), ());
     }
 
     /// Drain pending approvals on shutdown.
@@ -592,5 +600,85 @@ mod tests {
         assert_eq!(config.backoff_interval(3), Duration::from_secs(30));
         // Further polls stay at max
         assert_eq!(config.backoff_interval(10), Duration::from_secs(30));
+    }
+
+    /// Tests that multiple tasks submitted concurrently don't cause data loss.
+    ///
+    /// Verifies: BTreeMap composite key handles multiple tasks with same poll time.
+    #[tokio::test]
+    async fn test_concurrent_submit_no_data_loss() {
+        // Create adapter that returns same next_poll_at for all tasks
+        struct SameTimeAdapter {
+            fixed_poll_at: Instant,
+        }
+
+        #[async_trait]
+        impl ApprovalAdapter for SameTimeAdapter {
+            async fn post_approval_request(
+                &self,
+                request: &ApprovalRequest,
+            ) -> Result<ApprovalReference, AdapterError> {
+                Ok(ApprovalReference {
+                    task_id: request.task_id.clone(),
+                    external_id: format!("ts-{}", request.task_id),
+                    channel: "test-channel".to_string(),
+                    posted_at: chrono::Utc::now(),
+                    next_poll_at: self.fixed_poll_at, // Same time for all!
+                    poll_count: 0,
+                })
+            }
+
+            async fn poll_for_decision(
+                &self,
+                _reference: &ApprovalReference,
+            ) -> Result<Option<PollResult>, AdapterError> {
+                Ok(None) // Always pending
+            }
+
+            async fn cancel_approval(
+                &self,
+                _reference: &ApprovalReference,
+            ) -> Result<(), AdapterError> {
+                Ok(())
+            }
+
+            fn name(&self) -> &'static str {
+                "same-time"
+            }
+        }
+
+        let fixed_time = Instant::now() + Duration::from_secs(100);
+        let adapter = Arc::new(SameTimeAdapter {
+            fixed_poll_at: fixed_time,
+        });
+        let task_store = Arc::new(TaskStore::new(TaskStoreConfig::default()));
+        let config = PollingConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let scheduler = PollingScheduler::new(adapter, task_store, config, shutdown);
+
+        // Submit 5 tasks rapidly - they will all have the same next_poll_at
+        let mut task_ids = Vec::new();
+        for _ in 0..5 {
+            let task_id = TaskId::new();
+            task_ids.push(task_id.clone());
+            let request = test_request(task_id);
+            scheduler.submit(request).await.expect("Submit failed");
+        }
+
+        // All 5 tasks should be in the queue (no data loss from key collision)
+        assert_eq!(
+            scheduler.pending_count(),
+            5,
+            "All 5 tasks should be in queue despite same poll time"
+        );
+
+        // Verify each task is actually tracked
+        for task_id in &task_ids {
+            assert!(
+                scheduler.references.contains_key(task_id),
+                "Task {task_id} should be in references"
+            );
+        }
     }
 }
