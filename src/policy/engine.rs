@@ -39,6 +39,7 @@ pub struct CedarEngine {
 struct Stats {
     evaluation_count: AtomicU64,
     reload_count: AtomicU64,
+    last_reload: arc_swap::ArcSwap<Option<std::time::SystemTime>>,
 }
 
 impl CedarEngine {
@@ -78,6 +79,7 @@ impl CedarEngine {
             stats: Arc::new(Stats {
                 evaluation_count: AtomicU64::new(0),
                 reload_count: AtomicU64::new(0),
+                last_reload: arc_swap::ArcSwap::new(Arc::new(None)),
             }),
         })
     }
@@ -211,12 +213,19 @@ impl CedarEngine {
             }
         };
 
+        // Build entities with principal attributes
+        let entities = match self.build_entities(request) {
+            Ok(ents) => ents,
+            Err(e) => {
+                error!(error = %e, "Failed to build Cedar entities");
+                return false;
+            }
+        };
+
         // Evaluate
-        let response = self.authorizer.is_authorized(
-            &cedar_request,
-            policies,
-            &Entities::empty(), // Entities not used in v0.1
-        );
+        let response = self
+            .authorizer
+            .is_authorized(&cedar_request, policies, &entities);
 
         response.decision() == Decision::Allow
     }
@@ -309,6 +318,73 @@ impl CedarEngine {
         })
     }
 
+    /// Build Cedar entities with principal attributes.
+    ///
+    /// Creates entity data for the principal (App) with namespace, service_account,
+    /// and role memberships so policies can match on these attributes.
+    fn build_entities(&self, request: &PolicyRequest) -> Result<Entities, PolicyError> {
+        use cedar_policy::{Entity, RestrictedExpression};
+        use std::collections::HashMap;
+
+        let mut entities_vec = Vec::new();
+
+        // Build principal entity with attributes
+        let principal_uid = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("ThoughtGate::App").map_err(|e| PolicyError::CedarError {
+                details: format!("Invalid entity type: {}", e),
+            })?,
+            EntityId::from_str(&request.principal.app_name).map_err(|e| {
+                PolicyError::CedarError {
+                    details: format!("Invalid principal ID: {}", e),
+                }
+            })?,
+        );
+
+        // Build principal attributes
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "name".to_string(),
+            RestrictedExpression::new_string(request.principal.app_name.clone()),
+        );
+        attrs.insert(
+            "namespace".to_string(),
+            RestrictedExpression::new_string(request.principal.namespace.clone()),
+        );
+        attrs.insert(
+            "service_account".to_string(),
+            RestrictedExpression::new_string(request.principal.service_account.clone()),
+        );
+
+        // Build role parent entities (for role hierarchy)
+        let mut parents = std::collections::HashSet::new();
+        for role in &request.principal.roles {
+            let role_uid = EntityUid::from_type_name_and_id(
+                EntityTypeName::from_str("ThoughtGate::Role").map_err(|e| {
+                    PolicyError::CedarError {
+                        details: format!("Invalid role entity type: {}", e),
+                    }
+                })?,
+                EntityId::from_str(role).map_err(|e| PolicyError::CedarError {
+                    details: format!("Invalid role ID: {}", e),
+                })?,
+            );
+            parents.insert(role_uid);
+        }
+
+        // Create principal entity
+        let principal_entity =
+            Entity::new(principal_uid, attrs, parents).map_err(|e| PolicyError::CedarError {
+                details: format!("Failed to create principal entity: {}", e),
+            })?;
+
+        entities_vec.push(principal_entity);
+
+        // Build entities collection
+        Entities::from_entities(entities_vec, None).map_err(|e| PolicyError::CedarError {
+            details: format!("Failed to build entities: {}", e),
+        })
+    }
+
     /// Parse policies and validate against schema.
     ///
     /// Implements: REQ-POL-001/F-004 (Schema Validation)
@@ -354,6 +430,9 @@ impl CedarEngine {
         self.policies.store(Arc::new(new_policies));
         self.source.store(Arc::new(source));
         self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_reload
+            .store(Arc::new(Some(std::time::SystemTime::now())));
 
         info!("Policies reloaded successfully");
         Ok(())
@@ -370,7 +449,7 @@ impl CedarEngine {
 
         PolicyStats {
             policy_count: policies.policies().count(),
-            last_reload: None, // TODO: Track last reload time
+            last_reload: *self.stats.last_reload.load().as_ref(),
             reload_count: self.stats.reload_count.load(Ordering::Relaxed),
             evaluation_count: self.stats.evaluation_count.load(Ordering::Relaxed),
         }
@@ -400,12 +479,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_engine_creation() {
         let engine = CedarEngine::new();
         assert!(engine.is_ok());
     }
 
     #[test]
+    #[serial]
     fn test_evaluate_with_default_policies() {
         let engine = CedarEngine::new().expect("Failed to create engine");
 
@@ -421,6 +502,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_stats() {
         let engine = CedarEngine::new().expect("Failed to create engine");
 

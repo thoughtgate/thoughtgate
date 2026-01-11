@@ -21,8 +21,8 @@ use tracing::{info, warn};
 /// - K8s identity required but not available
 /// - Required environment variables missing
 pub fn infer_principal() -> Result<Principal, PolicyError> {
-    // Check for dev mode first
-    if env::var("THOUGHTGATE_DEV_MODE").is_ok() {
+    // Check for dev mode first (must be explicitly set to "true")
+    if env::var("THOUGHTGATE_DEV_MODE").as_deref() == Ok("true") {
         warn!("Using development mode principal - NOT FOR PRODUCTION");
         return Ok(dev_mode_principal());
     }
@@ -291,5 +291,42 @@ mod tests {
         // In a real policy evaluation, Cedar would check:
         // principal in ThoughtGate::Role::"admin"
         // This test just verifies the data structure is correct
+    }
+
+    /// Test that dev mode requires explicit "true" value
+    #[test]
+    #[serial]
+    fn test_dev_mode_requires_true() {
+        // Setting to "false" should NOT enable dev mode
+        unsafe {
+            env::set_var("THOUGHTGATE_DEV_MODE", "false");
+            env::remove_var("HOSTNAME");
+        }
+
+        let result = infer_principal();
+        // Should fail because K8s identity is missing and dev mode is not enabled
+        assert!(result.is_err());
+
+        // Setting to "1" should NOT enable dev mode
+        unsafe {
+            env::set_var("THOUGHTGATE_DEV_MODE", "1");
+        }
+
+        let result = infer_principal();
+        // Should fail because K8s identity is missing and dev mode is not enabled
+        assert!(result.is_err());
+
+        // Setting to "true" SHOULD enable dev mode
+        unsafe {
+            env::set_var("THOUGHTGATE_DEV_MODE", "true");
+        }
+
+        let result = infer_principal();
+        // Should succeed with dev principal
+        assert!(result.is_ok());
+
+        unsafe {
+            env::remove_var("THOUGHTGATE_DEV_MODE");
+        }
     }
 }
