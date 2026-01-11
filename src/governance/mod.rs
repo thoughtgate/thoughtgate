@@ -1,14 +1,16 @@
 //! Governance module for ThoughtGate.
 //!
-//! Implements: REQ-GOV-001 (Task Lifecycle), REQ-GOV-003 (Approval Integration)
+//! Implements: REQ-GOV-001 (Task Lifecycle), REQ-GOV-002 (Execution Pipeline),
+//!             REQ-GOV-003 (Approval Integration)
 //!
-//! This module provides task lifecycle management and approval integration for
-//! human-in-the-loop workflows. In v0.1, ThoughtGate uses **blocking mode** where
-//! HTTP connections are held until approval decisions are received.
+//! This module provides task lifecycle management, execution pipeline, and approval
+//! integration for human-in-the-loop workflows. In v0.1, ThoughtGate uses **blocking
+//! mode** where HTTP connections are held until approval decisions are received.
 //!
 //! ## Module Organization
 //!
 //! - `task` - Task lifecycle state machine (REQ-GOV-001)
+//! - `pipeline` - Approval execution pipeline (REQ-GOV-002)
 //! - `approval` - External approval system integration (REQ-GOV-003)
 //!
 //! ## v0.1 Constraints
@@ -25,12 +27,13 @@
 //! - Tool annotation rewriting during tools/list
 
 pub mod approval;
+pub mod pipeline;
 pub mod task;
 
 pub use task::{
     ApprovalDecision, ApprovalRecord, FailureInfo, FailureStage, JsonRpcId, Principal, Task,
     TaskError, TaskId, TaskStatus, TaskStore, TaskStoreConfig, TaskTransition, ToolCallRequest,
-    ToolCallResult,
+    ToolCallResult, hash_request,
 };
 
 // Re-export approval types
@@ -38,4 +41,10 @@ pub use approval::{
     AdapterError, ApprovalAdapter, ApprovalReference, ApprovalRequest, DecisionMethod,
     PollDecision, PollResult, PollingConfig, PollingScheduler, RateLimiter, SlackAdapter,
     SlackConfig,
+};
+
+// Re-export pipeline types
+pub use pipeline::{
+    ApprovalPipeline, ExecutionPipeline, PipelineConfig, PipelineError, PipelineResult,
+    PreHitlResult, TransformDriftMode,
 };

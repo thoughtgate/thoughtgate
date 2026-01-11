@@ -3145,6 +3145,7 @@ dependencies = [
  "dashmap",
  "futures",
  "futures-util",
+ "hex",
  "http",
  "http-body",
  "http-body-util",
