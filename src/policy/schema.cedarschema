@@ -1,0 +1,70 @@
+// Cedar schema for ThoughtGate policy engine
+//
+// Implements: REQ-POL-001/§5.2 (Cedar Schema)
+//
+// This schema defines the entity types, actions, and their relationships
+// for MCP request classification in ThoughtGate.
+
+namespace ThoughtGate {
+
+    // ═══════════════════════════════════════════════════════════
+    // PRINCIPALS
+    // ═══════════════════════════════════════════════════════════
+
+    /// The application pod making requests through ThoughtGate
+    entity App in [Role] = {
+        "name": String,               // From HOSTNAME
+        "namespace": String,          // From K8s ServiceAccount
+        "service_account": String,    // From K8s ServiceAccount token
+    };
+
+    /// Role for RBAC grouping
+    entity Role = {
+        "name": String,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // RESOURCES
+    // ═══════════════════════════════════════════════════════════
+
+    /// An MCP tool call request
+    entity ToolCall = {
+        "name": String,               // Tool name, e.g., "delete_user"
+        "server": String,             // Upstream MCP server identifier
+    };
+
+    /// Generic MCP method for non-tool requests
+    entity McpMethod = {
+        "method": String,             // e.g., "resources/read"
+        "server": String,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // CONTEXT
+    // ═══════════════════════════════════════════════════════════
+
+    /// Approval grant for post-approval re-evaluation
+    entity ApprovalGrant = {
+        "task_id": String,
+        "approved_by": String,
+        "approved_at": Long,          // Unix timestamp
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // ACTIONS (v0.1 Simplified)
+    // ═══════════════════════════════════════════════════════════
+
+    /// Forward: Send request to upstream immediately
+    action "Forward" appliesTo {
+        principal: [App, Role],
+        resource: [ToolCall, McpMethod],
+    };
+
+    /// Approve: Require human/agent approval before forwarding
+    action "Approve" appliesTo {
+        principal: [App, Role],
+        resource: [ToolCall, McpMethod],
+    };
+
+    // Reject is implicit: no action permitted = reject
+}

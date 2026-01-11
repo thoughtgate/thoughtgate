@@ -1,8 +1,13 @@
 ---
 source: src/proxy_service.rs
+assertion_line: 665
 expression: snapshot_data
 ---
 {
+  "test_case": "reverse_proxy_with_filtering",
+  "method": "POST",
+  "version": "HTTP/1.1",
+  "target_uri": "https://upstream.example.com/v1/chat/completions?param=value",
   "forwarded_headers": {
     "authorization": "Bearer secret-token",
     "connection": "keep-alive",
@@ -11,9 +16,5 @@ expression: snapshot_data
     "transfer-encoding": "chunked",
     "user-agent": "test-client/1.0",
     "x-custom-header": "custom-value"
-  },
-  "method": "POST",
-  "target_uri": "https://upstream.example.com/v1/chat/completions?param=value",
-  "test_case": "reverse_proxy_with_filtering",
-  "version": "HTTP/1.1"
+  }
 }

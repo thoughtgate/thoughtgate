@@ -16,6 +16,13 @@
 //! All responses are passed through directly in v0.1. No inspection or streaming
 //! distinction is required for MCP JSON-RPC responses.
 //!
+//! # MCP Transport
+//!
+//! The transport layer (REQ-CORE-003) handles:
+//! - JSON-RPC 2.0 parsing and validation
+//! - MCP method routing (tools/*, tasks/*, resources/*, prompts/*)
+//! - Upstream forwarding with connection pooling
+//!
 //! # Deferred Capabilities (v0.2+)
 //!
 //! The following paths are implemented but **deferred** for v0.1:
@@ -41,3 +48,4 @@ pub mod policy;
 pub mod proxy_body;
 pub mod proxy_service;
 pub mod timeout;
+pub mod transport;
