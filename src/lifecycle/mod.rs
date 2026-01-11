@@ -142,16 +142,22 @@ impl LifecycleConfig {
         );
 
         // Validate drain_timeout < shutdown_timeout as documented
-        // Also enforce a minimum of 1 second to ensure some draining can occur
+        // Reserve at least 1 second for post-drain cleanup
+        // Also enforce a minimum drain of 1 second
         const MIN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+        const MIN_POST_DRAIN_BUFFER: Duration = Duration::from_secs(1);
+
+        // Calculate maximum allowed drain_timeout (must leave room for post-drain cleanup)
+        let max_drain = Duration::from_secs(
+            shutdown_timeout
+                .as_secs()
+                .saturating_sub(MIN_POST_DRAIN_BUFFER.as_secs()),
+        );
 
         let drain_timeout = if drain_timeout >= shutdown_timeout {
-            let adjusted = Duration::from_secs(shutdown_timeout.as_secs().saturating_sub(5));
-            let adjusted = if adjusted < MIN_DRAIN_TIMEOUT {
-                MIN_DRAIN_TIMEOUT
-            } else {
-                adjusted
-            };
+            // drain_timeout >= shutdown_timeout: use 80% of shutdown or max_drain, whichever is smaller
+            let adjusted = Duration::from_secs((shutdown_timeout.as_secs() * 4) / 5);
+            let adjusted = adjusted.min(max_drain).max(MIN_DRAIN_TIMEOUT);
             warn!(
                 drain_timeout_secs = drain_timeout.as_secs(),
                 shutdown_timeout_secs = shutdown_timeout.as_secs(),
@@ -159,6 +165,15 @@ impl LifecycleConfig {
                 "drain_timeout must be less than shutdown_timeout, adjusting"
             );
             adjusted
+        } else if drain_timeout > max_drain {
+            // drain_timeout valid but doesn't leave enough buffer
+            warn!(
+                drain_timeout_secs = drain_timeout.as_secs(),
+                shutdown_timeout_secs = shutdown_timeout.as_secs(),
+                adjusted_drain_secs = max_drain.as_secs(),
+                "drain_timeout too close to shutdown_timeout, adjusting to leave cleanup buffer"
+            );
+            max_drain.max(MIN_DRAIN_TIMEOUT)
         } else if drain_timeout < MIN_DRAIN_TIMEOUT {
             warn!(
                 drain_timeout_secs = drain_timeout.as_secs(),
