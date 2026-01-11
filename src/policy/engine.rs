@@ -213,16 +213,12 @@ impl CedarEngine {
             }
         };
 
-        // Build entities with principal attributes
-        let entities = match self.build_entities(request) {
-            Ok(ents) => ents,
-            Err(e) => {
-                error!(error = %e, "Failed to build Cedar entities");
-                return false;
-            }
-        };
-
-        // Evaluate
+        // Evaluate with empty entities
+        // Note: For v0.1, we don't populate the entity store.
+        // This works for policies using entity UIDs (principal == ThoughtGate::App::"name")
+        // but not for attribute-based policies (principal.namespace == "prod").
+        // Full entity support will be added in a future version.
+        let entities = Entities::empty();
         let response = self
             .authorizer
             .is_authorized(&cedar_request, policies, &entities);
@@ -318,72 +314,6 @@ impl CedarEngine {
         })
     }
 
-    /// Build Cedar entities with principal attributes.
-    ///
-    /// Creates entity data for the principal (App) with namespace, service_account,
-    /// and role memberships so policies can match on these attributes.
-    fn build_entities(&self, request: &PolicyRequest) -> Result<Entities, PolicyError> {
-        use cedar_policy::{Entity, RestrictedExpression};
-        use std::collections::HashMap;
-
-        let mut entities_vec = Vec::new();
-
-        // Build principal entity with attributes
-        let principal_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::App").map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid entity type: {}", e),
-            })?,
-            EntityId::from_str(&request.principal.app_name).map_err(|e| {
-                PolicyError::CedarError {
-                    details: format!("Invalid principal ID: {}", e),
-                }
-            })?,
-        );
-
-        // Build principal attributes
-        let mut attrs = HashMap::new();
-        attrs.insert(
-            "name".to_string(),
-            RestrictedExpression::new_string(request.principal.app_name.clone()),
-        );
-        attrs.insert(
-            "namespace".to_string(),
-            RestrictedExpression::new_string(request.principal.namespace.clone()),
-        );
-        attrs.insert(
-            "service_account".to_string(),
-            RestrictedExpression::new_string(request.principal.service_account.clone()),
-        );
-
-        // Build role parent entities (for role hierarchy)
-        let mut parents = std::collections::HashSet::new();
-        for role in &request.principal.roles {
-            let role_uid = EntityUid::from_type_name_and_id(
-                EntityTypeName::from_str("ThoughtGate::Role").map_err(|e| {
-                    PolicyError::CedarError {
-                        details: format!("Invalid role entity type: {}", e),
-                    }
-                })?,
-                EntityId::from_str(role).map_err(|e| PolicyError::CedarError {
-                    details: format!("Invalid role ID: {}", e),
-                })?,
-            );
-            parents.insert(role_uid);
-        }
-
-        // Create principal entity
-        let principal_entity =
-            Entity::new(principal_uid, attrs, parents).map_err(|e| PolicyError::CedarError {
-                details: format!("Failed to create principal entity: {}", e),
-            })?;
-
-        entities_vec.push(principal_entity);
-
-        // Build entities collection
-        Entities::from_entities(entities_vec, None).map_err(|e| PolicyError::CedarError {
-            details: format!("Failed to build entities: {}", e),
-        })
-    }
 
     /// Parse policies and validate against schema.
     ///
