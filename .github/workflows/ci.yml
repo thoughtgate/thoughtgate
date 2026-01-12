@@ -312,26 +312,31 @@ jobs:
           from pathlib import Path
           
           # Use dict to deduplicate by name
-          # Bencher JSON format: {"benchmark_name": {"value": X}}
+          # Bencher BMF format: {"benchmark_name": {"measure": {"value": X}}}
+          # Three levels: benchmark -> measure -> value object
           metrics = {}
           
-          def add_metric(name, value):
-              """Add metric, deduplicating by name."""
-              metrics[name] = {"value": value}
+          def add_metric(name, value, measure="latency"):
+              """Add metric in BMF format with proper measure."""
+              metrics[name] = {measure: {"value": value}}
           
-          # Parse binary metrics
+          # Parse binary metrics (use "file-size" measure for size metrics)
           binary_file = Path("binary_metrics.json")
           if binary_file.exists():
               with open(binary_file) as f:
                   for m in json.load(f):
-                      add_metric(m["name"], m["value"])
+                      add_metric(m["name"], m["value"], "file-size")
           
-          # Parse startup metrics
+          # Parse startup metrics (use "latency" for timing, "file-size" for memory)
           startup_file = Path("startup_metrics.json")
           if startup_file.exists():
               with open(startup_file) as f:
                   for m in json.load(f):
-                      add_metric(m["name"], m["value"])
+                      name = m["name"]
+                      if "memory" in name or "rss" in name.lower():
+                          add_metric(name, m["value"], "file-size")
+                      else:
+                          add_metric(name, m["value"], "latency")
           
           # Parse Criterion results
           # Only look in "new" directory to avoid duplicates from base/new
@@ -357,20 +362,21 @@ jobs:
                           # Convert to appropriate units
                           if "policy" in bench_name.lower():
                               # Policy benchmarks in microseconds
-                              add_metric(f"policy/{bench_name}", mean_ns / 1000)
+                              add_metric(f"policy/{bench_name}", mean_ns / 1000, "latency")
                           else:
                               # TTFB benchmarks in milliseconds
-                              add_metric(f"ttfb/{bench_name}", mean_ns / 1_000_000)
+                              add_metric(f"ttfb/{bench_name}", mean_ns / 1_000_000, "latency")
                   except (KeyError, json.JSONDecodeError) as e:
                       print(f"Warning: Could not parse {estimates_file}: {e}")
           
-          # Write consolidated results in Bencher JSON format
+          # Write consolidated results in Bencher BMF format
           with open("bench_metrics.json", "w") as f:
               json.dump(metrics, f, indent=2)
           
           print(f"Consolidated {len(metrics)} metrics:")
           for name, data in sorted(metrics.items()):
-              print(f"  - {name}: {data['value']:.3f}")
+              measure = list(data.keys())[0]
+              print(f"  - {name} [{measure}]: {data[measure]['value']:.3f}")
           PYEOF
           
           echo ""
