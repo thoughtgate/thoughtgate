@@ -28,7 +28,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 futures-util = "0.3"
 
 # Socket configuration (REQ-CORE-001 Section 3.2)
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 # Cancellation and utilities (REQ-CORE-001 F-002)
 tokio-util = { version = "0.7", features = ["rt"] }
