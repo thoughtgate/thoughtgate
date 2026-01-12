@@ -80,13 +80,9 @@ fn bench_policy_eval_various_tools(c: &mut Criterion) {
 
     for tool_name in &tool_names {
         let request = create_test_request(tool_name);
-        group.bench_with_input(
-            BenchmarkId::from_parameter(tool_name),
-            tool_name,
-            |b, _| {
-                b.iter(|| engine.evaluate(&request))
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(tool_name), tool_name, |b, _| {
+            b.iter(|| engine.evaluate(&request))
+        });
     }
 
     group.finish();
@@ -118,13 +114,9 @@ fn bench_policy_eval_mcp_methods(c: &mut Criterion) {
             context: None,
         };
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(method),
-            method,
-            |b, _| {
-                b.iter(|| engine.evaluate(&request))
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(method), method, |b, _| {
+            b.iter(|| engine.evaluate(&request))
+        });
     }
 
     group.finish();
