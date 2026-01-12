@@ -245,11 +245,19 @@ jobs:
         run: |
           echo "Collecting startup timing metrics (M-START-001, M-START-003, M-MEM-001)..."
           START_NS=$(date +%s%N)
-          THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:19999" THOUGHTGATE_LISTEN_ADDR="127.0.0.1:18080" ./target/release/thoughtgate &
+          
+          # Start ThoughtGate with custom ports to avoid conflicts
+          # Health endpoint is on HEALTH_PORT (separate from main proxy port)
+          THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:19999" \
+          THOUGHTGATE_PORT=18080 \
+          THOUGHTGATE_HEALTH_PORT=18081 \
+          ./target/release/thoughtgate &
           PID=$!
+          
+          # Wait for /health endpoint (on health port, not proxy port)
           MAX_WAIT=100
           WAITED=0
-          while ! curl -sf http://127.0.0.1:18080/health > /dev/null 2>&1; do
+          while ! curl -sf http://127.0.0.1:18081/health > /dev/null 2>&1; do
             sleep 0.1
             WAITED=$((WAITED + 1))
             if [ "$WAITED" -ge "$MAX_WAIT" ]; then
@@ -261,9 +269,11 @@ jobs:
           HEALTHY_NS=$(date +%s%N)
           STARTUP_HEALTHY_MS=$(( (HEALTHY_NS - START_NS) / 1000000 ))
           echo "Time to healthy: ${STARTUP_HEALTHY_MS}ms"
+          
+          # Wait for /ready endpoint
           WAITED=0
           STARTUP_READY_MS=$STARTUP_HEALTHY_MS
-          while ! curl -sf http://127.0.0.1:18080/ready > /dev/null 2>&1; do
+          while ! curl -sf http://127.0.0.1:18081/ready > /dev/null 2>&1; do
             sleep 0.1
             WAITED=$((WAITED + 1))
             if [ "$WAITED" -ge "$MAX_WAIT" ]; then
@@ -276,10 +286,14 @@ jobs:
             STARTUP_READY_MS=$(( (READY_NS - START_NS) / 1000000 ))
           fi
           echo "Time to ready: ${STARTUP_READY_MS}ms"
+          
+          # Collect idle memory
           IDLE_RSS=$(grep VmRSS /proc/$PID/status 2>/dev/null | awk '{print $2 * 1024}' || echo "0")
           echo "Idle RSS: ${IDLE_RSS} bytes"
+          
           kill $PID 2>/dev/null || true
           wait $PID 2>/dev/null || true
+          
           cat > startup_metrics.json << EOF
           [
             {"name": "startup/to_healthy", "value": $STARTUP_HEALTHY_MS, "unit": "ms"},
