@@ -137,9 +137,8 @@ jobs:
           - fuzz_header_redaction
           - fuzz_full_request
           - fuzz_green_path       # REQ-CORE-001
-          # Deferred to v0.2+:
-          # - fuzz_amber_path       # REQ-CORE-002 (deferred)
-          # - fuzz_inspector_chain  # REQ-CORE-002 F-004 (deferred)
+          - fuzz_amber_path       # REQ-CORE-002 (enabled via amber_path feature)
+          - fuzz_inspector_chain  # REQ-CORE-002 F-004 (enabled via amber_path feature)
     
     steps:
       - name: Checkout code

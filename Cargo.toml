@@ -99,6 +99,9 @@ default = ["metrics"]
 mock = []
 fuzzing = []
 metrics = []
+# Amber Path: Buffered inspection for PII detection, schema validation, etc.
+# Deferred to v0.2+ - enable when response inspection is needed
+amber_path = []
 
 [dev-dependencies]
 # Kubernetes orchestration

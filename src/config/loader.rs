@@ -54,6 +54,9 @@ pub fn default_config_paths() -> Vec<PathBuf> {
 }
 
 /// Find the first existing config file from the search paths.
+///
+/// # Traceability
+/// - Implements: REQ-CFG-001 Section 5.3 (Configuration File Location)
 pub fn find_config_file(explicit_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
     // Priority 1: Explicit path (CLI flag)
     if let Some(path) = explicit_path {
@@ -99,6 +102,10 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
 }
 
 /// Load and validate configuration.
+///
+/// # Traceability
+/// - Implements: REQ-CFG-001 Section 9.1 (Configuration Loading Flow)
+/// - Implements: REQ-CFG-001 Section 8 (Validation Rules)
 pub fn load_and_validate(
     path: &Path,
     version: Version,
