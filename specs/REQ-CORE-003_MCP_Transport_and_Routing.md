@@ -446,49 +446,45 @@ if rule_match.action == Action::Policy {
 - **F-005.3:** Cedar Permit → continue to approval
 - **F-005.4:** Cedar Forbid → deny immediately
 
-### F-006: Gate 4 - Approval Workflow
+### F-006: Gate 4 - Approval Workflow (SEP-1686)
 
-Invoked when `action: approve` or Cedar permits:
+Invoked when `action: approve` or Cedar permits. Returns Task ID immediately.
 
 ```rust
 async fn execute_approval(
     request: &McpRequest,
     workflow: &str,
     timeout: Duration,
+    task_manager: Arc<TaskManager>,
 ) -> Result<McpResponse, ThoughtGateError> {
     let workflow_config = config.approval.get(workflow)
         .ok_or(ConfigError::UndefinedWorkflow)?;
     
-    // v0.2: SEP-1686 task mode
-    let decision = approval_engine
-        .request_and_wait(request, workflow_config, timeout)
+    // v0.2: SEP-1686 async mode - return Task ID immediately
+    // start_approval spawns a background poller and returns immediately
+    let task_id = approval_engine
+        .start_approval(request, workflow, task_manager.clone())
         .await?;
     
-    match decision {
-        ApprovalDecision::Approved { by } => {
-            // Forward to upstream
-            upstream.forward(request).await
-        }
-        ApprovalDecision::Rejected { by, reason } => {
-            Err(ThoughtGateError::ApprovalRejected { tool: request.tool_name() })
-        }
-        ApprovalDecision::Timeout => {
-            match workflow_config.on_timeout {
-                TimeoutAction::Deny => {
-                    Err(ThoughtGateError::ApprovalTimeout { .. })
-                }
-                // v0.3+: Escalate, AutoApprove
-            }
-        }
-    }
+    // Return SEP-1686 task response immediately
+    // Client will poll via tasks/get and retrieve result via tasks/result
+    Ok(McpResponse::task_created(task_id, TaskStatus::InputRequired))
 }
 ```
 
+**SEP-1686 Flow:**
+1. `start_approval` posts to Slack and spawns background poller
+2. Task ID returned to client immediately (< 100ms)
+3. Background task polls Slack for reaction
+4. On approval: task state → Approved (execution deferred to `tasks/result`)
+5. On rejection: task state → Failed with -32007
+6. On timeout: task state → Failed with -32008
+
 - **F-006.1:** Load workflow config from YAML
-- **F-006.2:** Block until approval decision (v0.2)
-- **F-006.3:** On approve → forward to upstream
-- **F-006.4:** On reject → return error
-- **F-006.5:** On timeout → execute `on_timeout` action
+- **F-006.2:** Start approval workflow (non-blocking)
+- **F-006.3:** Return Task ID immediately with `input_required` status
+- **F-006.4:** Background poller updates task state on decision
+- **F-006.5:** Upstream execution triggered by `tasks/result` call (see REQ-GOV-001)
 
 ### F-007: Upstream Forwarding
 
@@ -616,8 +612,8 @@ mcp_gate_evaluations_total{gate, result}
 mcp_upstream_requests_total{status}
 mcp_upstream_duration_seconds{quantile}
 mcp_connections_active
-thoughtgate_blocking_approval_total{result}
-thoughtgate_blocking_approval_duration_seconds{quantile}
+thoughtgate_approval_started_total{workflow}
+thoughtgate_approval_decision_duration_seconds{quantile}
 ```
 
 **Logging:**

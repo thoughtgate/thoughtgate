@@ -6,8 +6,26 @@
 | **Title** | Inspector Framework |
 | **Type** | Core Mechanic |
 | **Status** | **DEFERRED (v0.3+)** |
-| **Priority** | High |
-| **Tags** | `#inspection` `#extensibility` `#security` `#pii` `#prompt-injection` |
+| **Priority** | Low (deferred) |
+| **Tags** | `#inspection` `#extensibility` `#security` `#pii` `#prompt-injection` `#deferred` |
+
+> ## ⚠️ DEFERRED TO FUTURE VERSION
+>
+> **This requirement is deferred from v0.2.** The Inspector Framework is designed for Amber Path
+> request inspection (PII detection, prompt injection scanning), but v0.2 does not implement
+> response inspection or the Amber Path.
+>
+> **v0.2 Simplification:**
+> - All requests pass through without content inspection
+> - Policy decisions based on metadata only (tool name, principal, arguments schema)
+> - No PII detection or prompt injection scanning
+>
+> **When to Reintroduce:**
+> - When content-based policy decisions are needed
+> - When PII detection in arguments is required
+> - When prompt injection protection is required
+>
+> **See:** `architecture.md` Section 7.2 (Out of Scope)
 
 ## 1. Context & Decision Rationale
 

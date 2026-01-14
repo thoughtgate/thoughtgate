@@ -424,12 +424,22 @@ pub struct ApprovalEngine {
 }
 
 impl ApprovalEngine {
-    /// Request approval via SEP-1686 task (v0.2)
-    pub async fn request_and_wait(
+    /// Start approval workflow and return Task ID immediately (v0.2 SEP-1686)
+    /// 
+    /// This function does NOT block. It:
+    /// 1. Creates an ApprovalRequest
+    /// 2. Posts to the approval adapter (e.g., Slack)
+    /// 3. Spawns a background polling task
+    /// 4. Returns the Task ID immediately
+    /// 
+    /// The background task polls for the decision and updates the task state.
+    /// Client retrieves result via `tasks/result` after polling `tasks/get`.
+    pub async fn start_approval(
         &self,
         request: &McpRequest,
         workflow_name: &str,
-    ) -> Result<ApprovalDecision, ApprovalError> {
+        task_manager: Arc<TaskManager>,
+    ) -> Result<TaskId, ApprovalError> {
         let config = self.config.load();
         let workflow = load_workflow(&config, workflow_name)?;
         let adapter = self.get_or_create_adapter(workflow_name, workflow)?;
@@ -437,9 +447,10 @@ impl ApprovalEngine {
         let timeout = workflow.timeout.unwrap_or(Duration::from_secs(600));
         let on_timeout = workflow.on_timeout.clone().unwrap_or_default();
         
-        // Post approval request
+        // Create task ID and approval request
+        let task_id = TaskId::new();
         let approval_request = ApprovalRequest {
-            task_id: TaskId::new(),
+            task_id: task_id.clone(),
             tool_name: request.tool_name().to_string(),
             tool_arguments: request.arguments().clone(),
             principal: request.principal.clone(),
@@ -449,29 +460,99 @@ impl ApprovalEngine {
             workflow_name: workflow_name.to_string(),
         };
         
+        // Post approval request to adapter (e.g., Slack)
         let reference = adapter.post_approval_request(&approval_request).await?;
         
-        // Poll until decision or timeout
-        let deadline = Instant::now() + timeout;
-        let mut poll_interval = Duration::from_secs(5);
+        // Create task in InputRequired state
+        task_manager.create_task(
+            task_id.clone(),
+            request.clone(),
+            TaskState::InputRequired,
+            timeout,
+        ).await?;
         
-        loop {
-            if Instant::now() >= deadline {
-                return match on_timeout {
-                    TimeoutAction::Deny => Err(ApprovalError::Timeout),
-                    // v0.3+: Handle escalate, auto-approve
-                };
+        // Spawn background polling task - does NOT block the response
+        let task_id_clone = task_id.clone();
+        let adapter_clone = adapter.clone();
+        let task_manager_clone = task_manager.clone();
+        let request_clone = request.clone();
+        
+        tokio::spawn(async move {
+            poll_for_approval_decision(
+                task_id_clone,
+                adapter_clone,
+                reference,
+                timeout,
+                on_timeout,
+                task_manager_clone,
+                request_clone,
+            ).await
+        });
+        
+        // Return Task ID immediately - client will poll via tasks/get
+        Ok(task_id)
+    }
+}
+
+/// Background polling task for approval decision
+/// 
+/// This runs independently after start_approval returns.
+/// Updates task state when decision is received.
+async fn poll_for_approval_decision(
+    task_id: TaskId,
+    adapter: Arc<dyn ApprovalAdapter>,
+    reference: ApprovalReference,
+    timeout: Duration,
+    on_timeout: TimeoutAction,
+    task_manager: Arc<TaskManager>,
+    original_request: McpRequest,
+) {
+    let deadline = Instant::now() + timeout;
+    let mut poll_interval = Duration::from_secs(5);
+    
+    loop {
+        if Instant::now() >= deadline {
+            // Timeout reached
+            match on_timeout {
+                TimeoutAction::Deny => {
+                    task_manager.fail_task(
+                        &task_id,
+                        "Approval timeout",
+                        Some(-32008),
+                    ).await;
+                }
+                // v0.3+: Handle escalate, auto-approve
             }
-            
-            tokio::time::sleep(poll_interval).await;
-            
-            if let Some(decision) = adapter.poll_for_decision(&reference).await? {
-                return Ok(decision);
-            }
-            
-            // Exponential backoff
-            poll_interval = (poll_interval * 2).min(Duration::from_secs(30));
+            return;
         }
+        
+        tokio::time::sleep(poll_interval).await;
+        
+        match adapter.poll_for_decision(&reference).await {
+            Ok(Some(decision)) => {
+                match decision.decision {
+                    Decision::Approved { by } => {
+                        // Transition to Executing state
+                        // Actual upstream execution happens on tasks/result call
+                        task_manager.approve_task(&task_id, &by).await;
+                    }
+                    Decision::Rejected { by, reason } => {
+                        task_manager.reject_task(&task_id, &by, reason.as_deref()).await;
+                    }
+                }
+                return;
+            }
+            Ok(None) => {
+                // No decision yet, continue polling
+            }
+            Err(e) => {
+                tracing::warn!(task_id = %task_id, error = %e, "Polling error");
+                // Continue polling on transient errors
+            }
+        }
+        
+        // Exponential backoff
+        poll_interval = (poll_interval * 2).min(Duration::from_secs(30));
     }
 }
 ```
@@ -615,9 +696,13 @@ async fn execute_gate4(
     let approval_engine = get_approval_engine();
     
     // v0.2: SEP-1686 task mode
-    let decision = approval_engine
-        .request_and_wait(request, workflow_name)
+    // Start approval (non-blocking) - returns Task ID immediately
+    let task_id = approval_engine
+        .start_approval(request, workflow_name, task_manager.clone())
         .await?;
+    
+    // Return Task ID to client - background poller handles the wait
+    return Ok(TaskResponse::new(task_id, TaskStatus::InputRequired));
     
     match decision.decision {
         Decision::Approved => {

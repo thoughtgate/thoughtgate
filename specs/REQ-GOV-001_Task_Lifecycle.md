@@ -217,14 +217,15 @@ The system must additionally:
 
 ```rust
 /// Internal tracking for pending approvals (v0.2)
-/// NOT exposed via task API - for observability only
+/// Used for SEP-1686 task management and observability
 pub struct PendingApproval {
-    /// Unique identifier for correlation
+    /// Unique identifier (becomes task_id for SEP-1686)
     pub id: Uuid,
     
-    /// Original request (for logging/metrics)
+    /// Original request (for logging/metrics and deferred execution)
     pub tool_name: String,
     pub arguments_hash: String,
+    pub original_request: McpRequest,
     
     /// Principal making the request
     pub principal: Principal,
@@ -233,57 +234,93 @@ pub struct PendingApproval {
     pub created_at: Instant,
     pub timeout: Duration,
     
-    /// Channel to signal completion
-    pub completion_tx: oneshot::Sender<ApprovalOutcome>,
-    
-    /// Client connection state
-    pub client_connected: Arc<AtomicBool>,
+    /// Current state (SEP-1686 compatible)
+    pub state: ApprovalState,
 }
 
+/// SEP-1686 compatible approval states
+pub enum ApprovalState {
+    /// Awaiting human decision (maps to SEP-1686 input_required)
+    InputRequired,
+    /// Approved, ready for execution (maps to SEP-1686 working)
+    Approved { by: String },
+    /// Rejected by human
+    Rejected { by: String, reason: Option<String> },
+    /// Timed out waiting for decision
+    TimedOut,
+    /// Completed execution
+    Completed { result: serde_json::Value },
+    /// Failed during execution
+    Failed { error: String, code: i32 },
+}
+
+/// Unified outcome enum for approval decisions
 pub enum ApprovalOutcome {
-    Approved,
-    Rejected { reason: Option<String> },
+    Approved { by: String },
+    Rejected { by: String, reason: Option<String> },
     Timeout,
-    ClientDisconnected,
+    Shutdown,
 }
 ```
 
-### 6.2 v0.2: Approval Waiter Interface
+### 6.2 v0.2: Approval Store Interface
 
 ```rust
-#[async_trait]
-pub trait ApprovalWaiter: Send + Sync {
-    /// Wait for approval decision (blocking mode)
-    /// Returns when: approved, rejected, timeout, or client disconnects
-    async fn wait_for_approval(
-        &self,
-        pending: &PendingApproval,
-    ) -> ApprovalOutcome;
-    
-    /// Record an approval decision (called by REQ-GOV-003)
-    fn record_decision(
-        &self,
-        approval_id: Uuid,
-        decision: ApprovalDecision,
-    ) -> Result<(), ApprovalError>;
-    
-    /// Check if client is still connected
-    fn is_client_connected(&self, approval_id: Uuid) -> bool;
+/// Thread-safe store for pending approvals
+pub struct PendingApprovalStore {
+    /// Map of approval ID to approval state
+    approvals: DashMap<Uuid, PendingApproval>,
+    /// Broadcast channel for state changes (multiple subscribers)
+    state_tx: broadcast::Sender<(Uuid, ApprovalState)>,
 }
 
-pub enum ApprovalDecision {
-    Approved { decided_by: String },
-    Rejected { decided_by: String, reason: Option<String> },
+impl PendingApprovalStore {
+    /// Subscribe to state changes for a specific approval
+    pub fn subscribe(&self, id: &Uuid) -> broadcast::Receiver<(Uuid, ApprovalState)> {
+        self.state_tx.subscribe()
+    }
+    
+    /// Update approval state and notify subscribers
+    pub fn update_state(&self, id: &Uuid, state: ApprovalState) {
+        if let Some(mut approval) = self.approvals.get_mut(id) {
+            approval.state = state.clone();
+            let _ = self.state_tx.send((id.clone(), state));
+        }
+    }
+}
+
+#[async_trait]
+pub trait ApprovalWaiter: Send + Sync {
+    /// Await approval decision (async, non-blocking)
+    /// Uses broadcast receiver to get state updates
+    async fn wait_for_outcome(
+        &self,
+        id: &Uuid,
+        timeout: Duration,
+    ) -> ApprovalOutcome;
+    
+    /// Record an approval decision (called by background poller)
+    fn record_outcome(
+        &self,
+        approval_id: Uuid,
+        outcome: ApprovalOutcome,
+    ) -> Result<(), ApprovalError>;
 }
 ```
 
-### 6.3 v0.2: Pending Approval Store
+> **Note:** The `ApprovalOutcome` enum (defined in §6.1) is used consistently throughout
+> the approval workflow. There is no separate `ApprovalDecision` type.
+
+### 6.3 v0.2: Pending Approval Store Implementation
 
 ```rust
 /// In-memory store for pending approvals (v0.2)
+/// See §6.2 for the full interface with broadcast channel
 pub struct PendingApprovalStore {
     /// Map from approval ID to pending approval
     approvals: DashMap<Uuid, PendingApproval>,
+    /// Broadcast channel for state updates (defined in §6.2)
+    state_tx: broadcast::Sender<(Uuid, ApprovalState)>,
 }
 
 impl PendingApprovalStore {
@@ -381,7 +418,7 @@ pub enum TaskStatus {
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                  v0.2 BLOCKING APPROVAL FLOW                    │
+│                  v0.2 SEP-1686 ASYNC FLOW                    │
 └─────────────────────────────────────────────────────────────────┘
 
   1. Request arrives (tools/call with action: approve)
@@ -434,60 +471,69 @@ pub enum TaskStatus {
 
 ### F-001: Pending Approval Registration (v0.2)
 
-- **F-001.1:** Generate UUID for each pending approval
-- **F-001.2:** Store tool name and arguments hash (not full arguments)
+- **F-001.1:** Generate UUID for each pending approval (becomes task_id)
+- **F-001.2:** Store tool name, arguments hash, and original request
 - **F-001.3:** Record principal for observability
-- **F-001.4:** Create oneshot channel for completion signaling
-- **F-001.5:** Track client connection state via `Arc<AtomicBool>`
+- **F-001.4:** Initialize state as `InputRequired`
+- **F-001.5:** Register in `PendingApprovalStore`
 
-### F-002: Task Wait (v0.2)
+### F-002: Background Approval Polling (v0.2)
 
-- **F-002.1:** Use `tokio::select!` to wait for multiple conditions
-- **F-002.2:** Check for approval decision from Slack polling
+- **F-002.1:** Spawn background task via `tokio::spawn` (non-blocking)
+- **F-002.2:** Poll Slack adapter for approval decision
 - **F-002.3:** Check for timeout expiration
-- **F-002.4:** Check for client disconnection
-- **F-002.5:** Return first condition that triggers
+- **F-002.4:** Update task state on decision via broadcast channel
+- **F-002.5:** Notify subscribers of state change
 
 ```rust
-async fn wait_for_approval(
-    &self,
-    pending: &PendingApproval,
-) -> ApprovalOutcome {
-    let timeout = tokio::time::sleep(pending.timeout);
-    let decision_rx = pending.completion_rx.clone();
+/// Background polling task (spawned, non-blocking)
+async fn poll_for_approval(
+    store: Arc<PendingApprovalStore>,
+    id: Uuid,
+    adapter: Arc<dyn ApprovalAdapter>,
+    reference: ApprovalReference,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    let mut poll_interval = Duration::from_secs(5);
     
-    tokio::select! {
-        // Approval decision received
-        result = decision_rx => {
-            match result {
-                Ok(ApprovalDecision::Approved { .. }) => ApprovalOutcome::Approved,
-                Ok(ApprovalDecision::Rejected { reason, .. }) => {
-                    ApprovalOutcome::Rejected { reason }
-                }
-                Err(_) => ApprovalOutcome::ClientDisconnected,
+    loop {
+        if Instant::now() >= deadline {
+            store.update_state(&id, ApprovalState::TimedOut);
+            return;
+        }
+        
+        tokio::time::sleep(poll_interval).await;
+        
+        match adapter.poll_for_decision(&reference).await {
+            Ok(Some(ApprovalOutcome::Approved { by })) => {
+                store.update_state(&id, ApprovalState::Approved { by });
+                return;
+            }
+            Ok(Some(ApprovalOutcome::Rejected { by, reason })) => {
+                store.update_state(&id, ApprovalState::Rejected { by, reason });
+                return;
+            }
+            Ok(None) => {
+                // No decision yet, continue polling
+            }
+            Err(e) => {
+                tracing::warn!(id = %id, error = %e, "Polling error");
             }
         }
         
-        // Timeout expired
-        _ = timeout => {
-            ApprovalOutcome::Timeout
-        }
-        
-        // Client disconnection (checked periodically)
-        _ = wait_for_disconnect(pending.client_connected.clone()) => {
-            ApprovalOutcome::ClientDisconnected
-        }
+        // Exponential backoff
+        poll_interval = (poll_interval * 2).min(Duration::from_secs(30));
     }
 }
 ```
 
-### F-003: Client Disconnection Detection (v0.2)
+### F-003: Task State Subscription (v0.2)
 
-- **F-003.1:** Track TCP connection state
-- **F-003.2:** Set `client_connected` to false on disconnect
-- **F-003.3:** Cancel pending Slack request on disconnect
-- **F-003.4:** Log disconnection with correlation ID
-- **F-003.5:** Do NOT execute tool if client disconnects (prevent zombie execution)
+- **F-003.1:** Use `broadcast::Receiver` to subscribe to state changes
+- **F-003.2:** Filter events for relevant task ID
+- **F-003.3:** Support multiple subscribers per task
+- **F-003.4:** Clean up subscription on task completion
 
 ### F-004: Timeout Handling (v0.2)
 
@@ -600,33 +646,33 @@ thoughtgate_approval_duration_seconds{outcome}
 
 | Scenario | Expected Behavior | Test ID |
 |----------|-------------------|---------|
-| Approval approved | Forward to upstream, return result | EC-BLK-001 |
-| Approval rejected | Return -32007 error | EC-BLK-002 |
-| Approval timeout (on_timeout: deny) | Return -32008 error | EC-BLK-003 |
-| Client disconnects during wait | Cleanup, no execution | EC-BLK-004 |
-| Slack API error during wait | Retry or return -32603 | EC-BLK-005 |
-| Upstream error after approval | Return upstream error | EC-BLK-006 |
-| Multiple pending for same principal | All tracked independently | EC-BLK-007 |
-| Shutdown with pending approvals | Cleanup, return -32603 | EC-BLK-008 |
+| Approval approved | Task state → Approved, execute on tasks/result | EC-TASK-001 |
+| Approval rejected | Task state → Failed(-32007) | EC-TASK-002 |
+| Approval timeout (on_timeout: deny) | Task state → Failed(-32008) | EC-TASK-003 |
+| Slack API error during polling | Retry with backoff or fail task | EC-TASK-004 |
+| Upstream error after approval | Task state → Failed with upstream error | EC-TASK-005 |
+| Multiple pending for same principal | All tasks tracked independently | EC-TASK-006 |
+| Shutdown with pending tasks | Cancel tasks, state → Failed(-32603) | EC-TASK-007 |
+| Task TTL expiry | Task state → Expired | EC-TASK-008 |
 
 ### 9.2 v0.2 Assertions
 
 **Unit Tests:**
-- `test_pending_approval_registration` — Approval registered correctly
-- `test_blocking_wait_approved` — Returns on approval
-- `test_blocking_wait_rejected` — Returns on rejection
-- `test_blocking_wait_timeout` — Returns on timeout
-- `test_client_disconnect_detection` — Detects disconnect
-- `test_no_zombie_execution` — No execution after disconnect
+- `test_task_creation` — Task created with correct initial state
+- `test_task_state_approved` — Transitions to Approved on approval
+- `test_task_state_rejected` — Transitions to Failed on rejection
+- `test_task_state_timeout` — Transitions to Failed on timeout
+- `test_background_poller_spawn` — Poller spawned correctly
+- `test_tasks_get_status` — Returns correct task status
 
 **Integration Tests:**
-- `test_full_blocking_flow_approved` — Complete approved flow
-- `test_full_blocking_flow_rejected` — Complete rejected flow
-- `test_full_blocking_flow_timeout` — Complete timeout flow
+- `test_full_async_flow_approved` — Complete approved flow with polling
+- `test_full_async_flow_rejected` — Complete rejected flow
+- `test_full_async_flow_timeout` — Complete timeout flow
 
-## 10. v0.3+ Reference: Full SEP-1686 Specification
+## 10. SEP-1686 State Machine Reference
 
-This section documents the full SEP-1686 implementation for future reference. **Not implemented in v0.2.**
+This section documents the SEP-1686 state machine. **Implemented in v0.2.**
 
 ### 10.1 Task State Machine
 
@@ -722,7 +768,7 @@ async fn handle_tasks_cancel(&self, params: TasksCancelParams) -> JsonRpcRespons
 - [ ] Approval decision recording from REQ-GOV-003
 - [ ] No zombie execution (tool never runs after disconnect)
 - [ ] Metrics for pending count and outcomes
-- [ ] All edge cases (EC-BLK-001 to EC-BLK-008) covered
+- [ ] All edge cases (EC-TASK-001 to EC-TASK-008) covered
 - [ ] Integration with REQ-GOV-002 (pipeline) and REQ-GOV-003 (Slack)
 
 ### 11.2 v0.3+ Definition of Done (Future)

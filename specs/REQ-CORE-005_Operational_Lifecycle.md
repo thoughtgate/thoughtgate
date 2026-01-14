@@ -22,7 +22,7 @@ This requirement defines how ThoughtGate manages its operational lifecycle—sta
 
 | Version | Configuration | Approval Tracking | Shutdown Behavior |
 |---------|---------------|-------------------|-------------------|
-| **v0.2** | YAML config | `TaskStore` (SEP-1686) | Cancel pending tasks |
+| **v0.2** | YAML config | `PendingApprovalStore` (SEP-1686) | Cancel pending approvals |
 | v0.3+ | YAML + Cedar | `TaskStore` (SEP-1686) | Fail tasks with reason |
 
 ### 1.2 Deployment Context

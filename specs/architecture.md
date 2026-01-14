@@ -211,54 +211,59 @@ No response inspection or streaming distinction in v0.2.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     v0.2 BLOCKING APPROVAL FLOW                                 │
+│                     v0.2 SEP-1686 ASYNC APPROVAL FLOW                           │
 │                                                                                 │
 │   Agent                    ThoughtGate                    Human (Slack)         │
 │     │                           │                              │                │
 │     │  tools/call               │                              │                │
-│     │  {"name":"delete_user"}   │                              │                │
+│     │  {"name":"delete_user",   │                              │                │
+│     │   "task": {...}}          │                              │                │
 │     │ ─────────────────────────►│                              │                │
 │     │                           │                              │                │
 │     │              ┌────────────┴────────────┐                 │                │
 │     │              │ Gate 2: action: approve │                 │                │
-│     │              │ Hold HTTP connection    │                 │                │
+│     │              │ Create Task ID          │                 │                │
+│     │              │ Spawn background poller │                 │                │
 │     │              └────────────┬────────────┘                 │                │
 │     │                           │                              │                │
 │     │                           │    Slack Message             │                │
 │     │                           │ ────────────────────────────►│                │
 │     │                           │    (approval request)        │                │
 │     │                           │                              │                │
-│     │         (HTTP connection held open)                      │                │
-│     │              ...          │         (human reviews)      │                │
-│     │                           │              ...             │                │
+│     │  {"taskId": "tg_xxx",     │                              │                │
+│     │   "status": "input_required"}                            │                │
+│     │◄──────────────────────────│  (immediate response <100ms) │                │
+│     │                           │                              │                │
+│     │  (agent free to do        │         (human reviews)      │                │
+│     │   other work)             │              ...             │                │
 │     │                           │                              │                │
 │     │                           │    Reaction/Button           │                │
 │     │                           │◄─────────────────────────────│                │
 │     │                           │    (👍 approve / 👎 reject)  │                │
 │     │                           │                              │                │
 │     │              ┌────────────┴────────────┐                 │                │
-│     │              │ Check: Client connected?│                 │                │
+│     │              │ Background: Update task │                 │                │
+│     │              │ state to Approved/Failed│                 │                │
 │     │              └────────────┬────────────┘                 │                │
 │     │                           │                              │                │
+│     │  tasks/get (polling)      │                              │                │
+│     │ ─────────────────────────►│                              │                │
+│     │  {"status": "completed"}  │                              │                │
+│     │◄──────────────────────────│                              │                │
+│     │                           │                              │                │
+│     │  tasks/result             │                              │                │
+│     │ ─────────────────────────►│                              │                │
 │     │              ┌────────────┴────────────┐                 │                │
-│     │              │ On Approve:             │                 │                │
-│     │              │   Forward to Upstream   │                 │                │
-│     │              │   Return response       │                 │                │
-│     │              │ On Reject:              │                 │                │
-│     │              │   Return -32007 error   │                 │                │
-│     │              │ On Timeout:             │                 │                │
-│     │              │   Return -32008 error   │                 │                │
+│     │              │ Execute: Forward to     │                 │                │
+│     │              │ upstream, stream result │                 │                │
 │     │              └────────────┬────────────┘                 │                │
-│     │                           │                              │                │
 │     │  {"result": ...}          │                              │                │
 │     │◄──────────────────────────│                              │                │
-│     │  (or error)               │                              │                │
 │     │                           │                              │                │
 │     ▼                           ▼                              ▼                │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
-From client perspective: Slow tool call, but standard JSON-RPC response.
-No SEP-1686 task polling required in v0.2 blocking mode.
+From client perspective: Immediate Task ID, poll for status, retrieve result when ready.
 ```
 
 ## 5. Component Integration Matrix
@@ -274,7 +279,7 @@ No SEP-1686 task polling required in v0.2 blocking mode.
 | REQ-CORE-004 (Error Handling) | — | All | Active |
 | REQ-CORE-005 (Lifecycle) | REQ-CFG-001 | All | Active |
 | REQ-POL-001 (Cedar Policy) | REQ-CFG-001 | REQ-CORE-003 | Active (Gate 3) |
-| REQ-GOV-001 (Task Lifecycle) | REQ-CFG-001, REQ-CORE-003 | REQ-GOV-002, REQ-GOV-003 | Active (blocking mode) |
+| REQ-GOV-001 (Task Lifecycle) | REQ-CFG-001, REQ-CORE-003 | REQ-GOV-002, REQ-GOV-003 | Active (SEP-1686) |
 | REQ-GOV-002 (Execution Pipeline) | REQ-CFG-001, REQ-POL-001, REQ-GOV-001 | REQ-GOV-003 | Active (simplified) |
 | REQ-GOV-003 (Approval Integration) | REQ-CFG-001, REQ-GOV-001, REQ-GOV-002 | External systems | Active |
 
@@ -365,7 +370,7 @@ No SEP-1686 task polling required in v0.2 blocking mode.
 | CORE-003 | CFG-001 | `Config::load()` | Path → `Config` |
 | CORE-003 | CFG-001 | `GovernanceEngine::evaluate()` | tool_name, source_id → `GateResult` |
 | CFG-001 | POL-001 | `CedarEngine::evaluate()` | `CedarRequest` → `CedarDecision` |
-| CFG-001 | GOV-003 | `ApprovalEngine::request_and_wait()` | request, workflow → `ApprovalDecision` |
+| CFG-001 | GOV-003 | `ApprovalEngine::start_approval()` | request, workflow → `ApprovalDecision` |
 | CORE-003 | GOV-001 | `TaskManager::handle()` | SEP-1686 methods |
 | GOV-003 | GOV-001 | `TaskManager::record_approval()` | `ApprovalCallback` |
 | GOV-003 | External | Slack message | Approval request |
@@ -822,7 +827,7 @@ When a JSON-RPC batch request contains items that require different paths:
 
 ### 12.2 Approval Handling (v0.2 SEP-1686 Mode)
 
-**v0.2 uses blocking mode, NOT SEP-1686 auto-upgrade.**
+v0.2 uses SEP-1686 task mode for approval workflows.
 
 When a client sends a `tools/call` request and the governance rules require approval:
 

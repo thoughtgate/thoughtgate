@@ -7,7 +7,7 @@
 | **Type** | Governance Component |
 | **Status** | Draft |
 | **Priority** | **High** |
-| **Tags** | `#governance` `#pipeline` `#execution` `#approval` `#blocking` |
+| **Tags** | `#governance` `#pipeline` `#execution` `#approval` `#async` `#sep-1686` |
 
 ## 1. Context & Decision Rationale
 
@@ -29,44 +29,55 @@ In v0.2, the execution pipeline is minimal because:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    v0.2 SIMPLIFIED PIPELINE                     │
+│                v0.2 SEP-1686 ASYNC PIPELINE                     │
+│                                                                 │
+│   ═══════════════════════════════════════════════════════════   │
+│   REQUEST PATH (immediate response)                             │
+│   ═══════════════════════════════════════════════════════════   │
 │                                                                 │
 │   tools/call request                                            │
 │         │                                                       │
 │         ▼                                                       │
 │   ┌─────────────────────────────────────────────────────────┐  │
-│   │ 1. APPROVAL WAIT (blocking)                             │  │
+│   │ 1. START APPROVAL (non-blocking)                        │  │
+│   │    • Create Task in InputRequired state                 │  │
 │   │    • Post request to Slack                              │  │
-│   │    • Wait for reaction (👍/👎)                          │  │
-│   │    • Handle timeout                                     │  │
-│   └─────────────────────────────────────────────────────────┘  │
-│         │                                                       │
-│         ├─── Rejected ──► Return -32007                         │
-│         │                                                       │
-│         ├─── Timeout ───► Execute on_timeout action             │
-│         │                                                       │
-│         ▼ Approved                                              │
-│   ┌─────────────────────────────────────────────────────────┐  │
-│   │ 2. VALIDATION                                           │  │
-│   │    • Client still connected?                            │  │
-│   │    • Approval not expired?                              │  │
-│   └─────────────────────────────────────────────────────────┘  │
-│         │                                                       │
-│         ├─── Invalid ───► Return error                          │
-│         │                                                       │
-│         ▼ Valid                                                 │
-│   ┌─────────────────────────────────────────────────────────┐  │
-│   │ 3. FORWARD TO UPSTREAM                                  │  │
-│   │    • Send original request to MCP server                │  │
-│   │    • Apply execution timeout                            │  │
-│   │    • Handle upstream errors                             │  │
+│   │    • Spawn background poller                            │  │
 │   └─────────────────────────────────────────────────────────┘  │
 │         │                                                       │
 │         ▼                                                       │
 │   ┌─────────────────────────────────────────────────────────┐  │
-│   │ 4. RETURN RESPONSE                                      │  │
-│   │    • Pass through upstream result                       │  │
-│   │    • Or return upstream error                           │  │
+│   │ 2. RETURN TASK ID IMMEDIATELY                           │  │
+│   │    • {"taskId": "tg_xxx", "status": "input_required"}   │  │
+│   │    • Client polls tasks/get for status                  │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   ═══════════════════════════════════════════════════════════   │
+│   BACKGROUND PATH (runs independently)                          │
+│   ═══════════════════════════════════════════════════════════   │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ 3. POLL FOR DECISION (background task)                  │  │
+│   │    • Poll Slack for reaction (👍/👎)                    │  │
+│   │    • Exponential backoff                                │  │
+│   │    • Handle timeout                                     │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│         │                                                       │
+│         ├─── Approved ──► Task state → Approved                 │
+│         │                                                       │
+│         ├─── Rejected ──► Task state → Failed (-32007)          │
+│         │                                                       │
+│         └─── Timeout ────► Task state → Failed (-32008)         │
+│                                                                 │
+│   ═══════════════════════════════════════════════════════════   │
+│   RESULT PATH (on tasks/result call)                            │
+│   ═══════════════════════════════════════════════════════════   │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │ 4. EXECUTE UPSTREAM (on tasks/result)                   │  │
+│   │    • Verify task is Approved                            │  │
+│   │    • Forward original request to MCP server             │  │
+│   │    • Stream result to client                            │  │
 │   └─────────────────────────────────────────────────────────┘  │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -132,9 +143,9 @@ The full pipeline adds inspection phases:
 ### 3.1 v0.2 Intent
 
 The system must:
-1. Coordinate blocking approval wait (REQ-GOV-001)
-2. Validate approval before execution
-3. Check client is still connected
+1. Start approval workflow and return Task ID immediately
+2. Spawn background poller for approval decision
+3. Update task state when decision is received
 4. Forward approved request to upstream
 5. Return result or error to agent
 
@@ -154,8 +165,8 @@ The system must additionally:
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Blocking approval coordination | ✅ In Scope | Via REQ-GOV-001 |
-| Approval validation | ✅ In Scope | Expiry, client connected |
+| Async approval coordination | ✅ In Scope | Via REQ-GOV-001, REQ-GOV-003 |
+| Task state management | ✅ In Scope | InputRequired → Approved/Failed |
 | Upstream forwarding | ✅ In Scope | With timeout |
 | Response handling | ✅ In Scope | Pass through or error |
 | Metrics and logging | ✅ In Scope | Observability |
@@ -254,17 +265,17 @@ pub enum PipelineResult {
 ```rust
 #[async_trait]
 pub trait ExecutionPipeline: Send + Sync {
-    /// Execute the full approval pipeline (blocking mode)
-    async fn execute(&self, input: PipelineInput) -> PipelineResult;
+    /// Start approval pipeline and return Task ID (SEP-1686 async mode)
+    async fn start(&self, input: PipelineInput) -> Result<TaskId, PipelineError>;
 }
 ```
 
 ### 6.3 v0.2: Pipeline Implementation
 
 ```rust
-pub struct BlockingPipeline {
-    approval_waiter: Arc<dyn ApprovalWaiter>,
-    approval_poster: Arc<dyn ApprovalPoster>,
+pub struct AsyncPipeline {
+    approval_engine: Arc<ApprovalEngine>,
+    task_manager: Arc<TaskManager>,
     upstream_client: Arc<UpstreamClient>,
     config: PipelineConfig,
 }
@@ -274,33 +285,33 @@ pub struct PipelineConfig {
 }
 
 #[async_trait]
-impl ExecutionPipeline for BlockingPipeline {
-    async fn execute(&self, input: PipelineInput) -> PipelineResult {
-        // 1. Create pending approval
-        let pending = self.create_pending_approval(&input);
+impl ExecutionPipeline for AsyncPipeline {
+    /// Start approval workflow - returns Task ID immediately (SEP-1686)
+    async fn start(&self, input: PipelineInput) -> Result<TaskId, PipelineError> {
+        // 1. Start approval (posts to Slack, spawns background poller)
+        let task_id = self.approval_engine
+            .start_approval(&input.request, &input.workflow, self.task_manager.clone())
+            .await
+            .map_err(|e| PipelineError::ApprovalFailed(e))?;
         
-        // 2. Post to Slack
-        if let Err(e) = self.approval_poster.post(&input, &pending.id).await {
-            return PipelineResult::InternalError {
-                message: format!("Failed to post approval request: {}", e),
-            };
-        }
+        // 2. Return Task ID immediately - client will poll
+        Ok(task_id)
+    }
+    
+    /// Execute upstream call - called when client requests tasks/result
+    async fn execute_on_result(&self, task_id: &TaskId) -> PipelineResult {
+        // 1. Get task and verify it's approved
+        let task = self.task_manager.get_task(task_id).await?;
         
-        // 3. Wait for approval (blocking)
-        let outcome = self.approval_waiter.wait_for_approval(&pending).await;
-        
-        // 4. Handle outcome
-        match outcome {
-            ApprovalOutcome::Approved => {
-                // 5. Validate (client still connected?)
-                if !pending.client_connected.load(Ordering::Relaxed) {
-                    return PipelineResult::ClientDisconnected;
-                }
-                
-                // 6. Forward to upstream
-                self.forward_to_upstream(&input).await
+        match task.state {
+            TaskState::Approved => {
+                // 2. Forward to upstream
+                self.forward_to_upstream(&task.original_request).await
             }
-            ApprovalOutcome::Rejected { reason } => {
+            TaskState::InputRequired => {
+                PipelineResult::StillWaiting
+            }
+            TaskState::Failed { reason, code } => {
                 PipelineResult::Rejected {
                     reason,
                     decided_by: "approver".to_string(), // TODO: get from decision
@@ -355,12 +366,16 @@ pub struct PreAmberResult {
   Input: PipelineInput {request, principal, workflow, upstream_url}
          │
          ▼
+  ════════════════════════════════════════════════════════════════
+  REQUEST HANDLER (immediate response path)
+  ════════════════════════════════════════════════════════════════
+  
   ┌───────────────────────────────────────────────────────────────┐
-  │ 1. CREATE PENDING APPROVAL                                    │
+  │ 1. CREATE TASK                                                │
   │                                                               │
-  │    • Generate correlation ID                                  │
-  │    • Track client connection state                            │
-  │    • Register with PendingApprovalStore                       │
+  │    • Generate Task ID (tg_xxx)                                │
+  │    • Store original request for later execution               │
+  │    • Set state: InputRequired                                 │
   │                                                               │
   └───────────────────────────────────────────────────────────────┘
          │
@@ -372,67 +387,72 @@ pub struct PreAmberResult {
   │    • Include tool name, arguments summary, principal          │
   │    • Send via REQ-GOV-003                                     │
   │                                                               │
-  │    If post fails → Return InternalError                       │
+  │    If post fails → Fail task, return error                    │
   │                                                               │
   └───────────────────────────────────────────────────────────────┘
          │
          ▼
   ┌───────────────────────────────────────────────────────────────┐
-  │ 3. WAIT FOR APPROVAL (blocking)                               │
+  │ 3. SPAWN BACKGROUND POLLER                                    │
   │                                                               │
-  │    Poll for:                                                  │
-  │    • Approval decision from Slack polling                     │
-  │    • Timeout expiration                                       │
-  │    • Client disconnection                                     │
-  │                                                               │
-  └───────────────────────────────────────────────────────────────┘
-         │
-         ├─── Rejected ─────► Return PipelineResult::Rejected
-         │
-         ├─── Timeout ──────► Return PipelineResult::Timeout
-         │
-         ├─── Disconnected ─► Return PipelineResult::ClientDisconnected
-         │
-         ▼ Approved
-  ┌───────────────────────────────────────────────────────────────┐
-  │ 4. VALIDATE APPROVAL                                          │
-  │                                                               │
-  │    • Check client still connected                             │
-  │      (one final check before execution)                       │
-  │                                                               │
-  │    If disconnected → Return ClientDisconnected                │
-  │    (prevents zombie execution)                                │
+  │    tokio::spawn(poll_for_decision(...))                       │
+  │    • Does NOT block the response                              │
   │                                                               │
   └───────────────────────────────────────────────────────────────┘
          │
          ▼
   ┌───────────────────────────────────────────────────────────────┐
-  │ 5. FORWARD TO UPSTREAM                                        │
+  │ 4. RETURN TASK ID IMMEDIATELY                                 │
   │                                                               │
-  │    • Build HTTP request to upstream_url                       │
-  │    • Send original request (no transformation in v0.2)        │
-  │    • Apply execution timeout                                  │
+  │    {"taskId": "tg_xxx", "status": "input_required"}           │
+  │    • Response time < 100ms                                    │
   │                                                               │
-  │    Timeout → Return UpstreamError(-32001)                     │
-  │    Error   → Return UpstreamError(code, message)              │
+  └───────────────────────────────────────────────────────────────┘
+
+  ════════════════════════════════════════════════════════════════
+  BACKGROUND POLLER (runs independently after response)
+  ════════════════════════════════════════════════════════════════
+
+  ┌───────────────────────────────────────────────────────────────┐
+  │ 5. POLL FOR DECISION                                          │
+  │                                                               │
+  │    loop {                                                     │
+  │      sleep(poll_interval)                                     │
+  │      check timeout → fail task with -32008                    │
+  │      poll Slack for reaction                                  │
+  │      if decision → update task state, exit                    │
+  │      exponential backoff                                      │
+  │    }                                                          │
   │                                                               │
   └───────────────────────────────────────────────────────────────┘
          │
-         ▼
+         ├─── Approved ────► task.state = Approved
+         │
+         ├─── Rejected ────► task.state = Failed(-32007)
+         │
+         └─── Timeout ─────► task.state = Failed(-32008)
+
+  ════════════════════════════════════════════════════════════════
+  RESULT HANDLER (on tasks/result call)
+  ════════════════════════════════════════════════════════════════
+
   ┌───────────────────────────────────────────────────────────────┐
-  │ 6. RETURN RESPONSE                                            │
+  │ 6. EXECUTE UPSTREAM (triggered by tasks/result)               │
   │                                                               │
-  │    Return PipelineResult::Success { result }                  │
+  │    • Verify task.state == Approved                            │
+  │    • Forward original request to upstream                     │
+  │    • Stream result to client                                  │
+  │    • Mark task Completed                                      │
   │                                                               │
   └───────────────────────────────────────────────────────────────┘
 ```
 
-### F-001: Pending Approval Creation (v0.2)
+### F-001: Task Creation (v0.2)
 
-- **F-001.1:** Generate UUID for correlation
-- **F-001.2:** Create `Arc<AtomicBool>` for client connection tracking
-- **F-001.3:** Register with `PendingApprovalStore` (REQ-GOV-001)
-- **F-001.4:** Log creation with correlation ID, tool name, principal
+- **F-001.1:** Generate Task ID with `tg_` prefix
+- **F-001.2:** Store original request in TaskManager
+- **F-001.3:** Set initial state to `InputRequired`
+- **F-001.4:** Log creation with task ID, tool name, principal
 
 ### F-002: Approval Request Posting (v0.2)
 
@@ -441,19 +461,23 @@ pub struct PreAmberResult {
 - **F-002.3:** Handle posting errors gracefully
 - **F-002.4:** Log post success/failure
 
-### F-003: Task Creation (v0.2)
+### F-003: Background Poller (v0.2)
 
-- **F-003.1:** Delegate to REQ-GOV-001 `ApprovalWaiter`
+- **F-003.1:** Spawn via `tokio::spawn` - does NOT block response
+- **F-003.2:** Poll adapter with exponential backoff (5s → 30s max)
+- **F-003.3:** On approval → update task state to Approved
+- **F-003.4:** On rejection → update task state to Failed(-32007)
+- **F-003.5:** On timeout → update task state to Failed(-32008)
 - **F-003.2:** Return immediately when any condition triggers
 - **F-003.3:** Log outcome with correlation ID and duration
 
-### F-004: Approval Validation (v0.2)
+### F-004: Task State Updates (v0.2)
 
-- **F-004.1:** Final check that client is still connected
-- **F-004.2:** Prevent zombie execution (tool running with no client)
-- **F-004.3:** Log validation result
+- **F-004.1:** Transition task to Approved on approval
+- **F-004.2:** Transition task to Failed on rejection/timeout
+- **F-004.3:** Log state transitions with task ID
 
-### F-005: Upstream Forwarding (v0.2)
+### F-005: Upstream Forwarding (v0.2, on tasks/result)
 
 - **F-005.1:** Build JSON-RPC request for upstream MCP server
 - **F-005.2:** Apply configurable execution timeout
@@ -656,7 +680,7 @@ thoughtgate_upstream_duration_seconds
 
 ### NFR-003: Reliability (v0.2)
 
-- No zombie executions (tool never runs if client disconnected)
+- Task state always consistent after background poller completes
 - Proper cleanup on all exit paths
 - Clear error attribution (approval vs upstream vs internal)
 
