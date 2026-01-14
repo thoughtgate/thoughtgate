@@ -25,7 +25,7 @@ This requirement defines **task lifecycle management** for ThoughtGate's approva
 
 The blocking mode design was considered but **removed** in favor of SEP-1686:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         v0.2 BLOCKING MODE                                  │
 │                                                                             │
@@ -86,7 +86,7 @@ SEP-1686 introduces the "task primitive" to MCP, enabling:
 - Long-running operations that outlive request/response cycles
 - Status tracking for async workflows
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         v0.2 SEP-1686 MODE                                  │
 │                                                                             │
@@ -206,6 +206,7 @@ The system must additionally:
 | `cancelled` | Cancelled by client | Yes |
 
 **Additional ThoughtGate States:**
+
 | State | Meaning | Terminal? |
 |-------|---------|-----------|
 | `rejected` | Approver rejected request | Yes |
@@ -408,6 +409,7 @@ pub struct TaskId(pub Uuid);
 pub enum TaskStatus {
     // SEP-1686 standard states
     Working,
+    Executing,  // Between approval and completion (maps to "working" in SEP-1686)
     InputRequired,
     Completed,
     Failed,
@@ -422,7 +424,7 @@ pub enum TaskStatus {
 
 ### 7.1 v0.2: SEP-1686 Approval Flow
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                  v0.2 SEP-1686 ASYNC FLOW                    │
 └─────────────────────────────────────────────────────────────────┘
@@ -557,7 +559,7 @@ async fn poll_for_approval(
 
 ### 7.2 v0.3+: SEP-1686 Task Flow (Future Reference)
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                  v0.3+ SEP-1686 TASK FLOW                       │
 └─────────────────────────────────────────────────────────────────┘
@@ -685,7 +687,7 @@ This section documents the SEP-1686 state machine. **Implemented in v0.2.**
 
 ### 10.1 Task State Machine
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                    SEP-1686 STATE MACHINE                       │
 │                                                                 │
