@@ -124,6 +124,11 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 name = "ttfb"
 harness = false
 
+# Policy evaluation benchmark (REQ-OBS-001 M-POL-001, M-POL-002)
+[[bench]]
+name = "policy_eval"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true

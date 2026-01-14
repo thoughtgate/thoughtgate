@@ -229,7 +229,7 @@ impl TestContext {
         eprintln!("\n🚨 === END OF LOG DUMP ===\n");
     }
 
-    async fn run_test(&self) -> Result<(f64, f64)> {
+    async fn run_test(&self) -> Result<(f64, f64, f64)> {
         // Deploy ConfigMap & Job
         self.kubectl(&[
             "create",
@@ -393,6 +393,7 @@ impl TestContext {
         // We need to look for the summary metrics at the end
         let mut waiting_values: Vec<f64> = Vec::new();
         let mut duration_values: Vec<f64> = Vec::new();
+        let mut request_count: u64 = 0;
 
         for line in results_str.lines() {
             let line = line.trim();
@@ -410,12 +411,13 @@ impl TestContext {
                 match metric_name {
                     "http_req_waiting" => waiting_values.push(value),
                     "http_req_duration" => duration_values.push(value),
+                    "http_reqs" => request_count += 1,
                     _ => {}
                 }
             }
         }
 
-        // Calculate p95 from collected values
+        // Calculate percentiles from collected values
         let waiting_count = waiting_values.len();
         let duration_count = duration_values.len();
 
@@ -430,7 +432,17 @@ impl TestContext {
             bail!("Failed to extract metrics from K6 output");
         }
 
-        Ok((waiting_p95, duration_p95))
+        // Calculate throughput (requests per second)
+        // K6 benchmark runs for 10 seconds (see tests/benchmark.js)
+        const K6_DURATION_SECS: f64 = 10.0;
+        let throughput_rps = request_count as f64 / K6_DURATION_SECS;
+
+        println!(
+            "K6 stats: {} requests in {}s = {:.0} RPS",
+            request_count, K6_DURATION_SECS, throughput_rps
+        );
+
+        Ok((waiting_p95, duration_p95, throughput_rps))
     }
 }
 
@@ -495,11 +507,12 @@ impl Drop for TestContext {
 #[ignore = "Requires Kubernetes cluster - run with: cargo test -- --ignored"]
 async fn test_performance_baseline() -> Result<()> {
     let ctx = TestContext::new().await?;
-    let (ttfb, duration) = ctx.run_test().await?;
+    let (ttfb, duration, throughput) = ctx.run_test().await?;
 
     println!("\n--- 📈 Performance Results ---");
     println!("TTFB (p95):     {:.2}ms", ttfb);
-    println!("Duration (p95): {:.2}ms", duration);
+    println!("Latency (p95):  {:.2}ms", duration);
+    println!("Throughput:     {:.0} RPS", throughput);
     println!("-----------------------------\n");
 
     // Assertions - Mock has 500ms TTFB + 500ms streaming = ~1000ms total
@@ -509,22 +522,28 @@ async fn test_performance_baseline() -> Result<()> {
     }
     if duration >= 2000.0 {
         bail!(
-            "❌ Duration Regression: {:.2}ms (expected < 2000ms)",
+            "❌ Latency Regression: {:.2}ms (expected < 2000ms)",
             duration
         );
     }
 
-    // Export metrics for CI
+    // Export metrics for CI (REQ-OBS-001 compliant naming)
+    // Note: These are K8s/Kind environment metrics, not bare-metal targets
     let exports = vec![
         BenchExport {
-            name: "Time To First Byte".into(),
+            name: "ttfb/p95".into(),
             unit: "ms".into(),
             value: ttfb,
         },
         BenchExport {
-            name: "Stream Duration".into(),
+            name: "latency/p95".into(),
             unit: "ms".into(),
             value: duration,
+        },
+        BenchExport {
+            name: "throughput/rps".into(),
+            unit: "req/s".into(),
+            value: throughput,
         },
     ];
 

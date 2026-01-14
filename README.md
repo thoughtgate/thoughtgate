@@ -1,5 +1,10 @@
 # ThoughtGate
 
+[![CI](https://github.com/thoughtgate/thoughtgate/actions/workflows/ci.yml/badge.svg)](https://github.com/thoughtgate/thoughtgate/actions/workflows/ci.yml)
+[![Binary Size](https://bencher.dev/perf/thoughtgate/badge/binary-size)](https://bencher.dev/perf/thoughtgate)
+[![Latency p95](https://bencher.dev/perf/thoughtgate/badge/latency-p95)](https://bencher.dev/perf/thoughtgate)
+[![Throughput](https://bencher.dev/perf/thoughtgate/badge/throughput)](https://bencher.dev/perf/thoughtgate)
+
 **Human-in-the-loop approval workflows for MCP (Model Context Protocol) agents.**
 
 ThoughtGate is a sidecar proxy that intercepts MCP tool calls and routes them through policy-based approval workflows before execution. It ensures AI agents can't perform sensitive operations without human oversight.
@@ -42,6 +47,21 @@ AI agents are increasingly capable of taking real-world actions—deleting files
 | Multi-Upstream | v0.2 | Route to multiple MCP servers |
 | A2A Approval | v1.0 | Agent-to-agent approval workflows |
 | Prompt Guard | v1.0 | ML-based prompt injection detection |
+
+## Performance
+
+ThoughtGate is designed as a lightweight sidecar with minimal overhead:
+
+| Metric | Target | Description |
+|--------|--------|-------------|
+| **Binary size** | < 15 MB | Single static binary |
+| **Memory (idle)** | < 20 MB | Low footprint sidecar |
+| **Latency overhead** | < 2 ms p50 | Minimal proxy overhead |
+| **Throughput** | > 10,000 RPS | High capacity under load |
+| **Policy evaluation** | < 100 µs | Fast Cedar evaluation |
+| **Startup time** | < 100 ms | Fast cold start |
+
+See the [Bencher.dev dashboard](https://bencher.dev/perf/thoughtgate) for live performance tracking.
 
 ## Quick Start
 

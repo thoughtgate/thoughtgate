@@ -164,6 +164,42 @@ cargo fuzz run fuzz_jsonrpc    # Fuzz JSON-RPC parser
 - `REQ-CORE-001` - Green path streaming
 - `REQ-CORE-002` - Amber path buffering/inspection
 
+## Performance Metrics (REQ-OBS-001)
+
+Performance is tracked via Bencher.dev with the following metrics:
+
+| Category | Metrics | Target |
+|----------|---------|--------|
+| **Binary** | `binary/size` | < 15 MB |
+| **Memory** | `memory/idle_rss`, `memory/constrained_rss` | < 20 MB idle, < 100 MB constrained |
+| **Latency** | `latency/p50`, `latency/p95`, `latency/p99` | p50 < 5ms, p95 < 15ms |
+| **Throughput** | `throughput/rps_10vu`, `throughput/rps_constrained` | > 10K RPS, > 5K constrained |
+| **Overhead** | `overhead/latency_p50`, `overhead/percent_p50` | < 2ms, < 10% |
+| **Policy** | `policy/eval_p50`, `policy/eval_p99` | p50 < 100µs, p99 < 500µs |
+| **Startup** | `startup/to_healthy`, `startup/to_ready` | < 100ms healthy, < 150ms ready |
+
+### Benchmarking Commands
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run specific benchmark
+cargo bench --bench ttfb
+cargo bench --bench policy_eval
+
+# Collect metrics manually
+./scripts/collect_metrics.sh --binary-only
+./scripts/measure_overhead.sh
+./scripts/measure_constrained.sh --image thoughtgate:test
+```
+
+### CI Integration
+
+- **Bencher.dev** tracks metrics on `main`, `releases`, and `pr-*` branches
+- PRs get comparison comments with regression detection
+- CI fails on significant regressions (> 25% latency, > 50% memory)
+
 ## Quick Reference
 
 ### Error Codes

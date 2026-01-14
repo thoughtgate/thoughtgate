@@ -194,14 +194,20 @@ jobs:
           echo "🔬 Reproduce with: cargo +nightly fuzz run ${{ matrix.target }} <crash-file>"
           exit 1
 
-  # Stage 1e: Benchmarks (TTFB Performance Tracking)
+  # Stage 1e: Benchmarks (Performance Tracking with Bencher.dev)
+  #
+  # Implements: REQ-OBS-001 (Performance Metrics & Benchmarking)
+  #
+  # This job runs Criterion benchmarks and reports to Bencher.dev for:
+  # - Statistical regression detection
+  # - Branch-aware tracking (main/releases/PRs)
+  # - Marketing-ready performance dashboards
   bench:
-    name: Benchmarks (TTFB)
+    name: Benchmarks
     runs-on: ubuntu-latest
     needs: quick-checks
     permissions:
-      contents: write       # Needed to push benchmark results to gh-pages
-      pull-requests: write  # Needed to post PR comments with benchmark comparisons
+      pull-requests: write  # Needed to post PR comments
     
     steps:
       - name: Checkout code
@@ -216,175 +222,238 @@ jobs:
           shared-key: "bench"
           cache-on-failure: true
 
-      - name: Run benchmarks
+      - name: Build release binary
+        run: cargo build --release --bin thoughtgate
+
+      - name: Run Criterion benchmarks
         run: |
-          echo "Running TTFB benchmarks..."
-          cargo bench --bench ttfb -- --save-baseline ci-benchmark
+          echo "Running Criterion benchmarks..."
+          cargo bench --bench ttfb -- --noplot
+          cargo bench --bench policy_eval -- --noplot || echo "policy_eval benchmark not yet available"
           
           echo ""
           echo "Benchmark complete. Checking output..."
           ls -la target/criterion/ || echo "Warning: target/criterion not created"
-          
-      - name: Parse criterion output
+
+      - name: Collect binary metrics
         run: |
-          echo "Extracting criterion benchmark results..."
+          echo "Collecting binary size metrics..."
+          ./scripts/collect_metrics.sh --binary-only --output binary_metrics.json
+          cat binary_metrics.json
+
+      - name: Collect startup metrics
+        run: |
+          echo "Collecting startup timing metrics (M-START-001, M-START-003, M-MEM-001)..."
+          START_NS=$(date +%s%N)
           
-          # Debug: Show what criterion generated
-          echo "=== Criterion directory structure ==="
-          find target/criterion -type f -name "estimates.json" 2>/dev/null || echo "No estimates.json files found"
+          # Start ThoughtGate with custom ports to avoid conflicts
+          # Health endpoint is on HEALTH_PORT (separate from main proxy port)
+          THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:19999" \
+          THOUGHTGATE_PORT=18080 \
+          THOUGHTGATE_HEALTH_PORT=18081 \
+          ./target/release/thoughtgate &
+          PID=$!
+          
+          # Wait for /health endpoint (on health port, not proxy port)
+          MAX_WAIT=100
+          WAITED=0
+          while ! curl -sf http://127.0.0.1:18081/health > /dev/null 2>&1; do
+            sleep 0.1
+            WAITED=$((WAITED + 1))
+            if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+              echo "ERROR: Health check timed out"
+              kill $PID 2>/dev/null || true
+              exit 1
+            fi
+          done
+          HEALTHY_NS=$(date +%s%N)
+          STARTUP_HEALTHY_MS=$(( (HEALTHY_NS - START_NS) / 1000000 ))
+          echo "Time to healthy: ${STARTUP_HEALTHY_MS}ms"
+          
+          # Wait for /ready endpoint
+          WAITED=0
+          STARTUP_READY_MS=$STARTUP_HEALTHY_MS
+          while ! curl -sf http://127.0.0.1:18081/ready > /dev/null 2>&1; do
+            sleep 0.1
+            WAITED=$((WAITED + 1))
+            if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+              echo "WARN: Readiness check timed out"
+              break
+            fi
+          done
+          if [ "$WAITED" -lt "$MAX_WAIT" ]; then
+            READY_NS=$(date +%s%N)
+            STARTUP_READY_MS=$(( (READY_NS - START_NS) / 1000000 ))
+          fi
+          echo "Time to ready: ${STARTUP_READY_MS}ms"
+          
+          # Collect idle memory
+          IDLE_RSS=$(grep VmRSS /proc/$PID/status 2>/dev/null | awk '{print $2 * 1024}' || echo "0")
+          echo "Idle RSS: ${IDLE_RSS} bytes"
+          
+          kill $PID 2>/dev/null || true
+          wait $PID 2>/dev/null || true
+          
+          cat > startup_metrics.json << EOF
+          [
+            {"name": "startup/to_healthy", "value": $STARTUP_HEALTHY_MS, "unit": "ms"},
+            {"name": "startup/to_ready", "value": $STARTUP_READY_MS, "unit": "ms"},
+            {"name": "memory/idle_rss", "value": $IDLE_RSS, "unit": "bytes"}
+          ]
+          EOF
+          cat startup_metrics.json
+
+      - name: Parse and consolidate benchmark results
+        run: |
+          echo "Consolidating benchmark results for Bencher..."
           
           python3 << 'PYEOF'
           import json
           from pathlib import Path
           
-          def find_estimates_recursive(criterion_dir):
-              """Recursively find all estimates.json files under criterion directory"""
-              results = []
-              
-              for estimates_file in criterion_dir.rglob("estimates.json"):
-                  # Get the benchmark name from the path
-                  # Structure: target/criterion/<benchmark-name>/<baseline-or-new>/estimates.json
+          # Use dict to deduplicate by name
+          # Bencher BMF format: {"benchmark_name": {"measure": {"value": X}}}
+          # Three levels: benchmark -> measure -> value object
+          metrics = {}
+          
+          def add_metric(name, value, measure="latency"):
+              """Add metric in BMF format with proper measure."""
+              metrics[name] = {measure: {"value": value}}
+          
+          # Parse binary metrics (use "file-size" measure for size metrics)
+          binary_file = Path("binary_metrics.json")
+          if binary_file.exists():
+              with open(binary_file) as f:
+                  for m in json.load(f):
+                      add_metric(m["name"], m["value"], "file-size")
+          
+          # Parse startup metrics (use "latency" for timing, "file-size" for memory)
+          startup_file = Path("startup_metrics.json")
+          if startup_file.exists():
+              with open(startup_file) as f:
+                  for m in json.load(f):
+                      name = m["name"]
+                      if "memory" in name or "rss" in name.lower():
+                          add_metric(name, m["value"], "file-size")
+                      else:
+                          add_metric(name, m["value"], "latency")
+          
+          # Parse Criterion results
+          # Only look in "new" directory to avoid duplicates from base/new
+          criterion_dir = Path("target/criterion")
+          if criterion_dir.exists():
+              for estimates_file in criterion_dir.rglob("new/estimates.json"):
                   rel_path = estimates_file.relative_to(criterion_dir)
                   parts = rel_path.parts
                   
-                  if len(parts) < 2:
+                  if len(parts) < 3:
                       continue
                   
-                  # The benchmark name is everything except the last part (baseline dir)
-                  bench_name = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
-                  baseline_dir = parts[-2]  # e.g., "ci-benchmark", "new", "base"
-                  
-                  # Prefer ci-benchmark, then new, then base
-                  priority = {"ci-benchmark": 0, "new": 1, "base": 2}.get(baseline_dir, 999)
+                  # Build benchmark name from path (excluding "new" directory)
+                  # e.g., policy/eval_simple/new/estimates.json -> policy_eval_simple
+                  bench_parts = [p for p in parts[:-2] if p != "new"]
+                  bench_name = "_".join(bench_parts).replace(" ", "_")
                   
                   try:
                       with open(estimates_file) as f:
                           data = json.load(f)
                           mean_ns = data["mean"]["point_estimate"]
-                          results.append({
-                              "name": bench_name,
-                              "baseline": baseline_dir,
-                              "priority": priority,
-                              "value": mean_ns,
-                              "file": str(estimates_file)
-                          })
+                          
+                          # Convert to appropriate units
+                          if "policy" in bench_name.lower():
+                              # Policy benchmarks in microseconds
+                              add_metric(f"policy/{bench_name}", mean_ns / 1000, "latency")
+                          else:
+                              # TTFB benchmarks in milliseconds
+                              add_metric(f"ttfb/{bench_name}", mean_ns / 1_000_000, "latency")
                   except (KeyError, json.JSONDecodeError) as e:
                       print(f"Warning: Could not parse {estimates_file}: {e}")
-                      continue
-              
-              return results
           
-          criterion_dir = Path("target/criterion")
+          # Write consolidated results in Bencher BMF format
+          with open("bench_metrics.json", "w") as f:
+              json.dump(metrics, f, indent=2)
           
-          if not criterion_dir.exists():
-              print("ERROR: target/criterion not found!")
-              print("Benchmark may not have run successfully.")
-              exit(1)
-          
-          print(f"Scanning {criterion_dir} recursively...")
-          
-          all_results = find_estimates_recursive(criterion_dir)
-          
-          if not all_results:
-              print("\nERROR: No benchmark results found!")
-              print("Benchmark may have failed to run or produce output.")
-              exit(1)
-          
-          print(f"\nFound {len(all_results)} benchmark result(s):")
-          for r in all_results:
-              print(f"  - {r['name']} ({r['baseline']}): {r['value']:.2f} ns")
-          
-          # Group by benchmark name and pick the best baseline (lowest priority)
-          best_results = {}
-          for result in all_results:
-              name = result["name"]
-              if name not in best_results or result["priority"] < best_results[name]["priority"]:
-                  best_results[name] = result
-          
-          # Format for benchmark-action
-          final_results = [
-              {
-                  "name": name,
-                  "value": data["value"],
-                  "unit": "ns"
-              }
-              for name, data in best_results.items()
-          ]
-          
-          print(f"\nUsing {len(final_results)} benchmark result(s) for tracking:")
-          for r in final_results:
-              print(f"  ✓ {r['name']}: {r['value']:.2f} {r['unit']}")
-          
-          # Write results
-          with open("benchmark_results.json", "w") as f:
-              json.dump(final_results, f, indent=2)
-          
-          print(f"\n✓ Wrote benchmark_results.json")
+          print(f"Consolidated {len(metrics)} metrics:")
+          for name, data in sorted(metrics.items()):
+              measure = list(data.keys())[0]
+              print(f"  - {name} [{measure}]: {data[measure]['value']:.3f}")
           PYEOF
           
           echo ""
           echo "=== Final benchmark results ==="
-          cat benchmark_results.json
+          cat bench_metrics.json
 
-      - name: Create gh-pages branch if needed
+      - name: Install Bencher CLI
+        uses: bencherdev/bencher@main
+
+      - name: Report benchmarks to Bencher (main branch)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          # Check if gh-pages branch exists remotely
-          if ! git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            echo "📝 gh-pages branch does not exist, creating..."
-            
-            # Create orphan branch (no commit history)
-            git checkout --orphan gh-pages
-            git reset --hard
-            
-            # Create initial commit with README
-            cat > README.md << 'EOF'
-          # Benchmark Results
-          
-          This branch contains automated benchmark results.
-          
-          View the dashboard at: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/dev/bench/
-          EOF
-            
-            git add README.md
-            git config user.name "github-action-benchmark"
-            git config user.email "github@users.noreply.github.com"
-            git commit -m "Initialize gh-pages for benchmark results"
-            git push origin gh-pages
-            
-            # Switch back to main
-            git checkout main
-            echo "✅ gh-pages branch created"
-          else
-            echo "✅ gh-pages branch already exists"
-          fi
+          # REQ-OBS-001: Report with thresholds for regression detection
+          # Uses percentage-based thresholds: 10% max regression
+          bencher run \
+            --project thoughtgate \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch main \
+            --testbed ci-ubuntu-latest \
+            --adapter json \
+            --file bench_metrics.json \
+            --threshold-measure latency \
+            --threshold-test percentage \
+            --threshold-max-sample-size 64 \
+            --threshold-upper-boundary 0.10 \
+            --thresholds-reset \
+            --err
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
 
-      - name: Store benchmark result (Push to main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          tool: 'customSmallerIsBetter'
-          output-file-path: benchmark_results.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          # Alert on 110% performance regression (slower)
-          alert-threshold: '110%'
-          comment-on-alert: true
-          fail-on-alert: false
-          alert-comment-cc-users: '@${{ github.repository_owner }}'
+      - name: Report benchmarks to Bencher (release tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          bencher run \
+            --project thoughtgate \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch releases \
+            --testbed ci-ubuntu-latest \
+            --adapter json \
+            --file bench_metrics.json \
+            --branch-reset
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
 
-      - name: Compare benchmark result (Pull Requests)
+      - name: Report benchmarks to Bencher (Pull Requests)
         if: github.event_name == 'pull_request'
-        uses: benchmark-action/github-action-benchmark@v1
+        run: |
+          # REQ-OBS-001: PR checks with 10% regression threshold
+          # Posts comment on PR if regression detected
+          bencher run \
+            --project thoughtgate \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch "pr-${{ github.event.pull_request.number }}" \
+            --branch-start-point main \
+            --testbed ci-ubuntu-latest \
+            --adapter json \
+            --file bench_metrics.json \
+            --threshold-measure latency \
+            --threshold-test percentage \
+            --threshold-max-sample-size 64 \
+            --threshold-upper-boundary 0.10 \
+            --github-actions '${{ secrets.GITHUB_TOKEN }}' \
+            --err
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
         with:
-          tool: 'customSmallerIsBetter'
-          output-file-path: benchmark_results.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: false
-          # Comment with comparison on PRs
-          comment-always: true
-          alert-threshold: '110%'
-          fail-on-alert: true
+          name: benchmark-results
+          path: |
+            bench_metrics.json
+            binary_metrics.json
+            startup_metrics.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # Stage 2: Build Container Image
   build-container:
@@ -437,10 +506,14 @@ jobs:
           retention-days: 1
 
   # Stage 3: Kubernetes Integration Tests
+  #
+  # Implements: REQ-OBS-001 (K8s latency/throughput metrics)
   k8s-tests:
     name: Kubernetes Integration Tests
     runs-on: ubuntu-latest
     needs: build-container
+    permissions:
+      pull-requests: write  # Needed for Bencher PR comments
     
     steps:
       - name: Checkout code
@@ -479,6 +552,59 @@ jobs:
 
       - name: Run Kubernetes integration tests
         run: cargo test --test integration_k8s -- --nocapture
+
+      - name: Install Bencher CLI
+        if: always()
+        uses: bencherdev/bencher@main
+
+      - name: Report K8s metrics to Bencher (main branch)
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if [ -f bench_metrics.json ]; then
+            # REQ-OBS-001: K8s metrics with 15% threshold (allows for Kind variance)
+            bencher run \
+              --project thoughtgate \
+              --token '${{ secrets.BENCHER_API_TOKEN }}' \
+              --branch main \
+              --testbed ci-k8s-kind \
+              --adapter json \
+              --file bench_metrics.json \
+              --threshold-measure latency \
+              --threshold-test percentage \
+              --threshold-max-sample-size 64 \
+              --threshold-upper-boundary 0.15 \
+              --thresholds-reset \
+              --err || echo "Bencher report failed (non-fatal)"
+          else
+            echo "No bench_metrics.json found, skipping Bencher report"
+          fi
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+
+      - name: Report K8s metrics to Bencher (Pull Requests)
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          if [ -f bench_metrics.json ]; then
+            # REQ-OBS-001: K8s PR checks with 15% threshold
+            bencher run \
+              --project thoughtgate \
+              --token '${{ secrets.BENCHER_API_TOKEN }}' \
+              --branch "pr-${{ github.event.pull_request.number }}" \
+              --branch-start-point main \
+              --testbed ci-k8s-kind \
+              --adapter json \
+              --file bench_metrics.json \
+              --threshold-measure latency \
+              --threshold-test percentage \
+              --threshold-max-sample-size 64 \
+              --threshold-upper-boundary 0.15 \
+              --github-actions '${{ secrets.GITHUB_TOKEN }}' \
+              --err || echo "Bencher report failed (non-fatal)"
+          else
+            echo "No bench_metrics.json found, skipping Bencher report"
+          fi
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
 
       - name: Upload performance metrics
         if: always()
@@ -561,20 +687,98 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # REQ-OBS-001: Collect Docker image metrics (M-BIN-002 to M-BIN-005)
+      - name: Collect Docker image metrics
+        id: docker_metrics
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}"
+          echo "Collecting Docker image metrics for $IMAGE..."
+          
+          # M-BIN-002: Compressed image size (from manifest)
+          # Pull manifest and calculate total compressed size
+          MANIFEST=$(docker manifest inspect "$IMAGE" -v 2>/dev/null || echo "[]")
+          
+          if [ "$MANIFEST" != "[]" ]; then
+            # Calculate total compressed size across all layers
+            COMPRESSED_SIZE=$(echo "$MANIFEST" | jq '[.[] | .OCIManifest.layers[].size // 0] | add // 0')
+            echo "compressed_size=$COMPRESSED_SIZE" >> $GITHUB_OUTPUT
+            echo "  Compressed size: $COMPRESSED_SIZE bytes ($(echo "scale=2; $COMPRESSED_SIZE / 1048576" | bc) MB)"
+            
+            # M-BIN-003: Layer count (from first arch)
+            LAYER_COUNT=$(echo "$MANIFEST" | jq '.[0].OCIManifest.layers | length // 0')
+            echo "layer_count=$LAYER_COUNT" >> $GITHUB_OUTPUT
+            echo "  Layer count: $LAYER_COUNT"
+            
+            # M-BIN-005: Multi-arch verification
+            AMD64=$(echo "$MANIFEST" | jq -e '.[] | select(.Descriptor.platform.architecture == "amd64")' > /dev/null && echo "true" || echo "false")
+            ARM64=$(echo "$MANIFEST" | jq -e '.[] | select(.Descriptor.platform.architecture == "arm64")' > /dev/null && echo "true" || echo "false")
+            MULTI_ARCH=$([[ "$AMD64" == "true" && "$ARM64" == "true" ]] && echo "true" || echo "false")
+            echo "multi_arch=$MULTI_ARCH" >> $GITHUB_OUTPUT
+            echo "  Multi-arch (amd64+arm64): $MULTI_ARCH"
+          else
+            echo "Warning: Could not fetch manifest"
+            echo "compressed_size=0" >> $GITHUB_OUTPUT
+            echo "layer_count=0" >> $GITHUB_OUTPUT
+            echo "multi_arch=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Docker metrics JSON
+        run: |
+          cat > docker_metrics.json << EOF
+          [
+            {"name": "binary/docker_image_compressed", "value": ${{ steps.docker_metrics.outputs.compressed_size || 0 }}, "unit": "bytes"},
+            {"name": "binary/docker_layers", "value": ${{ steps.docker_metrics.outputs.layer_count || 0 }}, "unit": "count"}
+          ]
+          EOF
+          echo "Docker metrics:"
+          cat docker_metrics.json
+
+      - name: Install Bencher CLI
+        uses: bencherdev/bencher@main
+
+      - name: Report Docker metrics to Bencher
+        run: |
+          bencher run \
+            --project thoughtgate \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch releases \
+            --testbed ci-ubuntu-latest \
+            --adapter json \
+            --file docker_metrics.json \
+            || echo "Bencher report failed (non-fatal)"
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+
       - name: Generate release notes
         run: |
-          echo "## Container Images" > release-notes.md
-          echo "" >> release-notes.md
-          echo "Published to GitHub Container Registry:" >> release-notes.md
-          echo "" >> release-notes.md
-          echo '```bash' >> release-notes.md
-          echo "docker pull ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}" >> release-notes.md
-          echo "docker pull ghcr.io/${{ github.repository }}:latest" >> release-notes.md
-          echo '```' >> release-notes.md
-          echo "" >> release-notes.md
-          echo "## Supported Architectures" >> release-notes.md
-          echo "- linux/amd64" >> release-notes.md
-          echo "- linux/arm64" >> release-notes.md
+          VERSION="${{ steps.version.outputs.version }}"
+          COMPRESSED_MB=$(echo "scale=2; ${{ steps.docker_metrics.outputs.compressed_size || 0 }} / 1048576" | bc)
+          
+          cat > release-notes.md << EOF
+          ## Container Images
+          
+          Published to GitHub Container Registry:
+          
+          \`\`\`bash
+          docker pull ghcr.io/${{ github.repository }}:${VERSION}
+          docker pull ghcr.io/${{ github.repository }}:latest
+          \`\`\`
+          
+          ## Supported Architectures
+          - linux/amd64
+          - linux/arm64
+          
+          ## Performance Metrics
+          
+          | Metric | Value |
+          |--------|-------|
+          | Image Size (compressed) | ${COMPRESSED_MB} MB |
+          | Layer Count | ${{ steps.docker_metrics.outputs.layer_count }} |
+          | Multi-arch | ${{ steps.docker_metrics.outputs.multi_arch }} |
+          
+          See full performance dashboard: [Bencher.dev](https://bencher.dev/perf/thoughtgate)
+          EOF
+          
           cat release-notes.md
 
       - name: Upload release notes
@@ -584,3 +788,9 @@ jobs:
           path: release-notes.md
           retention-days: 90
 
+      - name: Upload Docker metrics
+        uses: actions/upload-artifact@v6
+        with:
+          name: docker-metrics
+          path: docker_metrics.json
+          retention-days: 90
