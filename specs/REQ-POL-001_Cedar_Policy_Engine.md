@@ -17,7 +17,7 @@ This requirement defines the **Cedar policy engine** for ThoughtGate—how compl
 
 Cedar is **Gate 3** in ThoughtGate's request decision flow. It is NOT the primary routing mechanism—YAML governance rules (Gate 2) handle most routing. Cedar is invoked only when a rule specifies `action: policy`.
 
-```
+```text
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
 │   GATE 1    │    │   GATE 2    │    │   GATE 3    │    │   GATE 4    │
 │ Visibility  │ → │ Governance  │ → │   Cedar     │ → │  Approval   │
@@ -365,7 +365,7 @@ pub enum CedarError {
 
 ### F-001: Policy Evaluation
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │              CEDAR EVALUATION (Gate 3)                        │
 │                                                              │

@@ -35,8 +35,8 @@ This requirement defines how ThoughtGate handles upstream MCP servers that requi
 **The Solution:**
 
 During the `Executing` phase of a ThoughtGate-owned task, check upstream's tool annotation and call appropriately:
-- `forbidden` / `optional` → Synchronous call (no task metadata), stream result to client
-- `required` → Call with task metadata, store upstream task ID, lazy-poll on client request
+- `forbidden` → DeferredSync path via `setup_deferred_sync()` - defer execution until `tasks/result` call
+- `optional` / `required` → Task path via `execute_with_task()` - create upstream task immediately, lazy-poll on client request
 
 **Key Design Decisions:**
 
@@ -46,7 +46,7 @@ During the `Executing` phase of a ThoughtGate-owned task, check upstream's tool 
 | Nested task visibility | Hidden from client | Client only sees TG task ID |
 | Polling model | **Lazy (on-demand)** | Sidecar resource efficiency; no background polling loops |
 | Result handling | **Stream without caching** | Bounded memory; works for any result size |
-| SSE notifications | **Not supported for TG-owned tasks** | Would require persistent upstream connections |
+| SSE notifications | **Supported for TG-owned tasks** | Lazy upstream subscription (see F-009, F-010, F-012) |
 
 ### 1.1 Lazy Polling Model
 

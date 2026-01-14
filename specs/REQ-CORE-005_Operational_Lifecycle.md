@@ -470,7 +470,7 @@ pub async fn cancel_pending_approvals(
         
         // Each waiter will:
         // 1. Receive shutdown signal
-        // 2. Return ApprovalOutcome::ClientDisconnected (or a new Shutdown variant)
+        // 2. Return ApprovalOutcome::Shutdown (server-initiated shutdown)
         // 3. Pipeline returns -32603 to client
         
         // Log each cancellation
