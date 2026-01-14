@@ -304,24 +304,30 @@ impl ExecutionPipeline for AsyncPipeline {
         let task = self.task_manager.get_task(task_id).await?;
         
         match task.state {
-            TaskState::Approved => {
+            TaskState::Approved { by } => {
                 // 2. Forward to upstream
                 self.forward_to_upstream(&task.original_request).await
             }
             TaskState::InputRequired => {
                 PipelineResult::StillWaiting
             }
-            TaskState::Failed { reason, code } => {
+            TaskState::Rejected { by, reason } => {
                 PipelineResult::Rejected {
                     reason,
-                    decided_by: "approver".to_string(), // TODO: get from decision
+                    decided_by: by,
                 }
             }
-            ApprovalOutcome::Timeout => {
+            TaskState::TimedOut => {
                 PipelineResult::Timeout
             }
-            ApprovalOutcome::ClientDisconnected => {
-                PipelineResult::ClientDisconnected
+            TaskState::Failed { error, code } => {
+                PipelineResult::UpstreamError {
+                    code,
+                    message: error,
+                }
+            }
+            TaskState::Completed { .. } => {
+                PipelineResult::AlreadyCompleted
             }
         }
     }
@@ -833,12 +839,12 @@ async fn check_transform_drift(
 ### 11.1 v0.2 Definition of Done
 
 - [ ] `PipelineInput` and `PipelineResult` types defined
-- [ ] `BlockingPipeline` implementation complete
-- [ ] Pending approval creation working
+- [ ] `AsyncPipeline` implementation complete
+- [ ] Task creation with SEP-1686 state machine
 - [ ] Approval request posting via REQ-GOV-003
-- [ ] Blocking wait via REQ-GOV-001
-- [ ] Client disconnection check before execution
-- [ ] Upstream forwarding with timeout
+- [ ] Background polling via `tokio::spawn` (non-blocking)
+- [ ] Task state updates on approval/rejection/timeout
+- [ ] Upstream forwarding on `tasks/result` call
 - [ ] Response mapping (success, rejected, timeout, errors)
 - [ ] Metrics for all pipeline stages
 - [ ] All edge cases (EC-PIP-001 to EC-PIP-010) covered

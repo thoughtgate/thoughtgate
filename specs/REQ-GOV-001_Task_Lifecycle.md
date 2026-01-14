@@ -275,6 +275,12 @@ pub struct PendingApprovalStore {
 }
 
 impl PendingApprovalStore {
+    /// Check if store is initialized and ready for use
+    /// For in-memory store, always returns true after construction
+    pub fn is_initialized(&self) -> bool {
+        true  // In-memory store is always ready
+    }
+    
     /// Subscribe to state changes for a specific approval
     pub fn subscribe(&self, id: &Uuid) -> broadcast::Receiver<(Uuid, ApprovalState)> {
         self.state_tx.subscribe()

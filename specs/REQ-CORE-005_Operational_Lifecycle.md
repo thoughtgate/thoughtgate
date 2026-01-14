@@ -367,6 +367,9 @@ pub async fn readiness_check(
 }
 ```
 
+> **Note:** `PendingApprovalStore::is_initialized()` is defined in REQ-GOV-001 §6.2.
+> For the in-memory store, this returns `true` after construction (always initialized).
+
 - **F-003.1:** Check all required subsystems
 - **F-003.2:** Return 200 only if ALL checks pass
 - **F-003.3:** Return 503 with details if any check fails
