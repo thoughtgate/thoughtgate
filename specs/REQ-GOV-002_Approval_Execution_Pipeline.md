@@ -543,9 +543,15 @@ async fn forward_to_upstream(&self, input: &PipelineInput) -> PipelineResult {
         };
     }
     
-    // Return result
-    PipelineResult::Success {
-        result: json_response.get("result").cloned().unwrap_or(serde_json::Value::Null),
+    // Per JSON-RPC 2.0: success response MUST include "result" field
+    match json_response.get("result") {
+        Some(result) => PipelineResult::Success {
+            result: result.clone(),
+        },
+        None => PipelineResult::UpstreamError {
+            code: -32600,
+            message: "Missing 'result' field in JSON-RPC response from upstream".to_string(),
+        },
     }
 }
 ```
@@ -701,6 +707,7 @@ thoughtgate_upstream_duration_seconds
 | Upstream returns error | Return upstream error | EC-PIP-008 |
 | Upstream timeout | Return -32001 | EC-PIP-009 |
 | Upstream returns invalid JSON | Return -32002 | EC-PIP-010 |
+| Upstream returns JSON-RPC response without 'result' | Return -32600 | EC-PIP-016 |
 | Workflow changes during pending approval | Complete with original workflow | EC-PIP-011 |
 | Duplicate tool call submission | Create separate tasks (no dedup) | EC-PIP-012 |
 | Approval timeout = 0 | Immediate timeout, execute on_timeout | EC-PIP-013 |
