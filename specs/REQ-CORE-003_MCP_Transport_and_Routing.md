@@ -7,52 +7,94 @@
 | **Type** | Core Mechanic |
 | **Status** | Draft |
 | **Priority** | **Critical** |
-| **Tags** | `#mcp` `#transport` `#json-rpc` `#routing` `#upstream` |
+| **Tags** | `#mcp` `#transport` `#json-rpc` `#routing` `#governance` `#4-gate` |
 
 ## 1. Context & Decision Rationale
 
-This requirement defines the **entry point** for ThoughtGate—how MCP messages are received, parsed, routed, and forwarded. ThoughtGate sits between MCP hosts (agents) and MCP servers (tools), acting as an **Application Layer Gateway** with policy enforcement.
+This requirement defines the **entry point** for ThoughtGate—how MCP messages are received, parsed, and routed through the 4-gate decision flow. ThoughtGate sits between MCP hosts (agents) and MCP servers (tools), acting as an **Application Layer Gateway** with policy enforcement.
 
-**Protocol Foundation:**
+### 1.1 Protocol Foundation
+
 - MCP uses JSON-RPC 2.0 over Streamable HTTP (POST with SSE response) or stdio
 - SEP-1686 extends MCP with task-based async execution
 - ThoughtGate must be protocol-transparent for non-intercepted methods
 
-**Architectural Position:**
+### 1.2 Architectural Position
+
 ```
-┌─────────────┐     ┌─────────────────────────────────────┐     ┌─────────────┐
-│  MCP Host   │────▶│           ThoughtGate               │────▶│  MCP Server │
-│  (Agent)    │◀────│  [REQ-CORE-003: This Requirement]   │◀────│  (Tools)    │
-└─────────────┘     └─────────────────────────────────────┘     └─────────────┘
+┌─────────────┐     ┌─────────────────────────────────────────┐     ┌─────────────┐
+│  MCP Host   │────►│           ThoughtGate                   │────►│  MCP Server │
+│  (Agent)    │◄────│  [REQ-CORE-003: This Requirement]       │◄────│  (Tools)    │
+└─────────────┘     └─────────────────────────────────────────┘     └─────────────┘
 ```
 
-**v0.1 Simplified Model:**
-ThoughtGate is an **MCP-specific gateway**, not a transparent HTTP proxy. All inbound MCP requests are parsed for JSON-RPC routing.
+### 1.3 The 4-Gate Decision Flow
 
-| Traffic Type | Handling | Notes |
-|--------------|----------|-------|
-| Inbound MCP requests | Parse JSON-RPC, route by method | This REQ |
-| Upstream responses | Pass through | No inspection in v0.1 |
+ThoughtGate routes requests through up to 4 gates:
 
-**v0.1 simplification:** Green Path (REQ-CORE-001) and Amber Path (REQ-CORE-002) are **deferred**. All responses are passed through without streaming or inspection distinction. These will be reintroduced when response inspection or LLM streaming is needed.
+```
+  Agent Request (tool + arguments)
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │ GATE 1: Visibility (REQ-CFG-001: expose config)              │
+  │   If tool NOT exposed → 404 Method Not Found                 │
+  └──────────────────────────────────────────────────────────────┘
+         │
+         │ Tool is visible
+         ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │ GATE 2: Governance Rules (REQ-CFG-001: governance.rules)     │
+  │   First matching rule determines action:                     │
+  │   - forward → Skip to Forward                                │
+  │   - deny → Reject immediately                                │
+  │   - approve → Skip to Gate 4                                 │
+  │   - policy → Continue to Gate 3                              │
+  └──────────────────────────────────────────────────────────────┘
+         │
+         │ action: policy
+         ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │ GATE 3: Cedar Policy (REQ-POL-001)                           │
+  │   Cedar evaluates policy_id with arguments:                  │
+  │   - Permit → Continue to Gate 4                              │
+  │   - Forbid → Reject immediately                              │
+  └──────────────────────────────────────────────────────────────┘
+         │
+         │ action: approve OR Cedar Permit
+         ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │ GATE 4: Approval Workflow (REQ-GOV-001, REQ-GOV-003)         │
+  │   Human/A2A approval via configured workflow:                │
+  │   - Approved → Forward to upstream                           │
+  │   - Rejected → Reject                                        │
+  │   - Timeout → on_timeout action                              │
+  └──────────────────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │ FORWARD TO UPSTREAM                                          │
+  │   Execute tool call, return result                           │
+  └──────────────────────────────────────────────────────────────┘
+```
 
 ## 2. Dependencies
 
 | Requirement | Relationship | Notes |
 |-------------|--------------|-------|
-| REQ-CORE-001 | **Deferred** | Green Path deferred to v0.2+ |
-| REQ-CORE-002 | **Deferred** | Amber Path deferred to v0.2+ |
-| REQ-CORE-004 | **Provides to** | Error responses formatted per this spec |
+| REQ-CFG-001 | **Receives from** | Configuration (sources, governance rules, expose config) |
+| REQ-POL-001 | **Invokes** | Cedar policy evaluation (Gate 3) |
+| REQ-CORE-004 | **Provides to** | Error responses formatted per spec |
 | REQ-CORE-005 | **Coordinates with** | Lifecycle events (startup, shutdown) |
-| REQ-POL-001 | **Receives from** | Routing decisions (Forward/Approve/Reject) |
 | REQ-GOV-001 | **Provides to** | Task method handling (`tasks/*`) |
+| REQ-GOV-003 | **Invokes** | Approval workflow (Gate 4) |
 
 ## 3. Intent
 
 The system must:
 1. Accept MCP connections from hosts via HTTP+SSE
 2. Parse JSON-RPC 2.0 messages correctly (requests, responses, notifications, batches)
-3. Route MCP methods to appropriate handlers
+3. Route requests through the 4-gate decision flow
 4. Forward requests to upstream MCP servers
 5. Correlate responses back to originating requests
 6. Support SEP-1686 task-augmented requests
@@ -61,7 +103,7 @@ The system must:
 
 ### 4.1 In Scope
 - JSON-RPC 2.0 parsing and validation
-- MCP method routing
+- 4-gate decision flow routing
 - HTTP+SSE transport (Streamable HTTP)
 - Upstream client (connection, forwarding, response handling)
 - Request/response correlation
@@ -69,12 +111,13 @@ The system must:
 - SSE event streaming for notifications
 
 ### 4.2 Out of Scope
-- Policy evaluation (REQ-POL-001)
+- Policy evaluation logic (REQ-POL-001)
+- Configuration loading/parsing (REQ-CFG-001)
 - Error formatting details (REQ-CORE-004)
 - Health endpoints (REQ-CORE-005)
 - Task state management (REQ-GOV-001)
+- Approval adapter implementation (REQ-GOV-003)
 - stdio transport (deferred to future version)
-- HTTP/2 and WebSocket upgrades (deferred, see REQ-CORE-001 notes)
 
 ## 5. Constraints
 
@@ -87,6 +130,7 @@ The system must:
 | `reqwest` | Upstream HTTP client | 0.11.x |
 | `serde_json` | JSON parsing | 1.x |
 | `uuid` | Request ID generation | 1.x |
+| `glob` | Pattern matching for rules | 0.3.x |
 
 ### 5.2 Protocol Compliance
 
@@ -97,18 +141,11 @@ The system must:
 - MUST return proper error codes per JSON-RPC spec
 
 **MCP Streamable HTTP Transport:**
-MCP uses "Streamable HTTP" which is POST-based with optional SSE responses:
 - Client sends: `POST /mcp/v1` with `Content-Type: application/json`
 - Server responds with either:
   - `Content-Type: application/json` for simple responses
-  - `Content-Type: text/event-stream` for streaming responses (notifications, progress)
-- This is distinct from legacy "GET /sse" handshake patterns
+  - `Content-Type: text/event-stream` for streaming responses
 - ThoughtGate MUST support both response types
-
-**MCP Method Requirements:**
-- MUST forward unknown methods transparently to upstream
-- MUST handle `Content-Type: application/json` for requests
-- MUST forward SSE streams from upstream to client without buffering (Green Path)
 
 **SEP-1686 Requirements:**
 - MUST detect `task` field in request params
@@ -117,84 +154,21 @@ MCP uses "Streamable HTTP" which is POST-based with optional SSE responses:
 
 ### 5.3 Connection Management
 
-**Architecture: Single-Port MCP Gateway**
-ThoughtGate operates as a dedicated MCP gateway on a single port, not a transparent HTTP proxy:
-- All traffic on this port is assumed to be MCP JSON-RPC
-- No protocol sniffing or multi-protocol handling required
-- For environments requiring both MCP governance and general HTTP proxying, deploy separate instances
+**Single-Port Architecture:**
+ThoughtGate exposes one port for all MCP traffic:
 
-| Setting | Default | Environment Variable |
-|---------|---------|---------------------|
-| Listen address | `0.0.0.0:8080` | `THOUGHTGATE_LISTEN` |
-| Upstream URL | (required) | `THOUGHTGATE_UPSTREAM` |
-| Request timeout | 30s | `THOUGHTGATE_REQUEST_TIMEOUT_SECS` |
-| Upstream connect timeout | 5s | `THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS` |
-| Max concurrent requests | 10000 | `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` |
-| Keep-alive | 60s | `THOUGHTGATE_KEEPALIVE_SECS` |
-| Max request body size | 1MB | `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` |
-| **Approval timeout (v0.1)** | 300s (5min) | `THOUGHTGATE_APPROVAL_TIMEOUT_SECS` |
+| Port | Purpose |
+|------|---------|
+| 8080 (default) | MCP gateway (inbound from agents) |
 
-### 5.4 Blocking Approval Mode (v0.1)
+Upstream MCP server URL is configured via `sources[].url` in YAML config.
 
-**⚠️ Critical: Zombie Execution Prevention**
+### 5.4 v0.2 Blocking Mode
 
-In v0.1 blocking mode, ThoughtGate holds the HTTP connection open while waiting for approval. This creates a risk of "zombie execution" where:
-1. Client times out and closes connection
-2. Human approves the request
-3. ThoughtGate executes the tool (side effect happens!)
-4. ThoughtGate tries to return response → socket closed
-5. Client thinks request failed, may retry → **double execution**
-
-**Mitigation: Connection Liveness Check**
-
-Before executing an approved tool, ThoughtGate MUST verify the client connection is still alive:
-
-```rust
-// Pseudocode for blocking approval flow
-async fn handle_blocking_approval(request: ToolCall, response_tx: Sender) {
-    // 1. Send approval request to Slack
-    let task_id = create_approval_task(&request).await;
-    
-    // 2. Wait for approval with timeout
-    let approval = tokio::select! {
-        result = wait_for_approval(task_id) => result,
-        _ = tokio::time::sleep(approval_timeout) => {
-            return Err(ApprovalTimeout { tool: request.name });
-        }
-    };
-    
-    // 3. CRITICAL: Check connection liveness before execution
-    if response_tx.is_closed() {
-        tracing::warn!(
-            task_id = %task_id,
-            tool = %request.name,
-            "Approval received but client disconnected - aborting execution"
-        );
-        metrics::counter!("thoughtgate_zombie_execution_prevented_total").increment(1);
-        return; // Do NOT execute - client cannot receive result
-    }
-    
-    // 4. Connection alive - safe to execute
-    match approval {
-        ApprovalDecision::Approved => {
-            let result = execute_tool(&request).await;
-            let _ = response_tx.send(result); // May still fail if client disconnects now
-        }
-        ApprovalDecision::Rejected { by } => {
-            return Err(ApprovalRejected { tool: request.name, rejected_by: by });
-        }
-    }
-}
-```
-
-**Configuration:**
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `THOUGHTGATE_APPROVAL_TIMEOUT_SECS` | 300 (5 min) | Max time to wait for approval in blocking mode |
-| `THOUGHTGATE_APPROVAL_LIVENESS_CHECK` | true | Check connection before execution |
-
-**Behavior Matrix:**
+In v0.2, approval uses **blocking mode**:
+- HTTP connection held until approval decision
+- Agent does not need SEP-1686 support
+- Timeout returns error, not task ID
 
 | Scenario | Behavior |
 |----------|----------|
@@ -208,7 +182,7 @@ async fn handle_blocking_approval(request: ToolCall, response_tx: Sender) {
 
 - **Connection Pooling:** Maintain persistent connections to upstream
 - **Retry Policy:** No automatic retry (let caller handle)
-- **Timeout:** Per-request timeout, configurable
+- **Timeout:** Per-request timeout from config
 - **TLS:** Support HTTPS upstreams, verify certificates by default
 
 ## 6. Interfaces
@@ -263,9 +237,9 @@ Content-Type: application/json
   "jsonrpc": "2.0",
   "id": 1,
   "error": {
-    "code": -32600,
-    "message": "Invalid Request",
-    "data": { ... }
+    "code": -32003,
+    "message": "Policy denied",
+    "data": { "correlation_id": "uuid" }
   }
 }
 ```
@@ -294,47 +268,55 @@ pub enum JsonRpcId {
 }
 ```
 
-### 6.4 Internal: Routing Decision
+### 6.4 Internal: Gate Routing
 
 ```rust
-pub enum RouteTarget {
-    /// Forward to policy engine for classification
-    PolicyEvaluation { request: McpRequest },
-
-    /// Handle internally (tasks/* methods)
-    TaskHandler { method: TaskMethod, request: McpRequest },
-
-    /// Forward directly to upstream (unknown methods)
-    PassThrough { request: McpRequest },
-}
-
-pub enum TaskMethod {
-    Get,      // tasks/get
-    Result,   // tasks/result
-    List,     // tasks/list
-    Cancel,   // tasks/cancel
-}
-
-/// v0.1 Simplified Policy Actions
-pub enum PolicyAction {
-    /// Forward request to upstream immediately
+/// Result of 4-gate evaluation
+pub enum GateResult {
+    /// Forward to upstream immediately
     Forward,
-    /// Require approval before forwarding
-    Approve { timeout: Duration },
-    /// Reject request with error
-    Reject { reason: String },
+    
+    /// Deny with error
+    Deny { 
+        code: i32, 
+        message: String,
+        source: DenySource,
+    },
+    
+    /// Require approval (Gate 4)
+    Approve {
+        workflow: String,
+        timeout: Duration,
+    },
+    
+    /// Request is not visible (404)
+    NotExposed,
+}
+
+pub enum DenySource {
+    GovernanceRule,    // action: deny
+    CedarPolicy,       // Cedar forbid
+    ApprovalRejected,  // Human rejected
+    ApprovalTimeout,   // Timeout reached
 }
 ```
 
-### 6.5 Errors (Delegated to REQ-CORE-004)
+### 6.5 Internal: Governance Engine Interface
 
-| Scenario | Error Code | Handled By |
-|----------|------------|------------|
-| Malformed JSON | -32700 | This REQ (parse phase) |
-| Invalid JSON-RPC | -32600 | This REQ (validation phase) |
-| Method not found | -32601 | REQ-CORE-004 |
-| Invalid params | -32602 | REQ-CORE-004 |
-| Upstream errors | -32000 to -32099 | REQ-CORE-004 |
+```rust
+/// Governance engine evaluates Gates 1-3
+pub trait GovernanceEngine: Send + Sync {
+    /// Evaluate request through gates 1-3
+    /// Returns GateResult indicating next action
+    fn evaluate(
+        &self,
+        tool_name: &str,
+        source_id: &str,
+        arguments: &serde_json::Value,
+        principal: &Principal,
+    ) -> GateResult;
+}
+```
 
 ## 7. Functional Requirements
 
@@ -350,140 +332,320 @@ The transport layer MUST parse incoming JSON according to JSON-RPC 2.0:
 - **F-001.6:** Reject invalid JSON-RPC structure with error code -32600
 - **F-001.7:** Generate `correlation_id` (UUID v4) for each request
 
-**Correlation ID:**
-Every request receives a unique correlation ID that propagates through all components:
-- Generated at parse time in MCP Transport layer
-- Stored in `McpRequest.correlation_id`
-- Included in all log entries for this request
-- Passed to Policy Engine, Task Manager, etc.
-- Returned in error responses for debugging
-
 ### F-002: Method Routing
 
 The transport layer MUST route methods to appropriate handlers:
 
 | Method Pattern | Route To | Notes |
 |----------------|----------|-------|
-| `tools/call` | Policy Engine | May become task-augmented |
-| `tools/list` | Policy Engine | May filter based on policy |
+| `tools/call` | Governance Engine (4-gate flow) | Primary interception point |
+| `tools/list` | Governance Engine | Filter by visibility (Gate 1) |
 | `tasks/get` | Task Handler | SEP-1686 |
 | `tasks/result` | Task Handler | SEP-1686 |
 | `tasks/list` | Task Handler | SEP-1686 |
 | `tasks/cancel` | Task Handler | SEP-1686 |
-| `resources/*` | Policy Engine | Subject to classification |
-| `prompts/*` | Policy Engine | Subject to classification |
+| `resources/*` | Governance Engine | Subject to policy |
+| `prompts/*` | Governance Engine | Subject to policy |
 | `*` (unknown) | Pass Through | Forward to upstream |
 
-### F-003: SEP-1686 Detection
+### F-003: Gate 1 - Visibility Check
 
-- **F-003.1:** Detect `task` field in request `params`
-- **F-003.2:** Extract `ttl` from task metadata
-- **F-003.3:** Flag request as task-augmented for downstream processing
-- **F-003.4:** Validate task metadata structure
-
-### F-004: Upstream Forwarding
-
-- **F-004.1:** Maintain connection pool to upstream MCP server
-- **F-004.2:** Forward requests with original headers (minus hop-by-hop)
-- **F-004.3:** Apply configurable timeout per request
-- **F-004.4:** Return upstream response to caller
-- **F-004.5:** Handle upstream connection failures (delegate to REQ-CORE-004)
-
-### F-005: Response Correlation
-
-- **F-005.1:** Track in-flight requests by correlation ID
-- **F-005.2:** Match responses to original requests
-- **F-005.3:** Handle response timeout (delegate to REQ-CORE-004)
-- **F-005.4:** Support concurrent requests to same upstream
-
-### F-006: SSE Streaming
-
-- **F-006.1:** Support SSE for server-to-client notifications
-- **F-006.2:** Forward upstream SSE events to client
-- **F-006.3:** Inject ThoughtGate notifications (e.g., `notifications/tasks/status`)
-- **F-006.4:** Handle client disconnect (close upstream connection)
-
-### F-007: Batch Request Handling
-
-- **F-007.1:** Parse batch requests (JSON arrays)
-- **F-007.2:** Process each request independently through policy evaluation
-- **F-007.3:** Aggregate responses into batch response array
-- **F-007.4:** Notifications in batch do not produce response entries
-- **F-007.5:** **Approval Batch Policy:** If ANY request in batch requires Approval, entire batch is task-augmented
-
-**Approval Batch Behavior:**
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     BATCH REQUEST WITH MIXED PATHS                              │
-│                                                                                 │
-│   Batch: [                                                                      │
-│     {id:1, method:"tools/call", params:{name:"read_file"}}     → Green         │
-│     {id:2, method:"tools/call", params:{name:"delete_user"}}   → Approval          │
-│     {id:3, method:"resources/list"}                            → Amber         │
-│   ]                                                                             │
-│                                                                                 │
-│   Result: Entire batch → Approval (highest restriction wins)                        │
-│                                                                                 │
-│   Response: {                                                                   │
-│     "jsonrpc": "2.0",                                                          │
-│     "id": null,                                                                 │
-│     "result": {                                                                 │
-│       "taskId": "batch-abc-123",                                               │
-│       "status": "working",                                                      │
-│       "itemCount": 3,                                                           │
-│       "approvalRequired": [2]  // Indices requiring Approval                           │
-│     }                                                                           │
-│   }                                                                             │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
+```rust
+fn check_visibility(tool_name: &str, source: &Source) -> bool {
+    let expose = source.expose.as_ref().unwrap_or(&ExposeConfig::All);
+    expose.is_visible(tool_name)
+}
 ```
 
-**Rationale:** 
-- Prevents partial execution leaving system in inconsistent state
-- Human approver sees complete context of agent's intended actions
-- Simplifies client handling (all-or-nothing)
+- **F-003.1:** Check tool visibility against `expose` config
+- **F-003.2:** Return 404 (-32601) if tool not visible
+- **F-003.3:** `expose: all` makes all tools visible (default)
+- **F-003.4:** `expose: allowlist` shows only matching patterns
+- **F-003.5:** `expose: blocklist` hides matching patterns
 
-## 8. Non-Functional Requirements
+### F-004: Gate 2 - Governance Rules
+
+```rust
+fn evaluate_governance(tool_name: &str, source_id: &str) -> RuleMatch {
+    for rule in &config.governance.rules {
+        // Check source filter
+        if let Some(filter) = &rule.source {
+            if !filter.matches(source_id) {
+                continue;
+            }
+        }
+        
+        // Check pattern match (first match wins)
+        if glob_match(&rule.pattern, tool_name) {
+            return RuleMatch {
+                action: rule.action,
+                policy_id: rule.policy_id.clone(),
+                approval_workflow: rule.approval.clone(),
+            };
+        }
+    }
+    
+    // No match - use default
+    RuleMatch {
+        action: config.governance.defaults.action,
+        policy_id: None,
+        approval_workflow: None,
+    }
+}
+```
+
+- **F-004.1:** Match rules in order (first match wins)
+- **F-004.2:** Filter by `source` if specified
+- **F-004.3:** Use glob patterns for matching
+- **F-004.4:** Fall through to `governance.defaults.action`
+- **F-004.5:** Return action + policy_id + approval workflow
+
+### F-005: Gate 3 - Cedar Policy
+
+Invoked only when `action: policy`:
+
+```rust
+if rule_match.action == Action::Policy {
+    let policy_id = rule_match.policy_id.expect("required");
+    
+    let cedar_request = CedarRequest {
+        principal,
+        resource: Resource::ToolCall {
+            name: tool_name.to_string(),
+            server: source_id.to_string(),
+            arguments: arguments.clone(),
+        },
+        context: CedarContext {
+            policy_id,
+            source_id: source_id.to_string(),
+            time: current_time_context(),
+        },
+    };
+    
+    match cedar_engine.evaluate(&cedar_request) {
+        CedarDecision::Permit => {
+            // Continue to Gate 4
+            GateResult::Approve {
+                workflow: rule_match.approval_workflow.unwrap_or("default".into()),
+                timeout: get_workflow_timeout(&rule_match.approval_workflow),
+            }
+        }
+        CedarDecision::Forbid { reason, .. } => {
+            GateResult::Deny {
+                code: -32003,
+                message: "Policy denied".into(),
+                source: DenySource::CedarPolicy,
+            }
+        }
+    }
+}
+```
+
+- **F-005.1:** Build CedarRequest with tool arguments
+- **F-005.2:** Pass `policy_id` from YAML rule
+- **F-005.3:** Cedar Permit → continue to approval
+- **F-005.4:** Cedar Forbid → deny immediately
+
+### F-006: Gate 4 - Approval Workflow
+
+Invoked when `action: approve` or Cedar permits:
+
+```rust
+async fn execute_approval(
+    request: &McpRequest,
+    workflow: &str,
+    timeout: Duration,
+) -> Result<McpResponse, ThoughtGateError> {
+    let workflow_config = config.approval.get(workflow)
+        .ok_or(ConfigError::UndefinedWorkflow)?;
+    
+    // v0.2: Blocking mode
+    let decision = approval_engine
+        .request_and_wait(request, workflow_config, timeout)
+        .await?;
+    
+    match decision {
+        ApprovalDecision::Approved { by } => {
+            // Forward to upstream
+            upstream.forward(request).await
+        }
+        ApprovalDecision::Rejected { by, reason } => {
+            Err(ThoughtGateError::ApprovalRejected { tool: request.tool_name() })
+        }
+        ApprovalDecision::Timeout => {
+            match workflow_config.on_timeout {
+                TimeoutAction::Deny => {
+                    Err(ThoughtGateError::ApprovalTimeout { .. })
+                }
+                // v0.3+: Escalate, AutoApprove
+            }
+        }
+    }
+}
+```
+
+- **F-006.1:** Load workflow config from YAML
+- **F-006.2:** Block until approval decision (v0.2)
+- **F-006.3:** On approve → forward to upstream
+- **F-006.4:** On reject → return error
+- **F-006.5:** On timeout → execute `on_timeout` action
+
+### F-007: Upstream Forwarding
+
+- **F-007.1:** Maintain connection pool to upstream MCP server
+- **F-007.2:** Forward requests with original headers (minus hop-by-hop)
+- **F-007.3:** Apply configurable timeout per request
+- **F-007.4:** Return upstream response to caller
+- **F-007.5:** Handle upstream connection failures (delegate to REQ-CORE-004)
+
+### F-008: Response Correlation
+
+- **F-008.1:** Track in-flight requests by correlation ID
+- **F-008.2:** Match responses to original requests
+- **F-008.3:** Handle response timeout (delegate to REQ-CORE-004)
+- **F-008.4:** Support concurrent requests to same upstream
+
+### F-009: SEP-1686 Detection
+
+- **F-009.1:** Detect `task` field in request `params`
+- **F-009.2:** Extract `ttl` from task metadata
+- **F-009.3:** Flag request as task-augmented for downstream processing
+- **F-009.4:** Validate task metadata structure
+
+### F-010: SSE Streaming
+
+- **F-010.1:** Support SSE for server-to-client notifications
+- **F-010.2:** Forward upstream SSE events to client
+- **F-010.3:** Inject ThoughtGate notifications (e.g., `notifications/tasks/status`)
+- **F-010.4:** Handle client disconnect (close upstream connection)
+
+## 8. Complete Request Flow Example
+
+```rust
+async fn handle_tools_call(request: McpRequest) -> Result<McpResponse, Error> {
+    let tool_name = request.tool_name();
+    let arguments = request.arguments();
+    let source_id = config.sources[0].id();  // v0.2: single source
+    let principal = infer_principal()?;
+    
+    // ═══════════════════════════════════════════════════════════
+    // GATE 1: Visibility
+    // ═══════════════════════════════════════════════════════════
+    let source = &config.sources[0];
+    if !check_visibility(&tool_name, source) {
+        return Err(ThoughtGateError::ToolNotExposed { tool: tool_name });
+    }
+    
+    // ═══════════════════════════════════════════════════════════
+    // GATE 2: Governance Rules
+    // ═══════════════════════════════════════════════════════════
+    let rule_match = evaluate_governance(&tool_name, source_id);
+    
+    match rule_match.action {
+        Action::Forward => {
+            // Skip gates 3 & 4, forward immediately
+            return upstream.forward(&request).await;
+        }
+        Action::Deny => {
+            return Err(ThoughtGateError::GovernanceRuleDenied { 
+                tool: tool_name,
+                rule: rule_match.pattern,
+            });
+        }
+        Action::Approve => {
+            // Skip gate 3, go to gate 4
+            let workflow = rule_match.approval_workflow.unwrap_or("default".into());
+            let timeout = get_workflow_timeout(&workflow);
+            return execute_approval(&request, &workflow, timeout).await;
+        }
+        Action::Policy => {
+            // Continue to gate 3
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════
+    // GATE 3: Cedar Policy
+    // ═══════════════════════════════════════════════════════════
+    let policy_id = rule_match.policy_id.expect("required for action: policy");
+    
+    let cedar_request = CedarRequest {
+        principal: principal.clone(),
+        resource: Resource::ToolCall {
+            name: tool_name.clone(),
+            server: source_id.to_string(),
+            arguments: arguments.clone(),
+        },
+        context: CedarContext {
+            policy_id: policy_id.clone(),
+            source_id: source_id.to_string(),
+            time: current_time_context(),
+        },
+    };
+    
+    match cedar_engine.evaluate(&cedar_request) {
+        CedarDecision::Forbid { reason, .. } => {
+            return Err(ThoughtGateError::PolicyDenied { 
+                tool: tool_name,
+                reason,
+            });
+        }
+        CedarDecision::Permit => {
+            // Continue to gate 4
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════
+    // GATE 4: Approval Workflow
+    // ═══════════════════════════════════════════════════════════
+    let workflow = rule_match.approval_workflow.unwrap_or("default".into());
+    let timeout = get_workflow_timeout(&workflow);
+    
+    execute_approval(&request, &workflow, timeout).await
+}
+```
+
+## 9. Non-Functional Requirements
 
 ### NFR-001: Observability
 
 **Metrics:**
 ```
-mcp_requests_total{method="tools/call|tasks/get|...", status="success|error"}
-mcp_request_duration_seconds{method="...", quantile="0.5|0.9|0.99"}
-mcp_upstream_requests_total{status="success|error|timeout"}
-mcp_upstream_duration_seconds{quantile="..."}
+mcp_requests_total{method, status, gate}
+mcp_request_duration_seconds{method, quantile}
+mcp_gate_evaluations_total{gate, result}
+mcp_upstream_requests_total{status}
+mcp_upstream_duration_seconds{quantile}
 mcp_connections_active
-mcp_batch_size_histogram
-
-# v0.1 Blocking Approval Metrics
-thoughtgate_blocking_approval_total{result="approved|rejected|timeout|client_disconnected"}
-thoughtgate_blocking_approval_duration_seconds{quantile="..."}
-thoughtgate_zombie_execution_prevented_total  # Critical safety metric
+thoughtgate_blocking_approval_total{result}
+thoughtgate_blocking_approval_duration_seconds{quantile}
 ```
 
 **Logging:**
 ```json
 {
   "level": "info",
-  "message": "MCP request received",
+  "message": "Request completed",
   "correlation_id": "uuid",
   "method": "tools/call",
-  "has_task_metadata": true,
-  "client_ip": "..."
+  "tool": "delete_user",
+  "gates": {
+    "visibility": "pass",
+    "governance": { "action": "policy", "rule": "delete_*" },
+    "cedar": { "decision": "permit", "policy_id": "deletion_policy" },
+    "approval": { "decision": "approved", "workflow": "default" }
+  },
+  "duration_ms": 1523
 }
 ```
-
-**Tracing:**
-- Span: `mcp.request` with attributes: `method`, `correlation_id`, `task_augmented`
-- Child span: `mcp.upstream` for forwarded requests
 
 ### NFR-002: Performance
 
 | Metric | Target |
 |--------|--------|
 | Parse latency (P99) | < 1ms |
-| Routing latency (P99) | < 0.5ms |
+| Gate 1-2 evaluation (P99) | < 0.5ms |
+| Gate 3 (Cedar) (P99) | < 1ms |
+| Total routing latency (P99) | < 3ms |
 | Max concurrent requests | 10,000 |
 | Memory per request | < 64KB average |
 
@@ -492,146 +654,45 @@ thoughtgate_zombie_execution_prevented_total  # Critical safety metric
 - **Connection pooling:** Reuse upstream connections
 - **Backpressure:** Reject new requests when at max concurrency (503)
 - **Timeout handling:** Fail fast on slow upstreams
+- **Config reload:** No request drops during hot-reload
 
-## 9. Verification Plan
+## 10. Testing Requirements
 
-### 9.1 Edge Case Matrix
+### 10.1 Unit Tests
 
-| Scenario | Expected Behavior | Test ID |
-|----------|-------------------|---------|
-| Valid JSON-RPC request | Parse, route, respond | EC-MCP-001 |
-| Malformed JSON | Return -32700 | EC-MCP-002 |
-| Invalid JSON-RPC (missing jsonrpc field) | Return -32600 | EC-MCP-003 |
-| Notification (no id) | Process, no response | EC-MCP-004 |
-| Batch request | Process all, return array | EC-MCP-005 |
-| Empty batch | Return -32600 | EC-MCP-006 |
-| Unknown method | Forward to upstream | EC-MCP-007 |
-| Task-augmented request | Detect metadata, flag request | EC-MCP-008 |
-| Upstream timeout | Return timeout error | EC-MCP-009 |
-| Upstream connection refused | Return connection error | EC-MCP-010 |
-| Max concurrency reached | Return 503 | EC-MCP-011 |
-| Client disconnects mid-request | Cancel upstream, cleanup | EC-MCP-012 |
-| Integer request ID | Preserve type in response | EC-MCP-013 |
-| String request ID | Preserve type in response | EC-MCP-014 |
-| SSE stream from upstream | Forward events to client | EC-MCP-015 |
+| Test | Description |
+|------|-------------|
+| `test_gate1_visibility_all` | All tools visible by default |
+| `test_gate1_visibility_allowlist` | Only allowlisted tools visible |
+| `test_gate1_visibility_blocklist` | Blocklisted tools hidden |
+| `test_gate2_rule_matching` | First matching rule wins |
+| `test_gate2_source_filter` | Source filter works |
+| `test_gate2_default_action` | Falls through to default |
+| `test_gate3_cedar_permit` | Cedar permit continues flow |
+| `test_gate3_cedar_forbid` | Cedar forbid denies |
+| `test_gate4_approval_approved` | Approval forwards request |
+| `test_gate4_approval_rejected` | Rejection returns error |
+| `test_gate4_approval_timeout` | Timeout follows on_timeout |
 
-### 9.2 Assertions
+### 10.2 Integration Tests
 
-**Unit Tests:**
-- `test_parse_valid_jsonrpc` — Verify parsing of well-formed requests
-- `test_parse_batch_request` — Verify batch handling
-- `test_detect_task_metadata` — Verify SEP-1686 detection
-- `test_route_tools_call` — Verify routing to policy engine
-- `test_route_tasks_get` — Verify routing to task handler
-- `test_preserve_id_type` — Verify ID type preservation
+| Test | Description |
+|------|-------------|
+| `test_full_forward_flow` | action: forward → upstream |
+| `test_full_deny_flow` | action: deny → error |
+| `test_full_approve_flow` | action: approve → approval → upstream |
+| `test_full_policy_permit_flow` | action: policy → permit → approval → upstream |
+| `test_full_policy_forbid_flow` | action: policy → forbid → error |
+| `test_config_hot_reload` | Config changes apply without restart |
 
-**Integration Tests:**
-- `test_end_to_end_forward` — Request flows through to upstream
-- `test_concurrent_requests` — Multiple requests handled correctly
-- `test_upstream_timeout` — Timeout triggers error response
-- `test_sse_forwarding` — SSE events reach client
+## 11. Error Codes
 
-**Load Tests:**
-- `bench_parse_throughput` — Target: 100,000 req/s parse rate
-- `bench_concurrent_connections` — 10,000 concurrent connections
+| Code | Name | Gate | Description |
+|------|------|------|-------------|
+| -32601 | Method not found | 1 | Tool not exposed |
+| -32003 | Policy Denied | 3 | Cedar forbid |
+| -32007 | Approval Rejected | 4 | Human rejected |
+| -32008 | Approval Timeout | 4 | Timeout reached |
+| -32014 | Governance Rule Denied | 2 | action: deny matched |
 
-## 10. Implementation Reference
-
-### Request Handler Pattern
-
-```rust
-async fn handle_mcp_request(
-    State(app): State<AppState>,
-    Json(payload): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    // 1. Parse JSON-RPC
-    let requests = match parse_jsonrpc(&payload) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    
-    // 2. Route each request
-    let mut responses = Vec::new();
-    for request in requests {
-        let response = match route_request(&app, request).await {
-            RouteTarget::PolicyEvaluation { request } => {
-                app.policy_engine.evaluate_and_execute(request).await
-            }
-            RouteTarget::TaskHandler { method, request } => {
-                app.task_manager.handle(method, request).await
-            }
-            RouteTarget::PassThrough { request } => {
-                app.upstream.forward(request).await
-            }
-        };
-        
-        // Only add response if request had an ID (not a notification)
-        if request.id.is_some() {
-            responses.push(response);
-        }
-    }
-    
-    // 3. Return response(s)
-    match responses.len() {
-        0 => StatusCode::NO_CONTENT.into_response(),
-        1 => Json(responses.remove(0)).into_response(),
-        _ => Json(responses).into_response(),
-    }
-}
-```
-
-### Upstream Client Pattern
-
-```rust
-pub struct UpstreamClient {
-    client: reqwest::Client,
-    base_url: Url,
-    timeout: Duration,
-}
-
-impl UpstreamClient {
-    pub async fn forward(&self, request: McpRequest) -> Result<JsonRpcResponse, UpstreamError> {
-        let response = self.client
-            .post(self.base_url.clone())
-            .json(&request.to_jsonrpc())
-            .timeout(self.timeout)
-            .send()
-            .await
-            .map_err(|e| self.classify_error(e))?;
-        
-        let body = response.json().await?;
-        Ok(body)
-    }
-    
-    fn classify_error(&self, error: reqwest::Error) -> UpstreamError {
-        if error.is_timeout() {
-            UpstreamError::Timeout
-        } else if error.is_connect() {
-            UpstreamError::ConnectionFailed
-        } else {
-            UpstreamError::Unknown(error.to_string())
-        }
-    }
-}
-```
-
-### Anti-Patterns to Avoid
-
-- **❌ Blocking JSON parsing:** Use async-aware parsing, don't block runtime
-- **❌ Unbounded request queues:** Enforce max concurrency with semaphore
-- **❌ ID type coercion:** Don't convert integer IDs to strings or vice versa
-- **❌ Swallowing notifications:** Notifications don't get responses, but still process them
-- **❌ Single upstream connection:** Use connection pooling for throughput
-
-## 11. Definition of Done
-
-- [ ] JSON-RPC 2.0 parser implemented (requests, notifications, batches)
-- [ ] Method router implemented with correct routing table
-- [ ] SEP-1686 task metadata detection working
-- [ ] Upstream client with connection pooling
-- [ ] SSE streaming support for notifications
-- [ ] Request/response correlation working
-- [ ] Concurrency limit enforced
-- [ ] All edge cases (EC-MCP-001 to EC-MCP-015) covered by tests
-- [ ] Metrics and logging implemented
-- [ ] Performance targets met (parse < 1ms P99)
+See REQ-CORE-004 for complete error handling specification.

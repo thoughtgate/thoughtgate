@@ -7,25 +7,45 @@
 | **Type** | Governance Component |
 | **Status** | Draft |
 | **Priority** | **High** |
-| **Tags** | `#governance` `#approval` `#polling` `#slack` `#integration` |
+| **Tags** | `#governance` `#approval` `#polling` `#slack` `#integration` `#gate4` |
 
 ## 1. Context & Decision Rationale
 
-This requirement defines how ThoughtGate integrates with external approval systems.
+This requirement defines how ThoughtGate integrates with external approval systems. It implements **Gate 4** of the request decision flow.
 
-### 1.1 The Sidecar Networking Challenge
+### 1.1 Gate 4 in the Decision Flow
+
+```
+  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+  │   GATE 1    │    │   GATE 2    │    │   GATE 3    │    │   GATE 4    │
+  │ Visibility  │ → │ Governance  │ → │   Cedar     │ → │  Approval   │
+  │  (expose)   │    │   (YAML)    │    │  (policy)   │    │  (this REQ) │
+  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+                           │                  │                  │
+                           │                  │                  │
+                     action: approve ─────────┼──────────────────►│
+                                              │                  │
+                     action: policy ──────────│                  │
+                           │          Cedar Permit ──────────────►│
+```
+
+Gate 4 is invoked when:
+- YAML governance rule has `action: approve`, OR
+- YAML rule has `action: policy` AND Cedar returns Permit
+
+### 1.2 The Sidecar Networking Challenge
 
 ThoughtGate runs as a **sidecar** inside a Kubernetes pod. This creates a fundamental networking constraint:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────────────────────────────────┐
 │                    THE CALLBACK PROBLEM                                         │
 │                                                                                 │
 │   ❌ CALLBACK MODEL (Doesn't work for sidecars)                                │
 │                                                                                 │
-│   Pod 1: 10.0.0.1 ──webhook──▶ Slack ──callback──▶ ??? (which pod?)            │
-│   Pod 2: 10.0.0.2 ──webhook──▶ Slack ──callback──▶ ???                         │
-│   Pod 3: 10.0.0.3 ──webhook──▶ Slack ──callback──▶ ???                         │
+│   Pod 1: 10.0.0.1 ──webhook──► Slack ──callback──► ??? (which pod?)            │
+│   Pod 2: 10.0.0.2 ──webhook──► Slack ──callback──► ???                         │
+│   Pod 3: 10.0.0.3 ──webhook──► Slack ──callback──► ???                         │
 │                                                                                 │
 │   Problem: Slack has no way to route callback to correct sidecar               │
 │   Sidecars are not individually addressable from external systems              │
@@ -34,47 +54,52 @@ ThoughtGate runs as a **sidecar** inside a Kubernetes pod. This creates a fundam
 │                                                                                 │
 │   ✅ POLLING MODEL (Sidecar-compatible)                                        │
 │                                                                                 │
-│   Pod 1: 10.0.0.1 ──post message──▶ Slack ◀──poll for reactions── Pod 1       │
-│   Pod 2: 10.0.0.2 ──post message──▶ Slack ◀──poll for reactions── Pod 2       │
-│   Pod 3: 10.0.0.3 ──post message──▶ Slack ◀──poll for reactions── Pod 3       │
+│   Pod 1: 10.0.0.1 ──post message──► Slack ◄───poll for reactions── Pod 1       │
+│   Pod 2: 10.0.0.2 ──post message──► Slack ◄───poll for reactions── Pod 2       │
+│   Pod 3: 10.0.0.3 ──post message──► Slack ◄───poll for reactions── Pod 3       │
 │                                                                                 │
 │   Solution: Each sidecar polls for its own task's approval decision           │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 Design Philosophy
+### 1.3 Design Philosophy
 
 - ThoughtGate posts approval requests to Slack (outbound only)
 - ThoughtGate polls Slack API for decisions (no inbound callbacks)
 - Each sidecar is self-sufficient (no central coordinator needed)
 - Adapters encapsulate polling logic for different systems
+- **Workflow configuration loaded from YAML config** (REQ-CFG-001)
 
 **Future Extensibility:**
-This architecture supports A2A (Agent-to-Agent) approval in future versions—an approval agent monitors a channel and responds via reactions or replies.
+This architecture supports A2A (Agent-to-Agent) approval in v0.3+—an approval agent monitors a channel and responds via reactions or replies.
 
 ## 2. Dependencies
 
 | Requirement | Relationship | Notes |
 |-------------|--------------|-------|
+| REQ-CFG-001 | **Receives from** | Workflow configuration (`approval.*`) |
 | REQ-GOV-001 | **Updates** | Task state on approval decision |
 | REQ-GOV-002 | **Triggers** | Execution pipeline on approval |
+| REQ-CORE-003 | **Invoked by** | Gate 4 of decision flow |
 | REQ-CORE-004 | **Uses** | Error responses for failures |
-| REQ-CORE-005 | **Coordinates** | Shutdown stops polling tasks |
+| REQ-CORE-005 | **Coordinates with** | Shutdown stops polling tasks |
 
 ## 3. Intent
 
 The system must:
-1. Post approval requests to external systems (Slack)
-2. Poll external systems for approval decisions
-3. Detect approval via reactions, button clicks, or replies
-4. Update task state when decision is detected
-5. Provide a Slack adapter as reference implementation
-6. Support polling multiple tasks concurrently
+1. Load approval workflow configuration from YAML config
+2. Post approval requests to external systems (Slack)
+3. Poll external systems for approval decisions
+4. Detect approval via reactions, button clicks, or replies
+5. Update task state when decision is detected
+6. Provide a Slack adapter as reference implementation
+7. Support polling multiple tasks concurrently
 
 ## 4. Scope
 
-### 4.1 In Scope
+### 4.1 In Scope (v0.2)
+- Load workflow config from YAML (`approval.*`)
 - Outbound message posting to Slack
 - Polling Slack API for decisions
 - Reaction-based approval detection (👍 = approve, 👎 = reject)
@@ -82,18 +107,126 @@ The system must:
 - Polling backoff and rate limiting
 - Adapter interface for extensibility
 - Approval metrics and logging
+- `on_timeout` behavior from config
 
-### 4.2 Out of Scope
+### 4.2 In Scope (v0.3+)
+- A2A approval adapter
+- Approval chains (sequential approvers)
+- Webhook destination with callback
+- External approval service integration
+
+### 4.3 Out of Scope
 - Inbound webhook/callback endpoints (not needed for polling model)
 - Building custom approval UIs
 - Teams adapter (future version)
 - PagerDuty adapter (future version)
-- A2A approval adapter (future version)
-- Approval batching (future version)
 
 ## 5. Constraints
 
-### 5.1 Configuration
+### 5.1 Configuration (from YAML)
+
+Approval workflows are defined in YAML config (REQ-CFG-001):
+
+```yaml
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+      mention:
+        - "@oncall"
+    timeout: 10m
+    on_timeout: deny
+
+  finance:
+    destination:
+      type: slack
+      channel: "#finance-approvals"
+      token_env: SLACK_FINANCE_BOT_TOKEN  # Different bot for finance
+    timeout: 30m
+    on_timeout: deny
+```
+
+**Workflow Selection:**
+The workflow name comes from the YAML governance rule's `approval:` field:
+
+```yaml
+governance:
+  rules:
+    - match: "delete_*"
+      action: approve
+      approval: default     # Uses approval.default config
+
+    - match: "transfer_*"
+      action: policy
+      policy_id: "financial"
+      approval: finance     # Uses approval.finance config if Cedar permits
+```
+
+### 5.2 Workflow Configuration Schema
+
+```rust
+/// Loaded from YAML approval.* config
+#[derive(Debug, Deserialize)]
+pub struct HumanWorkflow {
+    pub destination: ApprovalDestination,
+    pub timeout: Option<Duration>,      // Default: 10m
+    pub on_timeout: Option<TimeoutAction>,  // Default: deny
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum ApprovalDestination {
+    #[serde(rename = "slack")]
+    Slack {
+        channel: String,
+        #[serde(default)]
+        token_env: Option<String>,  // Env var name for bot token
+        #[serde(default)]
+        mention: Option<Vec<String>>,
+    },
+    
+    #[serde(rename = "webhook")]
+    Webhook {
+        url: String,
+        #[serde(default)]
+        auth: Option<WebhookAuth>,
+    },
+    
+    #[serde(rename = "cli")]
+    Cli,  // For local development
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutAction {
+    #[default]
+    Deny,
+    // v0.3+: Escalate, AutoApprove
+}
+```
+
+### 5.3 Slack Configuration
+
+Slack bot token is loaded from environment variable specified in config:
+
+| Config Field | Default Env Var | Notes |
+|--------------|-----------------|-------|
+| `token_env` | `SLACK_BOT_TOKEN` | Env var containing bot token |
+| `channel` | (required) | Channel name or ID |
+| `mention` | (optional) | Users/groups to @mention |
+
+**Example:**
+```yaml
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+      token_env: SLACK_BOT_TOKEN  # Reads from $SLACK_BOT_TOKEN
+```
+
+### 5.4 Polling Configuration
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
@@ -102,18 +235,14 @@ The system must:
 | Slack API rate limit | 1/sec | `THOUGHTGATE_SLACK_RATE_LIMIT_PER_SEC` |
 | Max concurrent polls | 100 | `THOUGHTGATE_MAX_CONCURRENT_POLLS` |
 
-### 5.2 Slack Configuration
+### 5.5 Reaction Configuration
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
-| Bot token | (required) | `SLACK_BOT_TOKEN` |
-| Default channel | `#approvals` | `SLACK_CHANNEL` |
 | Approve reaction | `+1` (👍) | `SLACK_APPROVE_REACTION` |
 | Reject reaction | `-1` (👎) | `SLACK_REJECT_REACTION` |
 
-**Note:** Unlike the callback model, polling requires a **Bot Token** (not just a webhook URL) to read messages and reactions via Slack API.
-
-### 5.3 Rate Limiting (CRITICAL)
+### 5.6 Rate Limiting (CRITICAL)
 
 **⚠️ Slack API Protection**
 
@@ -126,22 +255,8 @@ Slack API has strict rate limits (~1 request/second for most endpoints). With ma
 | Concurrent polls | 100 tasks | Oldest tasks polled first |
 | Backoff | Exponential | 5s → 10s → 20s → 30s max |
 
-**⚠️ Batch Polling Efficiency (IMPORTANT)**
+**Batch Polling Efficiency:**
 
-**Naive approach (O(n) API calls):**
-```
-For each pending task:
-    Call reactions.get(channel, ts)  // One API call per task!
-```
-With 20 pending tasks, this makes 20 API calls per poll cycle → hits rate limit immediately.
-
-**Efficient approach (O(1) API calls):**
-```
-Call conversations.history(channel, limit=100)  // One API call for ALL tasks
-Parse response to check reactions on all pending messages
-```
-
-**Recommended Implementation:**
 ```rust
 impl SlackAdapter {
     /// Efficient batch poll using conversations.history
@@ -167,11 +282,9 @@ impl SlackAdapter {
         let mut results = HashMap::new();
         for task_ref in pending_tasks {
             if let Some(msg) = messages.get(task_ref.external_id.as_str()) {
-                // Check reactions on this message
                 let decision = self.check_reactions(&msg.reactions);
                 results.insert(task_ref.task_id.clone(), decision);
             } else {
-                // Message not in recent history (old or deleted)
                 results.insert(task_ref.task_id.clone(), None);
             }
         }
@@ -181,92 +294,59 @@ impl SlackAdapter {
 }
 ```
 
-**Complexity Comparison:**
-| Approach | API Calls per Cycle | With 20 Tasks | With 100 Tasks |
-|----------|---------------------|---------------|----------------|
-| Per-task `reactions.get` | O(n) | 20 calls | 100 calls |
-| Batch `conversations.history` | O(1) | 1 call | 1 call |
-
-**Implementation:**
-```rust
-pub struct PollingScheduler {
-    rate_limiter: RateLimiter,          // Token bucket, 1/sec
-    pending_tasks: BTreeMap<Instant, TaskId>,  // Ordered by next poll time
-    max_concurrent: usize,
-}
-```
-
-### 5.4 Security Requirements
+### 5.7 Security Requirements
 
 - Bot token MUST NOT be logged
 - Slack API calls MUST use HTTPS
 - User identity from Slack is trusted (Slack authenticates users)
+- Token loaded from environment variable, never from config file directly
 
 ## 6. Interfaces
 
-### 6.1 Approval Message (ThoughtGate → Slack)
+### 6.1 Workflow Loading
 
-```
-POST https://slack.com/api/chat.postMessage
-Authorization: Bearer {bot_token}
-Content-Type: application/json
+```rust
+/// Load workflow configuration from YAML config
+pub fn load_workflow(
+    config: &Config,
+    workflow_name: &str,
+) -> Result<&HumanWorkflow, ApprovalError> {
+    config.approval
+        .as_ref()
+        .ok_or(ApprovalError::NoApprovalConfig)?
+        .get(workflow_name)
+        .ok_or(ApprovalError::WorkflowNotFound { 
+            name: workflow_name.to_string() 
+        })
+}
 
-{
-  "channel": "#approvals",
-  "blocks": [...],  // Block Kit message
-  "metadata": {
-    "event_type": "thoughtgate_approval",
-    "event_payload": {
-      "task_id": "550e8400-e29b-41d4-a716-446655440000"
+/// Create adapter from workflow configuration
+pub fn create_adapter(
+    workflow: &HumanWorkflow,
+) -> Result<Box<dyn ApprovalAdapter>, ApprovalError> {
+    match &workflow.destination {
+        ApprovalDestination::Slack { channel, token_env, mention } => {
+            let token_var = token_env.as_deref().unwrap_or("SLACK_BOT_TOKEN");
+            let token = std::env::var(token_var)
+                .map_err(|_| ApprovalError::MissingToken { var: token_var.to_string() })?;
+            
+            Ok(Box::new(SlackAdapter::new(
+                token,
+                channel.clone(),
+                mention.clone(),
+            )))
+        }
+        ApprovalDestination::Webhook { url, auth } => {
+            Ok(Box::new(WebhookAdapter::new(url.clone(), auth.clone())))
+        }
+        ApprovalDestination::Cli => {
+            Ok(Box::new(CliAdapter::new()))
+        }
     }
-  }
 }
 ```
 
-**Response:**
-```json
-{
-  "ok": true,
-  "channel": "C1234567890",
-  "ts": "1234567890.123456",
-  "message": {...}
-}
-```
-
-The `channel` and `ts` (timestamp) are stored to poll for reactions/replies.
-
-### 6.2 Poll for Reactions (ThoughtGate ← Slack)
-
-```
-GET https://slack.com/api/reactions.get
-  ?channel=C1234567890
-  &timestamp=1234567890.123456
-Authorization: Bearer {bot_token}
-```
-
-**Response:**
-```json
-{
-  "ok": true,
-  "message": {
-    "reactions": [
-      {"name": "+1", "users": ["U1234567"], "count": 1},
-      {"name": "eyes", "users": ["U7654321"], "count": 1}
-    ]
-  }
-}
-```
-
-### 6.3 Poll for Replies (Alternative)
-
-```
-GET https://slack.com/api/conversations.replies
-  ?channel=C1234567890
-  &ts=1234567890.123456
-Authorization: Bearer {bot_token}
-```
-
-### 6.4 Adapter Interface
+### 6.2 Adapter Interface
 
 ```rust
 #[async_trait]
@@ -303,9 +383,9 @@ pub struct ApprovalRequest {
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub correlation_id: String,
+    pub workflow_name: String,  // For logging/audit
 }
 
-/// Reference to posted approval message for polling
 pub struct ApprovalReference {
     pub task_id: TaskId,
     pub external_id: String,      // e.g., Slack message_ts
@@ -333,9 +413,81 @@ pub enum DecisionMethod {
 }
 ```
 
-### 6.5 Errors
+### 6.3 Approval Engine Interface
 
 ```rust
+/// Main approval engine used by Gate 4
+pub struct ApprovalEngine {
+    config: Arc<ArcSwap<Config>>,
+    adapters: HashMap<String, Box<dyn ApprovalAdapter>>,
+    polling_scheduler: PollingScheduler,
+}
+
+impl ApprovalEngine {
+    /// Request approval and block until decision (v0.2 blocking mode)
+    pub async fn request_and_wait(
+        &self,
+        request: &McpRequest,
+        workflow_name: &str,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        let config = self.config.load();
+        let workflow = load_workflow(&config, workflow_name)?;
+        let adapter = self.get_or_create_adapter(workflow_name, workflow)?;
+        
+        let timeout = workflow.timeout.unwrap_or(Duration::from_secs(600));
+        let on_timeout = workflow.on_timeout.clone().unwrap_or_default();
+        
+        // Post approval request
+        let approval_request = ApprovalRequest {
+            task_id: TaskId::new(),
+            tool_name: request.tool_name().to_string(),
+            tool_arguments: request.arguments().clone(),
+            principal: request.principal.clone(),
+            expires_at: Utc::now() + chrono::Duration::from_std(timeout).unwrap(),
+            created_at: Utc::now(),
+            correlation_id: request.correlation_id.to_string(),
+            workflow_name: workflow_name.to_string(),
+        };
+        
+        let reference = adapter.post_approval_request(&approval_request).await?;
+        
+        // Poll until decision or timeout
+        let deadline = Instant::now() + timeout;
+        let mut poll_interval = Duration::from_secs(5);
+        
+        loop {
+            if Instant::now() >= deadline {
+                return match on_timeout {
+                    TimeoutAction::Deny => Err(ApprovalError::Timeout),
+                    // v0.3+: Handle escalate, auto-approve
+                };
+            }
+            
+            tokio::time::sleep(poll_interval).await;
+            
+            if let Some(decision) = adapter.poll_for_decision(&reference).await? {
+                return Ok(decision);
+            }
+            
+            // Exponential backoff
+            poll_interval = (poll_interval * 2).min(Duration::from_secs(30));
+        }
+    }
+}
+```
+
+### 6.4 Errors
+
+```rust
+pub enum ApprovalError {
+    NoApprovalConfig,
+    WorkflowNotFound { name: String },
+    MissingToken { var: String },
+    Timeout,
+    Rejected { by: String, reason: Option<String> },
+    AdapterError(AdapterError),
+}
+
 pub enum AdapterError {
     PostFailed { reason: String, retriable: bool },
     PollFailed { reason: String, retriable: bool },
@@ -348,79 +500,68 @@ pub enum AdapterError {
 
 ## 7. Functional Requirements
 
-### F-001: Approval Request Posting
+### F-001: Workflow Loading
+
+- **F-001.1:** Load workflow config from YAML `approval.*` section
+- **F-001.2:** Fall back to `default` workflow if not specified
+- **F-001.3:** Error if workflow not found in config
+- **F-001.4:** Hot-reload workflow config without restart
+- **F-001.5:** Validate workflow config at load time
+
+### F-002: Adapter Selection
+
+- **F-002.1:** Create adapter based on `destination.type`
+- **F-002.2:** Load bot token from env var specified in `token_env`
+- **F-002.3:** Cache adapters per workflow (reuse connections)
+- **F-002.4:** Support multiple adapters for different workflows
+
+### F-003: Approval Request Posting
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────────────────────────────────┐
 │                     APPROVAL REQUEST FLOW                                       │
 │                                                                                 │
-│   Task Created (InputRequired)                                                  │
+│   Gate 4 Invoked (from REQ-CORE-003)                                           │
 │         │                                                                       │
 │         ▼                                                                       │
 │   ┌─────────────────────────────────────────────────────────────────────────┐  │
-│   │  1. Build Slack Block Kit message                                       │  │
-│   │  2. Rate limit check (wait if needed)                                   │  │
-│   │  3. POST to chat.postMessage                                            │  │
-│   │  4. Store channel + ts in ApprovalReference                             │  │
-│   │  5. Schedule first poll (after poll_interval)                           │  │
+│   │  1. Load workflow config from YAML                                      │  │
+│   │  2. Create/get adapter for destination                                  │  │
+│   │  3. Build Slack Block Kit message                                       │  │
+│   │  4. Rate limit check (wait if needed)                                   │  │
+│   │  5. POST to chat.postMessage                                            │  │
+│   │  6. Store channel + ts in ApprovalReference                             │  │
+│   │  7. Start polling loop                                                  │  │
 │   └─────────────────────────────────────────────────────────────────────────┘  │
 │         │                                                                       │
 │         ▼                                                                       │
-│   Polling Scheduled                                                             │
+│   Poll until decision or timeout                                               │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **F-001.1:** Build Block Kit message from task data
-- **F-001.2:** Include task ID in message metadata
-- **F-001.3:** Apply rate limiting before API call
-- **F-001.4:** Store message reference (channel, ts) in task
-- **F-001.5:** Schedule polling task
-- **F-001.6:** Handle posting failures with retry
+- **F-003.1:** Build Block Kit message from request data
+- **F-003.2:** Include @mentions from workflow config
+- **F-003.3:** Include task ID in message metadata
+- **F-003.4:** Apply rate limiting before API call
+- **F-003.5:** Store message reference for polling
+- **F-003.6:** Handle posting failures with retry
 
-### F-002: Polling Scheduler
+### F-004: Polling Loop
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     POLLING SCHEDULER                                           │
-│                                                                                 │
-│   ┌─────────────────────────────────────────────────────────────────────────┐  │
-│   │                    Polling Loop (background task)                       │  │
-│   │                                                                         │  │
-│   │   while !shutdown:                                                      │  │
-│   │     1. Get next task due for polling (ordered by next_poll_at)         │  │
-│   │     2. Wait until next_poll_at or new task arrives                     │  │
-│   │     3. Rate limit check                                                 │  │
-│   │     4. Poll adapter for decision                                        │  │
-│   │     5. If decision found:                                               │  │
-│   │        - Update task state                                              │  │
-│   │        - Trigger execution pipeline (if approved)                       │  │
-│   │        - Remove from polling queue                                      │  │
-│   │     6. If still pending:                                                │  │
-│   │        - Backoff: next_poll_at = now + interval * backoff_factor       │  │
-│   │        - Re-queue for next poll                                         │  │
-│   │     7. If task expired:                                                 │  │
-│   │        - Remove from polling queue                                      │  │
-│   │        - Task expiry handled by REQ-GOV-001                            │  │
-│   │                                                                         │  │
-│   └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+- **F-004.1:** Poll at configurable interval (default 5s)
+- **F-004.2:** Exponential backoff on repeated polls (5s → 10s → 20s → 30s)
+- **F-004.3:** Respect rate limits
+- **F-004.4:** Exit on timeout (from workflow config)
+- **F-004.5:** Return decision when detected
 
-- **F-002.1:** Maintain priority queue of tasks by next poll time
-- **F-002.2:** Respect rate limits across all polls
-- **F-002.3:** Exponential backoff on repeated polls (5s → 10s → 20s → 30s)
-- **F-002.4:** Remove expired tasks from queue
-- **F-002.5:** Handle shutdown gracefully (drain queue)
+### F-005: Decision Detection
 
-### F-003: Decision Detection
-
-- **F-003.1:** Check for approval reaction (👍 by default)
-- **F-003.2:** Check for rejection reaction (👎 by default)
-- **F-003.3:** If both reactions present, first one wins (by timestamp)
-- **F-003.4:** Extract user ID of reactor for audit
-- **F-003.5:** Look up user display name via Slack API (cached)
+- **F-005.1:** Check for approval reaction (👍 by default)
+- **F-005.2:** Check for rejection reaction (👎 by default)
+- **F-005.3:** If both reactions present, first one wins
+- **F-005.4:** Extract user ID of reactor for audit
+- **F-005.5:** Support reply-based decisions as fallback
 
 **Decision Priority:**
 | Check Order | Signal | Decision |
@@ -430,35 +571,23 @@ pub enum AdapterError {
 | 3 | Reply containing "approved" | Approved |
 | 4 | Reply containing "rejected" | Rejected |
 
-### F-004: Decision Processing
+### F-006: Timeout Handling
 
-- **F-004.1:** Verify task is still in InputRequired state
-- **F-004.2:** Build ApprovalRecord from decision
-- **F-004.3:** On approval: update task, trigger execution pipeline
-- **F-004.4:** On rejection: transition task to Rejected state
-- **F-004.5:** Update Slack message to show decision (edit message)
+- **F-006.1:** Read timeout from workflow config
+- **F-006.2:** Read `on_timeout` action from config
+- **F-006.3:** Execute `on_timeout` action when deadline reached
+- **F-006.4:** v0.2: Only `deny` supported
+- **F-006.5:** v0.3+: Support `escalate`, `auto_approve`
 
-### F-005: Approval Cancellation
+### F-007: Slack Message Format
 
-- **F-005.1:** Remove task from polling queue on cancellation
-- **F-005.2:** Optionally delete or update Slack message
-- **F-005.3:** Best-effort (don't fail if Slack update fails)
-
-### F-006: Slack Adapter Implementation
-
-- **F-006.1:** Use Slack Web API (not incoming webhooks)
-- **F-006.2:** Build Block Kit messages with clear formatting
-- **F-006.3:** Include reaction instructions in message
-- **F-006.4:** Cache user ID → display name mappings
-- **F-006.5:** Handle Slack API errors gracefully
-
-**Slack Message Format:**
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 🔒 Approval Required: delete_user                                           │
-├─────────────────────────────────────────────────────────────────────────────┤
+┌───────────────────────────────────────────────────────────────────────────┐
+│ 🔑 Approval Required: delete_user                                           │
+├───────────────────────────────────────────────────────────────────────────┤
 │ *Tool:* `delete_user`                                                       │
 │ *Principal:* production/agent-service                                       │
+│ *Workflow:* default                                                         │
 │                                                                             │
 │ *Arguments:*                                                                │
 │ ```                                                                         │
@@ -468,359 +597,172 @@ pub enum AdapterError {
 │ }                                                                           │
 │ ```                                                                         │
 │                                                                             │
-│ React with 👍 to *approve* or 👎 to *reject*                                │
+│ @oncall ← React with 👍 to *approve* or 👎 to *reject*                      │
 │                                                                             │
 │ Task ID: `abc-123` • Expires: 2025-01-08 11:30 UTC                         │
-└─────────────────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
-**After Approval:**
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ ✅ Approved: delete_user                                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ *Approved by:* @alice                                                       │
-│ *Approved at:* 2025-01-08 10:35 UTC                                        │
-│                                                                             │
-│ ... (original content) ...                                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
+## 8. Integration with Decision Flow
+
+```rust
+// In REQ-CORE-003 handle_tools_call()
+async fn execute_gate4(
+    request: &McpRequest,
+    workflow_name: &str,
+    config: &Config,
+) -> Result<McpResponse, ThoughtGateError> {
+    let approval_engine = get_approval_engine();
+    
+    // v0.2: Blocking mode
+    let decision = approval_engine
+        .request_and_wait(request, workflow_name)
+        .await?;
+    
+    match decision.decision {
+        Decision::Approved => {
+            info!(
+                task_id = %request.correlation_id,
+                approved_by = %decision.decided_by,
+                workflow = %workflow_name,
+                "Approval granted"
+            );
+            // Forward to upstream
+            upstream.forward(request).await
+        }
+        Decision::Rejected => {
+            Err(ThoughtGateError::ApprovalRejected {
+                tool: request.tool_name().to_string(),
+                rejected_by: Some(decision.decided_by),
+            })
+        }
+    }
+}
 ```
 
-## 8. Non-Functional Requirements
+## 9. Non-Functional Requirements
 
 ### NFR-001: Observability
 
 **Metrics:**
 ```
-thoughtgate_approval_posts_total{adapter="slack", status="success|failed"}
-thoughtgate_approval_polls_total{adapter="slack", result="pending|approved|rejected|expired|error"}
-thoughtgate_approval_decisions_total{adapter="slack", decision="approved|rejected", method="reaction|reply"}
-thoughtgate_approval_poll_latency_seconds{adapter="slack"}
-thoughtgate_approval_decision_latency_seconds{adapter="slack"}  // Time from post to decision
-thoughtgate_approval_polling_queue_size
+thoughtgate_approval_posts_total{adapter, workflow, status}
+thoughtgate_approval_polls_total{adapter, workflow, result}
+thoughtgate_approval_decisions_total{adapter, workflow, decision, method}
+thoughtgate_approval_poll_latency_seconds{adapter}
+thoughtgate_approval_decision_latency_seconds{adapter, workflow}
+thoughtgate_approval_timeout_total{workflow, on_timeout}
 ```
 
 **Logging:**
 ```json
-{"level":"info","event":"approval_posted","task_id":"abc-123","adapter":"slack","channel":"C123","ts":"1234.5678"}
+{"level":"info","event":"approval_requested","workflow":"default","task_id":"abc-123","tool":"delete_user"}
+{"level":"info","event":"approval_posted","workflow":"default","task_id":"abc-123","adapter":"slack","channel":"C123"}
 {"level":"debug","event":"approval_poll","task_id":"abc-123","poll_count":3,"result":"pending"}
-{"level":"info","event":"approval_decided","task_id":"abc-123","decision":"approved","decided_by":"alice","method":"reaction"}
-{"level":"warn","event":"poll_rate_limited","adapter":"slack","retry_after_ms":1000}
+{"level":"info","event":"approval_decided","workflow":"default","task_id":"abc-123","decision":"approved","decided_by":"alice"}
+{"level":"warn","event":"approval_timeout","workflow":"finance","task_id":"xyz-789","on_timeout":"deny"}
 ```
 
 ### NFR-002: Performance
 
 | Metric | Target |
 |--------|--------|
+| Workflow config lookup | < 1ms |
 | Message post latency | < 500ms (P99) |
 | Poll latency | < 200ms (P99) |
 | Decision detection | Within 2 poll cycles of reaction |
-| Memory per pending task | < 1KB |
 
 ### NFR-003: Reliability
 
 - Polling continues across transient Slack API failures
 - Exponential backoff prevents thundering herd
 - Rate limiting prevents API exhaustion
-- Graceful degradation if Slack is unavailable
+- Config hot-reload doesn't drop pending approvals
 
 ### NFR-004: Security
 
-- Bot token stored securely (K8s Secret)
-- Bot token never logged
-- User identity from Slack trusted
+- Bot token loaded from env var, never logged
+- Bot token never stored in config file
 - HTTPS for all Slack API calls
+- User identity from Slack trusted
 
-## 9. Verification Plan
+## 10. Testing Requirements
 
-### 9.1 Edge Case Matrix
+### 10.1 Unit Tests
 
-| Scenario | Expected Behavior | Test ID |
-|----------|-------------------|---------|
-| Message posted successfully | Reference stored, polling scheduled | EC-APR-001 |
-| Message post fails (retriable) | Retry with backoff | EC-APR-002 |
-| Message post fails (permanent) | Task marked failed | EC-APR-003 |
-| Poll finds 👍 reaction | Task approved, execution triggered | EC-APR-004 |
-| Poll finds 👎 reaction | Task rejected | EC-APR-005 |
-| Poll finds both reactions | First reaction wins | EC-APR-006 |
-| Poll finds no reactions | Re-queue with backoff | EC-APR-007 |
-| Task expires while polling | Remove from queue | EC-APR-008 |
-| Task cancelled while polling | Remove from queue, update message | EC-APR-009 |
-| Slack rate limited | Backoff, retry later | EC-APR-010 |
-| Slack API error | Log, retry with backoff | EC-APR-011 |
-| Bot token invalid | Log error, mark adapter unhealthy | EC-APR-012 |
-| Channel not found | Log error, fail task | EC-APR-013 |
-| 100 concurrent approvals | All polled within rate limits | EC-APR-014 |
-| Shutdown with pending polls | Graceful drain | EC-APR-015 |
-| User reacts then unreacts | No decision (reaction removed) | EC-APR-016 |
+| Test | Description |
+|------|-------------|
+| `test_workflow_loading` | Load workflow from config |
+| `test_workflow_not_found` | Error on missing workflow |
+| `test_default_workflow_fallback` | Fall back to default |
+| `test_adapter_creation_slack` | Create Slack adapter from config |
+| `test_adapter_creation_webhook` | Create webhook adapter from config |
+| `test_token_from_env` | Load token from configured env var |
+| `test_timeout_from_config` | Use timeout from workflow config |
+| `test_on_timeout_deny` | Deny on timeout |
 
-### 9.2 Assertions
+### 10.2 Integration Tests
 
-**Unit Tests:**
-- `test_polling_scheduler_ordering` — Tasks polled in next_poll_at order
-- `test_exponential_backoff` — Backoff increases correctly
-- `test_rate_limiter` — API calls stay within limit
-- `test_reaction_detection` — 👍/👎 correctly detected
+| Test | Description |
+|------|-------------|
+| `test_slack_post_and_poll` | Post message, poll for reaction |
+| `test_approval_flow_approve` | Full approve flow |
+| `test_approval_flow_reject` | Full reject flow |
+| `test_approval_flow_timeout` | Timeout triggers on_timeout |
+| `test_config_hot_reload` | New workflow available after reload |
 
-**Integration Tests:**
-- `test_full_approval_flow` — Post → Poll → Detect → Execute
-- `test_rejection_flow` — Post → Poll → Detect → Reject
-- `test_concurrent_approvals` — Many tasks polled correctly
-- `test_slack_api_mock` — Adapter works with mock Slack
+## 11. Example Configurations
 
-**Load Tests:**
-- `test_100_concurrent_tasks` — System stays within rate limits
-- `test_polling_under_load` — Latency stays acceptable
+### 11.1 Simple Single-Channel
 
-## 10. Implementation Reference
-
-### Polling Scheduler
-
-```rust
-pub struct PollingScheduler {
-    adapter: Arc<dyn ApprovalAdapter>,
-    task_manager: Arc<dyn TaskManager>,
-    execution_pipeline: Arc<ExecutionPipeline>,
-    
-    // Polling state
-    pending: Mutex<BTreeMap<Instant, TaskId>>,
-    references: DashMap<TaskId, ApprovalReference>,
-    
-    // Rate limiting
-    rate_limiter: RateLimiter,
-    
-    // Config
-    config: PollingConfig,
-    
-    // Shutdown
-    shutdown: CancellationToken,
-}
-
-pub struct PollingConfig {
-    pub base_interval: Duration,
-    pub max_interval: Duration,
-    pub max_concurrent: usize,
-}
-
-impl PollingScheduler {
-    pub async fn run(&self) {
-        loop {
-            tokio::select! {
-                _ = self.shutdown.cancelled() => break,
-                _ = self.poll_next() => {}
-            }
-        }
-    }
-    
-    async fn poll_next(&self) {
-        // Get next task due for polling
-        let (task_id, reference) = match self.get_next_due().await {
-            Some(t) => t,
-            None => {
-                // No tasks pending, wait for new task or shutdown
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                return;
-            }
-        };
-        
-        // Rate limit
-        self.rate_limiter.acquire().await;
-        
-        // Poll for decision
-        match self.adapter.poll_for_decision(&reference).await {
-            Ok(Some(decision)) => {
-                self.handle_decision(task_id, decision).await;
-            }
-            Ok(None) => {
-                // Still pending, reschedule with backoff
-                self.reschedule_with_backoff(task_id, reference).await;
-            }
-            Err(e) => {
-                tracing::warn!(task_id = %task_id, error = %e, "Poll failed");
-                self.reschedule_with_backoff(task_id, reference).await;
-            }
-        }
-    }
-    
-    async fn handle_decision(&self, task_id: TaskId, decision: ApprovalDecision) {
-        // Remove from polling queue
-        self.references.remove(&task_id);
-        
-        // Build approval record
-        let record = ApprovalRecord {
-            decision: decision.decision,
-            decided_by: decision.decided_by,
-            decided_at: decision.decided_at,
-            // ...
-        };
-        
-        // Update task and trigger pipeline
-        match decision.decision {
-            Decision::Approved => {
-                self.task_manager.approve(&task_id, record).await;
-                self.execution_pipeline.execute(task_id).await;
-            }
-            Decision::Rejected => {
-                self.task_manager.reject(&task_id, record).await;
-            }
-        }
-    }
-}
+```yaml
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 10m
+    on_timeout: deny
 ```
 
-### Slack Adapter
+### 11.2 Multiple Workflows
 
-```rust
-pub struct SlackAdapter {
-    client: reqwest::Client,
-    bot_token: String,
-    channel: String,
-    approve_reaction: String,  // Default: "+1"
-    reject_reaction: String,   // Default: "-1"
-    user_cache: Cache<String, String>,  // user_id -> display_name
-}
+```yaml
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 10m
+    on_timeout: deny
 
-#[async_trait]
-impl ApprovalAdapter for SlackAdapter {
-    async fn post_approval_request(
-        &self,
-        request: &ApprovalRequest,
-    ) -> Result<ApprovalReference, AdapterError> {
-        let blocks = self.build_blocks(request);
-        
-        let response = self.client
-            .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(&self.bot_token)
-            .json(&json!({
-                "channel": self.channel,
-                "blocks": blocks,
-                "metadata": {
-                    "event_type": "thoughtgate_approval",
-                    "event_payload": { "task_id": request.task_id.to_string() }
-                }
-            }))
-            .send()
-            .await?;
-        
-        let body: SlackResponse = response.json().await?;
-        
-        if !body.ok {
-            return Err(AdapterError::PostFailed {
-                reason: body.error.unwrap_or_default(),
-                retriable: false,
-            });
-        }
-        
-        Ok(ApprovalReference {
-            task_id: request.task_id.clone(),
-            external_id: body.ts.unwrap(),
-            channel: body.channel.unwrap(),
-            posted_at: Utc::now(),
-            next_poll_at: Instant::now() + Duration::from_secs(5),
-            poll_count: 0,
-        })
-    }
-    
-    async fn poll_for_decision(
-        &self,
-        reference: &ApprovalReference,
-    ) -> Result<Option<ApprovalDecision>, AdapterError> {
-        let response = self.client
-            .get("https://slack.com/api/reactions.get")
-            .bearer_auth(&self.bot_token)
-            .query(&[
-                ("channel", &reference.channel),
-                ("timestamp", &reference.external_id),
-            ])
-            .send()
-            .await?;
-        
-        let body: SlackReactionsResponse = response.json().await?;
-        
-        if !body.ok {
-            return Err(AdapterError::PollFailed {
-                reason: body.error.unwrap_or_default(),
-                retriable: true,
-            });
-        }
-        
-        // Check for approval reaction
-        if let Some(reaction) = body.find_reaction(&self.approve_reaction) {
-            let user = reaction.users.first().unwrap();
-            let display_name = self.get_user_name(user).await?;
-            
-            return Ok(Some(ApprovalDecision {
-                decision: Decision::Approved,
-                decided_by: display_name,
-                decided_at: Utc::now(),
-                method: DecisionMethod::Reaction { 
-                    emoji: self.approve_reaction.clone() 
-                },
-            }));
-        }
-        
-        // Check for rejection reaction
-        if let Some(reaction) = body.find_reaction(&self.reject_reaction) {
-            let user = reaction.users.first().unwrap();
-            let display_name = self.get_user_name(user).await?;
-            
-            return Ok(Some(ApprovalDecision {
-                decision: Decision::Rejected,
-                decided_by: display_name,
-                decided_at: Utc::now(),
-                method: DecisionMethod::Reaction { 
-                    emoji: self.reject_reaction.clone() 
-                },
-            }));
-        }
-        
-        // No decision yet
-        Ok(None)
-    }
-    
-    async fn cancel_approval(
-        &self,
-        reference: &ApprovalReference,
-    ) -> Result<(), AdapterError> {
-        // Update message to show cancelled (best effort)
-        let _ = self.client
-            .post("https://slack.com/api/chat.update")
-            .bearer_auth(&self.bot_token)
-            .json(&json!({
-                "channel": reference.channel,
-                "ts": reference.external_id,
-                "blocks": self.build_cancelled_blocks(),
-            }))
-            .send()
-            .await;
-        
-        Ok(())
-    }
-    
-    fn name(&self) -> &'static str {
-        "slack"
-    }
-}
+  finance:
+    destination:
+      type: slack
+      channel: "#finance-approvals"
+      token_env: SLACK_FINANCE_BOT_TOKEN
+      mention:
+        - "@finance-oncall"
+    timeout: 30m
+    on_timeout: deny
+
+  security:
+    destination:
+      type: slack
+      channel: "#security-approvals"
+      mention:
+        - "@security-team"
+    timeout: 5m
+    on_timeout: deny
 ```
 
-### Anti-Patterns to Avoid
+### 11.3 Local Development
 
-- **❌ Callback endpoints:** Don't expose inbound endpoints; sidecars aren't addressable
-- **❌ Polling too fast:** Respect rate limits; use exponential backoff
-- **❌ Ignoring rate limit errors:** Always handle 429 responses
-- **❌ Storing bot token in code:** Use K8s Secrets
-- **❌ Blocking on polls:** Polling should be async and non-blocking
-
-## 11. Definition of Done
-
-- [ ] Slack adapter implemented with chat.postMessage
-- [ ] Polling scheduler with priority queue
-- [ ] Reaction detection (👍/👎)
-- [ ] Rate limiting (token bucket)
-- [ ] Exponential backoff on polls
-- [ ] Message update after decision
-- [ ] Cancellation support
-- [ ] Graceful shutdown (drain polling queue)
-- [ ] Metrics for all operations
-- [ ] All edge cases (EC-APR-001 to EC-APR-016) covered
-- [ ] Integration test with Slack API mock
+```yaml
+approval:
+  default:
+    destination:
+      type: cli  # Prompt in terminal
+    timeout: 5m
+    on_timeout: deny
+```

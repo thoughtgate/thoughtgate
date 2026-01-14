@@ -7,79 +7,103 @@
 | **Type** | Policy Component |
 | **Status** | Draft |
 | **Priority** | **Critical** |
-| **Tags** | `#policy` `#cedar` `#security` `#classification` `#kubernetes` |
+| **Tags** | `#policy` `#cedar` `#security` `#abac` `#gate3` |
 
 ## 1. Context & Decision Rationale
 
-This requirement defines the **policy decision layer** for ThoughtGate—how requests are classified into Green, Amber, Approval, or Red paths based on Cedar policies.
+This requirement defines the **Cedar policy engine** for ThoughtGate—how complex policy decisions are evaluated when YAML governance rules delegate via `action: policy`.
 
-**Why Cedar?**
-- Millisecond-latency evaluation (critical for proxy performance)
-- Schema-validated policies (catch errors before deployment)
-- Expressive policy language (supports complex rules)
-- Battle-tested (AWS production workloads)
-- Rust-native crate available
+### 1.1 Cedar's Role in the 4-Gate Model
 
-**Decision Flow:**
+Cedar is **Gate 3** in ThoughtGate's request decision flow. It is NOT the primary routing mechanism—YAML governance rules (Gate 2) handle most routing. Cedar is invoked only when a rule specifies `action: policy`.
+
 ```
-┌─────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Request   │────▶│  Cedar Engine   │────▶│    Decision     │
-│  (ToolCall) │     │  (This REQ)     │     │ Green/Amber/    │
-└─────────────┘     └─────────────────┘     │ Approval/Red    │
-                            ▲               └─────────────────┘
-                            │
-                    ┌───────┴───────┐
-                    │   Policies    │
-                    │ (ConfigMap/   │
-                    │  Env/Default) │
-                    └───────────────┘
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   GATE 1    │    │   GATE 2    │    │   GATE 3    │    │   GATE 4    │
+│ Visibility  │ → │ Governance  │ → │   Cedar     │ → │  Approval   │
+│  (expose)   │    │   (YAML)    │    │  (policy)   │    │  Workflow   │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+                         │                  │
+                         │                  │
+                   action: forward    Only when
+                   action: deny       action: policy
+                   action: approve    
+                   action: policy ────────►│
 ```
+
+### 1.2 Why Cedar?
+
+Cedar provides value for **complex policy decisions** that YAML cannot express:
+
+| Capability | YAML Rules | Cedar |
+|------------|------------|-------|
+| Tool name matching | ✅ Glob patterns | ✅ Resource matching |
+| Simple conditions | ⚠️ Limited | ✅ Full boolean logic |
+| Argument inspection | ❌ | ✅ `resource.arguments.*` |
+| Principal-based ABAC | ❌ | ✅ Agent identity |
+| Time-based rules | ❌ | ✅ `context.time.*` |
+| Cross-attribute logic | ❌ | ✅ Complex expressions |
+
+**When to use Cedar:**
+- Spending limits: "Allow if amount < $10,000"
+- Time windows: "Only during business hours"
+- Principal restrictions: "Only production agents can deploy"
+- Complex conditions: "(A && B) || (C && !D)"
+
+**When YAML is sufficient:**
+- Simple routing: "Forward all read operations"
+- Blanket denials: "Block all admin tools"
+- Basic approval: "Approve all deletions"
+
+### 1.3 Cedar Decision Model
+
+Cedar returns **Permit** or **Forbid** only. It does NOT return routing decisions like "Forward" or "Approve"—that is handled by YAML.
+
+| Cedar Decision | ThoughtGate Behavior |
+|----------------|---------------------|
+| **Permit** | Continue to Gate 4 (use `approval:` from YAML rule) |
+| **Forbid** | Deny immediately with `-32003 Policy Denied` |
+
+> **Important:** Cedar is default-deny. If no policy matches, the request is **denied**.
 
 ## 2. Dependencies
 
 | Requirement | Relationship | Notes |
 |-------------|--------------|-------|
-| REQ-CORE-003 | **Receives from** | Parsed MCP requests |
-| REQ-CORE-001 | **Routes to** | Green Path decisions |
-| REQ-CORE-002 | **Routes to** | Amber Path decisions |
-| REQ-CORE-004 | **Routes to** | Red Path (policy denied) |
-| REQ-GOV-001 | **Routes to** | Approval decisions |
-| REQ-GOV-002 | **Provides to** | Post-approval re-evaluation |
+| REQ-CFG-001 | **Receives from** | Policy file paths (`cedar.policies`), policy_id binding |
+| REQ-CORE-003 | **Receives from** | Parsed MCP requests via Governance Engine |
+| REQ-CORE-004 | **Provides to** | Policy denial errors (-32003) |
+| REQ-GOV-001 | **Coordinates with** | Approval workflow (via YAML, not Cedar) |
 
 ## 3. Intent
 
 The system must:
-1. Define a Cedar schema for MCP request classification
-2. Evaluate policies to produce 3-way routing decisions (Forward/Approve/Reject)
-3. Load policies from ConfigMap, environment, or embedded defaults
-4. Hot-reload policies without restart
-5. Infer principal identity from Kubernetes environment
-
-> **v0.1 Simplification:** The 4-way classification (Green/Amber/Approval/Red) is reduced to
-> 3 actions (Forward/Approve/Reject). Green and Amber paths are deferred until response
-> inspection or streaming is needed. Post-approval re-evaluation is simplified since there's
-> no Amber Path inspection to perform.
+1. Define a Cedar schema for MCP request evaluation
+2. Evaluate policies and return **Permit/Forbid** decisions
+3. Load policies from paths specified in YAML config (`cedar.policies`)
+4. Hot-reload policies when files change
+5. Bind `policy_id` from YAML rules to Cedar `context.policy_id`
+6. Infer principal identity from Kubernetes environment
 
 ## 4. Scope
 
 ### 4.1 In Scope
-- Cedar schema definition (entities, actions)
-- Policy evaluation logic
-- 3-way action output (Forward, Approve, Reject) - v0.1
-- Policy loading (ConfigMap → Env → Embedded)
-- Policy hot-reload
-- Schema validation
+- Cedar schema definition (entities, actions, context)
+- Policy evaluation logic (Permit/Forbid)
+- Policy loading from YAML-configured paths
+- Policy hot-reload via file watching
+- `policy_id` binding from YAML rules
 - Principal identity inference (K8s)
 - Local development mode
-- Configuration management
+- Argument inspection via `resource.arguments`
 
 ### 4.2 Out of Scope
-- Policy authoring UI (users write Cedar directly)
-- Policy testing framework (deferred to future version)
-- Policy versioning/history (deferred to future version)
-- CRD-based policy management (architecture supports, not implemented)
-- 4-way classification (Green/Amber/Approval/Red) - deferred to v0.2+
-- Post-approval re-evaluation with ApprovalGrant context - deferred to v0.2+
+- Routing decisions (handled by YAML governance rules)
+- Approval workflow selection (handled by YAML `approval:` field)
+- Policy authoring UI
+- Policy testing framework (deferred)
+- Policy versioning/history (deferred)
+- "Advice" or metadata in Cedar responses (Cedar doesn't support this)
 
 ## 5. Constraints
 
@@ -118,8 +142,9 @@ entity Role = {
 
 /// An MCP tool call request
 entity ToolCall = {
-    name: String,               // Tool name, e.g., "delete_user"
-    server: String,             // Upstream MCP server identifier
+    name: String,               // Tool name, e.g., "transfer_funds"
+    server: String,             // Source ID from config
+    arguments: Record,          // Tool arguments for inspection
 };
 
 /// Generic MCP method for non-tool requests
@@ -132,80 +157,57 @@ entity McpMethod = {
 // CONTEXT
 // ═══════════════════════════════════════════════════════════
 
-/// Approval grant for post-approval re-evaluation
-entity ApprovalGrant = {
-    task_id: String,
-    approved_by: String,
-    approved_at: Long,          // Unix timestamp
+/// Context passed from YAML governance rules
+type RequestContext = {
+    policy_id: String,          // From YAML rule's policy_id field
+    source_id: String,          // Source that matched
+    time: TimeContext,          // Current time for time-based rules
+};
+
+type TimeContext = {
+    hour: Long,                 // 0-23 UTC
+    day_of_week: Long,          // 0=Sunday, 6=Saturday
+    timestamp: Long,            // Unix timestamp
 };
 
 // ═══════════════════════════════════════════════════════════
-// ACTIONS (v0.1 Simplified)
+// ACTIONS
 // ═══════════════════════════════════════════════════════════
 
-/// Forward: Send request to upstream immediately
-action Forward appliesTo {
+/// The only action: tools/call evaluation
+/// Cedar decides Permit or Forbid
+action "tools/call" appliesTo {
     principal: [App, Role],
-    resource: [ToolCall, McpMethod],
+    resource: [ToolCall],
+    context: RequestContext,
 };
 
-/// Approve: Require human/agent approval before forwarding
-action Approve appliesTo {
+action "mcp/method" appliesTo {
     principal: [App, Role],
-    resource: [ToolCall, McpMethod],
+    resource: [McpMethod],
+    context: RequestContext,
 };
-
-// Reject is implicit: no action permitted = reject
 ```
 
-> **v0.1 Note:** `StreamRaw` and `Inspect` actions are removed. When response inspection
-> or streaming is needed in future versions, these can be reintroduced.
+### 5.3 Policy Loading
 
-### 5.2.1 Action Semantics (Routing Reference) - v0.1
+Policy paths are configured in YAML config (`cedar.policies`):
 
-**Action-to-Behavior Mapping:**
-| Cedar Action | String Literal | Behavior |
-|--------------|----------------|----------|
-| `Forward` | `"ThoughtGate::Action::Forward"` | Send request to upstream immediately |
-| `Approve` | `"ThoughtGate::Action::Approve"` | Block until human approval, then forward |
-| (none permitted) | N/A | Reject with policy denial error (-32003) |
-
-**Evaluation Order:**
-The policy engine checks actions in this order and returns the first permitted:
-1. `Forward` → Send to upstream
-2. `Approve` → Block for approval
-3. (default) → Reject
-
-**Cross-Module Reference:**
-Other modules MUST use these exact action strings when calling Cedar:
-```rust
-// In REQ-CORE-003 (MCP Transport) routing:
-let action = policy_engine.evaluate(
-    &principal,
-    &resource,
-    "ThoughtGate::Action::Forward",  // Check Forward first
-);
-
-match action {
-    PolicyAction::Forward => upstream.forward(request).await,
-    PolicyAction::Approve { timeout } => {
-        // Block until approval (v0.1 mode)
-        let approval = wait_for_approval(request, timeout).await?;
-        upstream.forward(request).await
-    }
-    PolicyAction::Reject { reason } => {
-        Err(ThoughtGateError::PolicyDenied { reason })
-    }
-}
+```yaml
+cedar:
+  policies:
+    - /etc/thoughtgate/policies/financial.cedar
+    - /etc/thoughtgate/policies/time_restrictions.cedar
+  schema: /etc/thoughtgate/schema.cedarschema  # Optional
 ```
 
-### 5.3 Policy Loading Priority
+**Loading Priority (Fallback):**
 
-| Priority | Source | Path / Variable | Use Case |
-|----------|--------|-----------------|----------|
-| 1 | ConfigMap | `/etc/thoughtgate/policies.cedar` | Production (Hot-Reload) |
-| 2 | Env Var | `$THOUGHTGATE_POLICIES` | Simple / CI (< 10KB) |
-| 3 | Embedded | Compiled into binary | Local Dev / Fallback |
+| Priority | Source | Use Case |
+|----------|--------|----------|
+| 1 | YAML config `cedar.policies` | Production (recommended) |
+| 2 | Env var `$THOUGHTGATE_POLICIES` | Simple / CI (< 10KB) |
+| 3 | Embedded defaults | Local dev fallback |
 
 ### 5.4 Identity Inference
 
@@ -227,8 +229,7 @@ match action {
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
-| Policy file path | `/etc/thoughtgate/policies.cedar` | `THOUGHTGATE_POLICY_FILE` |
-| Schema file path | `/etc/thoughtgate/schema.cedarschema` | `THOUGHTGATE_SCHEMA_FILE` |
+| Schema file path | (from YAML) | `THOUGHTGATE_SCHEMA_FILE` |
 | Hot-reload interval | 10s | `THOUGHTGATE_POLICY_RELOAD_INTERVAL_SECS` |
 | Dev mode | false | `THOUGHTGATE_DEV_MODE` |
 
@@ -237,10 +238,11 @@ match action {
 ### 6.1 Input: Policy Evaluation Request
 
 ```rust
-pub struct PolicyRequest {
+/// Request from Governance Engine to Cedar
+pub struct CedarRequest {
     pub principal: Principal,
     pub resource: Resource,
-    pub context: Option<PolicyContext>,
+    pub context: CedarContext,
 }
 
 pub struct Principal {
@@ -254,6 +256,7 @@ pub enum Resource {
     ToolCall {
         name: String,
         server: String,
+        arguments: serde_json::Value,
     },
     McpMethod {
         method: String,
@@ -261,479 +264,562 @@ pub enum Resource {
     },
 }
 
-pub struct PolicyContext {
-    pub approval_grant: Option<ApprovalGrant>,
+/// Context passed from YAML rule
+pub struct CedarContext {
+    /// policy_id from YAML rule (required for action: policy)
+    pub policy_id: String,
+    /// Source ID that matched
+    pub source_id: String,
+    /// Current time for time-based rules
+    pub time: TimeContext,
 }
 
-pub struct ApprovalGrant {
-    pub task_id: String,
-    pub approved_by: String,
-    pub approved_at: i64,
+pub struct TimeContext {
+    pub hour: u8,           // 0-23 UTC
+    pub day_of_week: u8,    // 0=Sunday
+    pub timestamp: i64,     // Unix timestamp
 }
 ```
 
-### 6.2 Output: Policy Action (v0.1)
+### 6.2 Output: Cedar Decision
 
 ```rust
-/// v0.1 Simplified Policy Actions
-pub enum PolicyAction {
-    /// Forward request to upstream immediately
-    Forward,
-
-    /// Require approval before forwarding (block until decision)
-    Approve {
-        /// Timeout for approval workflow
-        timeout: Duration,
+/// Cedar returns Permit or Forbid only
+/// Routing decisions come from YAML, not Cedar
+pub enum CedarDecision {
+    /// Policy permits the request
+    /// ThoughtGate continues to Gate 4 (approval workflow from annotation or YAML)
+    Permit {
+        /// Policy IDs that contributed to the permit decision
+        /// Used to look up @thoughtgate_approval annotations
+        determining_policies: Vec<String>,
     },
 
-    /// Reject the request
-    Reject {
-        /// Reason for denial (safe for logging, not user-facing)
+    /// Policy forbids the request
+    /// ThoughtGate denies immediately
+    Forbid {
+        /// Reason for denial (safe for logging)
         reason: String,
+        /// Policy IDs that caused denial
+        policy_ids: Vec<String>,
     },
 }
 ```
 
-> **Note:** The 4-way `PolicyDecision` enum (Green/Amber/Approval/Red) from the original
-> design is simplified to 3 actions for v0.1. Green and Amber paths are deferred.
+> **Note:** There is no "NoDecision" variant. Cedar is default-deny—if no policy explicitly permits, the result is Forbid.
 
 ### 6.3 Cedar Engine Interface
 
 ```rust
 #[async_trait]
-pub trait PolicyEngine: Send + Sync {
-    /// Evaluate a request and return action (v0.1 simplified)
-    fn evaluate(&self, request: &PolicyRequest) -> PolicyAction;
+pub trait CedarEngine: Send + Sync {
+    /// Evaluate a request and return Permit/Forbid
+    fn evaluate(&self, request: &CedarRequest) -> CedarDecision;
 
-    /// Reload policies from configured source
-    async fn reload(&self) -> Result<(), PolicyError>;
+    /// Reload policies from configured paths
+    async fn reload(&self) -> Result<(), CedarError>;
 
-    /// Get current policy source
-    fn policy_source(&self) -> PolicySource;
+    /// Get current policy source info
+    fn policy_info(&self) -> PolicyInfo;
 
-    /// Get policy statistics
-    fn stats(&self) -> PolicyStats;
+    /// Get evaluation statistics
+    fn stats(&self) -> CedarStats;
 }
 
-pub enum PolicySource {
-    ConfigMap { path: PathBuf, loaded_at: DateTime<Utc> },
-    Environment { loaded_at: DateTime<Utc> },
-    Embedded,
-}
-
-pub struct PolicyStats {
+pub struct PolicyInfo {
+    pub paths: Vec<PathBuf>,
     pub policy_count: usize,
     pub last_reload: Option<DateTime<Utc>>,
-    pub reload_count: u64,
+}
+
+pub struct CedarStats {
     pub evaluation_count: u64,
+    pub permit_count: u64,
+    pub forbid_count: u64,
+    pub avg_eval_time_us: u64,
 }
 ```
 
 ### 6.4 Errors
 
 ```rust
-pub enum PolicyError {
+pub enum CedarError {
     /// Policy file not found
     FileNotFound { path: PathBuf },
     
     /// Policy syntax error
-    ParseError { details: String, line: Option<usize> },
+    ParseError { path: PathBuf, details: String, line: Option<usize> },
     
     /// Schema validation failed
     SchemaValidation { details: String },
     
     /// Identity inference failed
     IdentityError { details: String },
+    
+    /// Policy evaluation failed (internal error)
+    EvaluationError { details: String },
 }
 ```
 
 ## 7. Functional Requirements
 
-### F-001: Policy Evaluation (v0.1 Simplified)
+### F-001: Policy Evaluation
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│           POLICY EVALUATION (v0.1)                       │
-│                                                          │
-│   1. Check: Is Forward permitted?                        │
-│      └─► YES → Return Forward                            │
-│                                                          │
-│   2. Check: Is Approve permitted?                        │
-│      └─► YES → Return Approve                            │
-│                                                          │
-│   3. Default: Return Reject (denied)                     │
-│                                                          │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│              CEDAR EVALUATION (Gate 3)                        │
+│                                                              │
+│   Input:                                                     │
+│   - Principal (App identity)                                 │
+│   - Resource (ToolCall with arguments)                       │
+│   - Context (policy_id, source_id, time)                     │
+│                                                              │
+│   Evaluation:                                                │
+│   1. Find policies matching context.policy_id                │
+│   2. Evaluate permit/forbid conditions                       │
+│   3. If ANY forbid matches → Forbid                          │
+│   4. If ANY permit matches (no forbid) → Permit              │
+│   5. If NO policy matches → Forbid (default-deny)            │
+│                                                              │
+│   Output: Permit or Forbid                                   │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-- **F-001.1:** Evaluate actions in order: Forward → Approve
-- **F-001.2:** First permitted action determines the result
-- **F-001.3:** No permitted action results in Reject
+- **F-001.1:** Evaluate policies filtered by `context.policy_id`
+- **F-001.2:** Forbid takes precedence over Permit (Cedar semantics)
+- **F-001.3:** No matching policy results in Forbid (default-deny)
 - **F-001.4:** Evaluation must complete in < 1ms (P99)
+- **F-001.5:** Arguments must be accessible via `resource.arguments.*`
 
-### F-002: Post-Approval Handling - DEFERRED
+### F-002: Policy ID Binding
 
-> **Deferred to v0.2+:** Post-approval re-evaluation with ApprovalGrant context is deferred.
-> In v0.1 blocking mode, once approval is received, the request is forwarded immediately
-> without re-evaluation. Policy drift detection will be added in a future version.
+The `policy_id` from YAML rules binds to Cedar's `context.policy_id`:
 
-### F-003: Policy Loading
-
-```rust
-fn load_policies() -> Result<PolicySet, PolicyError> {
-    // 1. Try ConfigMap
-    let config_path = env::var("THOUGHTGATE_POLICY_FILE")
-        .unwrap_or_else(|_| "/etc/thoughtgate/policies.cedar".into());
-    
-    if Path::new(&config_path).exists() {
-        info!(path = %config_path, "Loading policies from ConfigMap");
-        return load_from_file(&config_path);
-    }
-    
-    // 2. Try Environment Variable
-    if let Ok(policy_str) = env::var("THOUGHTGATE_POLICIES") {
-        info!("Loading policies from environment variable");
-        return parse_policies(&policy_str);
-    }
-    
-    // 3. Fallback to Embedded
-    warn!("Using embedded default policies");
-    Ok(embedded_default_policies())
-}
+```yaml
+# YAML governance rule
+governance:
+  rules:
+    - match: "transfer_*"
+      action: policy
+      policy_id: "financial_transfer"  # ← Bound to Cedar context
+      approval: finance                 # ← Used if Cedar permits
 ```
 
-- **F-003.1:** Check ConfigMap path first
-- **F-003.2:** Fall back to environment variable
-- **F-003.3:** Fall back to embedded default
-- **F-003.4:** Log which source was used
-- **F-003.5:** Validate against schema before accepting
+```cedar
+// Cedar policy
+permit(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "financial_transfer" &&
+    resource.arguments.amount < 10000
+};
 
-### F-004: Schema Validation
+forbid(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "financial_transfer" &&
+    resource.arguments.amount >= 100000
+};
+```
 
-- **F-004.1:** Load schema from file or embedded
-- **F-004.2:** Validate all policies against schema
-- **F-004.3:** Reject policies that don't conform
-- **F-004.4:** Provide clear error messages for schema violations
+- **F-002.1:** `policy_id` MUST be passed to Cedar as `context.policy_id`
+- **F-002.2:** Policies SHOULD filter by `context.policy_id` for clarity
+- **F-002.3:** Multiple rules can share the same `policy_id`
 
-### F-005: Hot-Reload
+### F-003: Argument Inspection
+
+Cedar can inspect tool arguments for fine-grained decisions:
+
+```cedar
+// Allow small transfers
+permit(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "transfer_check" &&
+    resource.arguments.amount < 1000 &&
+    resource.arguments.currency == "USD"
+};
+
+// Forbid transfers to blocked countries
+forbid(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "transfer_check" &&
+    resource.arguments.destination_country in ["XX", "YY", "ZZ"]
+};
+```
+
+- **F-003.1:** Tool arguments MUST be available as `resource.arguments`
+- **F-003.2:** Arguments are JSON values (string, number, boolean, object, array)
+- **F-003.3:** Missing arguments result in condition failure (not error)
+
+### F-004: Time-Based Rules
+
+Cedar can enforce time-based restrictions:
+
+```cedar
+// Only allow deployments during business hours
+permit(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "deploy_check" &&
+    context.time.hour >= 9 &&
+    context.time.hour < 17 &&
+    context.time.day_of_week >= 1 &&  // Monday
+    context.time.day_of_week <= 5     // Friday
+};
+```
+
+- **F-004.1:** Time context MUST be populated with current UTC time
+- **F-004.2:** Time fields: `hour` (0-23), `day_of_week` (0-6), `timestamp`
+
+### F-005: Principal-Based Rules
+
+Cedar can make decisions based on agent identity:
+
+```cedar
+// Only production agents can access production tools
+permit(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "prod_access" &&
+    principal.namespace == "production"
+};
+
+// Deny staging agents from production
+forbid(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "prod_access" &&
+    principal.namespace == "staging"
+};
+```
+
+- **F-005.1:** Principal identity MUST be inferred from K8s environment
+- **F-005.2:** Principal attributes: `app_name`, `namespace`, `service_account`
+
+### F-006: Policy Hot-Reload
+
+- **F-006.1:** Watch policy files for changes
+- **F-006.2:** Reload policies atomically (no partial updates)
+- **F-006.3:** Log reload success/failure
+- **F-006.4:** Continue with old policies if reload fails
+- **F-006.5:** Emit metric on reload
+
+### F-007: Integration with Governance Engine
+
+Cedar is invoked by the Governance Engine when `action: policy`:
 
 ```rust
-async fn policy_reload_loop(
-    engine: Arc<CedarEngine>,
-    path: PathBuf,
-    interval: Duration,
-) {
-    let mut last_mtime = None;
-    
-    loop {
-        tokio::time::sleep(interval).await;
+// In Governance Engine (REQ-CFG-001)
+let rule_match = governance.evaluate(tool_name, source_id);
+
+match rule_match.action {
+    Action::Forward => forward_to_upstream(request).await,
+    Action::Deny => deny_request("governance rule"),
+    Action::Approve => {
+        // Go directly to Gate 4
+        let workflow = rule_match.approval_workflow.unwrap_or("default");
+        approval_engine.request_approval(request, workflow).await
+    }
+    Action::Policy => {
+        // Invoke Cedar (Gate 3)
+        let cedar_request = CedarRequest {
+            principal: infer_principal()?,
+            resource: Resource::ToolCall {
+                name: tool_name,
+                server: source_id,
+                arguments: request.params.clone(),
+            },
+            context: CedarContext {
+                policy_id: rule_match.policy_id.expect("required for action: policy"),
+                source_id: source_id.to_string(),
+                time: current_time_context(),
+            },
+        };
         
-        let current_mtime = fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        
-        if current_mtime != last_mtime {
-            match engine.reload().await {
-                Ok(()) => {
-                    last_mtime = current_mtime;
-                    info!("Policies reloaded successfully");
-                    metrics::increment!("policy_reloads_total", "status" => "success");
-                }
-                Err(e) => {
-                    error!(error = %e, "Policy reload failed, keeping old policies");
-                    metrics::increment!("policy_reloads_total", "status" => "failure");
-                }
+        match cedar_engine.evaluate(&cedar_request) {
+            CedarDecision::Permit { determining_policies } => {
+                // Lookup workflow: annotation → YAML rule → "default"
+                let workflow = policy_annotations
+                    .get_workflow(&determining_policies)
+                    .or(rule_match.approval_workflow.as_deref())
+                    .unwrap_or("default");
+                
+                // Continue to Gate 4
+                approval_engine.request_approval(request, workflow).await
+            }
+            CedarDecision::Forbid { reason, .. } => {
+                deny_request(&reason)
             }
         }
     }
 }
 ```
 
-- **F-005.1:** Poll file mtime every N seconds (configurable)
-- **F-005.2:** Use polling (not inotify) for K8s ConfigMap compatibility
-- **F-005.3:** On change: parse → validate → atomic swap
-- **F-005.4:** On validation failure: keep old policies, log error
-- **F-005.5:** Atomic swap using `arc_swap` for lock-free reads
-
-### F-006: Identity Inference
-
-```rust
-fn infer_principal() -> Result<Principal, PolicyError> {
-    // Check for dev mode
-    if env::var("THOUGHTGATE_DEV_MODE").is_ok() {
-        return Ok(dev_mode_principal());
-    }
-    
-    // Kubernetes identity
-    let name = env::var("HOSTNAME")
-        .map_err(|_| PolicyError::IdentityError {
-            details: "HOSTNAME not set".into()
-        })?;
-    
-    let namespace = fs::read_to_string(
-        "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-    ).map_err(|_| PolicyError::IdentityError {
-        details: "Cannot read namespace from ServiceAccount".into()
-    })?;
-    
-    let sa_token = fs::read_to_string(
-        "/var/run/secrets/kubernetes.io/serviceaccount/token"
-    ).ok();
-    
-    let service_account = sa_token
-        .and_then(|t| parse_sa_from_token(&t))
-        .unwrap_or_else(|| "default".into());
-    
-    Ok(Principal {
-        app_name: name,
-        namespace: namespace.trim().into(),
-        service_account,
-        roles: vec![],  // Roles loaded from policy or external source
-    })
-}
+- **F-007.1:** Cedar MUST only be invoked for `action: policy` rules
+- **F-007.2:** `policy_id` from YAML rule MUST be passed in context
+- **F-007.3:** Approval workflow MUST be resolved from annotation → YAML → "default"
+- **F-007.4:** Cedar `Forbid` MUST return -32003 error immediately
 ```
 
-- **F-006.1:** Read identity from K8s ServiceAccount mount
-- **F-006.2:** Support dev mode override via environment variables
-- **F-006.3:** Log warning when using dev mode
-- **F-006.4:** Fail startup if K8s identity required but not available
+## 8. Example Policies
 
-### F-007: Embedded Default Policy (v0.1)
+### 8.0 Using Policy Annotations for Workflow Routing
+
+Cedar policies return only `permit` or `forbid`—they cannot return arbitrary data. To specify which approval workflow to use for a permitted request, use **static annotations** on the policy:
 
 ```cedar
-// Default permissive policy for development
-// WARNING: Do not use in production
-
+// Standard annotation format
+@id("policy_unique_id")
+@thoughtgate_approval("workflow_name")  // ← References YAML approval config
 permit(
     principal,
-    action == ThoughtGate::Action::"Forward",
+    action == Action::"tools/call",
     resource
-);
-
-permit(
-    principal,
-    action == ThoughtGate::Action::"Approve",
-    resource
-);
+)
+when { ... };
 ```
 
-- **F-007.1:** Embedded policy permits Forward and Approve (for dev)
-- **F-007.2:** Log WARNING when embedded policy is active
-- **F-007.3:** Embedded policy should never be used in production
-
-## 8. Non-Functional Requirements
-
-### NFR-001: Observability
-
-**Metrics:**
-```
-policy_evaluations_total{action="forward|approve|reject"}
-policy_evaluation_duration_seconds{quantile="0.5|0.9|0.99"}
-policy_reloads_total{status="success|failure"}
-policy_source{source="configmap|env|embedded"}
-```
-
-**Logging:**
-```json
-{"level":"info","message":"Policy evaluation","principal":"app-xyz","resource":"delete_user","action":"approve"}
-{"level":"info","message":"Policies reloaded","source":"configmap","policy_count":12}
-```
-
-**Audit Log (for compliance):**
-```json
-{
-  "event": "policy_decision",
-  "timestamp": "2025-01-08T10:30:00Z",
-  "principal": {
-    "app": "agent-service",
-    "namespace": "production",
-    "service_account": "agent-sa"
-  },
-  "resource": {
-    "type": "tool_call",
-    "name": "delete_user"
-  },
-  "action": "approve",
-  "policy_source": "configmap"
-}
-```
-
-### NFR-002: Performance
-
-| Metric | Target |
-|--------|--------|
-| Evaluation latency (P50) | < 0.1ms |
-| Evaluation latency (P99) | < 1ms |
-| Hot-reload latency | < 100ms |
-| Memory per policy | < 1KB average |
-
-### NFR-003: Reliability
-
-- Policy evaluation must never panic
-- Invalid policies must not crash the system
-- Hot-reload failures must not affect running policies
-
-## 9. Verification Plan
-
-### 9.1 Edge Case Matrix (v0.1)
-
-| Scenario | Expected Behavior | Test ID |
-|----------|-------------------|---------|
-| Forward permitted | Return Forward | EC-POL-001 |
-| Only Approve permitted | Return Approve | EC-POL-002 |
-| No action permitted | Return Reject | EC-POL-003 |
-| ConfigMap exists | Load from ConfigMap | EC-POL-004 |
-| ConfigMap missing, Env exists | Load from Env | EC-POL-005 |
-| Both missing | Load embedded | EC-POL-006 |
-| ConfigMap invalid syntax | Keep old, log error | EC-POL-007 |
-| ConfigMap schema violation | Keep old, log error | EC-POL-008 |
-| ConfigMap updated | Reload within interval | EC-POL-009 |
-| K8s identity available | Infer principal | EC-POL-010 |
-| K8s identity missing, dev mode | Use dev principal | EC-POL-011 |
-| K8s identity missing, no dev | Fail startup | EC-POL-012 |
-| Role-based policy | Match role hierarchy | EC-POL-013 |
-
-### 9.2 Assertions
-
-**Unit Tests:**
-- `test_evaluate_forward` — Forward permits return Forward
-- `test_evaluate_approve` — Approve permits return Approve
-- `test_evaluate_reject` — No permits return Reject
-- `test_policy_loading_priority` — ConfigMap > Env > Embedded
-- `test_schema_validation` — Invalid policies rejected
-
-**Integration Tests:**
-- `test_hot_reload_atomic` — 1000 requests during reload, no errors
-- `test_configmap_symlink_swap` — K8s-style ConfigMap update works
-- `test_identity_inference_k8s` — Identity inferred in K8s environment
-
-**Performance Tests:**
-- `bench_evaluation_latency` — Target: P99 < 1ms
-- `bench_concurrent_evaluation` — 10k concurrent evaluations
-
-## 10. Implementation Reference
-
-### Cedar Engine Implementation (v0.1)
+**How ThoughtGate processes annotations:**
 
 ```rust
-pub struct CedarEngine {
-    authorizer: Authorizer,
-    policies: ArcSwap<PolicySet>,
-    schema: Schema,
-    principal: Principal,
+// At policy load time: Parse and cache annotations
+pub struct PolicyAnnotations {
+    /// Map from Policy ID to approval workflow name
+    pub workflow_mapping: HashMap<PolicyId, String>,
 }
 
-impl CedarEngine {
-    /// Evaluate a policy request.
-    ///
-    /// # Decision Logic (v0.1)
-    /// Check Forward → Approve → Reject
-    ///
-    /// # Returns
-    /// - `PolicyAction::Forward` if Forward action is permitted
-    /// - `PolicyAction::Approve` if only Approve action is permitted
-    /// - `PolicyAction::Reject` if no action is permitted
-    pub fn evaluate(&self, request: &PolicyRequest) -> PolicyAction {
-        let policies = self.policies.load();
-
-        // v0.1: Check actions in priority order: Forward → Approve
-        let actions = ["Forward", "Approve"];
-
-        for action_name in &actions {
-            if self.is_action_permitted(request, action_name, &policies) {
-                return match *action_name {
-                    "Forward" => PolicyAction::Forward,
-                    "Approve" => PolicyAction::Approve {
-                        timeout: Duration::from_secs(300), // Default 5 minutes
-                    },
-                    _ => unreachable!(),
-                };
+impl PolicyAnnotations {
+    pub fn load_from(policy_set: &PolicySet) -> Self {
+        let mut workflow_mapping = HashMap::new();
+        
+        for policy in policy_set.policies() {
+            // Cedar's annotation() method returns Option<&Annotation>
+            if let Some(workflow) = policy.annotation("thoughtgate_approval") {
+                // workflow.as_str() gives us the annotation value
+                workflow_mapping.insert(
+                    policy.id().clone(), 
+                    workflow.as_str().to_string()
+                );
             }
         }
+        
+        PolicyAnnotations { workflow_mapping }
+    }
+}
 
-        // No action permitted - Reject
-        PolicyAction::Reject {
-            reason: "No policy permits this request".to_string(),
+// At evaluation time: Look up workflow for the determining policy
+fn get_workflow_for_permit(
+    annotations: &PolicyAnnotations,
+    determining_policies: &[PolicyId],
+    yaml_fallback: Option<&str>,
+) -> String {
+    // Check annotation on first determining policy
+    if let Some(policy_id) = determining_policies.first() {
+        if let Some(workflow) = annotations.workflow_mapping.get(policy_id) {
+            return workflow.clone();
         }
     }
+    
+    // Fall back to YAML rule's approval field, then "default"
+    yaml_fallback.unwrap_or("default").to_string()
 }
 ```
 
-### Example Policies (v0.1)
+**Workflow resolution priority:**
+1. Cedar policy `@thoughtgate_approval` annotation
+2. YAML rule `approval:` field
+3. Literal `"default"`
+
+**⚠️ Important:** The `@thoughtgate_approval` annotation is a ThoughtGate-specific convention, not a built-in Cedar feature. ThoughtGate parses these at load time using Cedar's annotation API.
+
+### 8.1 Financial Transfer Limits
 
 ```cedar
-// ══════════════════════════════════════════════════════════
-// FORWARD: Safe operations go directly to upstream
-// ══════════════════════════════════════════════════════════
-
+// Low-value: permit (approval handled by YAML)
 permit(
     principal,
-    action == ThoughtGate::Action::"Forward",
+    action == Action::"tools/call",
     resource
-) when {
-    resource.name.startsWith("get_") ||
-    resource.name.startsWith("list_") ||
-    resource.name.startsWith("describe_") ||
-    resource.name.startsWith("read_")
+)
+when {
+    context.policy_id == "financial" &&
+    resource.arguments.amount < 10000
 };
 
-// ══════════════════════════════════════════════════════════
-// APPROVE: Dangerous operations need human approval
-// ══════════════════════════════════════════════════════════
-
-permit(
+// High-value: forbid entirely
+forbid(
     principal,
-    action == ThoughtGate::Action::"Approve",
+    action == Action::"tools/call",
     resource
-) when {
-    resource.name.startsWith("delete_") ||
-    resource.name.startsWith("drop_") ||
-    resource.name.startsWith("destroy_") ||
-    resource.name == "execute_sql" ||
-    resource.name == "send_email" ||
-    resource.name == "transfer_funds"
+)
+when {
+    context.policy_id == "financial" &&
+    resource.arguments.amount >= 1000000
 };
+```
 
-// Production namespace: writes need approval
+### 8.2 Time-Based Deployment Window
+
+```cedar
+// Allow deployments only during business hours (UTC)
 permit(
     principal,
-    action == ThoughtGate::Action::"Approve",
+    action == Action::"tools/call",
     resource
-) when {
+)
+when {
+    context.policy_id == "deploy_window" &&
+    context.time.hour >= 9 &&
+    context.time.hour < 17 &&
+    context.time.day_of_week >= 1 &&
+    context.time.day_of_week <= 5
+};
+```
+
+### 8.3 Namespace Isolation
+
+```cedar
+// Production namespace can access production tools
+permit(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "namespace_isolation" &&
     principal.namespace == "production" &&
-    !resource.name.startsWith("get_") &&
-    !resource.name.startsWith("list_")
+    resource.server.contains("prod")
 };
 
-// ══════════════════════════════════════════════════════════
-// ROLE OVERRIDES: Admins can forward all operations
-// ══════════════════════════════════════════════════════════
-
-permit(
-    principal in ThoughtGate::Role::"admin",
-    action == ThoughtGate::Action::"Forward",
+// Block staging from production
+forbid(
+    principal,
+    action == Action::"tools/call",
     resource
-);
+)
+when {
+    context.policy_id == "namespace_isolation" &&
+    principal.namespace == "staging" &&
+    resource.server.contains("prod")
+};
 ```
 
-### Anti-Patterns to Avoid
+## 9. Testing Requirements
 
-- **❌ Blocking on policy load:** Use async loading, don't block startup
-- **❌ Mutable policy set:** Use `ArcSwap` for lock-free reads
-- **❌ Ignoring schema:** Always validate against schema
-- **❌ Logging policy details:** Don't expose policy rules in logs/errors
-- **❌ Hardcoded identity:** Always infer from environment
+### 9.1 Unit Tests
 
-## 11. Definition of Done (v0.1)
+| Test | Description |
+|------|-------------|
+| `test_permit_simple` | Basic permit policy |
+| `test_forbid_simple` | Basic forbid policy |
+| `test_forbid_precedence` | Forbid wins over permit |
+| `test_default_deny` | No matching policy = forbid |
+| `test_argument_inspection` | Access resource.arguments |
+| `test_time_context` | Time-based conditions |
+| `test_principal_attributes` | Principal-based conditions |
+| `test_policy_id_filtering` | Policy scoped by policy_id |
+| `test_hot_reload` | Policy reload works |
+| `test_reload_failure` | Bad policy keeps old |
 
-- [ ] Cedar schema defined and documented (Forward/Approve actions)
-- [ ] Policy evaluation (3-way: Forward/Approve/Reject) implemented
-- [ ] Policy loading with priority (ConfigMap → Env → Embedded)
-- [ ] Schema validation on load
-- [ ] Hot-reload with atomic swap
-- [ ] Identity inference (K8s + dev mode)
-- [ ] Audit logging for decisions
-- [ ] Metrics for evaluations and reloads
-- [ ] All edge cases (EC-POL-001 to EC-POL-013) covered
-- [ ] Performance target met (P99 < 1ms)
-- [ ] Example policies documented
+### 9.2 Integration Tests
+
+| Test | Description |
+|------|-------------|
+| `test_governance_to_cedar` | Governance engine invokes Cedar |
+| `test_cedar_permit_to_approval` | Permit flows to approval |
+| `test_cedar_forbid_denies` | Forbid returns error |
+| `test_yaml_config_paths` | Load from config paths |
+
+## 10. Observability
+
+### 10.1 Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `thoughtgate_cedar_evaluations_total` | Counter | `decision`, `policy_id` | Evaluation count |
+| `thoughtgate_cedar_evaluation_duration_seconds` | Histogram | - | Evaluation latency |
+| `thoughtgate_cedar_reload_total` | Counter | `status` | Reload attempts |
+| `thoughtgate_cedar_policies_loaded` | Gauge | - | Current policy count |
+
+### 10.2 Logging
+
+| Event | Level | Fields |
+|-------|-------|--------|
+| Policy evaluation | DEBUG | `policy_id`, `decision`, `duration_us` |
+| Policy permit | INFO | `policy_id`, `tool`, `principal` |
+| Policy forbid | WARN | `policy_id`, `tool`, `reason` |
+| Policy reload success | INFO | `path`, `policy_count` |
+| Policy reload failure | ERROR | `path`, `error` |
+
+## 11. Migration from v0.1
+
+### 11.1 Breaking Changes
+
+| v0.1 | v0.2 | Migration |
+|------|------|-----------|
+| Cedar returns Forward/Approve/Reject | Cedar returns Permit/Forbid | Move routing logic to YAML |
+| Cedar is primary router | Cedar is Gate 3 only | Add YAML governance rules |
+| `THOUGHTGATE_POLICY_FILE` env var | `cedar.policies` in YAML | Update config |
+
+### 11.2 Policy Migration
+
+**v0.1 Policy (routing):**
+```cedar
+// OLD: Cedar decided to forward
+permit(
+    principal,
+    action == Action::"Forward",
+    resource
+)
+when { resource.name like "get_*" };
+```
+
+**v0.2 Policy (evaluation):**
+```yaml
+# NEW: YAML handles routing
+governance:
+  rules:
+    - match: "get_*"
+      action: forward  # Routing in YAML
+    
+    - match: "transfer_*"
+      action: policy
+      policy_id: "financial"  # Delegate to Cedar
+      approval: finance
+```
+
+```cedar
+// NEW: Cedar only evaluates when action: policy
+permit(
+    principal,
+    action == Action::"tools/call",
+    resource
+)
+when {
+    context.policy_id == "financial" &&
+    resource.arguments.amount < 10000
+};
+```

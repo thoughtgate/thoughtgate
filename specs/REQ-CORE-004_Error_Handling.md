@@ -7,7 +7,7 @@
 | **Type** | Core Mechanic |
 | **Status** | Draft |
 | **Priority** | **High** |
-| **Tags** | `#errors` `#json-rpc` `#red-path` `#reliability` |
+| **Tags** | `#errors` `#json-rpc` `#red-path` `#reliability` `#4-gate` |
 
 ## 1. Context & Decision Rationale
 
@@ -18,17 +18,26 @@ This requirement defines how ThoughtGate handles and communicates errors. Proper
 3. **Security:** Don't leak internal details in error messages
 4. **Protocol compliance:** JSON-RPC 2.0 error format
 
-**Red Path Context:**
-The "Red Path" is when the Cedar policy engine denies a request. This is one category of error, but this requirement covers ALL error scenarios—policy denial, upstream failures, internal errors, and protocol violations.
+**4-Gate Error Sources:**
+The 4-gate decision flow (REQ-CORE-003) can produce errors at each gate:
+
+| Gate | Error Source | Error Code |
+|------|--------------|------------|
+| Gate 1 (Visibility) | Tool not exposed | -32015 |
+| Gate 2 (Governance) | `action: deny` matched | -32014 |
+| Gate 3 (Cedar) | Policy forbid | -32003 |
+| Gate 4 (Approval) | Rejected or timeout | -32007, -32008 |
 
 ## 2. Dependencies
 
 | Requirement | Relationship | Notes |
 |-------------|--------------|-------|
-| REQ-CORE-003 | **Receives from** | Parse errors, upstream errors |
-| REQ-POL-001 | **Receives from** | Policy denial decisions |
+| REQ-CFG-001 | **Receives from** | Configuration errors |
+| REQ-CORE-003 | **Receives from** | Parse errors, upstream errors, gate errors |
+| REQ-POL-001 | **Receives from** | Cedar policy denial decisions (Gate 3) |
 | REQ-GOV-001 | **Receives from** | Task errors (not found, expired, etc.) |
 | REQ-GOV-002 | **Receives from** | Execution pipeline failures |
+| REQ-GOV-003 | **Receives from** | Approval errors (Gate 4) |
 | All | **Provides to** | Standardized error formatting |
 
 ## 3. Intent
@@ -46,11 +55,12 @@ The system must:
 ### 4.1 In Scope
 - JSON-RPC 2.0 error response formatting
 - Error classification and categorization
-- Error code assignment
+- Error code assignment (including 4-gate errors)
 - Error logging with context
 - Error metrics
-- Red Path (policy denial) handling
+- Gate-specific error handling (visibility, governance, policy, approval)
 - Upstream error handling
+- Configuration error handling
 - Internal error handling
 - Panic recovery
 
@@ -79,27 +89,32 @@ The system must:
 
 ### 5.2 ThoughtGate Custom Error Codes
 
-| Code | Name | Meaning |
-|------|------|---------|
-| -32000 | Upstream Connection Failed | Cannot connect to MCP server |
-| -32001 | Upstream Timeout | MCP server didn't respond in time |
-| -32002 | Upstream Error | MCP server returned error |
-| -32003 | Policy Denied | Cedar policy rejected request |
-| -32004 | Task Not Found | Invalid task ID |
-| -32005 | Task Expired | Task TTL exceeded |
-| -32006 | Task Cancelled | Task was cancelled |
-| -32007 | Approval Rejected | Human rejected the request |
-| -32008 | Approval Timeout | Approval window expired |
-| -32009 | Rate Limited | Too many requests |
-| -32010 | Inspection Failed | Amber path inspector rejected |
-| -32011 | Policy Drift | Policy changed, denying approved request |
-| -32012 | Transform Drift | Request changed during approval |
-| -32013 | Service Unavailable | ThoughtGate overloaded |
+| Code | Name | Gate | Meaning |
+|------|------|------|---------|
+| -32000 | Upstream Connection Failed | - | Cannot connect to MCP server |
+| -32001 | Upstream Timeout | - | MCP server didn't respond in time |
+| -32002 | Upstream Error | - | MCP server returned error |
+| -32003 | Policy Denied | 3 | Cedar policy forbid |
+| -32004 | Task Not Found | - | Invalid task ID |
+| -32005 | Task Expired | - | Task TTL exceeded |
+| -32006 | Task Cancelled | - | Task was cancelled |
+| -32007 | Approval Rejected | 4 | Human rejected the request |
+| -32008 | Approval Timeout | 4 | Approval window expired |
+| -32009 | Rate Limited | - | Too many requests |
+| -32010 | Inspection Failed | - | Amber path inspector rejected |
+| -32011 | Policy Drift | - | Policy changed, denying approved request |
+| -32012 | Transform Drift | - | Request changed during approval |
+| -32013 | Service Unavailable | - | ThoughtGate overloaded |
+| -32014 | Governance Rule Denied | 2 | `action: deny` matched in YAML |
+| -32015 | Tool Not Exposed | 1 | Tool hidden by `expose` config |
+| -32016 | Configuration Error | - | Invalid configuration |
+| -32017 | Workflow Not Found | 4 | Approval workflow not defined |
 
 ### 5.3 Error Message Guidelines
 
 **DO:**
 - Be specific about what failed
+- Indicate which gate rejected the request
 - Suggest remediation when possible
 - Include request correlation ID
 - Use consistent terminology
@@ -109,6 +124,7 @@ The system must:
 - Include stack traces in responses
 - Reveal policy rules or Cedar internals
 - Include sensitive data (arguments, credentials)
+- Leak configuration details
 
 ## 6. Interfaces
 
@@ -117,37 +133,85 @@ The system must:
 ```rust
 /// All error types that can occur in ThoughtGate
 pub enum ThoughtGateError {
+    // ═══════════════════════════════════════════════════════════
     // Protocol errors (from REQ-CORE-003)
+    // ═══════════════════════════════════════════════════════════
     ParseError { details: String },
     InvalidRequest { details: String },
     MethodNotFound { method: String },
     InvalidParams { details: String },
     
+    // ═══════════════════════════════════════════════════════════
+    // Gate 1: Visibility errors (from REQ-CFG-001)
+    // ═══════════════════════════════════════════════════════════
+    ToolNotExposed { 
+        tool: String,
+        source: String,
+    },
+    
+    // ═══════════════════════════════════════════════════════════
+    // Gate 2: Governance rule errors (from REQ-CFG-001)
+    // ═══════════════════════════════════════════════════════════
+    GovernanceRuleDenied { 
+        tool: String,
+        rule: Option<String>,  // Pattern that matched
+    },
+    
+    // ═══════════════════════════════════════════════════════════
+    // Gate 3: Cedar policy errors (from REQ-POL-001)
+    // ═══════════════════════════════════════════════════════════
+    PolicyDenied { 
+        tool: String, 
+        policy_id: Option<String>,
+        reason: Option<String>,
+    },
+    
+    // ═══════════════════════════════════════════════════════════
+    // Gate 4: Approval errors (from REQ-GOV-003)
+    // ═══════════════════════════════════════════════════════════
+    ApprovalRejected { 
+        tool: String, 
+        rejected_by: Option<String>,
+        workflow: Option<String>,
+    },
+    ApprovalTimeout { 
+        tool: String, 
+        timeout_secs: u64,
+        workflow: Option<String>,
+    },
+    WorkflowNotFound {
+        workflow: String,
+    },
+    
+    // ═══════════════════════════════════════════════════════════
     // Upstream errors (from REQ-CORE-003)
+    // ═══════════════════════════════════════════════════════════
     UpstreamConnectionFailed { url: String, reason: String },
     UpstreamTimeout { url: String, timeout_secs: u64 },
     UpstreamError { code: i32, message: String },
     
-    // Policy errors (from REQ-POL-001)
-    PolicyDenied { tool: String, reason: Option<String> },
-    // Note: ApprovalAutoUpgrade removed - not SEP-1686 compliant
-    // v0.1 uses blocking mode; v0.2+ uses proper SEP-1686 task response
-    
-    // Task errors (from REQ-GOV-001) - v0.2+
+    // ═══════════════════════════════════════════════════════════
+    // Task errors (from REQ-GOV-001)
+    // ═══════════════════════════════════════════════════════════
     TaskNotFound { task_id: String },
     TaskExpired { task_id: String },
     TaskCancelled { task_id: String },
     
-    // Approval errors (from REQ-GOV-002, REQ-GOV-003)
-    ApprovalRejected { tool: String, rejected_by: Option<String> },  // v0.1: blocking mode rejection
-    ApprovalTimeout { tool: String, timeout_secs: u64 },             // v0.1: blocking mode timeout
-    
+    // ═══════════════════════════════════════════════════════════
     // Pipeline errors (from REQ-GOV-002)
+    // ═══════════════════════════════════════════════════════════
     InspectionFailed { inspector: String, reason: String },
     PolicyDrift { task_id: String },
     TransformDrift { task_id: String },
     
+    // ═══════════════════════════════════════════════════════════
+    // Configuration errors (from REQ-CFG-001)
+    // ═══════════════════════════════════════════════════════════
+    ConfigurationError { details: String },
+    
+    // ═══════════════════════════════════════════════════════════
     // Operational errors
+    // ═══════════════════════════════════════════════════════════
     RateLimited { retry_after_secs: Option<u64> },
     ServiceUnavailable { reason: String },
     InternalError { correlation_id: String },
@@ -165,219 +229,182 @@ pub struct JsonRpcError {
 
 pub struct ErrorData {
     pub correlation_id: String,
-    pub error_type: String,
-    pub details: Option<serde_json::Value>,
-    pub retry_after: Option<u64>,
+    pub gate: Option<String>,      // Which gate rejected: "visibility", "governance", "policy", "approval"
+    pub tool: Option<String>,      // Tool that was being called
+    pub details: Option<String>,   // Safe details for debugging
 }
 ```
 
-**Example Response:**
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "error": {
-    "code": -32003,
-    "message": "Policy denied: Tool 'delete_user' is not permitted",
-    "data": {
-      "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
-      "error_type": "policy_denied",
-      "details": {
-        "tool": "delete_user"
-      }
-    }
-  }
-}
-```
-
-### 6.3 Internal: Error Logging
+### 6.3 Error Mapping Implementation
 
 ```rust
-pub struct ErrorLog {
-    pub timestamp: DateTime<Utc>,
-    pub level: LogLevel,
-    pub correlation_id: String,
-    pub error_type: String,
-    pub error_code: i32,
-    pub message: String,
-    pub context: ErrorContext,
-}
-
-pub struct ErrorContext {
-    pub method: Option<String>,
-    pub task_id: Option<String>,
-    pub principal: Option<String>,
-    pub upstream_url: Option<String>,
-    pub duration_ms: Option<u64>,
-    // Internal-only fields (not in response)
-    pub stack_trace: Option<String>,
-    pub internal_details: Option<String>,
+impl From<ThoughtGateError> for JsonRpcError {
+    fn from(err: ThoughtGateError) -> Self {
+        match err {
+            // Gate 1: Visibility
+            ThoughtGateError::ToolNotExposed { tool, .. } => JsonRpcError {
+                code: -32015,
+                message: format!("Tool '{}' is not available", tool),
+                data: Some(ErrorData {
+                    gate: Some("visibility".into()),
+                    tool: Some(tool),
+                    ..Default::default()
+                }),
+            },
+            
+            // Gate 2: Governance
+            ThoughtGateError::GovernanceRuleDenied { tool, rule } => JsonRpcError {
+                code: -32014,
+                message: format!("Tool '{}' is denied by governance rules", tool),
+                data: Some(ErrorData {
+                    gate: Some("governance".into()),
+                    tool: Some(tool),
+                    details: rule.map(|r| format!("Matched rule: {}", r)),
+                    ..Default::default()
+                }),
+            },
+            
+            // Gate 3: Cedar Policy
+            ThoughtGateError::PolicyDenied { tool, policy_id, .. } => JsonRpcError {
+                code: -32003,
+                message: format!("Policy denied access to tool '{}'", tool),
+                data: Some(ErrorData {
+                    gate: Some("policy".into()),
+                    tool: Some(tool),
+                    // Don't include policy_id or reason in response (security)
+                    ..Default::default()
+                }),
+            },
+            
+            // Gate 4: Approval
+            ThoughtGateError::ApprovalRejected { tool, rejected_by, .. } => JsonRpcError {
+                code: -32007,
+                message: format!("Approval rejected for tool '{}'", tool),
+                data: Some(ErrorData {
+                    gate: Some("approval".into()),
+                    tool: Some(tool),
+                    details: rejected_by.map(|by| format!("Rejected by: {}", by)),
+                    ..Default::default()
+                }),
+            },
+            
+            ThoughtGateError::ApprovalTimeout { tool, timeout_secs, .. } => JsonRpcError {
+                code: -32008,
+                message: format!("Approval timeout for tool '{}' after {}s", tool, timeout_secs),
+                data: Some(ErrorData {
+                    gate: Some("approval".into()),
+                    tool: Some(tool),
+                    ..Default::default()
+                }),
+            },
+            
+            ThoughtGateError::WorkflowNotFound { workflow } => JsonRpcError {
+                code: -32017,
+                message: format!("Approval workflow '{}' not found", workflow),
+                data: Some(ErrorData {
+                    gate: Some("approval".into()),
+                    details: Some(format!("Check approval.{} in config", workflow)),
+                    ..Default::default()
+                }),
+            },
+            
+            // Configuration errors
+            ThoughtGateError::ConfigurationError { details } => JsonRpcError {
+                code: -32016,
+                message: "Configuration error".into(),
+                data: Some(ErrorData {
+                    details: Some(details),
+                    ..Default::default()
+                }),
+            },
+            
+            // ... other error mappings unchanged
+            _ => todo!("Map remaining errors"),
+        }
+    }
 }
 ```
 
 ## 7. Functional Requirements
 
-### F-001: Error Classification
+### F-001: Gate Error Classification
 
-The system MUST classify errors into categories:
+- **F-001.1:** Classify errors by originating gate
+- **F-001.2:** Include gate identifier in error data
+- **F-001.3:** Log gate-specific context for debugging
+- **F-001.4:** Track metrics per gate
 
-| Category | Errors | User Actionable? |
-|----------|--------|------------------|
-| **Protocol** | Parse, InvalidRequest, MethodNotFound, InvalidParams | Yes (fix request) |
-| **Upstream** | ConnectionFailed, Timeout, UpstreamError | Maybe (retry/wait) |
-| **Policy** | PolicyDenied | Yes (change request or request different tool) |
-| **Task** | NotFound, Expired, Cancelled | Yes (create new task) - v0.2+ |
-| **Approval** | Rejected, Timeout | Yes (resubmit for approval) |
-| **Pipeline** | InspectionFailed, PolicyDrift, TransformDrift | Maybe (resubmit) |
-| **Operational** | RateLimited, ServiceUnavailable | Yes (wait and retry) |
-| **Internal** | InternalError | No (contact operator) |
+### F-002: Error Response Formatting
 
-### F-002: Error Code Mapping
+- **F-002.1:** Format all errors as JSON-RPC 2.0 error responses
+- **F-002.2:** Include correlation ID in all error responses
+- **F-002.3:** Include gate identifier for gate-related errors
+- **F-002.4:** Sanitize error messages (no internal details)
 
-```rust
-impl ThoughtGateError {
-    pub fn to_jsonrpc_code(&self) -> i32 {
-        match self {
-            // Standard JSON-RPC codes
-            Self::ParseError { .. } => -32700,
-            Self::InvalidRequest { .. } => -32600,
-            Self::MethodNotFound { .. } => -32601,
-            Self::InvalidParams { .. } => -32602,
-            Self::InternalError { .. } => -32603,
-            
-            // ThoughtGate custom codes
-            Self::UpstreamConnectionFailed { .. } => -32000,
-            Self::UpstreamTimeout { .. } => -32001,
-            Self::UpstreamError { .. } => -32002,
-            Self::PolicyDenied { .. } => -32003,
-            Self::TaskNotFound { .. } => -32004,      // v0.2+
-            Self::TaskExpired { .. } => -32005,       // v0.2+
-            Self::TaskCancelled { .. } => -32006,     // v0.2+
-            Self::ApprovalRejected { .. } => -32007,
-            Self::ApprovalTimeout { .. } => -32008,
-            Self::RateLimited { .. } => -32009,
-            Self::InspectionFailed { .. } => -32010,
-            Self::PolicyDrift { .. } => -32011,
-            Self::TransformDrift { .. } => -32012,
-            Self::ServiceUnavailable { .. } => -32013,
-            // -32014 reserved (was ApprovalAutoUpgrade, removed as non-SEP-1686-compliant)
-        }
-    }
-}
-```
-
-### F-003: Error Message Generation
-
-- **F-003.1:** Generate user-friendly message for each error type
-- **F-003.2:** Include tool/method name where relevant
-- **F-003.3:** Include task ID for task-related errors
-- **F-003.4:** Include retry guidance for retriable errors
-- **F-003.5:** Never include sensitive data (arguments, credentials, internal IPs)
-
-**Message Templates:**
-```
-ParseError:           "Invalid JSON: {details}"
-InvalidRequest:       "Invalid JSON-RPC request: {details}"
-MethodNotFound:       "Method '{method}' not found"
-InvalidParams:        "Invalid parameters: {details}"
-UpstreamConnFailed:   "Cannot connect to MCP server"
-UpstreamTimeout:      "MCP server did not respond in time"
-UpstreamError:        "MCP server error: {message}"
-PolicyDenied:         "Policy denied: Tool '{tool}' is not permitted"
-TaskNotFound:         "Task '{task_id}' not found"
-TaskExpired:          "Task '{task_id}' has expired"
-TaskCancelled:        "Task '{task_id}' was cancelled"
-ApprovalRejected:     "Request for '{tool}' was rejected during approval"
-ApprovalTimeout:      "Approval window expired for '{tool}' after {timeout_secs}s"
-RateLimited:          "Too many requests. Retry after {retry_after} seconds"
-InspectionFailed:     "Request validation failed: {reason}"
-PolicyDrift:          "Policy changed. Request no longer permitted"
-TransformDrift:       "Request context changed during approval"
-ServiceUnavailable:   "Service temporarily unavailable"
-InternalError:        "Internal error. Reference: {correlation_id}"
-```
-
-### F-004: Error Response Formatting
+### F-003: Error Logging
 
 ```rust
-impl ThoughtGateError {
-    pub fn to_jsonrpc_error(&self, correlation_id: &str) -> JsonRpcError {
-        JsonRpcError {
-            code: self.to_jsonrpc_code(),
-            message: self.to_message(),
-            data: Some(ErrorData {
-                correlation_id: correlation_id.to_string(),
-                error_type: self.error_type_name(),
-                details: self.safe_details(),
-                retry_after: self.retry_after(),
-            }),
-        }
-    }
-}
-```
-
-### F-005: Error Logging
-
-- **F-005.1:** Log ALL errors at appropriate level
-- **F-005.2:** Include full context (correlation ID, method, timing)
-- **F-005.3:** Include stack trace for Internal errors
-- **F-005.4:** Redact sensitive data before logging
-- **F-005.5:** Use structured JSON logging format
-
-**Log Levels:**
-| Error Category | Log Level |
-|----------------|-----------|
-| Protocol (client error) | WARN |
-| Upstream | WARN |
-| Policy denied | INFO (expected behavior) |
-| Task lifecycle | INFO |
-| Approval lifecycle | INFO |
-| Rate limited | WARN |
-| Internal | ERROR |
-
-### F-006: Panic Recovery
-
-- **F-006.1:** Catch panics at request handler boundary
-- **F-006.2:** Convert panic to InternalError response
-- **F-006.3:** Log panic with stack trace at ERROR level
-- **F-006.4:** Ensure connection is properly closed
-- **F-006.5:** Increment panic metric
-
-```rust
-async fn handle_with_panic_recovery(
-    request: McpRequest,
-) -> JsonRpcResponse {
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        handle_request(request)
-    }));
-    
-    match result {
-        Ok(response) => response,
-        Err(panic_info) => {
-            let correlation_id = Uuid::new_v4().to_string();
-            tracing::error!(
+fn log_error(err: &ThoughtGateError, correlation_id: &str) {
+    match err {
+        ThoughtGateError::ToolNotExposed { tool, source } => {
+            warn!(
                 correlation_id = %correlation_id,
-                panic = ?panic_info,
-                "Panic in request handler"
+                gate = "visibility",
+                tool = %tool,
+                source = %source,
+                "Tool not exposed"
             );
-            metrics::increment_counter!("thoughtgate_panics_total");
-            
-            ThoughtGateError::InternalError { correlation_id }
-                .to_jsonrpc_error(&correlation_id)
         }
+        ThoughtGateError::GovernanceRuleDenied { tool, rule } => {
+            warn!(
+                correlation_id = %correlation_id,
+                gate = "governance",
+                tool = %tool,
+                rule = ?rule,
+                "Governance rule denied"
+            );
+        }
+        ThoughtGateError::PolicyDenied { tool, policy_id, reason } => {
+            warn!(
+                correlation_id = %correlation_id,
+                gate = "policy",
+                tool = %tool,
+                policy_id = ?policy_id,
+                reason = ?reason,
+                "Cedar policy denied"
+            );
+        }
+        ThoughtGateError::ApprovalRejected { tool, rejected_by, workflow } => {
+            info!(
+                correlation_id = %correlation_id,
+                gate = "approval",
+                tool = %tool,
+                rejected_by = ?rejected_by,
+                workflow = ?workflow,
+                "Approval rejected"
+            );
+        }
+        // ... other error logging
+        _ => {}
     }
 }
 ```
 
-### F-007: Error Metrics
+- **F-003.1:** Log all errors with correlation ID
+- **F-003.2:** Log full internal context (not exposed to client)
+- **F-003.3:** Use appropriate log levels (error, warn, info)
+- **F-003.4:** Include gate information for gate errors
 
-All errors MUST be tracked:
+### F-004: Error Metrics
 
 ```
-thoughtgate_errors_total{type="parse_error|policy_denied|...", code="-32700"}
-thoughtgate_upstream_errors_total{type="timeout|connection|error"}
-thoughtgate_panics_total
+thoughtgate_errors_total{code, gate, category}
+thoughtgate_gate_denials_total{gate, reason}
 ```
+
+- **F-004.1:** Count errors by code
+- **F-004.2:** Count errors by gate
+- **F-004.3:** Track denial reasons per gate
 
 ## 8. Non-Functional Requirements
 
@@ -385,152 +412,55 @@ thoughtgate_panics_total
 
 **Metrics:**
 ```
-thoughtgate_errors_total{type, code}
-thoughtgate_error_latency_seconds{type}
-thoughtgate_panics_total
+thoughtgate_errors_total{code="-32015", gate="visibility", category="client"}
+thoughtgate_errors_total{code="-32014", gate="governance", category="client"}
+thoughtgate_errors_total{code="-32003", gate="policy", category="client"}
+thoughtgate_errors_total{code="-32007", gate="approval", category="client"}
+thoughtgate_errors_total{code="-32008", gate="approval", category="client"}
+thoughtgate_errors_total{code="-32000", gate="", category="upstream"}
+thoughtgate_gate_denials_total{gate="visibility"}
+thoughtgate_gate_denials_total{gate="governance"}
+thoughtgate_gate_denials_total{gate="policy"}
+thoughtgate_gate_denials_total{gate="approval"}
 ```
 
 **Logging:**
-- Structured JSON format
-- Correlation ID in every log entry
-- Timing information for debugging
-
-**Tracing:**
-- Error span with error details
-- Link to parent request span
-
-### NFR-002: Performance
-
-- Error path should not be significantly slower than success path
-- Error formatting < 1ms
-- No allocations in hot error paths where possible
-
-### NFR-003: Reliability
-
-- Error responses must always be valid JSON-RPC
-- Panics must be caught and converted to errors
-- Partial responses must never be sent
-
-### NFR-004: Security
-
-- Never expose internal IP addresses
-- Never expose Cedar policy details
-- Never expose request arguments in error messages
-- Never expose stack traces in responses
-- Sanitize all user-provided data before logging
-
-## 9. Verification Plan
-
-### 9.1 Edge Case Matrix
-
-| Scenario | Expected Error | Test ID |
-|----------|----------------|---------|
-| Malformed JSON | -32700 Parse error | EC-ERR-001 |
-| Missing `jsonrpc` field | -32600 Invalid Request | EC-ERR-002 |
-| Unknown method | -32601 Method not found | EC-ERR-003 |
-| Invalid tool params | -32602 Invalid params | EC-ERR-004 |
-| Upstream unreachable | -32000 Connection failed | EC-ERR-005 |
-| Upstream slow | -32001 Timeout | EC-ERR-006 |
-| Upstream 500 | -32002 Upstream error | EC-ERR-007 |
-| Cedar policy denies | -32003 Policy denied | EC-ERR-008 |
-| Unknown task ID | -32004 Task not found | EC-ERR-009 |
-| Expired task | -32005 Task expired | EC-ERR-010 |
-| Cancelled task | -32006 Task cancelled | EC-ERR-011 |
-| Human rejects | -32007 Approval rejected | EC-ERR-012 |
-| Approval window closes | -32008 Approval timeout | EC-ERR-013 |
-| Too many requests | -32009 Rate limited | EC-ERR-014 |
-| Inspector rejects | -32010 Inspection failed | EC-ERR-015 |
-| Policy changed post-approval | -32011 Policy drift | EC-ERR-016 |
-| Request changed post-approval | -32012 Transform drift | EC-ERR-017 |
-| Max concurrency | -32013 Service unavailable | EC-ERR-018 |
-| Handler panic | -32603 Internal error | EC-ERR-019 |
-
-### 9.2 Assertions
-
-**Unit Tests:**
-- `test_error_code_mapping` — All errors map to correct codes
-- `test_error_message_generation` — Messages are user-friendly
-- `test_error_data_sanitization` — No sensitive data leaks
-- `test_panic_recovery` — Panics produce valid error response
-
-**Integration Tests:**
-- `test_upstream_timeout_error` — Timeout produces correct error
-- `test_policy_denied_error` — Cedar denial produces correct error
-- `test_error_logging` — Errors logged with full context
-
-**Security Tests:**
-- `test_no_internal_ip_leak` — Internal IPs never in response
-- `test_no_policy_leak` — Cedar rules never in response
-- `test_no_argument_leak` — Request arguments never in error message
-
-## 10. Implementation Reference
-
-### Error Conversion Pattern
-
-```rust
-impl From<ThoughtGateError> for JsonRpcResponse {
-    fn from(error: ThoughtGateError) -> Self {
-        let correlation_id = get_current_correlation_id();
-        
-        // Log the error
-        error.log(&correlation_id);
-        
-        // Track metric
-        metrics::increment_counter!(
-            "thoughtgate_errors_total",
-            "type" => error.error_type_name(),
-            "code" => error.to_jsonrpc_code().to_string()
-        );
-        
-        // Build response
-        JsonRpcResponse::error(error.to_jsonrpc_error(&correlation_id))
-    }
-}
+```json
+{"level":"warn","correlation_id":"abc-123","gate":"visibility","tool":"admin_delete","source":"upstream","message":"Tool not exposed"}
+{"level":"warn","correlation_id":"def-456","gate":"governance","tool":"delete_all","rule":"*_all","message":"Governance rule denied"}
+{"level":"warn","correlation_id":"ghi-789","gate":"policy","tool":"transfer_funds","policy_id":"financial","message":"Cedar policy denied"}
+{"level":"info","correlation_id":"jkl-012","gate":"approval","tool":"deploy_prod","rejected_by":"alice","message":"Approval rejected"}
 ```
 
-### Error Handler Middleware
+### NFR-002: Security
 
-```rust
-pub async fn error_handling_middleware<B>(
-    request: Request<B>,
-    next: Next<B>,
-) -> Response {
-    let correlation_id = request
-        .headers()
-        .get("x-correlation-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    
-    // Store correlation ID for logging
-    let _guard = tracing::span!(
-        tracing::Level::INFO,
-        "request",
-        correlation_id = %correlation_id
-    ).entered();
-    
-    let response = next.run(request).await;
-    
-    response
-}
-```
+- Never include sensitive data in error responses
+- Never include policy rules or Cedar details
+- Never include configuration internals
+- Log full context internally for debugging
 
-### Anti-Patterns to Avoid
+## 9. Testing Requirements
 
-- **❌ Generic error messages:** "An error occurred" is useless
-- **❌ Exposing internals:** "Cedar policy line 42 failed" reveals too much
-- **❌ Silent failures:** Every error must be logged
-- **❌ Inconsistent codes:** Same error type must always use same code
-- **❌ Missing correlation ID:** Every error response needs one
+### 9.1 Unit Tests
 
-## 11. Definition of Done
+| Test | Description |
+|------|-------------|
+| `test_gate1_error_format` | ToolNotExposed maps to -32015 |
+| `test_gate2_error_format` | GovernanceRuleDenied maps to -32014 |
+| `test_gate3_error_format` | PolicyDenied maps to -32003 |
+| `test_gate4_rejected_format` | ApprovalRejected maps to -32007 |
+| `test_gate4_timeout_format` | ApprovalTimeout maps to -32008 |
+| `test_workflow_not_found_format` | WorkflowNotFound maps to -32017 |
+| `test_error_data_includes_gate` | Gate field populated |
+| `test_error_data_includes_correlation` | Correlation ID included |
+| `test_no_sensitive_data_in_response` | Policy rules not leaked |
 
-- [ ] All error types defined in `ThoughtGateError` enum
-- [ ] Error code mapping implemented and tested
-- [ ] Error message templates defined (no sensitive data)
-- [ ] JSON-RPC error response formatting working
-- [ ] Error logging with full context
-- [ ] Panic recovery at handler boundary
-- [ ] Metrics for all error types
-- [ ] Security review passed (no data leaks)
-- [ ] All edge cases (EC-ERR-001 to EC-ERR-019) covered
-- [ ] Documentation of all error codes for API consumers
+### 9.2 Integration Tests
+
+| Test | Description |
+|------|-------------|
+| `test_gate1_returns_32015` | Blocked tool returns -32015 |
+| `test_gate2_returns_32014` | action: deny returns -32014 |
+| `test_gate3_returns_32003` | Cedar forbid returns -32003 |
+| `test_gate4_reject_returns_32007` | Rejection returns -32007 |
+| `test_gate4_timeout_returns_32008` | Timeout returns -32008 |

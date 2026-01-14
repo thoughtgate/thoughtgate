@@ -7,73 +7,149 @@
 | **Type** | Governance Component |
 | **Status** | Draft |
 | **Priority** | **Critical** |
-| **Tags** | `#governance` `#tasks` `#sep-1686` `#state-machine` `#async` |
+| **Tags** | `#governance` `#tasks` `#sep-1686` `#state-machine` `#async` `#blocking` |
 
 ## 1. Context & Decision Rationale
 
-This requirement defines the **task lifecycle management** for ThoughtGate's approval workflows. It implements SEP-1686, the MCP specification for async task execution.
+This requirement defines **task lifecycle management** for ThoughtGate's approval workflows.
 
-**What is SEP-1686?**
+### 1.1 Version Scope Overview
+
+| Version | Mode | Task Exposure | Description |
+|---------|------|---------------|-------------|
+| **v0.2** | **Blocking** | Internal only | HTTP connection held; no task API exposed |
+| v0.3+ | SEP-1686 | Full API | Async tasks with `tasks/*` methods |
+
+### 1.2 v0.2: Blocking Mode
+
+In v0.2, ThoughtGate uses **blocking mode** for approval workflows:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         v0.2 BLOCKING MODE                                  │
+│                                                                             │
+│   Agent                    ThoughtGate                    Human (Slack)     │
+│     │                           │                              │            │
+│     │  tools/call               │                              │            │
+│     │ ─────────────────────────►│                              │            │
+│     │                           │                              │            │
+│     │         ┌─────────────────┴─────────────────┐            │            │
+│     │         │ HTTP connection held open         │            │            │
+│     │         │ Internal tracking for correlation │            │            │
+│     │         └─────────────────┬─────────────────┘            │            │
+│     │                           │                              │            │
+│     │                           │   Post approval request      │            │
+│     │                           │ ────────────────────────────►│            │
+│     │                           │                              │            │
+│     │     (connection blocked)  │      (human reviews)         │            │
+│     │              ...          │           ...                │            │
+│     │                           │                              │            │
+│     │                           │   Reaction (👍/👎)           │            │
+│     │                           │◄─────────────────────────────│            │
+│     │                           │                              │            │
+│     │         ┌─────────────────┴─────────────────┐            │            │
+│     │         │ On approve: forward to upstream   │            │            │
+│     │         │ On reject: return error           │            │            │
+│     │         │ On timeout: return error          │            │            │
+│     │         └─────────────────┬─────────────────┘            │            │
+│     │                           │                              │            │
+│     │  {"result": ...}          │                              │            │
+│     │◄──────────────────────────│                              │            │
+│     │  (or error response)      │                              │            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Key characteristics:
+• Agent sees normal tools/call → response (just slow)
+• No task ID exposed to agent
+• No tasks/* methods available
+• Works with ANY MCP client (no SEP-1686 support required)
+```
+
+**Why Blocking Mode for v0.2?**
+- Simplest possible implementation
+- Works with all existing MCP clients
+- No client-side changes required
+- Approval timeouts are typically short (< 30 minutes)
+
+**Limitations of Blocking Mode:**
+- HTTP connection may timeout for long approvals
+- Agent cannot do other work while waiting
+- No visibility into approval progress
+- Connection drops lose the request
+
+### 1.3 v0.3+: SEP-1686 Mode (Future)
+
 SEP-1686 introduces the "task primitive" to MCP, enabling:
 - Deferred result retrieval via polling
 - Long-running operations that outlive request/response cycles
 - Status tracking for async workflows
 
-**Why Tasks?**
-Approval (human or agent-based) can take minutes, hours, or days. Without tasks:
-- Agent would block waiting for approval
-- Connection timeouts would fail the request
-- No way to track approval status
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         v0.3+ SEP-1686 MODE (FUTURE)                        │
+│                                                                             │
+│   Agent                    ThoughtGate                    Human (Slack)     │
+│     │                           │                              │            │
+│     │  tools/call               │                              │            │
+│     │  (with task field)        │                              │            │
+│     │ ─────────────────────────►│                              │            │
+│     │                           │                              │            │
+│     │  {"taskId": "abc-123",    │   Post approval request      │            │
+│     │   "status": "working"}    │ ────────────────────────────►│            │
+│     │◄──────────────────────────│                              │            │
+│     │                           │                              │            │
+│     │  (agent free to do        │      (human reviews)         │            │
+│     │   other work)             │           ...                │            │
+│     │                           │                              │            │
+│     │  tasks/get                │                              │            │
+│     │ ─────────────────────────►│                              │            │
+│     │  {"status": "working"}    │                              │            │
+│     │◄──────────────────────────│                              │            │
+│     │                           │   Reaction (👍/👎)           │            │
+│     │           ...             │◄─────────────────────────────│            │
+│     │                           │                              │            │
+│     │  tasks/result             │                              │            │
+│     │ ─────────────────────────►│                              │            │
+│     │  {"result": ...}          │                              │            │
+│     │◄──────────────────────────│                              │            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-With tasks:
-- Agent receives task ID immediately
-- Agent polls for status
-- Approval happens out-of-band
-- Agent retrieves result when ready
-
-**⚠️ v0.1 Limitation: Blocking Mode Only**
-
-SEP-1686 requires that:
-1. Server declares `capabilities.tasks.requests.tools.call: true` during initialize
-2. Server adds annotations to tools during `tools/list` to indicate async support
-3. Client includes `task` field in request to opt-in to async mode
-
-**v0.1 does NOT implement full SEP-1686.** Instead:
-- ThoughtGate uses **blocking mode**: holds HTTP connection until approval
-- No task capability advertisement
-- No tool annotation rewriting
-- Works with any client (no SEP-1686 support required)
-
-**v0.2 will implement full SEP-1686** with:
-- Task capability declaration during initialize
-- Tool annotation rewriting during tools/list
-- Task-augmented call handling
-- Blocking fallback for legacy clients
-
-See RFC-001 §10.1 for details.
+Key characteristics:
+• Agent receives task ID immediately
+• Agent polls for status
+• Agent retrieves result when ready
+• Requires SEP-1686-aware client
+```
 
 ## 2. Dependencies
 
-| Requirement | Relationship | Notes |
-|-------------|--------------|-------|
-| REQ-CORE-003 | **Receives from** | MCP routing for `tasks/*` methods (v0.2+) |
-| REQ-CORE-004 | **Provides to** | Error formatting for task/approval errors |
-| REQ-CORE-005 | **Coordinates with** | Shutdown handling for pending approvals |
-| REQ-POL-001 | **Receives from** | Approval decisions that trigger blocking/tasks |
-| REQ-GOV-002 | **Provides to** | Task state for execution pipeline (v0.2+) |
-| REQ-GOV-003 | **Coordinates with** | Approval decisions update task state |
+| Requirement | Relationship | v0.2 | v0.3+ |
+|-------------|--------------|------|-------|
+| REQ-CFG-001 | **Receives from** | Timeout configuration | Task configuration |
+| REQ-CORE-003 | **Receives from** | — | MCP routing for `tasks/*` methods |
+| REQ-CORE-004 | **Provides to** | Error formatting | Error formatting |
+| REQ-CORE-005 | **Coordinates with** | Shutdown handling | Shutdown handling |
+| REQ-POL-001 | **Receives from** | Approval decisions | Approval decisions |
+| REQ-GOV-002 | **Provides to** | — | Task state for pipeline |
+| REQ-GOV-003 | **Coordinates with** | Approval decisions | Approval decisions |
 
 ## 3. Intent
 
-**v0.1 (Blocking Mode):**
-The system must:
-1. Block HTTP connection until approval decision is received
-2. Execute tool and return result on approval
-3. Return error on rejection or timeout
-4. Support configurable approval timeout
+### 3.1 v0.2 Intent (Blocking Mode)
 
-**v0.2+ (SEP-1686 Mode):**
 The system must:
+1. Hold HTTP connection open during approval wait
+2. Track pending approvals internally for observability
+3. Enforce configurable approval timeout
+4. Execute tool and return result on approval
+5. Return error on rejection or timeout
+6. Handle client disconnection gracefully
+
+### 3.2 v0.3+ Intent (SEP-1686 Mode)
+
+The system must additionally:
 1. Implement SEP-1686 task state machine
 2. Store tasks with request data for later execution
 3. Handle `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel` methods
@@ -85,42 +161,47 @@ The system must:
 
 ## 4. Scope
 
-### 4.1 In Scope
-- Task data structure
-- Task state machine (agent-visible and internal states)
-- In-memory task storage with TTL
-- SEP-1686 method implementations
-- Task creation from Approval decisions
-- Concurrency control (optimistic locking)
-- Rate limiting
-- Task metrics and logging
+### 4.1 v0.2 Scope
 
-### 4.2 Out of Scope
-- Approval logic (REQ-GOV-002, REQ-GOV-003)
-- Execution pipeline (REQ-GOV-002)
-- Persistent storage (deferred to future version)
-- Task migration/recovery (deferred to future version)
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Blocking wait during approval | ✅ In Scope | Core v0.2 functionality |
+| Internal approval tracking | ✅ In Scope | For correlation/observability |
+| Configurable timeout | ✅ In Scope | From YAML config |
+| Client disconnection detection | ✅ In Scope | Prevent zombie approvals |
+| Metrics and logging | ✅ In Scope | Observability |
+| Task API (`tasks/*` methods) | ❌ Out of Scope | v0.3+ |
+| Task state machine | ❌ Out of Scope | v0.3+ |
+| Task storage with TTL | ❌ Out of Scope | v0.3+ |
+| Rate limiting | ❌ Out of Scope | v0.3+ |
+
+### 4.2 v0.3+ Scope (Future)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Task data structure | In Scope | Full SEP-1686 |
+| Task state machine | In Scope | Working → Completed/Failed |
+| In-memory task storage | In Scope | With TTL cleanup |
+| `tasks/get` | In Scope | Status retrieval |
+| `tasks/result` | In Scope | Result retrieval |
+| `tasks/list` | In Scope | Pagination |
+| `tasks/cancel` | In Scope | Cancellation |
+| Rate limiting | In Scope | Per-principal and global |
+| Capability advertisement | In Scope | During initialize |
+| Tool annotation rewriting | In Scope | During tools/list |
 
 ## 5. Constraints
 
-### 5.1 SEP-1686 Compliance
+### 5.1 v0.2 Configuration
 
-**Task States (per SEP-1686):**
-| State | Meaning | Terminal? |
-|-------|---------|-----------|
-| `working` | Request is being processed | No |
-| `input_required` | Awaiting external input (approval) | No |
-| `completed` | Success, result available | Yes |
-| `failed` | Error occurred | Yes |
-| `cancelled` | Cancelled by client | Yes |
+| Setting | Default | Source | Description |
+|---------|---------|--------|-------------|
+| Approval timeout | From workflow | `approval.<name>.timeout` | Max wait time |
+| On timeout action | `deny` | `approval.<name>.on_timeout` | Action when timeout |
 
-**Additional States (ThoughtGate-specific):**
-| State | Meaning | Terminal? | Visible to Agent? |
-|-------|---------|-----------|-------------------|
-| `rejected` | Approver rejected request | Yes | Yes |
-| `expired` | TTL exceeded | Yes | Yes |
+**Note:** v0.2 uses workflow-level timeout from YAML configuration (REQ-CFG-001), not global task TTL.
 
-### 5.2 Configuration
+### 5.2 v0.3+ Configuration (Future)
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
@@ -130,615 +211,542 @@ The system must:
 | Max pending per principal | 10 | `THOUGHTGATE_TASK_MAX_PENDING_PER_PRINCIPAL` |
 | Max pending global | 1000 | `THOUGHTGATE_TASK_MAX_PENDING_GLOBAL` |
 
-### 5.3 Storage Constraints (v0.1)
+### 5.3 SEP-1686 Task States (v0.3+ Reference)
 
-- In-memory storage only (no persistence)
-- Tasks lost on restart (acceptable for v0.1)
-- Memory limit: ~2KB per task average
+| State | Meaning | Terminal? |
+|-------|---------|-----------|
+| `working` | Request is being processed | No |
+| `input_required` | Awaiting external input (approval) | No |
+| `completed` | Success, result available | Yes |
+| `failed` | Error occurred | Yes |
+| `cancelled` | Cancelled by client | Yes |
 
-### 5.4 State Persistence Risk (CRITICAL)
-
-**⚠️ v0.1 Limitation: Volatile Task State**
-
-ThoughtGate sidecars in Kubernetes are ephemeral. If the Application Pod restarts (crash, deployment, scaling), the sidecar restarts and **all in-memory task state is lost**.
-
-**Impact:**
-- All pending Approval approvals are lost
-- Active tasks in `working` or `input_required` state disappear
-- Agents polling for task status will receive `404 Not Found`
-
-**Client Expectations:**
-Clients (agents) MUST handle task lookup failures gracefully:
-1. On `404 Not Found` for `tasks/get` or `tasks/result`, assume task was lost
-2. Retry the original `tools/call` request to create a new task
-3. Implement idempotency keys if tool operations must not be duplicated
-
-**Mitigation Strategies (Future):**
-| Version | Strategy | Trade-off |
-|---------|----------|-----------|
-| v0.1 | Accept data loss | Simple, fast |
-| future version | Redis-backed store | Adds dependency, survives restarts |
-| future version | PostgreSQL + WAL | Full durability, complex |
-
-**Operational Guidance:**
-- Monitor `tasks_pending` metric before deployments
-- Consider "drain" period before rolling updates
-- Alert on high pending task counts during restarts
+**Additional ThoughtGate States:**
+| State | Meaning | Terminal? |
+|-------|---------|-----------|
+| `rejected` | Approver rejected request | Yes |
+| `expired` | TTL exceeded | Yes |
 
 ## 6. Interfaces
 
-### 6.1 Task Structure
+### 6.1 v0.2: Pending Approval Tracker
 
 ```rust
+/// Internal tracking for pending approvals (v0.2)
+/// NOT exposed via task API - for observability only
+pub struct PendingApproval {
+    /// Unique identifier for correlation
+    pub id: Uuid,
+    
+    /// Original request (for logging/metrics)
+    pub tool_name: String,
+    pub arguments_hash: String,
+    
+    /// Principal making the request
+    pub principal: Principal,
+    
+    /// Timing
+    pub created_at: Instant,
+    pub timeout: Duration,
+    
+    /// Channel to signal completion
+    pub completion_tx: oneshot::Sender<ApprovalOutcome>,
+    
+    /// Client connection state
+    pub client_connected: Arc<AtomicBool>,
+}
+
+pub enum ApprovalOutcome {
+    Approved,
+    Rejected { reason: Option<String> },
+    Timeout,
+    ClientDisconnected,
+}
+```
+
+### 6.2 v0.2: Approval Waiter Interface
+
+```rust
+#[async_trait]
+pub trait ApprovalWaiter: Send + Sync {
+    /// Wait for approval decision (blocking mode)
+    /// Returns when: approved, rejected, timeout, or client disconnects
+    async fn wait_for_approval(
+        &self,
+        pending: &PendingApproval,
+    ) -> ApprovalOutcome;
+    
+    /// Record an approval decision (called by REQ-GOV-003)
+    fn record_decision(
+        &self,
+        approval_id: Uuid,
+        decision: ApprovalDecision,
+    ) -> Result<(), ApprovalError>;
+    
+    /// Check if client is still connected
+    fn is_client_connected(&self, approval_id: Uuid) -> bool;
+}
+
+pub enum ApprovalDecision {
+    Approved { decided_by: String },
+    Rejected { decided_by: String, reason: Option<String> },
+}
+```
+
+### 6.3 v0.2: Pending Approval Store
+
+```rust
+/// In-memory store for pending approvals (v0.2)
+pub struct PendingApprovalStore {
+    /// Map from approval ID to pending approval
+    approvals: DashMap<Uuid, PendingApproval>,
+}
+
+impl PendingApprovalStore {
+    pub fn new() -> Self {
+        Self {
+            approvals: DashMap::new(),
+        }
+    }
+    
+    /// Register a new pending approval
+    pub fn register(&self, approval: PendingApproval) -> Uuid {
+        let id = approval.id;
+        self.approvals.insert(id, approval);
+        id
+    }
+    
+    /// Get pending approval by ID
+    pub fn get(&self, id: Uuid) -> Option<dashmap::mapref::one::Ref<Uuid, PendingApproval>> {
+        self.approvals.get(&id)
+    }
+    
+    /// Remove pending approval (on completion)
+    pub fn remove(&self, id: Uuid) -> Option<PendingApproval> {
+        self.approvals.remove(&id).map(|(_, v)| v)
+    }
+    
+    /// Count pending approvals (for metrics)
+    pub fn count(&self) -> usize {
+        self.approvals.len()
+    }
+    
+    /// Count pending approvals for principal
+    pub fn count_for_principal(&self, principal: &str) -> usize {
+        self.approvals
+            .iter()
+            .filter(|entry| entry.principal.app_name == principal)
+            .count()
+    }
+}
+```
+
+### 6.4 v0.3+: Full Task Structure (Future Reference)
+
+```rust
+/// Full task structure for SEP-1686 mode (v0.3+)
 pub struct Task {
     // Identity
-    pub id: TaskId,                              // UUID v4
+    pub id: TaskId,
     
     // Request Data
-    pub original_request: ToolCallRequest,       // What agent sent
-    pub pre_approval_transformed: ToolCallRequest,   // After Pre-Approval Amber
-    pub request_hash: String,                    // SHA256 for integrity
+    pub original_request: ToolCallRequest,
+    pub request_hash: String,
     
     // Principal
-    pub principal: Principal,                    // Who made the request
+    pub principal: Principal,
     
     // Timing
     pub created_at: DateTime<Utc>,
     pub ttl: Duration,
     pub expires_at: DateTime<Utc>,
-    pub poll_interval: Duration,                 // Suggested poll frequency
+    pub poll_interval: Duration,
     
     // State
     pub status: TaskStatus,
     pub status_message: Option<String>,
-    pub transitions: Vec<TaskTransition>,        // Audit trail
+    pub transitions: Vec<TaskTransition>,
     
-    // Approval (populated when approved/rejected)
+    // Approval
     pub approval: Option<ApprovalRecord>,
     
-    // Result (populated when terminal)
+    // Result
     pub result: Option<ToolCallResult>,
     pub failure: Option<FailureInfo>,
 }
 
 pub struct TaskId(pub Uuid);
 
-pub struct ToolCallRequest {
-    pub name: String,
-    pub arguments: serde_json::Value,
-    pub mcp_request_id: JsonRpcId,
-}
-
-pub struct ApprovalRecord {
-    pub decision: ApprovalDecision,
-    pub decided_by: String,
-    pub decided_at: DateTime<Utc>,
-    pub approval_valid_until: DateTime<Utc>,
-    pub metadata: Option<serde_json::Value>,
-}
-
-pub enum ApprovalDecision {
-    Approved,
-    Rejected { reason: Option<String> },
-}
-
-pub struct FailureInfo {
-    pub stage: FailureStage,
-    pub reason: String,
-    pub retriable: bool,
-}
-
-pub enum FailureStage {
-    PreHitlInspection,
-    ApprovalTimeout,
-    ApprovalRejected,
-    PolicyDrift,
-    PostHitlInspection,
-    TransformDrift,
-    UpstreamError,
-    ServiceShutdown,
-}
-
-pub struct TaskTransition {
-    pub from: TaskStatus,
-    pub to: TaskStatus,
-    pub at: DateTime<Utc>,
-    pub reason: Option<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    // SEP-1686 standard states
+    Working,
+    InputRequired,
+    Completed,
+    Failed,
+    Cancelled,
+    // ThoughtGate extensions
+    Rejected,
+    Expired,
 }
 ```
 
-### 6.2 Task Status
+## 7. Behavior Specification
+
+### 7.1 v0.2: Blocking Approval Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  v0.2 BLOCKING APPROVAL FLOW                    │
+└─────────────────────────────────────────────────────────────────┘
+
+  1. Request arrives (tools/call with action: approve)
+     │
+     ▼
+  2. Create PendingApproval
+     │
+     ├─ Generate UUID for correlation
+     ├─ Hash arguments for logging
+     ├─ Create completion channel
+     └─ Track client connection state
+     │
+     ▼
+  3. Register with PendingApprovalStore
+     │
+     ▼
+  4. Post approval request to Slack (REQ-GOV-003)
+     │
+     ▼
+  5. Wait for outcome (blocking)
+     │
+     ├─────────────────────────────────────────────┐
+     │                                             │
+     │  Poll for:                                  │
+     │  • Approval decision from Slack             │
+     │  • Timeout expiration                       │
+     │  • Client disconnection                     │
+     │                                             │
+     └─────────────────────────────────────────────┘
+     │
+     ├─── Approved ─────────────────────┐
+     │                                  │
+     ├─── Rejected ──► Return -32007    │
+     │                                  │
+     ├─── Timeout ───► Execute          │
+     │                 on_timeout       │
+     │                 action           │
+     │                                  │
+     └─── Disconnected ► Cleanup        │
+                        (no response)   │
+                                        │
+                                        ▼
+  6. Forward to upstream ◄──────────────┘
+     │
+     ▼
+  7. Return response to agent
+
+  8. Cleanup: Remove from PendingApprovalStore
+```
+
+### F-001: Pending Approval Registration (v0.2)
+
+- **F-001.1:** Generate UUID for each pending approval
+- **F-001.2:** Store tool name and arguments hash (not full arguments)
+- **F-001.3:** Record principal for observability
+- **F-001.4:** Create oneshot channel for completion signaling
+- **F-001.5:** Track client connection state via `Arc<AtomicBool>`
+
+### F-002: Blocking Wait (v0.2)
+
+- **F-002.1:** Use `tokio::select!` to wait for multiple conditions
+- **F-002.2:** Check for approval decision from Slack polling
+- **F-002.3:** Check for timeout expiration
+- **F-002.4:** Check for client disconnection
+- **F-002.5:** Return first condition that triggers
 
 ```rust
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TaskStatus {
-    // Non-Terminal (agent keeps polling)
-    Working,
-    InputRequired,
+async fn wait_for_approval(
+    &self,
+    pending: &PendingApproval,
+) -> ApprovalOutcome {
+    let timeout = tokio::time::sleep(pending.timeout);
+    let decision_rx = pending.completion_rx.clone();
     
-    // Internal Transitional (not exposed to agent)
-    Executing,
-    
-    // Terminal (agent retrieves result or error)
-    Completed,
-    Failed,
-    Rejected,
-    Cancelled,
-    Expired,
-}
-
-impl TaskStatus {
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Rejected | 
-            Self::Cancelled | Self::Expired
-        )
-    }
-    
-    pub fn is_agent_visible(&self) -> bool {
-        !matches!(self, Self::Executing)
-    }
-    
-    /// Convert to SEP-1686 status string
-    pub fn to_sep1686(&self) -> &'static str {
-        match self {
-            Self::Working | Self::Executing => "working",
-            Self::InputRequired => "input_required",
-            Self::Completed => "completed",
-            Self::Failed | Self::Expired => "failed",
-            Self::Rejected => "failed",
-            Self::Cancelled => "cancelled",
+    tokio::select! {
+        // Approval decision received
+        result = decision_rx => {
+            match result {
+                Ok(ApprovalDecision::Approved { .. }) => ApprovalOutcome::Approved,
+                Ok(ApprovalDecision::Rejected { reason, .. }) => {
+                    ApprovalOutcome::Rejected { reason }
+                }
+                Err(_) => ApprovalOutcome::ClientDisconnected,
+            }
+        }
+        
+        // Timeout expired
+        _ = timeout => {
+            ApprovalOutcome::Timeout
+        }
+        
+        // Client disconnection (checked periodically)
+        _ = wait_for_disconnect(pending.client_connected.clone()) => {
+            ApprovalOutcome::ClientDisconnected
         }
     }
 }
 ```
 
-### 6.3 SEP-1686 Method Interfaces
+### F-003: Client Disconnection Detection (v0.2)
 
-**tasks/get:**
-```rust
-pub struct TasksGetRequest {
-    pub task_id: TaskId,
-}
+- **F-003.1:** Track TCP connection state
+- **F-003.2:** Set `client_connected` to false on disconnect
+- **F-003.3:** Cancel pending Slack request on disconnect
+- **F-003.4:** Log disconnection with correlation ID
+- **F-003.5:** Do NOT execute tool if client disconnects (prevent zombie execution)
 
-pub struct TasksGetResponse {
-    pub task_id: TaskId,
-    pub status: String,                      // SEP-1686 status
-    pub status_message: Option<String>,
-    pub created_at: String,                  // ISO 8601
-    pub ttl: u64,                            // milliseconds
-    pub poll_interval: Option<u64>,          // milliseconds
-}
-```
+### F-004: Timeout Handling (v0.2)
 
-**tasks/result:**
-```rust
-pub struct TasksResultRequest {
-    pub task_id: TaskId,
-}
+- **F-004.1:** Use workflow timeout from YAML configuration
+- **F-004.2:** Execute `on_timeout` action when timeout expires
+- **F-004.3:** `on_timeout: deny` returns -32008 error
+- **F-004.4:** Log timeout with correlation ID and duration
 
-pub type TasksResultResponse = ToolCallResult;
-```
+### F-005: Approval Decision Recording (v0.2)
 
-**tasks/list:**
-```rust
-pub struct TasksListRequest {
-    pub cursor: Option<String>,
-    pub limit: Option<usize>,
-}
+- **F-005.1:** Receive decision from REQ-GOV-003 (Slack polling)
+- **F-005.2:** Signal completion via oneshot channel
+- **F-005.3:** If approval not found (expired/cleaned up), log and ignore
+- **F-005.4:** Record decision metadata for audit logging
 
-pub struct TasksListResponse {
-    pub tasks: Vec<TaskSummary>,
-    pub next_cursor: Option<String>,
-}
-
-pub struct TaskSummary {
-    pub task_id: TaskId,
-    pub status: String,
-    pub created_at: String,
-    pub tool_name: String,
-}
-```
-
-**tasks/cancel:**
-```rust
-pub struct TasksCancelRequest {
-    pub task_id: TaskId,
-}
-
-pub struct TasksCancelResponse {
-    pub task_id: TaskId,
-    pub status: String,
-}
-```
-
-### 6.4 Task Manager Interface
-
-```rust
-#[async_trait]
-pub trait TaskManager: Send + Sync {
-    /// Create a new task for approval workflow
-    async fn create(
-        &self,
-        original_request: ToolCallRequest,
-        transformed_request: ToolCallRequest,
-        principal: Principal,
-        ttl: Duration,
-    ) -> Result<Task, TaskError>;
-    
-    /// Get task by ID (SEP-1686: tasks/get)
-    async fn get(&self, task_id: &TaskId) -> Result<Task, TaskError>;
-    
-    /// Get task result, blocks if not terminal (SEP-1686: tasks/result)
-    async fn get_result(
-        &self,
-        task_id: &TaskId,
-        timeout: Duration,
-    ) -> Result<ToolCallResult, TaskError>;
-    
-    /// List tasks with pagination (SEP-1686: tasks/list)
-    async fn list(
-        &self,
-        principal: &Principal,
-        cursor: Option<String>,
-        limit: usize,
-    ) -> Result<TasksListResponse, TaskError>;
-    
-    /// Cancel a task (SEP-1686: tasks/cancel)
-    async fn cancel(&self, task_id: &TaskId) -> Result<Task, TaskError>;
-    
-    /// Transition task state (internal, with optimistic locking)
-    async fn transition(
-        &self,
-        task_id: &TaskId,
-        expected_status: TaskStatus,
-        new_status: TaskStatus,
-        reason: Option<String>,
-    ) -> Result<Task, TaskError>;
-    
-    /// Record approval decision (called by REQ-GOV-003)
-    async fn record_approval(
-        &self,
-        task_id: &TaskId,
-        decision: ApprovalDecision,
-        decided_by: String,
-    ) -> Result<Task, TaskError>;
-    
-    /// Store execution result (called by REQ-GOV-002)
-    async fn complete(
-        &self,
-        task_id: &TaskId,
-        result: ToolCallResult,
-    ) -> Result<Task, TaskError>;
-    
-    /// Mark task as failed (called by REQ-GOV-002)
-    async fn fail(
-        &self,
-        task_id: &TaskId,
-        failure: FailureInfo,
-    ) -> Result<Task, TaskError>;
-}
-```
-
-### 6.5 Errors
-
-```rust
-pub enum TaskError {
-    NotFound { task_id: TaskId },
-    Expired { task_id: TaskId },
-    AlreadyTerminal { task_id: TaskId, status: TaskStatus },
-    ConcurrentModification { task_id: TaskId, expected: TaskStatus, actual: TaskStatus },
-    RateLimited { principal: String, retry_after: Duration },
-    CapacityExceeded,
-    ResultNotReady { task_id: TaskId },
-    Internal { details: String },
-}
-```
-
-## 7. Functional Requirements
-
-### F-001: Task State Machine
+### 7.2 v0.3+: SEP-1686 Task Flow (Future Reference)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      TASK STATE MACHINE                          │
-│                                                                  │
-│                        ┌─────────┐                               │
-│            ┌──────────▶│ Working │──────────┐                    │
-│            │           └────┬────┘          │                    │
-│         (create)            │               │                    │
-│                             ▼               │                    │
-│                    ┌────────────────┐       │                    │
-│                    │ InputRequired  │       │                    │
-│                    │(await approval)│       │                    │
-│                    └───────┬────────┘       │                    │
-│                            │                │                    │
-│           ┌────────────────┼────────────────┼──────────┐        │
-│           ▼                ▼                ▼          ▼        │
-│     ┌──────────┐    ┌──────────┐    ┌──────────┐ ┌─────────┐   │
-│     │ Approved │    │ Rejected │    │ Cancelled│ │ Expired │   │
-│     │(internal)│    │(terminal)│    │(terminal)│ │(terminal)│   │
-│     └────┬─────┘    └──────────┘    └──────────┘ └─────────┘   │
-│          │                                                       │
-│          ▼                                                       │
-│    ┌───────────┐                                                │
-│    │ Executing │ (internal, not visible to agent)               │
-│    └─────┬─────┘                                                │
-│          │                                                       │
-│    ┌─────┴─────┐                                                │
-│    ▼           ▼                                                │
-│ ┌───────────┐ ┌───────────┐                                     │
-│ │ Completed │ │  Failed   │                                     │
-│ │ (terminal)│ │ (terminal)│                                     │
-│ └───────────┘ └───────────┘                                     │
-│                                                                  │
+│                  v0.3+ SEP-1686 TASK FLOW                       │
 └─────────────────────────────────────────────────────────────────┘
+
+  1. Request arrives (tools/call with task field)
+     │
+     ▼
+  2. Create Task in Working state
+     │
+     ▼
+  3. Return task-augmented response immediately
+     {"taskId": "abc-123", "status": "working"}
+     │
+     ▼
+  4. Transition to InputRequired
+     │
+     ▼
+  5. Post approval request to Slack
+     │
+     ▼
+  (Agent polls via tasks/get)
+     │
+     ▼
+  6. Receive approval decision
+     │
+     ├─── Approved ──► Transition to Working (Executing)
+     │                        │
+     │                        ▼
+     │                 Forward to upstream
+     │                        │
+     │                        ▼
+     │                 Transition to Completed
+     │
+     ├─── Rejected ──► Transition to Rejected
+     │
+     └─── Timeout ───► Transition to Expired
+
+  7. Agent retrieves result via tasks/result
 ```
 
-**Valid Transitions:**
-| From | To | Trigger |
-|------|----|---------|
-| `Working` | `InputRequired` | Pre-Approval complete, awaiting approval |
-| `Working` | `Failed` | Pre-Approval inspection failed |
-| `InputRequired` | `Executing` | Approval received |
-| `InputRequired` | `Rejected` | Approver rejected |
-| `InputRequired` | `Cancelled` | Agent cancelled |
-| `InputRequired` | `Expired` | TTL exceeded |
-| `Executing` | `Completed` | Execution succeeded |
-| `Executing` | `Failed` | Execution failed |
+### F-006 to F-012: SEP-1686 Methods (v0.3+ - Deferred)
 
-- **F-001.1:** Enforce valid transitions only
-- **F-001.2:** Reject invalid transitions with error
-- **F-001.3:** Record all transitions in audit trail
-- **F-001.4:** Terminal states are immutable
+These features are deferred to v0.3+:
 
-### F-002: Task Creation
+- **F-006:** Task creation with state machine
+- **F-007:** Dynamic poll interval computation
+- **F-008:** `tasks/get` implementation
+- **F-009:** `tasks/result` implementation
+- **F-010:** `tasks/list` with pagination
+- **F-011:** `tasks/cancel` implementation
+- **F-012:** Rate limiting and capacity management
 
-- **F-002.1:** Generate unique task ID (UUID v4)
-- **F-002.2:** Store original and transformed request
-- **F-002.3:** Compute request hash (SHA256) for integrity verification
-- **F-002.4:** Apply TTL bounds (min 60s, max configurable)
-- **F-002.5:** Check rate limits before creation
-- **F-002.6:** Check global capacity before creation
-- **F-002.7:** Compute initial poll_interval based on TTL
-
-**Poll Interval Calculation:**
-The `poll_interval` returned to agents is computed dynamically based on remaining TTL:
-
-```rust
-fn compute_poll_interval(remaining_ttl: Duration) -> Duration {
-    let secs = remaining_ttl.as_secs();
-    match secs {
-        0..=60 => Duration::from_secs(2),      // Last minute: poll every 2s
-        61..=300 => Duration::from_secs(5),    // Last 5 min: poll every 5s
-        301..=900 => Duration::from_secs(10),  // Last 15 min: poll every 10s
-        _ => Duration::from_secs(30),          // Otherwise: poll every 30s
-    }
-}
-```
-
-**Configuration:**
-| Setting | Default | Environment Variable |
-|---------|---------|---------------------|
-| Min poll interval | `2s` | `THOUGHTGATE_TASK_MIN_POLL_INTERVAL_SECS` |
-| Max poll interval | `30s` | `THOUGHTGATE_TASK_MAX_POLL_INTERVAL_SECS` |
-
-**Rationale:** More frequent polling as expiration approaches allows agents to react quickly to approval decisions while reducing load during long waits.
-
-### F-003: SEP-1686 tasks/get
-
-- **F-003.1:** Return current task status
-- **F-003.2:** Map internal states to agent-visible states (`Executing` → `Working`)
-- **F-003.3:** Include timing information (created_at, ttl, poll_interval)
-- **F-003.4:** Return error -32004 for unknown task ID
-
-### F-004: SEP-1686 tasks/result
-
-- **F-004.1:** Return result immediately if task completed
-- **F-004.2:** Return error with failure info if task failed/rejected/expired
-- **F-004.3:** Block and poll if task not terminal (up to timeout)
-- **F-004.4:** Return error -32006 (ResultNotReady) if timeout exceeded
-
-### F-005: SEP-1686 tasks/list
-
-- **F-005.1:** Return tasks for the requesting principal only
-- **F-005.2:** Support cursor-based pagination
-- **F-005.3:** Order by creation time (newest first)
-- **F-005.4:** Include only summary information (not full request data)
-- **F-005.5:** Default limit: 20, max limit: 100
-
-### F-006: SEP-1686 tasks/cancel
-
-- **F-006.1:** Only cancel tasks in `InputRequired` state
-- **F-006.2:** Return error -32007 for terminal tasks
-- **F-006.3:** Return error -32007 for `Executing` tasks (too late)
-- **F-006.4:** Notify approval adapter to cleanup pending approval
-- **F-006.5:** Record cancellation in audit trail
-
-### F-007: Optimistic Locking
-
-- **F-007.1:** Check expected status before transition
-- **F-007.2:** Return `ConcurrentModification` error if status changed
-- **F-007.3:** Validate transition is legal per state machine
-- **F-007.4:** Atomic update (no partial transitions)
-
-### F-008: TTL and Expiration
-
-- **F-008.1:** Run cleanup task periodically (configurable interval, default 60s)
-- **F-008.2:** Expire non-terminal tasks where `now > expires_at`
-- **F-008.3:** Log each expiration with task_id, tool, and age
-- **F-008.4:** Remove terminal tasks after grace period (1 hour after terminal)
-
-### F-009: Rate Limiting
-
-- **F-009.1:** Track pending (non-terminal) tasks per principal
-- **F-009.2:** Reject creation if principal exceeds limit
-- **F-009.3:** Track total pending tasks globally
-- **F-009.4:** Reject creation if global limit exceeded
-- **F-009.5:** Return `RateLimited` error with `retry_after` hint
+See §10 for full specification reference.
 
 ## 8. Non-Functional Requirements
 
-### NFR-001: Observability
+### NFR-001: Observability (v0.2)
 
 **Metrics:**
 ```
-tasks_created_total{tool="delete_user"}
-tasks_completed_total{tool="delete_user", outcome="completed|failed|rejected|expired|cancelled"}
-tasks_active{status="working|input_required"}
-tasks_duration_seconds{stage="total|approval_wait|execution"}
-task_transitions_total{from="working", to="input_required"}
-task_rate_limited_total{principal="app-xyz"}
+thoughtgate_approvals_pending{principal}
+thoughtgate_approvals_total{outcome="approved|rejected|timeout|disconnected"}
+thoughtgate_approval_duration_seconds{outcome}
 ```
 
 **Logging:**
 ```json
-{"level":"info","message":"Task created","task_id":"abc-123","tool":"delete_user","principal":"app-xyz"}
-{"level":"info","message":"Task status changed","task_id":"abc-123","from":"input_required","to":"executing"}
-{"level":"warn","message":"Task expired","task_id":"abc-123","tool":"delete_user","age_seconds":600}
+{"level":"info","event":"approval_pending","correlation_id":"abc-123","tool":"delete_user","principal":"app-xyz"}
+{"level":"info","event":"approval_complete","correlation_id":"abc-123","outcome":"approved","duration_ms":45000}
+{"level":"warn","event":"approval_timeout","correlation_id":"abc-123","tool":"delete_user","timeout_secs":600}
+{"level":"warn","event":"client_disconnected","correlation_id":"abc-123","tool":"delete_user"}
 ```
 
-### NFR-002: Performance
+### NFR-002: Performance (v0.2)
 
 | Metric | Target |
 |--------|--------|
-| Task creation | < 1ms |
-| Task lookup | < 0.1ms |
-| Transition | < 0.5ms |
-| Memory per task | < 2KB |
-| Max concurrent tasks | 10,000 |
+| Approval registration | < 1ms |
+| Decision recording | < 1ms |
+| Memory per pending approval | < 500 bytes |
+| Max concurrent pending | 1,000 |
 
-### NFR-003: Reliability
+### NFR-003: Reliability (v0.2)
 
-- No data races on concurrent access
-- Atomic state transitions
-- Graceful handling of storage pressure
+- No zombie executions (tool runs after client disconnect)
+- Proper cleanup on all exit paths
+- Graceful handling of Slack API failures
 
 ## 9. Verification Plan
 
-### 9.1 Edge Case Matrix
+### 9.1 v0.2 Edge Case Matrix
 
 | Scenario | Expected Behavior | Test ID |
 |----------|-------------------|---------|
-| Create task | Returns task with Working status | EC-TASK-001 |
-| Get existing task | Returns task status | EC-TASK-002 |
-| Get non-existent task | Returns NotFound error | EC-TASK-003 |
-| Get result, task completed | Returns result immediately | EC-TASK-004 |
-| Get result, task pending | Blocks until complete or timeout | EC-TASK-005 |
-| Get result, task failed | Returns failure info | EC-TASK-006 |
-| Cancel pending task | Transitions to Cancelled | EC-TASK-007 |
-| Cancel completed task | Returns AlreadyTerminal error | EC-TASK-008 |
-| Cancel executing task | Returns AlreadyTerminal error | EC-TASK-009 |
-| List tasks | Returns principal's tasks only | EC-TASK-010 |
-| List with pagination | Returns correct pages | EC-TASK-011 |
-| Task expires | Transitions to Expired | EC-TASK-012 |
-| Concurrent transition | One succeeds, one gets ConcurrentMod | EC-TASK-013 |
-| Rate limit exceeded | Returns RateLimited error | EC-TASK-014 |
-| Capacity exceeded | Returns CapacityExceeded error | EC-TASK-015 |
-| Shutdown with pending | Tasks marked as Failed (shutdown) | EC-TASK-016 |
+| Approval approved | Forward to upstream, return result | EC-BLK-001 |
+| Approval rejected | Return -32007 error | EC-BLK-002 |
+| Approval timeout (on_timeout: deny) | Return -32008 error | EC-BLK-003 |
+| Client disconnects during wait | Cleanup, no execution | EC-BLK-004 |
+| Slack API error during wait | Retry or return -32603 | EC-BLK-005 |
+| Upstream error after approval | Return upstream error | EC-BLK-006 |
+| Multiple pending for same principal | All tracked independently | EC-BLK-007 |
+| Shutdown with pending approvals | Cleanup, return -32603 | EC-BLK-008 |
 
-### 9.2 Assertions
+### 9.2 v0.2 Assertions
 
 **Unit Tests:**
-- `test_state_machine_valid_transitions` — Valid transitions succeed
-- `test_state_machine_invalid_transitions` — Invalid transitions rejected
-- `test_optimistic_locking` — Concurrent modification detected
-- `test_ttl_expiration` — Tasks expire correctly
-- `test_rate_limiting` — Limits enforced per principal
-- `test_global_capacity` — Global limits enforced
+- `test_pending_approval_registration` — Approval registered correctly
+- `test_blocking_wait_approved` — Returns on approval
+- `test_blocking_wait_rejected` — Returns on rejection
+- `test_blocking_wait_timeout` — Returns on timeout
+- `test_client_disconnect_detection` — Detects disconnect
+- `test_no_zombie_execution` — No execution after disconnect
 
 **Integration Tests:**
-- `test_full_task_lifecycle` — Create → InputRequired → Executing → Completed
-- `test_task_cancellation` — Cancel while in InputRequired
-- `test_concurrent_access` — Multiple clients accessing same task
+- `test_full_blocking_flow_approved` — Complete approved flow
+- `test_full_blocking_flow_rejected` — Complete rejected flow
+- `test_full_blocking_flow_timeout` — Complete timeout flow
 
-**Load Tests:**
-- `bench_task_creation` — Target: 10,000 tasks/second
-- `bench_concurrent_transitions` — 1,000 concurrent transitions
+## 10. v0.3+ Reference: Full SEP-1686 Specification
 
-## 10. Implementation Reference
+This section documents the full SEP-1686 implementation for future reference. **Not implemented in v0.2.**
 
-### Task Store
+### 10.1 Task State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SEP-1686 STATE MACHINE                       │
+│                                                                 │
+│                         ┌─────────┐                             │
+│                         │ Working │                             │
+│                         └────┬────┘                             │
+│                              │                                  │
+│              ┌───────────────┼───────────────┐                  │
+│              │               │               │                  │
+│              ▼               ▼               ▼                  │
+│     ┌─────────────┐   ┌───────────┐   ┌──────────┐             │
+│     │InputRequired│   │ Completed │   │  Failed  │             │
+│     └──────┬──────┘   └───────────┘   └──────────┘             │
+│            │                                                    │
+│    ┌───────┼───────┬───────────┐                               │
+│    │       │       │           │                               │
+│    ▼       ▼       ▼           ▼                               │
+│ ┌──────┐ ┌────┐ ┌────────┐ ┌─────────┐                        │
+│ │Cancel│ │Work│ │Rejected│ │ Expired │                        │
+│ │-led  │ │-ing│ │        │ │         │                        │
+│ └──────┘ └──┬─┘ └────────┘ └─────────┘                        │
+│             │                                                  │
+│     ┌───────┴───────┐                                          │
+│     │               │                                          │
+│     ▼               ▼                                          │
+│ ┌─────────┐   ┌──────────┐                                     │
+│ │Completed│   │  Failed  │                                     │
+│ └─────────┘   └──────────┘                                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 Task Store Interface (v0.3+)
 
 ```rust
-pub struct InMemoryTaskStore {
-    tasks: DashMap<TaskId, Task>,
-    by_principal: DashMap<String, Vec<TaskId>>,
-    config: TaskStoreConfig,
-}
-
-impl InMemoryTaskStore {
-    pub fn new(config: TaskStoreConfig) -> Self {
-        Self {
-            tasks: DashMap::new(),
-            by_principal: DashMap::new(),
-            config,
-        }
-    }
-    
-    pub async fn insert(&self, task: Task) -> Result<(), TaskError> {
-        // Check global capacity
-        if self.tasks.len() >= self.config.max_global {
-            return Err(TaskError::CapacityExceeded);
-        }
-        
-        // Check per-principal limit
-        let principal_key = task.principal.app_name.clone();
-        let pending_count = self.count_pending_for_principal(&principal_key);
-        
-        if pending_count >= self.config.max_per_principal {
-            return Err(TaskError::RateLimited {
-                principal: principal_key,
-                retry_after: Duration::from_secs(60),
-            });
-        }
-        
-        // Insert
-        let task_id = task.id.clone();
-        self.tasks.insert(task_id.clone(), task);
-        self.by_principal
-            .entry(principal_key)
-            .or_default()
-            .push(task_id);
-        
-        Ok(())
-    }
+#[async_trait]
+pub trait TaskStore: Send + Sync {
+    async fn create(&self, task: Task) -> Result<TaskId, TaskError>;
+    async fn get(&self, id: &TaskId) -> Result<Option<Task>, TaskError>;
+    async fn update(&self, id: &TaskId, update: TaskUpdate) -> Result<Task, TaskError>;
+    async fn transition(&self, id: &TaskId, to: TaskStatus, expected: TaskStatus) -> Result<Task, TaskError>;
+    async fn list(&self, principal: &Principal, cursor: Option<String>, limit: usize) -> Result<TaskList, TaskError>;
+    async fn delete(&self, id: &TaskId) -> Result<(), TaskError>;
+    async fn cleanup_expired(&self) -> Result<usize, TaskError>;
 }
 ```
 
-### Request Hash
+### 10.3 SEP-1686 Method Handlers (v0.3+)
 
 ```rust
-fn hash_request(request: &ToolCallRequest) -> String {
-    use sha2::{Sha256, Digest};
-    
-    let mut hasher = Sha256::new();
-    hasher.update(request.name.as_bytes());
-    hasher.update(request.arguments.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+// tasks/get
+async fn handle_tasks_get(&self, params: TasksGetParams) -> JsonRpcResponse {
+    let task = self.store.get(&params.task_id).await?;
+    // Map internal states to SEP-1686 visible states
+    // Return task status and timing info
+}
+
+// tasks/result
+async fn handle_tasks_result(&self, params: TasksResultParams) -> JsonRpcResponse {
+    let task = self.store.get(&params.task_id).await?;
+    if task.status.is_terminal() {
+        // Return result or failure
+    } else {
+        // Block until terminal or timeout
+    }
+}
+
+// tasks/list
+async fn handle_tasks_list(&self, params: TasksListParams) -> JsonRpcResponse {
+    // Return paginated list of tasks for principal
+}
+
+// tasks/cancel
+async fn handle_tasks_cancel(&self, params: TasksCancelParams) -> JsonRpcResponse {
+    // Cancel if in InputRequired state
+    // Return error if already terminal or executing
 }
 ```
-
-### Anti-Patterns to Avoid
-
-- **❌ Blocking locks:** Use `DashMap` or similar for concurrent access
-- **❌ Unbounded storage:** Always enforce limits
-- **❌ Lost transitions:** Always record in audit trail
-- **❌ Exposing internal states:** Map `Executing` to `Working` for agents
-- **❌ Silent expiration:** Always log and metric on expiration
 
 ## 11. Definition of Done
 
-- [ ] Task structure defined with all fields
-- [ ] State machine implemented with valid transitions only
+### 11.1 v0.2 Definition of Done
+
+- [ ] `PendingApproval` struct defined with all fields
+- [ ] `PendingApprovalStore` implemented with registration/lookup/removal
+- [ ] Blocking wait implemented with `tokio::select!`
+- [ ] Client disconnection detection working
+- [ ] Timeout handling with `on_timeout` action
+- [ ] Approval decision recording from REQ-GOV-003
+- [ ] No zombie execution (tool never runs after disconnect)
+- [ ] Metrics for pending count and outcomes
+- [ ] All edge cases (EC-BLK-001 to EC-BLK-008) covered
+- [ ] Integration with REQ-GOV-002 (pipeline) and REQ-GOV-003 (Slack)
+
+### 11.2 v0.3+ Definition of Done (Future)
+
+- [ ] Full Task structure with SEP-1686 states
+- [ ] State machine with valid transitions only
 - [ ] In-memory storage with TTL cleanup
-- [ ] `tasks/get` implemented per SEP-1686
-- [ ] `tasks/result` implemented with blocking behavior
-- [ ] `tasks/list` implemented with pagination
-- [ ] `tasks/cancel` implemented with state validation
-- [ ] Optimistic locking prevents race conditions
-- [ ] Rate limiting enforced (per-principal and global)
-- [ ] Metrics for all task operations
-- [ ] All edge cases (EC-TASK-001 to EC-TASK-016) covered
-- [ ] Performance targets met (< 1ms creation)
+- [ ] All `tasks/*` methods implemented
+- [ ] Rate limiting enforced
+- [ ] Capability advertisement during initialize
+- [ ] Tool annotation rewriting during tools/list
