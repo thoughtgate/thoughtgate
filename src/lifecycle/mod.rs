@@ -76,19 +76,10 @@ pub struct LifecycleConfig {
     /// Connection drain timeout (default: 25s, must be < shutdown_timeout)
     pub drain_timeout: Duration,
     /// Startup timeout (default: 15s)
-    ///
-    /// TODO: Implement startup timeout enforcement in main.rs to fail fast
-    /// if initialization takes too long.
     pub startup_timeout: Duration,
     /// Require upstream connectivity at startup (default: false)
-    ///
-    /// TODO: Implement startup check in main.rs to verify upstream is reachable
-    /// before marking service as ready when this is true.
     pub require_upstream_at_startup: bool,
     /// Upstream health check interval (default: 30s)
-    ///
-    /// TODO: Implement periodic background health check task that updates
-    /// upstream_health at this interval, rather than relying on request-time checks.
     pub upstream_health_interval: Duration,
 }
 

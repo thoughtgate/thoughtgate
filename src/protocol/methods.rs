@@ -400,7 +400,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed["name"], "delete_user");
-        assert_eq!(parsed["arguments"]["userId"], serde_json::Value::Null); // Note: our json uses user_id
+        // Arguments are passed through unchanged - user_id stays as user_id (snake_case)
+        // The camelCase serialization only applies to the request struct fields, not argument contents
+        assert_eq!(parsed["arguments"]["user_id"], "123");
         assert_eq!(parsed["task"]["ttl"], 600000);
     }
 

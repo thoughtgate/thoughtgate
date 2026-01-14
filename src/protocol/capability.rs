@@ -260,7 +260,11 @@ impl CapabilityCache {
     pub fn set_upstream_supports_tasks(&self, supports: bool) {
         self.upstream_supports_tasks
             .store(supports, Ordering::SeqCst);
-        *self.last_initialize.write().unwrap() = Some(Instant::now());
+        // Use poison-safe write to avoid panics if another thread panicked while holding the lock
+        *self
+            .last_initialize
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
     }
 
     /// Sets whether upstream supports SSE task notifications.
@@ -288,7 +292,11 @@ impl CapabilityCache {
     /// Returns the time of the last initialize, if any.
     #[must_use]
     pub fn last_initialize(&self) -> Option<Instant> {
-        *self.last_initialize.read().unwrap()
+        // Use poison-safe read to avoid panics if another thread panicked while holding the lock
+        *self
+            .last_initialize
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Invalidates the cache (e.g., on upstream reconnect).
@@ -296,7 +304,11 @@ impl CapabilityCache {
         self.upstream_supports_tasks.store(false, Ordering::SeqCst);
         self.upstream_supports_task_sse
             .store(false, Ordering::SeqCst);
-        *self.last_initialize.write().unwrap() = None;
+        // Use poison-safe write to avoid panics if another thread panicked while holding the lock
+        *self
+            .last_initialize
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
