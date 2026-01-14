@@ -16,8 +16,8 @@
 //! # Traceability
 //! - Deferred: REQ-CORE-001 (Zero-Copy Peeking Strategy)
 
-use crate::config::ProxyConfig;
 use crate::error::{ProxyError, ProxyResult};
+use crate::proxy_config::ProxyConfig;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::Uri;

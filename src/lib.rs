@@ -48,6 +48,7 @@ pub mod logging_layer;
 pub mod metrics;
 pub mod policy;
 pub mod proxy_body;
+pub mod proxy_config;
 pub mod proxy_service;
 pub mod timeout;
 pub mod transport;

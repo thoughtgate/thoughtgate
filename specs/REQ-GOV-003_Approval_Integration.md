@@ -346,7 +346,44 @@ pub fn create_adapter(
 }
 ```
 
-### 6.2 Adapter Interface
+### 6.2 Approval Poster Trait
+
+```rust
+/// Trait for posting approval requests to external systems.
+/// Used by REQ-GOV-002 execution pipeline.
+#[async_trait]
+pub trait ApprovalPoster: Send + Sync {
+    /// Post an approval request to the configured channel.
+    /// Returns the message identifier for later correlation.
+    async fn post(
+        &self,
+        request: &ToolCallRequest,
+        workflow: &HumanWorkflow,
+        correlation_id: Uuid,
+    ) -> Result<MessageId, ApprovalPostError>;
+}
+
+/// Unique identifier for a posted approval message
+pub struct MessageId(pub String);
+
+/// Error type for approval posting failures
+#[derive(Debug, thiserror::Error)]
+pub enum ApprovalPostError {
+    #[error("Failed to post message: {reason}")]
+    PostFailed { reason: String, retriable: bool },
+
+    #[error("Channel not found: {channel}")]
+    ChannelNotFound { channel: String },
+
+    #[error("Invalid token")]
+    InvalidToken,
+
+    #[error("Rate limited, retry after {retry_after:?}")]
+    RateLimited { retry_after: Duration },
+}
+```
+
+### 6.3 Adapter Interface
 
 ```rust
 #[async_trait]
@@ -413,7 +450,7 @@ pub enum DecisionMethod {
 }
 ```
 
-### 6.3 Approval Engine Interface
+### 6.4 Approval Engine Interface
 
 ```rust
 /// Main approval engine used by Gate 4
@@ -557,7 +594,7 @@ async fn poll_for_approval_decision(
 }
 ```
 
-### 6.4 Errors
+### 6.5 Errors
 
 ```rust
 pub enum ApprovalError {

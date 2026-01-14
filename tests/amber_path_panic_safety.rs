@@ -11,9 +11,9 @@
 use http::{Request, Response};
 use std::sync::Arc;
 use thoughtgate::buffered_forwarder::BufferedForwarder;
-use thoughtgate::config::ProxyConfig;
 use thoughtgate::error::{ProxyError, ProxyResult};
 use thoughtgate::inspector::{Decision, InspectionContext, Inspector};
+use thoughtgate::proxy_config::ProxyConfig;
 
 /// Test inspector that panics unconditionally
 struct PanicInspector;

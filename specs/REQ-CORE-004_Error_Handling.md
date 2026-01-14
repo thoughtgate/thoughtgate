@@ -235,7 +235,49 @@ pub struct ErrorData {
 }
 ```
 
-### 6.3 Error Mapping Implementation
+### 6.3 Error Data Population Rules
+
+The following table specifies when each `ErrorData` field should be populated:
+
+| Error Type | `gate` | `tool` | `details` |
+|------------|--------|--------|-----------|
+| `ToolNotExposed` | `"visibility"` | Yes | No |
+| `GovernanceRuleDenied` | `"governance"` | Yes | Rule pattern (if safe to expose) |
+| `PolicyDenied` | `"policy"` | Yes | No (security: don't expose policy internals) |
+| `ApprovalRejected` | `"approval"` | Yes | Rejector identity (if approved by user) |
+| `ApprovalTimeout` | `"approval"` | Yes | Timeout duration |
+| `WorkflowNotFound` | `"approval"` | No | Workflow name |
+| `UpstreamConnectionFailed` | `null` | No | URL (without auth params) |
+| `UpstreamTimeout` | `null` | No | Timeout value |
+| `UpstreamError` | `null` | No | Upstream error message (sanitized) |
+| `TaskNotFound` | `null` | No | No |
+| `TaskExpired` | `null` | No | TTL duration |
+| `TaskCancelled` | `null` | No | No |
+| `RateLimited` | `null` | No | `retry_after` value |
+| `InspectionFailed` | `null` | No | Inspector name (not reason) |
+| `PolicyDrift` | `null` | No | No (security) |
+| `TransformDrift` | `null` | No | No (security) |
+| `ServiceUnavailable` | `null` | No | Generic reason |
+| `ConfigurationError` | `null` | No | Sanitized config details |
+| `InternalError` | `null` | No | No (log correlation_id only) |
+| `ParseError` | `null` | No | Parse location hint |
+| `InvalidRequest` | `null` | No | Validation details |
+| `MethodNotFound` | `null` | No | Requested method name |
+| `InvalidParams` | `null` | No | Parameter validation details |
+
+**Population Guidelines:**
+
+1. **`gate`:** Only set for gate-specific errors (visibility, governance, policy, approval). Helps agents understand _where_ in the decision flow the error occurred.
+
+2. **`tool`:** Set when the error is associated with a specific tool call. Omit for system-level errors (rate limiting, service unavailable).
+
+3. **`details`:** Provide actionable debugging information while avoiding:
+   - Policy rule internals (security)
+   - Full stack traces (security)
+   - Credentials or tokens (security)
+   - Internal implementation details
+
+### 6.4 Error Mapping Implementation
 
 ```rust
 impl From<ThoughtGateError> for JsonRpcError {
