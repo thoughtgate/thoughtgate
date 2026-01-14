@@ -22,7 +22,7 @@ This requirement defines how ThoughtGate manages its operational lifecycle—sta
 
 | Version | Configuration | Approval Tracking | Shutdown Behavior |
 |---------|---------------|-------------------|-------------------|
-| **v0.2** | YAML config | `PendingApprovalStore` | Cancel blocking waits |
+| **v0.2** | YAML config | `TaskStore` (SEP-1686) | Cancel pending tasks |
 | v0.3+ | YAML + Cedar | `TaskStore` (SEP-1686) | Fail tasks with reason |
 
 ### 1.2 Deployment Context
@@ -450,7 +450,7 @@ pub async fn drain_requests(
 
 ### F-006: Pending Approval Cleanup on Shutdown (v0.2)
 
-In v0.2 blocking mode, pending approvals are HTTP connections waiting for Slack responses:
+In v0.2, pending approvals are tracked as SEP-1686 tasks waiting for Slack responses:
 
 ```rust
 pub async fn cancel_pending_approvals(

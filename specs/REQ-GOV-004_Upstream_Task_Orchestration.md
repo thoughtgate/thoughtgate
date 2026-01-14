@@ -5,10 +5,12 @@
 | **ID** | `REQ-GOV-004` |
 | **Title** | Upstream Task Orchestration |
 | **Type** | Governance Component |
-| **Status** | Draft |
-| **Priority** | **High** |
-| **Version** | v0.2 |
+| **Status** | **DEFERRED (v0.3+)** |
+| **Priority** | Medium |
+| **Version** | v0.3+ |
 | **Tags** | `#governance` `#tasks` `#upstream` `#lazy-polling` `#streaming` `#cancellation` |
+
+> **⚠️ DEFERRED TO v0.3+:** This requirement handles upstream MCP servers that require task-augmented calls. For v0.2, if an upstream tool has `taskSupport: "required"`, ThoughtGate will return an error indicating the tool requires async support not yet implemented. Full upstream task orchestration is deferred to v0.3+.
 
 ## 1. Context & Decision Rationale
 

@@ -5,8 +5,8 @@
 | **ID** | `REQ-CORE-006` |
 | **Title** | Inspector Framework |
 | **Type** | Core Mechanic |
-| **Status** | Draft |
-| **Priority** | **High** |
+| **Status** | **DEFERRED (v0.3+)** |
+| **Priority** | High |
 | **Tags** | `#inspection` `#extensibility` `#security` `#pii` `#prompt-injection` |
 
 ## 1. Context & Decision Rationale

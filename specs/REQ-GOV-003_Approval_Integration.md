@@ -424,7 +424,7 @@ pub struct ApprovalEngine {
 }
 
 impl ApprovalEngine {
-    /// Request approval and block until decision (v0.2 blocking mode)
+    /// Request approval via SEP-1686 task (v0.2)
     pub async fn request_and_wait(
         &self,
         request: &McpRequest,
@@ -614,7 +614,7 @@ async fn execute_gate4(
 ) -> Result<McpResponse, ThoughtGateError> {
     let approval_engine = get_approval_engine();
     
-    // v0.2: Blocking mode
+    // v0.2: SEP-1686 task mode
     let decision = approval_engine
         .request_and_wait(request, workflow_name)
         .await?;

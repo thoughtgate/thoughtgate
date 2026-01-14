@@ -190,7 +190,7 @@ Not all gates are executed for every request:
 │   6. Gate 4: Approval Workflow (if action: approve OR Cedar Permit)             │
 │      • Load workflow config from approval.<workflow_name>                       │
 │      • Post approval request to destination (Slack)                             │
-│      • v0.2 Blocking Mode: Hold HTTP connection                                 │
+│      • v0.2 SEP-1686: Return task ID immediately                                 │
 │      • Poll for decision (reaction-based)                                       │
 │      • Approved → Continue to step 7                                            │
 │      • Rejected → Return -32007 (Approval Rejected)                             │
@@ -207,7 +207,7 @@ Response handling is the same for all paths: pass it through.
 No response inspection or streaming distinction in v0.2.
 ```
 
-### 4.2 Approval Flow (v0.2 Blocking Mode)
+### 4.2 Approval Flow (v0.2 SEP-1686 Mode)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -523,7 +523,7 @@ Environment variables can override specific settings but cannot define complex s
 | YAML Governance Rules | Draft | First-line routing (forward/deny/approve/policy) |
 | Cedar Policy Engine | Draft | Gate 3 - complex policy decisions |
 | Request Forwarding | Draft | Pass requests to upstream, return responses |
-| Blocking Approval Mode | Draft | Hold connection until approval (v0.2) |
+| SEP-1686 Task Mode | Draft | Async approval with task polling (v0.2) |
 | Slack Integration | Draft | Polling-based approval |
 | Health/Readiness | Draft | K8s probes |
 | Config Hot-Reload | Draft | Reload YAML without restart |
@@ -536,7 +536,7 @@ Environment variables can override specific settings but cannot define complex s
 |---------|-------|
 | **Zero-Copy Streaming (Green Path)** | Deferred until response streaming/inspection needed |
 | **Buffered Inspection (Amber Path)** | Deferred until request/response inspection needed |
-| **SEP-1686 Task Polling** | v0.2 uses blocking mode; async tasks deferred |
+| **Blocking Mode** | Removed; SEP-1686 is the v0.2 standard |
 | **Gateway Deployment Mode** | Centralized proxy for multiple agents; requires auth |
 | **CLI Wrapper** | `thoughtgate wrap -- command` for local dev |
 | **Agent Authentication** | API keys, mTLS, JWT for gateway mode |
@@ -820,7 +820,7 @@ When a JSON-RPC batch request contains items that require different paths:
 - Human approver sees complete context of what agent is trying to do
 - Simplifies client handling (all-or-nothing)
 
-### 12.2 Approval Handling (v0.2 Blocking Mode)
+### 12.2 Approval Handling (v0.2 SEP-1686 Mode)
 
 **v0.2 uses blocking mode, NOT SEP-1686 auto-upgrade.**
 
@@ -833,10 +833,10 @@ When a client sends a `tools/call` request and the governance rules require appr
 5. On REJECT: Return error -32007 (ApprovalRejected)
 6. On TIMEOUT: Execute on_timeout action (default: return -32008)
 
-**Why Blocking Mode for v0.2:**
-- Works with ANY MCP client (no SEP-1686 support required)
-- Simple implementation for MVP
-- Predictable behavior for agents
+**Why SEP-1686 for v0.2:**
+- Handles long-running approvals without HTTP timeout issues
+- Agent can do other work while waiting
+- Visibility into approval progress via task status
 
 ### 12.3 Configuration Hot-Reload
 
@@ -876,7 +876,7 @@ ThoughtGate watches the config file and reloads on changes:
 | **Approve** | Require human approval before forwarding (action in YAML) |
 | **Deny** | Reject request with error (action in YAML) |
 | **Policy** | Delegate to Cedar for complex decisions (action in YAML) |
-| **Blocking Mode** | v0.2 approval mode: hold HTTP connection until decision |
+| **Task Mode** | v0.2 approval mode: SEP-1686 async tasks |
 | **Task** | SEP-1686 entity tracking async request through approval workflow |
 | **Sidecar** | Deployment pattern where ThoughtGate runs alongside agent in same pod |
 | **Upstream** | The MCP server that ThoughtGate proxies requests to |
@@ -998,4 +998,4 @@ Request → Parse JSON-RPC → Route by Method
 | REQ-GOV-001 | Task Lifecycle & SEP-1686 | Draft | Governance |
 | REQ-GOV-002 | Approval Execution Pipeline | Draft (simplified) | Governance |
 | REQ-GOV-003 | Approval Integration (Gate 4) | Draft | Governance |
-| REQ-GOV-004 | Upstream Task Orchestration | Draft | Governance |
+| REQ-GOV-004 | Upstream Task Orchestration | **Deferred** | Governance |

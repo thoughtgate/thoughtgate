@@ -441,7 +441,7 @@ pub struct PreAmberResult {
 - **F-002.3:** Handle posting errors gracefully
 - **F-002.4:** Log post success/failure
 
-### F-003: Blocking Wait (v0.2)
+### F-003: Task Creation (v0.2)
 
 - **F-003.1:** Delegate to REQ-GOV-001 `ApprovalWaiter`
 - **F-003.2:** Return immediately when any condition triggers

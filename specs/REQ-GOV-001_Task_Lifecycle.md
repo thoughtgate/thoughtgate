@@ -17,12 +17,13 @@ This requirement defines **task lifecycle management** for ThoughtGate's approva
 
 | Version | Mode | Task Exposure | Description |
 |---------|------|---------------|-------------|
-| **v0.2** | **Blocking** | Internal only | HTTP connection held; no task API exposed |
-| v0.3+ | SEP-1686 | Full API | Async tasks with `tasks/*` methods |
+| **v0.2** | **SEP-1686** | Full API | Async tasks with `tasks/*` methods |
 
-### 1.2 v0.2: Blocking Mode
+> **Note:** Blocking mode (holding HTTP connection during approval) was considered for v0.2 but removed due to fundamental timeout issues. SEP-1686 is now the standard implementation.
 
-In v0.2, ThoughtGate uses **blocking mode** for approval workflows:
+### 1.2 Historical: Blocking Mode (Removed)
+
+The blocking mode design was considered but **removed** in favor of SEP-1686:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -78,7 +79,7 @@ Key characteristics:
 - No visibility into approval progress
 - Connection drops lose the request
 
-### 1.3 v0.3+: SEP-1686 Mode (Future)
+### 1.3 v0.2: SEP-1686 Mode
 
 SEP-1686 introduces the "task primitive" to MCP, enabling:
 - Deferred result retrieval via polling
@@ -87,7 +88,7 @@ SEP-1686 introduces the "task primitive" to MCP, enabling:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         v0.3+ SEP-1686 MODE (FUTURE)                        │
+│                         v0.2 SEP-1686 MODE                                  │
 │                                                                             │
 │   Agent                    ThoughtGate                    Human (Slack)     │
 │     │                           │                              │            │
@@ -137,17 +138,7 @@ Key characteristics:
 
 ## 3. Intent
 
-### 3.1 v0.2 Intent (Blocking Mode)
-
-The system must:
-1. Hold HTTP connection open during approval wait
-2. Track pending approvals internally for observability
-3. Enforce configurable approval timeout
-4. Execute tool and return result on approval
-5. Return error on rejection or timeout
-6. Handle client disconnection gracefully
-
-### 3.2 v0.3+ Intent (SEP-1686 Mode)
+### 3.1 v0.2 Intent (SEP-1686 Mode)
 
 The system must additionally:
 1. Implement SEP-1686 task state machine
@@ -161,34 +152,27 @@ The system must additionally:
 
 ## 4. Scope
 
-### 4.1 v0.2 Scope
+### 4.1 v0.2 Scope (SEP-1686)
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Blocking wait during approval | ✅ In Scope | Core v0.2 functionality |
-| Internal approval tracking | ✅ In Scope | For correlation/observability |
-| Configurable timeout | ✅ In Scope | From YAML config |
-| Client disconnection detection | ✅ In Scope | Prevent zombie approvals |
+| Task data structure | ✅ In Scope | Full SEP-1686 |
+| Task state machine | ✅ In Scope | Working → Completed/Failed |
+| In-memory task storage | ✅ In Scope | With TTL cleanup |
+| TTL cleanup background task | ✅ In Scope | Periodic expired task removal |
+| `tasks/get` | ✅ In Scope | Status retrieval |
+| `tasks/result` | ✅ In Scope | Result retrieval |
+| `tasks/list` | ✅ In Scope | Simple (no pagination) |
+| `tasks/cancel` | ✅ In Scope | Cancellation |
+| Capability advertisement | ✅ In Scope | During initialize (REQ-CORE-007) |
+| Tool annotation rewriting | ✅ In Scope | During tools/list (REQ-CORE-007) |
+| Task metadata validation | ✅ In Scope | On tools/call (REQ-CORE-007) |
 | Metrics and logging | ✅ In Scope | Observability |
-| Task API (`tasks/*` methods) | ❌ Out of Scope | v0.3+ |
-| Task state machine | ❌ Out of Scope | v0.3+ |
-| Task storage with TTL | ❌ Out of Scope | v0.3+ |
-| Rate limiting | ❌ Out of Scope | v0.3+ |
-
-### 4.2 v0.3+ Scope (Future)
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Task data structure | In Scope | Full SEP-1686 |
-| Task state machine | In Scope | Working → Completed/Failed |
-| In-memory task storage | In Scope | With TTL cleanup |
-| `tasks/get` | In Scope | Status retrieval |
-| `tasks/result` | In Scope | Result retrieval |
-| `tasks/list` | In Scope | Pagination |
-| `tasks/cancel` | In Scope | Cancellation |
-| Rate limiting | In Scope | Per-principal and global |
-| Capability advertisement | In Scope | During initialize |
-| Tool annotation rewriting | In Scope | During tools/list |
+| Rate limiting | ❌ Deferred | v0.3+ (nice-to-have) |
+| `tasks/list` pagination | ❌ Deferred | v0.3+ (return all initially) |
+| SSE notifications | ❌ Deferred | v0.3+ (polling works for v0.2) |
+| Blocking mode | ❌ Removed | Replaced by SEP-1686 async |
+| Client disconnection detection | ❌ Removed | Less critical with async polling |
 
 ## 5. Constraints
 
@@ -393,7 +377,7 @@ pub enum TaskStatus {
 
 ## 7. Behavior Specification
 
-### 7.1 v0.2: Blocking Approval Flow
+### 7.1 v0.2: SEP-1686 Approval Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -456,7 +440,7 @@ pub enum TaskStatus {
 - **F-001.4:** Create oneshot channel for completion signaling
 - **F-001.5:** Track client connection state via `Arc<AtomicBool>`
 
-### F-002: Blocking Wait (v0.2)
+### F-002: Task Wait (v0.2)
 
 - **F-002.1:** Use `tokio::select!` to wait for multiple conditions
 - **F-002.2:** Check for approval decision from Slack polling

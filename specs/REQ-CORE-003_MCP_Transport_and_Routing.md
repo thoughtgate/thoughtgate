@@ -163,11 +163,11 @@ ThoughtGate exposes one port for all MCP traffic:
 
 Upstream MCP server URL is configured via `sources[].url` in YAML config.
 
-### 5.4 v0.2 Blocking Mode
+### 5.4 v0.2 SEP-1686 Mode
 
-In v0.2, approval uses **blocking mode**:
-- HTTP connection held until approval decision
-- Agent does not need SEP-1686 support
+In v0.2, approval uses **SEP-1686 task mode**:
+- Task ID returned immediately
+- Agent polls for status and retrieves result
 - Timeout returns error, not task ID
 
 | Scenario | Behavior |
@@ -459,7 +459,7 @@ async fn execute_approval(
     let workflow_config = config.approval.get(workflow)
         .ok_or(ConfigError::UndefinedWorkflow)?;
     
-    // v0.2: Blocking mode
+    // v0.2: SEP-1686 task mode
     let decision = approval_engine
         .request_and_wait(request, workflow_config, timeout)
         .await?;
