@@ -76,19 +76,10 @@ pub struct LifecycleConfig {
     /// Connection drain timeout (default: 25s, must be < shutdown_timeout)
     pub drain_timeout: Duration,
     /// Startup timeout (default: 15s)
-    ///
-    /// TODO: Implement startup timeout enforcement in main.rs to fail fast
-    /// if initialization takes too long.
     pub startup_timeout: Duration,
     /// Require upstream connectivity at startup (default: false)
-    ///
-    /// TODO: Implement startup check in main.rs to verify upstream is reachable
-    /// before marking service as ready when this is true.
     pub require_upstream_at_startup: bool,
     /// Upstream health check interval (default: 30s)
-    ///
-    /// TODO: Implement periodic background health check task that updates
-    /// upstream_health at this interval, rather than relying on request-time checks.
     pub upstream_health_interval: Duration,
 }
 
@@ -275,11 +266,11 @@ pub struct LifecycleManager {
     /// Cached upstream health status
     upstream_health: ArcSwap<UpstreamHealthStatus>,
 
-    /// Whether policies are loaded
-    policies_loaded: AtomicBool,
+    /// Whether configuration is loaded and validated
+    config_loaded: AtomicBool,
 
-    /// Whether task store is initialized
-    task_store_initialized: AtomicBool,
+    /// Whether approval store is initialized
+    approval_store_initialized: AtomicBool,
 
     /// Configuration
     config: LifecycleConfig,
@@ -302,8 +293,8 @@ impl LifecycleManager {
             shutdown_token: CancellationToken::new(),
             active_requests: AtomicUsize::new(0),
             upstream_health: ArcSwap::new(Arc::new(UpstreamHealthStatus::default())),
-            policies_loaded: AtomicBool::new(false),
-            task_store_initialized: AtomicBool::new(false),
+            config_loaded: AtomicBool::new(false),
+            approval_store_initialized: AtomicBool::new(false),
             config,
             version: env!("CARGO_PKG_VERSION"),
         }
@@ -344,18 +335,19 @@ impl LifecycleManager {
         );
     }
 
-    /// Mark policies as loaded.
+    /// Mark configuration as loaded and validated.
     ///
     /// Implements: REQ-CORE-005/F-003.3
-    pub fn mark_policies_loaded(&self) {
-        self.policies_loaded.store(true, Ordering::SeqCst);
+    pub fn mark_config_loaded(&self) {
+        self.config_loaded.store(true, Ordering::SeqCst);
     }
 
-    /// Mark task store as initialized.
+    /// Mark approval store as initialized.
     ///
     /// Implements: REQ-CORE-005/F-003.5
-    pub fn mark_task_store_initialized(&self) {
-        self.task_store_initialized.store(true, Ordering::SeqCst);
+    pub fn mark_approval_store_initialized(&self) {
+        self.approval_store_initialized
+            .store(true, Ordering::SeqCst);
     }
 
     /// Update cached upstream health status.
@@ -448,9 +440,9 @@ impl LifecycleManager {
     pub fn readiness_checks(&self) -> ReadinessChecks {
         let upstream_health = self.upstream_health.load();
         ReadinessChecks {
-            policies_loaded: self.policies_loaded.load(Ordering::SeqCst),
+            config_loaded: self.config_loaded.load(Ordering::SeqCst),
             upstream_reachable: upstream_health.is_healthy,
-            task_store_initialized: self.task_store_initialized.load(Ordering::SeqCst),
+            approval_store_initialized: self.approval_store_initialized.load(Ordering::SeqCst),
         }
     }
 
@@ -500,6 +492,82 @@ impl LifecycleManager {
     /// Implements: REQ-CORE-005/F-004
     pub fn mark_stopped(&self) {
         self.state.store(Arc::new(LifecycleState::Stopped));
+    }
+
+    /// Spawns a background task that periodically checks upstream health.
+    ///
+    /// Implements: REQ-CORE-005/F-008
+    ///
+    /// The task runs at `upstream_health_interval` (default 30s) and updates
+    /// the cached upstream health status. It stops when the shutdown token
+    /// is cancelled.
+    ///
+    /// # Arguments
+    ///
+    /// * `upstream_url` - The upstream URL to check (e.g., "http://backend:8080")
+    /// * `client` - A pre-configured reqwest client with appropriate timeouts
+    ///
+    /// # Returns
+    ///
+    /// A JoinHandle for the spawned task. The task will run until shutdown.
+    pub fn spawn_upstream_health_checker(
+        self: &Arc<Self>,
+        upstream_url: String,
+        client: reqwest::Client,
+    ) -> tokio::task::JoinHandle<()> {
+        let lifecycle = Arc::clone(self);
+        let shutdown_token = self.shutdown_token.clone();
+        let interval_duration = self.config.upstream_health_interval;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval_duration);
+            // Don't check immediately on first tick (give service time to start)
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => {
+                        tracing::debug!("Upstream health checker stopping due to shutdown");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let result = client
+                            .head(&upstream_url)
+                            .send()
+                            .await;
+
+                        match result {
+                            Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+                                lifecycle.update_upstream_health(true, None);
+                                tracing::debug!(
+                                    upstream = %upstream_url,
+                                    status = %resp.status(),
+                                    "Upstream health check passed"
+                                );
+                            }
+                            Ok(resp) => {
+                                let error_msg = format!("HTTP {}", resp.status());
+                                lifecycle.update_upstream_health(false, Some(error_msg.clone()));
+                                tracing::warn!(
+                                    upstream = %upstream_url,
+                                    status = %resp.status(),
+                                    "Upstream health check failed: non-success status"
+                                );
+                            }
+                            Err(e) => {
+                                let error_msg = e.to_string();
+                                lifecycle.update_upstream_health(false, Some(error_msg.clone()));
+                                tracing::warn!(
+                                    upstream = %upstream_url,
+                                    error = %e,
+                                    "Upstream health check failed: connection error"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -685,18 +753,18 @@ mod tests {
 
         let checks = lifecycle.readiness_checks();
         assert!(!checks.all_pass());
-        assert!(!checks.policies_loaded);
+        assert!(!checks.config_loaded);
         assert!(!checks.upstream_reachable);
-        assert!(!checks.task_store_initialized);
+        assert!(!checks.approval_store_initialized);
 
-        lifecycle.mark_policies_loaded();
+        lifecycle.mark_config_loaded();
         let checks = lifecycle.readiness_checks();
-        assert!(checks.policies_loaded);
+        assert!(checks.config_loaded);
         assert!(!checks.all_pass());
 
-        lifecycle.mark_task_store_initialized();
+        lifecycle.mark_approval_store_initialized();
         let checks = lifecycle.readiness_checks();
-        assert!(checks.task_store_initialized);
+        assert!(checks.approval_store_initialized);
         assert!(!checks.all_pass()); // upstream still unhealthy
 
         lifecycle.update_upstream_health(true, None);

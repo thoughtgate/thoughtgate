@@ -47,6 +47,7 @@ pub mod lifecycle;
 pub mod logging_layer;
 pub mod metrics;
 pub mod policy;
+pub mod protocol;
 pub mod proxy_body;
 pub mod proxy_service;
 pub mod timeout;

@@ -58,6 +58,9 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 sha2 = "0.10"
 hex = "0.4"
 
+# SEP-1686 Protocol (REQ-CORE-007)
+nanoid = "0.4"
+
 # Async trait support (REQ-CORE-002 Inspector interface)
 async-trait = "0.1"
 

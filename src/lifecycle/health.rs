@@ -65,12 +65,12 @@ pub struct UnhealthyResponse {
 /// Implements: REQ-CORE-005/§6.2
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadinessChecks {
-    /// Whether Cedar policies are loaded
-    pub policies_loaded: bool,
+    /// Whether configuration is loaded and validated
+    pub config_loaded: bool,
     /// Whether upstream is reachable (cached)
     pub upstream_reachable: bool,
-    /// Whether task store is initialized
-    pub task_store_initialized: bool,
+    /// Whether approval store is initialized
+    pub approval_store_initialized: bool,
 }
 
 impl ReadinessChecks {
@@ -79,7 +79,7 @@ impl ReadinessChecks {
     /// Implements: REQ-CORE-005/F-003.1
     #[must_use]
     pub fn all_pass(&self) -> bool {
-        self.policies_loaded && self.upstream_reachable && self.task_store_initialized
+        self.config_loaded && self.upstream_reachable && self.approval_store_initialized
     }
 
     /// Returns the first failing check name.
@@ -87,12 +87,12 @@ impl ReadinessChecks {
     /// Implements: REQ-CORE-005/F-003.2
     #[must_use]
     pub fn first_failure(&self) -> Option<&'static str> {
-        if !self.policies_loaded {
-            Some("policies_loaded")
+        if !self.config_loaded {
+            Some("config_loaded")
         } else if !self.upstream_reachable {
             Some("upstream_reachable")
-        } else if !self.task_store_initialized {
-            Some("task_store_initialized")
+        } else if !self.approval_store_initialized {
+            Some("approval_store_initialized")
         } else {
             None
         }
@@ -276,14 +276,14 @@ mod tests {
 
     #[derive(Debug, Deserialize)]
     struct TestReadinessChecks {
-        policies_loaded: bool,
+        config_loaded: bool,
         upstream_reachable: bool,
-        task_store_initialized: bool,
+        approval_store_initialized: bool,
     }
 
     impl TestReadinessChecks {
         fn all_pass(&self) -> bool {
-            self.policies_loaded && self.upstream_reachable && self.task_store_initialized
+            self.config_loaded && self.upstream_reachable && self.approval_store_initialized
         }
     }
 
@@ -401,8 +401,8 @@ mod tests {
     #[tokio::test]
     async fn test_ready_all_checks_pass() {
         let lifecycle = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
-        lifecycle.mark_policies_loaded();
-        lifecycle.mark_task_store_initialized();
+        lifecycle.mark_config_loaded();
+        lifecycle.mark_approval_store_initialized();
         lifecycle.update_upstream_health(true, None);
         lifecycle.mark_ready();
 
@@ -428,8 +428,8 @@ mod tests {
     #[tokio::test]
     async fn test_ready_upstream_unhealthy() {
         let lifecycle = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
-        lifecycle.mark_policies_loaded();
-        lifecycle.mark_task_store_initialized();
+        lifecycle.mark_config_loaded();
+        lifecycle.mark_approval_store_initialized();
         // upstream_health stays false (default)
         lifecycle.mark_ready();
 
@@ -454,8 +454,8 @@ mod tests {
     #[tokio::test]
     async fn test_ready_during_shutdown() {
         let lifecycle = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
-        lifecycle.mark_policies_loaded();
-        lifecycle.mark_task_store_initialized();
+        lifecycle.mark_config_loaded();
+        lifecycle.mark_approval_store_initialized();
         lifecycle.update_upstream_health(true, None);
         lifecycle.mark_ready();
         lifecycle.begin_shutdown();
@@ -479,33 +479,33 @@ mod tests {
     #[test]
     fn test_readiness_checks_helpers() {
         let checks = ReadinessChecks {
-            policies_loaded: false,
+            config_loaded: false,
             upstream_reachable: true,
-            task_store_initialized: true,
+            approval_store_initialized: true,
         };
         assert!(!checks.all_pass());
-        assert_eq!(checks.first_failure(), Some("policies_loaded"));
+        assert_eq!(checks.first_failure(), Some("config_loaded"));
 
         let checks = ReadinessChecks {
-            policies_loaded: true,
+            config_loaded: true,
             upstream_reachable: false,
-            task_store_initialized: true,
+            approval_store_initialized: true,
         };
         assert!(!checks.all_pass());
         assert_eq!(checks.first_failure(), Some("upstream_reachable"));
 
         let checks = ReadinessChecks {
-            policies_loaded: true,
+            config_loaded: true,
             upstream_reachable: true,
-            task_store_initialized: false,
+            approval_store_initialized: false,
         };
         assert!(!checks.all_pass());
-        assert_eq!(checks.first_failure(), Some("task_store_initialized"));
+        assert_eq!(checks.first_failure(), Some("approval_store_initialized"));
 
         let checks = ReadinessChecks {
-            policies_loaded: true,
+            config_loaded: true,
             upstream_reachable: true,
-            task_store_initialized: true,
+            approval_store_initialized: true,
         };
         assert!(checks.all_pass());
         assert_eq!(checks.first_failure(), None);

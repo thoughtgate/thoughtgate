@@ -79,6 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lifecycle_config = LifecycleConfig::from_env();
     let lifecycle = Arc::new(LifecycleManager::new(lifecycle_config));
 
+    // Record startup deadline for timeout enforcement
+    // Implements: REQ-CORE-005/F-001 (startup timeout)
+    let startup_deadline = std::time::Instant::now() + lifecycle.config().startup_timeout;
+
     // Initialize OpenTelemetry metrics (REQ-CORE-001 NFR-001)
     #[cfg(feature = "metrics")]
     {
@@ -175,11 +179,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut shutdown_rx = shutdown_tx.subscribe();
 
+    // Phase 6: Upstream connectivity check and health checker
+    // Implements: REQ-CORE-005/F-001.4, F-008
+    let health_check_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create health check client: {}", e))?;
+
+    if let Some(ref upstream_url) = cli_config.upstream_url {
+        // Check startup upstream connectivity if required
+        // Implements: REQ-CORE-005/F-001.4
+        if lifecycle.config().require_upstream_at_startup {
+            info!(upstream = %upstream_url, "Verifying upstream connectivity at startup");
+            match health_check_client.head(upstream_url).send().await {
+                Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+                    lifecycle.update_upstream_health(true, None);
+                    info!(
+                        upstream = %upstream_url,
+                        status = %resp.status(),
+                        "Upstream connectivity verified"
+                    );
+                }
+                Ok(resp) => {
+                    error!(
+                        upstream = %upstream_url,
+                        status = %resp.status(),
+                        "Upstream returned non-success status at startup"
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    error!(
+                        upstream = %upstream_url,
+                        error = %e,
+                        "Cannot connect to upstream at startup"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // Mark upstream as healthy initially (will be updated by health checker)
+            lifecycle.update_upstream_health(true, None);
+        }
+
+        // Spawn background upstream health checker
+        // Implements: REQ-CORE-005/F-008
+        lifecycle.spawn_upstream_health_checker(upstream_url.clone(), health_check_client);
+        info!(
+            upstream = %upstream_url,
+            interval_secs = lifecycle.config().upstream_health_interval.as_secs(),
+            "Background upstream health checker started"
+        );
+    } else {
+        // No upstream configured - mark as healthy (forward proxy mode)
+        lifecycle.update_upstream_health(true, None);
+    }
+
+    // Check startup timeout before marking ready
+    // Implements: REQ-CORE-005/F-001 (startup timeout enforcement)
+    if std::time::Instant::now() > startup_deadline {
+        error!(
+            timeout_secs = lifecycle.config().startup_timeout.as_secs(),
+            "Startup timeout exceeded"
+        );
+        std::process::exit(1);
+    }
+
     // Mark as ready
     // Implements: REQ-CORE-005/F-001
-    lifecycle.mark_policies_loaded(); // Policies loaded (proxy mode)
-    lifecycle.mark_task_store_initialized(); // Task store ready (proxy mode)
-    lifecycle.update_upstream_health(true, None); // Assume healthy initially
+    lifecycle.mark_config_loaded(); // Configuration loaded and validated
+    lifecycle.mark_approval_store_initialized(); // Approval store ready
     lifecycle.mark_ready();
 
     // Main accept loop
@@ -299,6 +368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// - SIGINT (Ctrl+C): Begin graceful shutdown
 /// - SIGTERM: Begin graceful shutdown
+/// - SIGQUIT: Immediate shutdown (no drain)
 fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<LifecycleManager>) {
     // SIGINT handler
     let shutdown_tx_sigint = shutdown_tx.clone();
@@ -319,8 +389,8 @@ fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<Life
     // SIGTERM handler (Unix only)
     #[cfg(unix)]
     {
-        let shutdown_tx_sigterm = shutdown_tx;
-        let lifecycle_sigterm = lifecycle;
+        let shutdown_tx_sigterm = shutdown_tx.clone();
+        let lifecycle_sigterm = lifecycle.clone();
         tokio::spawn(async move {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(mut sigterm) => {
@@ -335,6 +405,33 @@ fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<Life
             }
         });
     }
+
+    // SIGQUIT handler (Unix only) - Immediate shutdown without draining
+    // Implements: REQ-CORE-005/§5.2, EC-OPS-013
+    #[cfg(unix)]
+    {
+        let lifecycle_sigquit = lifecycle;
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit()) {
+                Ok(mut sigquit) => {
+                    sigquit.recv().await;
+                    warn!(
+                        active_requests = lifecycle_sigquit.active_request_count(),
+                        "Received SIGQUIT, immediate shutdown (no drain)"
+                    );
+                    lifecycle_sigquit.mark_stopped();
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to listen for SIGQUIT");
+                }
+            }
+        });
+    }
+
+    // Prevent unused variable warning on non-Unix
+    #[cfg(not(unix))]
+    let _ = (shutdown_tx, lifecycle);
 }
 
 /// Serve health endpoints on a dedicated port.
