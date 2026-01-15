@@ -448,7 +448,7 @@ fn extract_port(uri: &Uri) -> ProxyResult<u16> {
 pub fn configure_socket(socket: &Socket, config: &ProxyConfig) -> ProxyResult<()> {
     // Set TCP_NODELAY (disable Nagle's algorithm)
     socket
-        .set_nodelay(config.tcp_nodelay)
+        .set_tcp_nodelay(config.tcp_nodelay)
         .map_err(|e| ProxyError::Connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
 
     // Set TCP keepalive

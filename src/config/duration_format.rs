@@ -144,12 +144,12 @@ mod tests {
         }
 
         let yaml = "duration: 10m\n";
-        let parsed: TestStruct = serde_yaml::from_str(yaml).unwrap();
+        let parsed: TestStruct = serde_yml::from_str(yaml).unwrap();
         assert_eq!(parsed.duration, Duration::from_secs(600));
 
         // Note: serialized form may differ (humantime format)
-        let serialized = serde_yaml::to_string(&parsed).unwrap();
-        let reparsed: TestStruct = serde_yaml::from_str(&serialized).unwrap();
+        let serialized = serde_yml::to_string(&parsed).unwrap();
+        let reparsed: TestStruct = serde_yml::from_str(&serialized).unwrap();
         assert_eq!(parsed, reparsed);
     }
 
@@ -162,7 +162,7 @@ mod tests {
         }
 
         let yaml = "duration: 5m\n";
-        let parsed: TestStruct = serde_yaml::from_str(yaml).unwrap();
+        let parsed: TestStruct = serde_yml::from_str(yaml).unwrap();
         assert_eq!(parsed.duration, Some(Duration::from_secs(300)));
     }
 
@@ -175,7 +175,7 @@ mod tests {
         }
 
         let yaml = "{}\n";
-        let parsed: TestStruct = serde_yaml::from_str(yaml).unwrap();
+        let parsed: TestStruct = serde_yml::from_str(yaml).unwrap();
         assert_eq!(parsed.duration, None);
     }
 }

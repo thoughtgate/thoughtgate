@@ -91,7 +91,7 @@ pub enum ConfigError {
     // ─────────────────────────────────────────────────────────────────────────
     /// YAML parsing error.
     #[error("YAML parse error: {0}")]
-    ParseError(#[from] serde_yaml::Error),
+    ParseError(#[from] serde_yml::Error),
 
     /// I/O error reading config file.
     #[error("I/O error: {0}")]

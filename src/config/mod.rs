@@ -85,7 +85,7 @@ approval:
 "##;
 
         // Parse
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = serde_yml::from_str(yaml).unwrap();
 
         // Validate
         let result = validate(&config, Version::V0_2).unwrap();
