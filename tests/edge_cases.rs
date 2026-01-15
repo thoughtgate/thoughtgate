@@ -349,7 +349,7 @@ async fn test_ec007_large_chunk() {
 #[tokio::test]
 #[ignore] // Expensive test - run with --ignored
 async fn test_ec008_concurrent_streams_limit() {
-    use thoughtgate::config::ProxyConfig;
+    use thoughtgate::proxy_config::ProxyConfig;
 
     // Test the semaphore logic with a small limit
     let config = ProxyConfig {

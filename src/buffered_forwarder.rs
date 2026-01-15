@@ -45,10 +45,10 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::config::ProxyConfig;
 use crate::error::{ProxyError, ProxyResult};
 use crate::inspector::{Decision, InspectionContext, Inspector};
 use crate::metrics::{AmberPathTimer, InspectorTimer, get_amber_metrics};
+use crate::proxy_config::ProxyConfig;
 
 /// Helper type alias for bodies that may include trailers.
 ///

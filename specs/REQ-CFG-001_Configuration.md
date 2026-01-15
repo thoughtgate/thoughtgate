@@ -180,6 +180,104 @@ approval:
 - Only in string fields
 - Validated after substitution
 
+### 5.6 Centralized Default Values
+
+The following defaults are used across ThoughtGate components. These values are centralized here to ensure consistency and provide a single source of truth.
+
+```rust
+/// Centralized default values for ThoughtGate configuration.
+///
+/// These defaults are used when explicit configuration is not provided.
+/// All timing-related values should reference this struct to ensure consistency.
+pub struct ThoughtGateDefaults {
+    /// Maximum time to wait for upstream tool execution (REQ-GOV-002)
+    pub execution_timeout: Duration,
+
+    /// Maximum time for graceful shutdown (REQ-CORE-005)
+    pub shutdown_timeout: Duration,
+
+    /// Time to wait for in-flight requests to complete during shutdown (REQ-CORE-005)
+    /// Must be less than shutdown_timeout to allow cleanup
+    pub drain_timeout: Duration,
+
+    /// Interval between Slack API polls for approval decisions (REQ-GOV-003)
+    pub approval_poll_interval: Duration,
+
+    /// Maximum interval between Slack polls after backoff (REQ-GOV-003)
+    pub approval_poll_max_interval: Duration,
+
+    /// Interval for health check probes (REQ-CORE-005)
+    pub health_check_interval: Duration,
+
+    /// Default approval workflow timeout if not specified in config
+    pub default_approval_timeout: Duration,
+
+    /// Default task TTL for SEP-1686 tasks (REQ-GOV-001)
+    pub default_task_ttl: Duration,
+
+    /// Maximum task TTL allowed (REQ-GOV-001)
+    pub max_task_ttl: Duration,
+
+    /// Interval for expired task cleanup (REQ-GOV-001)
+    pub task_cleanup_interval: Duration,
+}
+
+impl Default for ThoughtGateDefaults {
+    fn default() -> Self {
+        Self {
+            execution_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(30),
+            drain_timeout: Duration::from_secs(25),  // Must be < shutdown_timeout
+            approval_poll_interval: Duration::from_secs(5),
+            approval_poll_max_interval: Duration::from_secs(30),
+            health_check_interval: Duration::from_secs(10),
+            default_approval_timeout: Duration::from_secs(600),  // 10 minutes
+            default_task_ttl: Duration::from_secs(600),          // 10 minutes
+            max_task_ttl: Duration::from_secs(86400),            // 24 hours
+            task_cleanup_interval: Duration::from_secs(60),
+        }
+    }
+}
+```
+
+**Default Values Reference Table:**
+
+| Setting | Default | Component | Notes |
+|---------|---------|-----------|-------|
+| `execution_timeout` | 30s | REQ-GOV-002 | Max upstream wait |
+| `shutdown_timeout` | 30s | REQ-CORE-005 | Graceful shutdown limit |
+| `drain_timeout` | 25s | REQ-CORE-005 | Must be < shutdown_timeout |
+| `approval_poll_interval` | 5s | REQ-GOV-003 | Base Slack poll interval |
+| `approval_poll_max_interval` | 30s | REQ-GOV-003 | Max after backoff |
+| `health_check_interval` | 10s | REQ-CORE-005 | Health probe frequency |
+| `default_approval_timeout` | 10m | REQ-GOV-003 | If workflow timeout unset |
+| `default_task_ttl` | 10m | REQ-GOV-001 | Task expiration |
+| `max_task_ttl` | 24h | REQ-GOV-001 | Maximum task lifetime |
+| `task_cleanup_interval` | 60s | REQ-GOV-001 | Expired task pruning |
+
+**Invariants:**
+
+1. `drain_timeout` < `shutdown_timeout` (allows time for cleanup after drain)
+2. `approval_poll_interval` < `approval_poll_max_interval` (backoff range)
+3. `default_task_ttl` <= `max_task_ttl`
+
+**Environment Variable Overrides:**
+
+All defaults can be overridden via environment variables:
+
+| Default | Environment Variable |
+|---------|---------------------|
+| `execution_timeout` | `THOUGHTGATE_EXECUTION_TIMEOUT_SECS` |
+| `shutdown_timeout` | `THOUGHTGATE_SHUTDOWN_TIMEOUT_SECS` |
+| `drain_timeout` | `THOUGHTGATE_DRAIN_TIMEOUT_SECS` |
+| `approval_poll_interval` | `THOUGHTGATE_APPROVAL_POLL_INTERVAL_SECS` |
+| `approval_poll_max_interval` | `THOUGHTGATE_APPROVAL_POLL_MAX_INTERVAL_SECS` |
+| `health_check_interval` | `THOUGHTGATE_HEALTH_CHECK_INTERVAL_SECS` |
+| `default_approval_timeout` | `THOUGHTGATE_DEFAULT_APPROVAL_TIMEOUT_SECS` |
+| `default_task_ttl` | `THOUGHTGATE_DEFAULT_TASK_TTL_SECS` |
+| `max_task_ttl` | `THOUGHTGATE_MAX_TASK_TTL_SECS` |
+| `task_cleanup_interval` | `THOUGHTGATE_TASK_CLEANUP_INTERVAL_SECS` |
+
 ## 6. Interfaces
 
 ### 6.1 Input: Configuration File

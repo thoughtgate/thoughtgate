@@ -29,17 +29,27 @@ pub struct JsonRpcError {
 ///
 /// Contains structured error information for debugging and observability.
 /// All fields are safe for client consumption (no sensitive data).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ErrorData {
     /// Unique identifier for tracing this error in logs
     pub correlation_id: String,
 
-    /// Machine-readable error type name
-    pub error_type: String,
+    /// Which gate rejected the request: "visibility", "governance", "policy", "approval"
+    ///
+    /// Implements: REQ-CORE-004/F-001 (Gate Error Classification)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+
+    /// Tool that was being called when error occurred
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 
     /// Type-specific error details (sanitized)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<serde_json::Value>,
+    pub details: Option<String>,
+
+    /// Machine-readable error type name (for metrics/logging)
+    pub error_type: String,
 
     /// Suggested retry delay in seconds (for retriable errors)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,13 +64,13 @@ mod tests {
     fn test_jsonrpc_error_serialization() {
         let error = JsonRpcError {
             code: -32003,
-            message: "Policy denied: Tool 'delete_user' is not permitted".to_string(),
+            message: "Policy denied access to tool 'delete_user'".to_string(),
             data: Some(ErrorData {
                 correlation_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                gate: Some("policy".to_string()),
+                tool: Some("delete_user".to_string()),
+                details: None, // Security: No policy details
                 error_type: "policy_denied".to_string(),
-                details: Some(serde_json::json!({
-                    "tool": "delete_user"
-                })),
                 retry_after: None,
             }),
         };
@@ -70,14 +80,15 @@ mod tests {
         assert_eq!(json["code"], -32003);
         assert_eq!(
             json["message"],
-            "Policy denied: Tool 'delete_user' is not permitted"
+            "Policy denied access to tool 'delete_user'"
         );
         assert_eq!(
             json["data"]["correlation_id"],
             "550e8400-e29b-41d4-a716-446655440000"
         );
         assert_eq!(json["data"]["error_type"], "policy_denied");
-        assert_eq!(json["data"]["details"]["tool"], "delete_user");
+        assert_eq!(json["data"]["gate"], "policy");
+        assert_eq!(json["data"]["tool"], "delete_user");
     }
 
     #[test]
@@ -101,8 +112,10 @@ mod tests {
             message: "Rate limited".to_string(),
             data: Some(ErrorData {
                 correlation_id: "test-id".to_string(),
+                gate: None,
+                tool: None,
+                details: Some("Retry after 60s".to_string()),
                 error_type: "rate_limited".to_string(),
-                details: None,
                 retry_after: Some(60),
             }),
         };
@@ -118,8 +131,10 @@ mod tests {
             message: "Internal error".to_string(),
             data: Some(ErrorData {
                 correlation_id: "test-id".to_string(),
-                error_type: "internal_error".to_string(),
+                gate: None,
+                tool: None,
                 details: None,
+                error_type: "internal_error".to_string(),
                 retry_after: None,
             }),
         };
@@ -129,5 +144,27 @@ mod tests {
         // Optional None fields should be omitted
         assert!(!json_str.contains("\"details\""));
         assert!(!json_str.contains("\"retry_after\""));
+        assert!(!json_str.contains("\"gate\""));
+        assert!(!json_str.contains("\"tool\""));
+    }
+
+    #[test]
+    fn test_gate_error_serialization() {
+        let error = JsonRpcError {
+            code: -32015,
+            message: "Tool 'admin_delete' is not available".to_string(),
+            data: Some(ErrorData {
+                correlation_id: "test-id".to_string(),
+                gate: Some("visibility".to_string()),
+                tool: Some("admin_delete".to_string()),
+                details: None,
+                error_type: "tool_not_exposed".to_string(),
+                retry_after: None,
+            }),
+        };
+
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["data"]["gate"], "visibility");
+        assert_eq!(json["data"]["tool"], "admin_delete");
     }
 }

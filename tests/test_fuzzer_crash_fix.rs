@@ -8,9 +8,9 @@
 use http::Request;
 use std::sync::Arc;
 use thoughtgate::buffered_forwarder::BufferedForwarder;
-use thoughtgate::config::ProxyConfig;
 use thoughtgate::error::ProxyError;
 use thoughtgate::inspector::{Decision, InspectionContext, Inspector};
+use thoughtgate::proxy_config::ProxyConfig;
 
 /// Error-returning inspector that mimics the fixed fuzz behavior
 struct ErrorInspector;

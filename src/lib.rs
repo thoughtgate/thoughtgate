@@ -38,7 +38,11 @@
 //! - Deferred: REQ-CORE-001 (Zero-Copy Streaming)
 //! - Deferred: REQ-CORE-002 (Buffered Inspection)
 
+// Amber Path: BufferedForwarder (deferred to v0.2+)
+// Enable with `--features amber_path` when response inspection is needed
+#[cfg(feature = "amber_path")]
 pub mod buffered_forwarder;
+
 pub mod config;
 pub mod error;
 pub mod governance;
@@ -49,6 +53,7 @@ pub mod metrics;
 pub mod policy;
 pub mod protocol;
 pub mod proxy_body;
+pub mod proxy_config;
 pub mod proxy_service;
 pub mod timeout;
 pub mod transport;

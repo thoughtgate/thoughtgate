@@ -21,7 +21,7 @@ async-trait = "0.1"
 
 [dependencies.thoughtgate]
 path = ".."
-features = ["fuzzing"]
+features = ["fuzzing", "amber_path"]
 
 # Prevent this from interfering with normal builds
 [[bin]]

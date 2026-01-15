@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use thoughtgate::buffered_forwarder::BufferedForwarder;
-use thoughtgate::config::ProxyConfig;
 use thoughtgate::error::ProxyError;
+use thoughtgate::proxy_config::ProxyConfig;
 use thoughtgate::inspector::{Decision, InspectionContext, Inspector};
 
 /// Fuzz input for inspector chain testing

@@ -14,9 +14,9 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 
 use thoughtgate::buffered_forwarder::BufferedForwarder;
-use thoughtgate::config::ProxyConfig;
 use thoughtgate::error::ProxyError;
 use thoughtgate::inspector::{Decision, InspectionContext, Inspector};
+use thoughtgate::proxy_config::ProxyConfig;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Helpers

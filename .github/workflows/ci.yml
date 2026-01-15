@@ -136,9 +136,9 @@ jobs:
           - fuzz_uri_parsing
           - fuzz_header_redaction
           - fuzz_full_request
-          - fuzz_amber_path       # REQ-CORE-002
           - fuzz_green_path       # REQ-CORE-001
-          - fuzz_inspector_chain  # REQ-CORE-002 F-004
+          - fuzz_amber_path       # REQ-CORE-002 (enabled via amber_path feature)
+          - fuzz_inspector_chain  # REQ-CORE-002 F-004 (enabled via amber_path feature)
     
     steps:
       - name: Checkout code

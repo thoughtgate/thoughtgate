@@ -20,8 +20,8 @@ use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
 
 use thoughtgate::buffered_forwarder::BufferedForwarder;
-use thoughtgate::config::ProxyConfig;
 use thoughtgate::error::ProxyError;
+use thoughtgate::proxy_config::ProxyConfig;
 use thoughtgate::inspector::{Decision, InspectionContext, Inspector};
 
 /// Fuzz input for Amber Path testing

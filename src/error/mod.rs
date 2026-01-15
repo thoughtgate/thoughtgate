@@ -109,14 +109,46 @@ pub enum ThoughtGateError {
         message: String,
     },
 
-    // Policy errors (from REQ-POL-001)
+    // ═══════════════════════════════════════════════════════════
+    // Gate 1: Visibility errors (from REQ-CFG-001)
+    // ═══════════════════════════════════════════════════════════
+    /// Tool is not exposed by the source's visibility configuration.
+    ///
+    /// Implements: REQ-CORE-004/§5.2 (-32015)
+    #[error("Tool '{tool}' is not available")]
+    ToolNotExposed {
+        /// The tool name that is not exposed
+        tool: String,
+        /// The source ID that hides this tool
+        source_id: String,
+    },
+
+    // ═══════════════════════════════════════════════════════════
+    // Gate 2: Governance rule errors (from REQ-CFG-001)
+    // ═══════════════════════════════════════════════════════════
+    /// Governance rule matched with action: deny.
+    ///
+    /// Implements: REQ-CORE-004/§5.2 (-32014)
+    #[error("Tool '{tool}' is denied by governance rules")]
+    GovernanceRuleDenied {
+        /// The tool name that was denied
+        tool: String,
+        /// The rule pattern that matched (if safe to expose)
+        rule: Option<String>,
+    },
+
+    // ═══════════════════════════════════════════════════════════
+    // Gate 3: Cedar policy errors (from REQ-POL-001)
+    // ═══════════════════════════════════════════════════════════
     /// Cedar policy engine denied the request.
     ///
-    /// Implements: REQ-CORE-004/EC-ERR-008
-    #[error("Policy denied: Tool '{tool}' is not permitted")]
+    /// Implements: REQ-CORE-004/§5.2 (-32003)
+    #[error("Policy denied access to tool '{tool}'")]
     PolicyDenied {
         /// The tool name that was denied
         tool: String,
+        /// The policy ID that denied (for logging, not exposed to client)
+        policy_id: Option<String>,
         /// Optional reason for the denial (does not expose policy internals)
         reason: Option<String>,
     },
@@ -149,27 +181,42 @@ pub enum ThoughtGateError {
         task_id: String,
     },
 
-    // Approval errors (from REQ-GOV-002, REQ-GOV-003)
+    // ═══════════════════════════════════════════════════════════
+    // Gate 4: Approval errors (from REQ-GOV-002, REQ-GOV-003)
+    // ═══════════════════════════════════════════════════════════
     /// Human reviewer rejected the request.
     ///
-    /// Implements: REQ-CORE-004/EC-ERR-012
-    #[error("Request for '{tool}' was rejected during approval")]
+    /// Implements: REQ-CORE-004/§5.2 (-32007)
+    #[error("Approval rejected for tool '{tool}'")]
     ApprovalRejected {
         /// The tool that was rejected
         tool: String,
         /// Optional identifier of who rejected it
         rejected_by: Option<String>,
+        /// The workflow that processed the rejection
+        workflow: Option<String>,
     },
 
     /// Approval window expired without a decision.
     ///
-    /// Implements: REQ-CORE-004/EC-ERR-013
-    #[error("Approval window expired for '{tool}' after {timeout_secs}s")]
+    /// Implements: REQ-CORE-004/§5.2 (-32008)
+    #[error("Approval timeout for tool '{tool}' after {timeout_secs}s")]
     ApprovalTimeout {
         /// The tool that timed out
         tool: String,
         /// The timeout duration in seconds
         timeout_secs: u64,
+        /// The workflow that timed out
+        workflow: Option<String>,
+    },
+
+    /// Approval workflow not found in configuration.
+    ///
+    /// Implements: REQ-CORE-004/§5.2 (-32017)
+    #[error("Approval workflow '{workflow}' not found")]
+    WorkflowNotFound {
+        /// The workflow name that was not found
+        workflow: String,
     },
 
     // Pipeline errors (from REQ-GOV-002) - v0.2+
@@ -211,7 +258,21 @@ pub enum ThoughtGateError {
         task_id: String,
     },
 
+    // ═══════════════════════════════════════════════════════════
+    // Configuration errors (from REQ-CFG-001)
+    // ═══════════════════════════════════════════════════════════
+    /// Configuration is invalid or cannot be loaded.
+    ///
+    /// Implements: REQ-CORE-004/§5.2 (-32016)
+    #[error("Configuration error: {details}")]
+    ConfigurationError {
+        /// Description of the configuration error (sanitized)
+        details: String,
+    },
+
+    // ═══════════════════════════════════════════════════════════
     // Operational errors
+    // ═══════════════════════════════════════════════════════════
     /// Too many requests - rate limit exceeded.
     ///
     /// Implements: REQ-CORE-004/EC-ERR-014
@@ -243,10 +304,10 @@ pub enum ThoughtGateError {
 impl ThoughtGateError {
     /// Maps error to JSON-RPC 2.0 error code.
     ///
-    /// Implements: REQ-CORE-004/F-002 (Error Code Mapping)
+    /// Implements: REQ-CORE-004/§5.1, §5.2 (Error Code Mapping)
     ///
     /// Standard JSON-RPC codes (-32700 to -32603) are used for protocol errors.
-    /// ThoughtGate custom codes (-32000 to -32013) are used for application errors.
+    /// ThoughtGate custom codes (-32000 to -32017) are used for application errors.
     pub fn to_jsonrpc_code(&self) -> i32 {
         match self {
             // Standard JSON-RPC codes
@@ -256,27 +317,49 @@ impl ThoughtGateError {
             Self::InvalidParams { .. } => -32602,
             Self::InternalError { .. } => -32603,
 
-            // ThoughtGate custom codes
+            // ThoughtGate custom codes: Upstream (-32000 to -32002)
             Self::UpstreamConnectionFailed { .. } => -32000,
             Self::UpstreamTimeout { .. } => -32001,
             Self::UpstreamError { .. } => -32002,
+
+            // ThoughtGate custom codes: Gate 3 - Cedar Policy (-32003)
             Self::PolicyDenied { .. } => -32003,
+
+            // ThoughtGate custom codes: Task errors (-32004 to -32006)
             Self::TaskNotFound { .. } => -32004,
             Self::TaskExpired { .. } => -32005,
             Self::TaskCancelled { .. } => -32006,
+
+            // ThoughtGate custom codes: Gate 4 - Approval (-32007, -32008, -32017)
             Self::ApprovalRejected { .. } => -32007,
             Self::ApprovalTimeout { .. } => -32008,
+            Self::WorkflowNotFound { .. } => -32017,
+
+            // ThoughtGate custom codes: Rate limiting (-32009)
             Self::RateLimited { .. } => -32009,
+
+            // ThoughtGate custom codes: Pipeline errors (-32010 to -32012)
             Self::InspectionFailed { .. } => -32010,
             Self::PolicyDrift { .. } => -32011,
             Self::TransformDrift { .. } => -32012,
+
+            // ThoughtGate custom codes: Operational (-32013)
             Self::ServiceUnavailable { .. } => -32013,
+
+            // ThoughtGate custom codes: Gate 2 - Governance (-32014)
+            Self::GovernanceRuleDenied { .. } => -32014,
+
+            // ThoughtGate custom codes: Gate 1 - Visibility (-32015)
+            Self::ToolNotExposed { .. } => -32015,
+
+            // ThoughtGate custom codes: Configuration (-32016)
+            Self::ConfigurationError { .. } => -32016,
         }
     }
 
     /// Returns the error type name for metrics and logging.
     ///
-    /// Implements: REQ-CORE-004/F-007 (Error Metrics)
+    /// Implements: REQ-CORE-004/F-004 (Error Metrics)
     pub fn error_type_name(&self) -> &'static str {
         match self {
             Self::ParseError { .. } => "parse_error",
@@ -286,16 +369,20 @@ impl ThoughtGateError {
             Self::UpstreamConnectionFailed { .. } => "upstream_connection_failed",
             Self::UpstreamTimeout { .. } => "upstream_timeout",
             Self::UpstreamError { .. } => "upstream_error",
+            Self::ToolNotExposed { .. } => "tool_not_exposed",
+            Self::GovernanceRuleDenied { .. } => "governance_rule_denied",
             Self::PolicyDenied { .. } => "policy_denied",
             Self::TaskNotFound { .. } => "task_not_found",
             Self::TaskExpired { .. } => "task_expired",
             Self::TaskCancelled { .. } => "task_cancelled",
             Self::ApprovalRejected { .. } => "approval_rejected",
             Self::ApprovalTimeout { .. } => "approval_timeout",
+            Self::WorkflowNotFound { .. } => "workflow_not_found",
             Self::RateLimited { .. } => "rate_limited",
             Self::InspectionFailed { .. } => "inspection_failed",
             Self::PolicyDrift { .. } => "policy_drift",
             Self::TransformDrift { .. } => "transform_drift",
+            Self::ConfigurationError { .. } => "configuration_error",
             Self::ServiceUnavailable { .. } => "service_unavailable",
             Self::InternalError { .. } => "internal_error",
         }
@@ -311,59 +398,129 @@ impl ThoughtGateError {
         }
     }
 
+    /// Returns the gate that rejected the request, if applicable.
+    ///
+    /// Implements: REQ-CORE-004/F-001 (Gate Error Classification)
+    pub fn gate(&self) -> Option<&'static str> {
+        match self {
+            // Gate 1: Visibility
+            Self::ToolNotExposed { .. } => Some("visibility"),
+
+            // Gate 2: Governance
+            Self::GovernanceRuleDenied { .. } => Some("governance"),
+
+            // Gate 3: Cedar Policy
+            Self::PolicyDenied { .. } => Some("policy"),
+
+            // Gate 4: Approval
+            Self::ApprovalRejected { .. }
+            | Self::ApprovalTimeout { .. }
+            | Self::WorkflowNotFound { .. } => Some("approval"),
+
+            // Non-gate errors
+            _ => None,
+        }
+    }
+
+    /// Returns the tool name associated with this error, if applicable.
+    ///
+    /// Implements: REQ-CORE-004/§6.3 (Error Data Population Rules)
+    pub fn tool(&self) -> Option<&str> {
+        match self {
+            Self::ToolNotExposed { tool, .. }
+            | Self::GovernanceRuleDenied { tool, .. }
+            | Self::PolicyDenied { tool, .. }
+            | Self::ApprovalRejected { tool, .. }
+            | Self::ApprovalTimeout { tool, .. } => Some(tool),
+            _ => None,
+        }
+    }
+
     /// Returns safe details for client consumption (no sensitive data).
     ///
-    /// Implements: REQ-CORE-004/NFR-004 (Security - No Data Leaks)
-    pub fn safe_details(&self) -> Option<serde_json::Value> {
+    /// Implements: REQ-CORE-004/§6.3 (Error Data Population Rules)
+    /// Implements: REQ-CORE-004/NFR-002 (Security - No Data Leaks)
+    pub fn safe_details(&self) -> Option<String> {
         match self {
-            Self::MethodNotFound { method } => Some(serde_json::json!({ "method": method })),
-            Self::PolicyDenied { tool, reason } => {
-                let mut details = serde_json::json!({ "tool": tool });
-                if let Some(r) = reason {
-                    details["reason"] = serde_json::Value::String(r.clone());
-                }
-                Some(details)
+            // Gate 1: Visibility - No details (security)
+            Self::ToolNotExposed { .. } => None,
+
+            // Gate 2: Governance - Rule pattern if safe to expose
+            Self::GovernanceRuleDenied { rule, .. } => {
+                rule.as_ref().map(|r| format!("Matched rule: {}", r))
             }
-            Self::TaskNotFound { task_id }
-            | Self::TaskExpired { task_id }
-            | Self::TaskCancelled { task_id }
-            | Self::PolicyDrift { task_id }
-            | Self::TransformDrift { task_id } => Some(serde_json::json!({ "task_id": task_id })),
-            Self::ApprovalRejected { tool, rejected_by } => {
-                let mut details = serde_json::json!({ "tool": tool });
-                if let Some(by) = rejected_by {
-                    details["rejected_by"] = serde_json::Value::String(by.clone());
-                }
-                Some(details)
+
+            // Gate 3: Policy - No details (security: don't expose policy internals)
+            Self::PolicyDenied { .. } => None,
+
+            // Gate 4: Approval
+            Self::ApprovalRejected { rejected_by, .. } => rejected_by
+                .as_ref()
+                .map(|by| format!("Rejected by: {}", by)),
+            Self::ApprovalTimeout { timeout_secs, .. } => {
+                Some(format!("Timeout after {}s", timeout_secs))
             }
-            Self::ApprovalTimeout { tool, timeout_secs } => Some(serde_json::json!({
-                "tool": tool,
-                "timeout_secs": timeout_secs
-            })),
-            Self::InspectionFailed { inspector, .. } => {
-                // Don't expose full reason (may contain sensitive data)
-                Some(serde_json::json!({ "inspector": inspector }))
+            Self::WorkflowNotFound { workflow } => {
+                Some(format!("Check approval.{} in config", workflow))
+            }
+
+            // Upstream errors
+            Self::UpstreamConnectionFailed { .. } => None, // Don't expose internal URLs
+            Self::UpstreamTimeout { timeout_secs, .. } => {
+                Some(format!("Timeout after {}s", timeout_secs))
             }
             Self::UpstreamError { code, .. } => {
                 // Don't expose upstream message (may contain internal details)
-                Some(serde_json::json!({ "upstream_code": code }))
+                Some(format!("Upstream error code: {}", code))
             }
-            // For other errors, no additional details needed
-            _ => None,
+
+            // Task errors
+            Self::TaskNotFound { .. } => None,
+            Self::TaskExpired { task_id, .. } => Some(format!("Task {} expired", task_id)),
+            Self::TaskCancelled { .. } => None,
+
+            // Pipeline errors - No details (security)
+            Self::InspectionFailed { inspector, .. } => {
+                // Only expose inspector name, not reason
+                Some(format!("Inspector: {}", inspector))
+            }
+            Self::PolicyDrift { .. } => None,
+            Self::TransformDrift { .. } => None,
+
+            // Configuration errors
+            Self::ConfigurationError { details } => Some(details.clone()),
+
+            // Operational errors
+            Self::RateLimited { retry_after_secs } => {
+                retry_after_secs.map(|s| format!("Retry after {}s", s))
+            }
+            Self::ServiceUnavailable { reason } => Some(reason.clone()),
+
+            // Protocol errors
+            Self::ParseError { details } => Some(details.clone()),
+            Self::InvalidRequest { details } => Some(details.clone()),
+            Self::MethodNotFound { method } => Some(format!("Method: {}", method)),
+            Self::InvalidParams { details } => Some(details.clone()),
+
+            // Internal error - correlation ID only (log lookup)
+            Self::InternalError { .. } => None,
         }
     }
 
     /// Converts error to JSON-RPC error response.
     ///
-    /// Implements: REQ-CORE-004/F-004 (Error Response Formatting)
+    /// Implements: REQ-CORE-004/§6.4 (Error Mapping Implementation)
+    /// Implements: REQ-CORE-004/F-002 (Error Response Formatting)
     pub fn to_jsonrpc_error(&self, correlation_id: &str) -> JsonRpcError {
         JsonRpcError {
             code: self.to_jsonrpc_code(),
             message: self.to_string(),
             data: Some(ErrorData {
                 correlation_id: correlation_id.to_string(),
-                error_type: self.error_type_name().to_string(),
+                gate: self.gate().map(String::from),
+                tool: self.tool().map(String::from),
                 details: self.safe_details(),
+                error_type: self.error_type_name().to_string(),
                 retry_after: self.retry_after(),
             }),
         }
@@ -444,6 +601,7 @@ mod tests {
         assert_eq!(
             ThoughtGateError::PolicyDenied {
                 tool: "test".to_string(),
+                policy_id: None,
                 reason: None
             }
             .to_jsonrpc_code(),
@@ -473,7 +631,8 @@ mod tests {
         assert_eq!(
             ThoughtGateError::ApprovalRejected {
                 tool: "test".to_string(),
-                rejected_by: None
+                rejected_by: None,
+                workflow: None
             }
             .to_jsonrpc_code(),
             -32007
@@ -481,7 +640,8 @@ mod tests {
         assert_eq!(
             ThoughtGateError::ApprovalTimeout {
                 tool: "test".to_string(),
-                timeout_secs: 300
+                timeout_secs: 300,
+                workflow: None
             }
             .to_jsonrpc_code(),
             -32008
@@ -539,6 +699,7 @@ mod tests {
         assert_eq!(
             ThoughtGateError::PolicyDenied {
                 tool: "test".to_string(),
+                policy_id: None,
                 reason: None
             }
             .error_type_name(),
@@ -583,7 +744,7 @@ mod tests {
 
     /// Tests that sensitive data is not exposed in error details.
     ///
-    /// Verifies: REQ-CORE-004/NFR-004 (Security)
+    /// Verifies: REQ-CORE-004/NFR-002 (Security)
     #[test]
     fn test_no_sensitive_data_leak() {
         // Upstream errors should not expose full message
@@ -593,9 +754,9 @@ mod tests {
         };
         let details = err.safe_details();
         assert!(details.is_some());
-        let json = details.unwrap();
-        assert!(!json.to_string().contains("sensitive data"));
-        assert!(json.get("upstream_code").is_some());
+        let details_str = details.unwrap();
+        assert!(!details_str.contains("sensitive data"));
+        assert!(details_str.contains("-1")); // Only code exposed
 
         // Inspection failures should not expose full reason
         let err = ThoughtGateError::InspectionFailed {
@@ -604,9 +765,9 @@ mod tests {
         };
         let details = err.safe_details();
         assert!(details.is_some());
-        let json = details.unwrap();
-        assert!(!json.to_string().contains("Sensitive"));
-        assert_eq!(json.get("inspector").unwrap(), "test");
+        let details_str = details.unwrap();
+        assert!(!details_str.contains("Sensitive"));
+        assert!(details_str.contains("test")); // Inspector name exposed
 
         // Connection failures should not expose internal URLs
         let err = ThoughtGateError::UpstreamConnectionFailed {
@@ -616,11 +777,21 @@ mod tests {
         let details = err.safe_details();
         // Should have no details to avoid leaking internal URLs
         assert!(details.is_none());
+
+        // Policy denied should not expose policy internals
+        let err = ThoughtGateError::PolicyDenied {
+            tool: "delete_user".to_string(),
+            policy_id: Some("secret_policy".to_string()),
+            reason: Some("Internal rule matched".to_string()),
+        };
+        let details = err.safe_details();
+        // Security: No details for policy denied
+        assert!(details.is_none());
     }
 
     /// Tests error message generation follows templates.
     ///
-    /// Verifies: REQ-CORE-004/F-003
+    /// Verifies: REQ-CORE-004/F-002
     #[test]
     fn test_error_message_generation() {
         assert_eq!(
@@ -634,29 +805,32 @@ mod tests {
         assert_eq!(
             ThoughtGateError::PolicyDenied {
                 tool: "delete_user".to_string(),
+                policy_id: None,
                 reason: None
             }
             .to_string(),
-            "Policy denied: Tool 'delete_user' is not permitted"
+            "Policy denied access to tool 'delete_user'"
         );
 
         assert_eq!(
             ThoughtGateError::ApprovalTimeout {
                 tool: "dangerous_operation".to_string(),
-                timeout_secs: 300
+                timeout_secs: 300,
+                workflow: None
             }
             .to_string(),
-            "Approval window expired for 'dangerous_operation' after 300s"
+            "Approval timeout for tool 'dangerous_operation' after 300s"
         );
     }
 
     /// Tests JSON-RPC error response formatting.
     ///
-    /// Verifies: REQ-CORE-004/F-004
+    /// Verifies: REQ-CORE-004/§6.4
     #[test]
     fn test_jsonrpc_error_formatting() {
         let err = ThoughtGateError::PolicyDenied {
             tool: "delete_user".to_string(),
+            policy_id: Some("finance_policy".to_string()),
             reason: Some("Admin approval required".to_string()),
         };
 
@@ -666,13 +840,268 @@ mod tests {
         assert_eq!(jsonrpc_err.code, -32003);
         assert_eq!(
             jsonrpc_err.message,
-            "Policy denied: Tool 'delete_user' is not permitted"
+            "Policy denied access to tool 'delete_user'"
         );
 
         let data = jsonrpc_err.data.unwrap();
         assert_eq!(data.correlation_id, correlation_id);
         assert_eq!(data.error_type, "policy_denied");
-        assert!(data.details.is_some());
+        assert_eq!(data.gate, Some("policy".to_string()));
+        assert_eq!(data.tool, Some("delete_user".to_string()));
+        // Security: PolicyDenied should NOT expose details
+        assert!(data.details.is_none());
         assert_eq!(data.retry_after, None);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Gate-specific error tests (REQ-CORE-004 §9.1)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Tests Gate 1 (Visibility) error format.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_gate1_error_format
+    #[test]
+    fn test_gate1_error_format() {
+        let err = ThoughtGateError::ToolNotExposed {
+            tool: "admin_delete".to_string(),
+            source_id: "upstream".to_string(),
+        };
+
+        assert_eq!(err.to_jsonrpc_code(), -32015);
+        assert_eq!(err.gate(), Some("visibility"));
+        assert_eq!(err.tool(), Some("admin_delete"));
+        assert_eq!(err.error_type_name(), "tool_not_exposed");
+
+        let jsonrpc = err.to_jsonrpc_error("test-id");
+        let data = jsonrpc.data.unwrap();
+        assert_eq!(data.gate, Some("visibility".to_string()));
+        assert_eq!(data.tool, Some("admin_delete".to_string()));
+        // Security: No details for visibility errors
+        assert!(data.details.is_none());
+    }
+
+    /// Tests Gate 2 (Governance) error format.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_gate2_error_format
+    #[test]
+    fn test_gate2_error_format() {
+        let err = ThoughtGateError::GovernanceRuleDenied {
+            tool: "delete_all".to_string(),
+            rule: Some("*_all".to_string()),
+        };
+
+        assert_eq!(err.to_jsonrpc_code(), -32014);
+        assert_eq!(err.gate(), Some("governance"));
+        assert_eq!(err.tool(), Some("delete_all"));
+        assert_eq!(err.error_type_name(), "governance_rule_denied");
+
+        let jsonrpc = err.to_jsonrpc_error("test-id");
+        let data = jsonrpc.data.unwrap();
+        assert_eq!(data.gate, Some("governance".to_string()));
+        assert_eq!(data.tool, Some("delete_all".to_string()));
+        assert_eq!(data.details, Some("Matched rule: *_all".to_string()));
+    }
+
+    /// Tests Gate 3 (Policy) error format.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_gate3_error_format
+    #[test]
+    fn test_gate3_error_format() {
+        let err = ThoughtGateError::PolicyDenied {
+            tool: "transfer_funds".to_string(),
+            policy_id: Some("finance".to_string()),
+            reason: Some("Amount exceeds limit".to_string()),
+        };
+
+        assert_eq!(err.to_jsonrpc_code(), -32003);
+        assert_eq!(err.gate(), Some("policy"));
+        assert_eq!(err.tool(), Some("transfer_funds"));
+
+        let jsonrpc = err.to_jsonrpc_error("test-id");
+        let data = jsonrpc.data.unwrap();
+        assert_eq!(data.gate, Some("policy".to_string()));
+        assert_eq!(data.tool, Some("transfer_funds".to_string()));
+        // Security: No policy details exposed
+        assert!(data.details.is_none());
+    }
+
+    /// Tests Gate 4 (Approval) rejected error format.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_gate4_rejected_format
+    #[test]
+    fn test_gate4_rejected_format() {
+        let err = ThoughtGateError::ApprovalRejected {
+            tool: "deploy_prod".to_string(),
+            rejected_by: Some("alice@example.com".to_string()),
+            workflow: Some("production".to_string()),
+        };
+
+        assert_eq!(err.to_jsonrpc_code(), -32007);
+        assert_eq!(err.gate(), Some("approval"));
+        assert_eq!(err.tool(), Some("deploy_prod"));
+
+        let jsonrpc = err.to_jsonrpc_error("test-id");
+        let data = jsonrpc.data.unwrap();
+        assert_eq!(data.gate, Some("approval".to_string()));
+        assert_eq!(data.tool, Some("deploy_prod".to_string()));
+        assert_eq!(
+            data.details,
+            Some("Rejected by: alice@example.com".to_string())
+        );
+    }
+
+    /// Tests Gate 4 (Approval) timeout error format.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_gate4_timeout_format
+    #[test]
+    fn test_gate4_timeout_format() {
+        let err = ThoughtGateError::ApprovalTimeout {
+            tool: "dangerous_op".to_string(),
+            timeout_secs: 300,
+            workflow: Some("default".to_string()),
+        };
+
+        assert_eq!(err.to_jsonrpc_code(), -32008);
+        assert_eq!(err.gate(), Some("approval"));
+        assert_eq!(err.tool(), Some("dangerous_op"));
+
+        let jsonrpc = err.to_jsonrpc_error("test-id");
+        let data = jsonrpc.data.unwrap();
+        assert_eq!(data.gate, Some("approval".to_string()));
+        assert_eq!(data.details, Some("Timeout after 300s".to_string()));
+    }
+
+    /// Tests workflow not found error format.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_workflow_not_found_format
+    #[test]
+    fn test_workflow_not_found_format() {
+        let err = ThoughtGateError::WorkflowNotFound {
+            workflow: "missing_workflow".to_string(),
+        };
+
+        assert_eq!(err.to_jsonrpc_code(), -32017);
+        assert_eq!(err.gate(), Some("approval"));
+        assert!(err.tool().is_none());
+        assert_eq!(err.error_type_name(), "workflow_not_found");
+
+        let jsonrpc = err.to_jsonrpc_error("test-id");
+        let data = jsonrpc.data.unwrap();
+        assert_eq!(data.gate, Some("approval".to_string()));
+        assert!(data.tool.is_none());
+        assert_eq!(
+            data.details,
+            Some("Check approval.missing_workflow in config".to_string())
+        );
+    }
+
+    /// Tests configuration error format.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_configuration_error_format
+    #[test]
+    fn test_configuration_error_format() {
+        let err = ThoughtGateError::ConfigurationError {
+            details: "Invalid schema version".to_string(),
+        };
+
+        assert_eq!(err.to_jsonrpc_code(), -32016);
+        assert!(err.gate().is_none());
+        assert!(err.tool().is_none());
+        assert_eq!(err.error_type_name(), "configuration_error");
+
+        let jsonrpc = err.to_jsonrpc_error("test-id");
+        let data = jsonrpc.data.unwrap();
+        assert!(data.gate.is_none());
+        assert_eq!(data.details, Some("Invalid schema version".to_string()));
+    }
+
+    /// Tests that correlation ID is always included.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_error_data_includes_correlation
+    #[test]
+    fn test_error_data_includes_correlation() {
+        let errors = vec![
+            ThoughtGateError::ParseError {
+                details: "test".to_string(),
+            },
+            ThoughtGateError::ToolNotExposed {
+                tool: "test".to_string(),
+                source_id: "test".to_string(),
+            },
+            ThoughtGateError::InternalError {
+                correlation_id: "internal-id".to_string(),
+            },
+        ];
+
+        for err in errors {
+            let jsonrpc = err.to_jsonrpc_error("my-correlation-id");
+            let data = jsonrpc.data.unwrap();
+            assert_eq!(data.correlation_id, "my-correlation-id");
+        }
+    }
+
+    /// Tests that gate field is only set for gate errors.
+    ///
+    /// Verifies: REQ-CORE-004/§9.1 test_error_data_includes_gate
+    #[test]
+    fn test_error_data_includes_gate() {
+        // Gate errors should have gate field
+        let gate_errors = vec![
+            (
+                ThoughtGateError::ToolNotExposed {
+                    tool: "t".to_string(),
+                    source_id: "s".to_string(),
+                },
+                "visibility",
+            ),
+            (
+                ThoughtGateError::GovernanceRuleDenied {
+                    tool: "t".to_string(),
+                    rule: None,
+                },
+                "governance",
+            ),
+            (
+                ThoughtGateError::PolicyDenied {
+                    tool: "t".to_string(),
+                    policy_id: None,
+                    reason: None,
+                },
+                "policy",
+            ),
+            (
+                ThoughtGateError::ApprovalRejected {
+                    tool: "t".to_string(),
+                    rejected_by: None,
+                    workflow: None,
+                },
+                "approval",
+            ),
+        ];
+
+        for (err, expected_gate) in gate_errors {
+            assert_eq!(err.gate(), Some(expected_gate));
+        }
+
+        // Non-gate errors should not have gate field
+        let non_gate_errors = vec![
+            ThoughtGateError::ParseError {
+                details: "test".to_string(),
+            },
+            ThoughtGateError::UpstreamTimeout {
+                url: "test".to_string(),
+                timeout_secs: 30,
+            },
+            ThoughtGateError::TaskNotFound {
+                task_id: "test".to_string(),
+            },
+            ThoughtGateError::RateLimited {
+                retry_after_secs: None,
+            },
+        ];
+
+        for err in non_gate_errors {
+            assert!(err.gate().is_none());
+        }
     }
 }
