@@ -2,29 +2,50 @@
 //!
 //! Implements: REQ-POL-001 (Cedar Policy Engine)
 //!
-//! # v0.1 Simplified Model
+//! # v0.2 Model
 //!
-//! The policy engine evaluates requests and returns one of three actions:
+//! Cedar is Gate 3 in the 4-Gate decision model. It returns Permit/Forbid only—
+//! routing decisions (Forward/Approve/Deny) are handled by YAML governance rules.
 //!
-//! - **Forward**: Send request directly to upstream
-//! - **Approve**: Require human approval before forwarding
-//! - **Reject**: Deny the request with an error
+//! Cedar is invoked when a governance rule specifies `action: policy`.
+//! The `policy_id` from the YAML rule is bound to `context.policy_id`.
 //!
-//! This replaces the original 4-way classification (Green/Amber/Approval/Red).
-//! Green and Amber paths are deferred until response inspection or LLM streaming is needed.
+//! ## Key v0.2 Types
+//!
+//! - [`CedarRequest`] - Input to Cedar evaluation
+//! - [`CedarResource`] - Resource with arguments for inspection
+//! - [`CedarContext`] - Context with policy_id, source_id, time
+//! - [`CedarDecision`] - Output: Permit or Forbid
+//! - [`PolicyAnnotations`] - Cached `@thoughtgate_approval` annotations
+//!
+//! # v0.1 Compatibility
+//!
+//! The legacy `PolicyAction` enum (Forward/Approve/Reject) is retained for
+//! backward compatibility but deprecated. Use `CedarDecision` for v0.2.
 
 pub mod engine;
 pub mod loader;
 pub mod principal;
+pub mod types;
+
+// Re-export v0.2 types
+pub use types::{
+    CedarContext, CedarDecision, CedarRequest, CedarResource, CedarStats, PolicyAnnotations,
+    PolicyInfo, TimeContext,
+};
 
 use std::time::Duration;
 use thiserror::Error;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// v0.1 Simplified Policy Actions
+// v0.1 Simplified Policy Actions (DEPRECATED)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// v0.1 Simplified Policy Actions.
+///
+/// **DEPRECATED:** Use [`CedarDecision`] for v0.2 Cedar evaluation.
+/// In v0.2, Cedar returns Permit/Forbid only. Routing decisions are
+/// handled by YAML governance rules.
 ///
 /// The result of evaluating Cedar policies against an MCP request.
 /// This enum determines how the request is handled.
@@ -38,6 +59,7 @@ use thiserror::Error;
 ///
 /// # Traceability
 /// - Implements: REQ-POL-001/§6.2 (Policy Action output)
+#[deprecated(since = "0.2.0", note = "Use CedarDecision for v0.2 evaluation")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyAction {
     /// Forward request to upstream immediately.
@@ -67,6 +89,7 @@ pub enum PolicyAction {
     },
 }
 
+#[allow(deprecated)]
 impl PolicyAction {
     /// Returns `true` if this action forwards the request immediately.
     pub fn is_forward(&self) -> bool {
@@ -92,6 +115,7 @@ impl PolicyAction {
     }
 }
 
+#[allow(deprecated)]
 impl Default for PolicyAction {
     /// Default action is to reject (fail-closed).
     ///
@@ -313,10 +337,11 @@ mod tests {
     use super::*;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // v0.1 PolicyAction tests
+    // v0.1 PolicyAction tests (deprecated but retained for backward compat)
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
+    #[allow(deprecated)]
     fn test_forward_action() {
         let action = PolicyAction::Forward;
         assert!(action.is_forward());
@@ -326,6 +351,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_approve_action() {
         let action = PolicyAction::Approve {
             timeout: Duration::from_secs(300),
@@ -337,6 +363,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_reject_action() {
         let action = PolicyAction::Reject {
             reason: "Not permitted".to_string(),
@@ -348,6 +375,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_default_is_reject() {
         let action = PolicyAction::default();
         assert!(action.is_reject());

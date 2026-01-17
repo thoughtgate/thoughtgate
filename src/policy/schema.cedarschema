@@ -1,9 +1,14 @@
-// Cedar schema for ThoughtGate policy engine
+// Cedar schema for ThoughtGate policy engine (v0.2)
 //
 // Implements: REQ-POL-001/§5.2 (Cedar Schema)
 //
-// This schema defines the entity types, actions, and their relationships
-// for MCP request classification in ThoughtGate.
+// In v0.2, Cedar is Gate 3 in the 4-Gate model. It returns Permit/Forbid
+// decisions only—routing decisions are handled by YAML governance rules.
+//
+// Key changes from v0.1:
+// - Actions: "tools/call" and "mcp/method" (not Forward/Approve)
+// - Resources: ToolCall now includes "arguments" for inspection
+// - Context: RequestContext with policy_id, source_id, time
 
 namespace ThoughtGate {
 
@@ -11,14 +16,16 @@ namespace ThoughtGate {
     // PRINCIPALS
     // ═══════════════════════════════════════════════════════════
 
-    /// The application pod making requests through ThoughtGate
+    /// The application pod making requests through ThoughtGate.
+    /// Identity is inferred from K8s ServiceAccount or dev mode.
     entity App in [Role] = {
         "name": String,               // From HOSTNAME
         "namespace": String,          // From K8s ServiceAccount
         "service_account": String,    // From K8s ServiceAccount token
     };
 
-    /// Role for RBAC grouping
+    /// Role for RBAC grouping.
+    /// Apps can be members of roles: `App in Role::"admin"`
     entity Role = {
         "name": String,
     };
@@ -27,23 +34,65 @@ namespace ThoughtGate {
     // RESOURCES
     // ═══════════════════════════════════════════════════════════
 
-    /// An MCP tool call request
+    /// An MCP tool call request with arguments.
+    ///
+    /// Arguments are accessible in policies as `resource.arguments.*`:
+    /// ```cedar
+    /// permit(...) when { resource.arguments.amount < 10000 };
+    /// ```
+    ///
+    /// Note: arguments is defined as an open record { } to support
+    /// arbitrary tool argument structures at runtime.
     entity ToolCall = {
-        "name": String,               // Tool name, e.g., "delete_user"
-        "server": String,             // Upstream MCP server identifier
+        "name": String,               // Tool name, e.g., "transfer_funds"
+        "server": String,             // Source ID from config
+        "arguments": { },             // Tool arguments (open record)
     };
 
-    /// Generic MCP method for non-tool requests
+    /// Generic MCP method for non-tool requests.
     entity McpMethod = {
         "method": String,             // e.g., "resources/read"
         "server": String,
     };
 
     // ═══════════════════════════════════════════════════════════
-    // CONTEXT
+    // CONTEXT (v0.2)
     // ═══════════════════════════════════════════════════════════
 
-    /// Approval grant for post-approval re-evaluation
+    /// Context passed from YAML governance rules.
+    ///
+    /// - policy_id: Bound from YAML rule's `policy_id` field
+    /// - source_id: The source that matched in Gate 2
+    /// - time: Current time for time-based rules
+    type RequestContext = {
+        "policy_id": String,
+        "source_id": String,
+        "time": TimeContext,
+    };
+
+    /// Time context for time-based policies.
+    ///
+    /// Example: Allow only during business hours
+    /// ```cedar
+    /// permit(...) when {
+    ///     context.time.hour >= 9 &&
+    ///     context.time.hour < 17 &&
+    ///     context.time.day_of_week >= 1 &&  // Monday
+    ///     context.time.day_of_week <= 5     // Friday
+    /// };
+    /// ```
+    type TimeContext = {
+        "hour": Long,                 // 0-23 UTC
+        "day_of_week": Long,          // 0=Sunday, 6=Saturday
+        "timestamp": Long,            // Unix timestamp
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // LEGACY ENTITIES (v0.1 - for backward compatibility)
+    // ═══════════════════════════════════════════════════════════
+
+    /// Approval grant for post-approval re-evaluation.
+    /// Retained for backward compatibility with v0.1 policies.
     entity ApprovalGrant = {
         "task_id": String,
         "approved_by": String,
@@ -51,20 +100,42 @@ namespace ThoughtGate {
     };
 
     // ═══════════════════════════════════════════════════════════
-    // ACTIONS (v0.1 Simplified)
+    // ACTIONS (v0.2)
     // ═══════════════════════════════════════════════════════════
 
-    /// Forward: Send request to upstream immediately
+    /// Evaluate a tools/call request.
+    ///
+    /// Cedar returns Permit or Forbid. If Permit, ThoughtGate continues
+    /// to Gate 4 (approval workflow). If Forbid, request is denied
+    /// with -32003 PolicyDenied.
+    action "tools/call" appliesTo {
+        principal: [App, Role],
+        resource: [ToolCall],
+        context: RequestContext,
+    };
+
+    /// Evaluate a generic MCP method request.
+    action "mcp/method" appliesTo {
+        principal: [App, Role],
+        resource: [McpMethod],
+        context: RequestContext,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // LEGACY ACTIONS (v0.1 - retained for migration)
+    // ═══════════════════════════════════════════════════════════
+    // These actions are deprecated. Use YAML governance rules for
+    // routing decisions and Cedar for evaluation only.
+
+    /// DEPRECATED: Use YAML `action: forward` instead.
     action "Forward" appliesTo {
         principal: [App, Role],
         resource: [ToolCall, McpMethod],
     };
 
-    /// Approve: Require human/agent approval before forwarding
+    /// DEPRECATED: Use YAML `action: approve` instead.
     action "Approve" appliesTo {
         principal: [App, Role],
         resource: [ToolCall, McpMethod],
     };
-
-    // Reject is implicit: no action permitted = reject
 }

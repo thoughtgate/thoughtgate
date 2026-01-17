@@ -12,6 +12,8 @@
 //! cargo bench --bench policy_eval
 //! ```
 
+#![allow(deprecated)] // Using v0.1 API for benchmarking backward compatibility
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::time::Duration;
 use thoughtgate::policy::{PolicyRequest, Principal, Resource, engine::CedarEngine};

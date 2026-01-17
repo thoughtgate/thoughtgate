@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::inspector::{Decision, InspectionContext, Inspector};
 use crate::policy::engine::CedarEngine;
+#[allow(deprecated)] // v0.1 types for backward compatibility
 use crate::policy::{
     ApprovalGrant, PolicyAction, PolicyContext, PolicyRequest, Principal as PolicyPrincipal,
     Resource,
@@ -446,6 +447,7 @@ impl ApprovalPipeline {
     /// Re-evaluate policy with approval context.
     ///
     /// Implements: REQ-GOV-002/F-004
+    #[allow(deprecated)] // Using v0.1 PolicyAction API
     fn reevaluate_policy(
         &self,
         task: &Task,
