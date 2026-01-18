@@ -10,11 +10,38 @@ on:
     branches:
       - '**'
 
+# Cancel in-progress runs when a new commit is pushed to the same PR/branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  # Stage 0: Detect if only docs/config changed (skip heavy jobs)
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - 'benches/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Dockerfile'
+              - 'build.rs'
+              - '.cargo/**'
+
   # Stage 1a: Quick Checks (fast-fail)
   quick-checks:
     name: Format & Lint
@@ -127,20 +154,20 @@ jobs:
   # This keeps CI fast while still providing comprehensive fuzz coverage
 
   # Stage 1d: Benchmarks (Performance Tracking with Bencher.dev)
+  # Only runs on main branch and release tags to save CI time on PRs
   #
   # Implements: REQ-OBS-001 (Performance Metrics & Benchmarking)
   #
   # This job runs Criterion benchmarks and reports to Bencher.dev for:
   # - Statistical regression detection
-  # - Branch-aware tracking (main/releases/PRs)
+  # - Branch-aware tracking (main/releases)
   # - Marketing-ready performance dashboards
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
     needs: quick-checks
+    if: github.event_name == 'push'  # Only on main/tags, skip PRs
     continue-on-error: true  # Allow CI to pass while new baselines are established
-    permissions:
-      pull-requests: write  # Needed to post PR comments
     
     steps:
       - name: Checkout code
@@ -354,28 +381,6 @@ jobs:
         env:
           BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
 
-      - name: Report benchmarks to Bencher (Pull Requests)
-        if: github.event_name == 'pull_request'
-        run: |
-          # REQ-OBS-001: PR checks with 10% regression threshold
-          # Posts comment on PR if regression detected
-          bencher run \
-            --project thoughtgate \
-            --token '${{ secrets.BENCHER_API_TOKEN }}' \
-            --branch "pr-${{ github.event.pull_request.number }}" \
-            --branch-start-point main \
-            --testbed ci-ubuntu-latest \
-            --adapter json \
-            --file bench_metrics.json \
-            --threshold-measure latency \
-            --threshold-test percentage \
-            --threshold-max-sample-size 64 \
-            --threshold-upper-boundary 0.10 \
-            --github-actions '${{ secrets.GITHUB_TOKEN }}' \
-            --err
-        env:
-          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
-
       - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v6
@@ -389,11 +394,13 @@ jobs:
           retention-days: 30
 
   # Stage 2: Build Container Image
+  # Skip for docs-only changes on PRs (always run on main/tags)
   build-container:
     name: Build Container Image
     runs-on: ubuntu-latest
-    needs: [build, test]
-    
+    needs: [changes, build, test]
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'push'
+
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
       
@@ -439,12 +446,14 @@ jobs:
           retention-days: 1
 
   # Stage 3: Kubernetes Integration Tests
+  # Skip for docs-only changes on PRs (always run on main/tags)
   #
   # Implements: REQ-OBS-001 (K8s latency/throughput metrics)
   k8s-tests:
     name: Kubernetes Integration Tests
     runs-on: ubuntu-latest
-    needs: build-container
+    needs: [changes, build-container]
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'push'
     permissions:
       pull-requests: write  # Needed for Bencher PR comments
     

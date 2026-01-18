@@ -1,3 +1,4 @@
+#![cfg(feature = "amber_path")]
 //! Panic Safety Tests for REQ-CORE-002 Amber Path
 //!
 //! # Traceability

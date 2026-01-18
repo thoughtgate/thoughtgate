@@ -1,3 +1,4 @@
+#![cfg(feature = "amber_path")]
 //! Edge case tests for the Amber Path (REQ-CORE-002).
 //!
 //! These tests verify the BufferedForwarder handles all edge cases

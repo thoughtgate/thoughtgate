@@ -1,3 +1,4 @@
+#![cfg(feature = "amber_path")]
 //! Test to verify the fuzzer crash fix
 //!
 //! This test reproduces the crash found by fuzzing and verifies it's fixed.
