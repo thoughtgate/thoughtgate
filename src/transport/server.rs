@@ -492,8 +492,8 @@ fn task_error_to_thoughtgate(error: crate::governance::TaskError) -> ThoughtGate
         TaskError::RateLimited { retry_after, .. } => ThoughtGateError::RateLimited {
             retry_after_secs: Some(retry_after.as_secs()),
         },
-        TaskError::ResultNotReady { task_id } => ThoughtGateError::InvalidRequest {
-            details: format!("Task result not ready: {}", task_id),
+        TaskError::ResultNotReady { task_id } => ThoughtGateError::TaskResultNotReady {
+            task_id: task_id.to_string(),
         },
         TaskError::CapacityExceeded => ThoughtGateError::ServiceUnavailable {
             reason: "Task capacity exceeded".to_string(),

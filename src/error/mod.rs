@@ -181,6 +181,15 @@ pub enum ThoughtGateError {
         task_id: String,
     },
 
+    /// The task result is not yet ready.
+    ///
+    /// Implements: REQ-CORE-004/EC-ERR-012
+    #[error("Task '{task_id}' result not ready")]
+    TaskResultNotReady {
+        /// The task ID whose result is pending
+        task_id: String,
+    },
+
     // ═══════════════════════════════════════════════════════════
     // Gate 4: Approval errors (from REQ-GOV-002, REQ-GOV-003)
     // ═══════════════════════════════════════════════════════════
@@ -325,10 +334,11 @@ impl ThoughtGateError {
             // ThoughtGate custom codes: Gate 3 - Cedar Policy (-32003)
             Self::PolicyDenied { .. } => -32003,
 
-            // ThoughtGate custom codes: Task errors (-32004 to -32006)
+            // ThoughtGate custom codes: Task errors (-32004 to -32006, -32020)
             Self::TaskNotFound { .. } => -32004,
             Self::TaskExpired { .. } => -32005,
             Self::TaskCancelled { .. } => -32006,
+            Self::TaskResultNotReady { .. } => -32020,
 
             // ThoughtGate custom codes: Gate 4 - Approval (-32007, -32008, -32017)
             Self::ApprovalRejected { .. } => -32007,
@@ -375,6 +385,7 @@ impl ThoughtGateError {
             Self::TaskNotFound { .. } => "task_not_found",
             Self::TaskExpired { .. } => "task_expired",
             Self::TaskCancelled { .. } => "task_cancelled",
+            Self::TaskResultNotReady { .. } => "task_result_not_ready",
             Self::ApprovalRejected { .. } => "approval_rejected",
             Self::ApprovalTimeout { .. } => "approval_timeout",
             Self::WorkflowNotFound { .. } => "workflow_not_found",
@@ -478,6 +489,9 @@ impl ThoughtGateError {
             Self::TaskNotFound { .. } => None,
             Self::TaskExpired { task_id, .. } => Some(format!("Task {} expired", task_id)),
             Self::TaskCancelled { .. } => None,
+            Self::TaskResultNotReady { task_id } => {
+                Some(format!("Task {} result pending", task_id))
+            }
 
             // Pipeline errors - No details (security)
             Self::InspectionFailed { inspector, .. } => {

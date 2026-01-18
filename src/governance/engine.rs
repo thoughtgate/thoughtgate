@@ -626,18 +626,24 @@ impl ApprovalEngine {
     /// Returns the polling scheduler.
     ///
     /// Used to run the background polling loop.
+    ///
+    /// Implements: REQ-GOV-003/F-002 (Slack Polling)
     #[must_use]
     pub fn scheduler(&self) -> &PollingScheduler {
         &self.scheduler
     }
 
     /// Returns the task store.
+    ///
+    /// Implements: REQ-GOV-001/F-001 (Task Storage)
     #[must_use]
     pub fn task_store(&self) -> &TaskStore {
         &self.task_store
     }
 
     /// Returns the engine configuration.
+    ///
+    /// Implements: REQ-GOV-001/F-003 (Configuration Access)
     #[must_use]
     pub fn config(&self) -> &ApprovalEngineConfig {
         &self.config
