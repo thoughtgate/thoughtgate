@@ -873,7 +873,9 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ThoughtGateError::ApprovalRejected { tool, rejected_by } => {
+            ThoughtGateError::ApprovalRejected {
+                tool, rejected_by, ..
+            } => {
                 assert_eq!(tool, "delete_user");
                 assert_eq!(rejected_by, Some("test-reviewer".to_string()));
             }

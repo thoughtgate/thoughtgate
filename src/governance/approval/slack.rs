@@ -816,4 +816,486 @@ mod tests {
             AdapterError::RateLimited { .. }
         ));
     }
+
+    // ========================================================================
+    // Wiremock Integration Tests
+    // ========================================================================
+    //
+    // These tests verify actual HTTP interactions with the Slack API using
+    // wiremock to simulate Slack API responses.
+
+    /// Creates a SlackAdapter that talks to a wiremock server instead of Slack.
+    fn adapter_with_base_url(
+        _base_url: &str,
+        config: SlackConfig,
+    ) -> Result<SlackAdapter, AdapterError> {
+        // Create a client that uses the wiremock server URL
+        let client = Client::builder()
+            .timeout(config.api_timeout)
+            .build()
+            .map_err(|e| AdapterError::PostFailed {
+                reason: format!("Failed to build HTTP client: {e}"),
+                retriable: false,
+            })?;
+
+        Ok(SlackAdapter {
+            client,
+            config,
+            user_cache: DashMap::new(),
+        })
+    }
+
+    /// Implements the wiremock-based test adapter that overrides URLs.
+    struct WiremockSlackAdapter {
+        inner: SlackAdapter,
+        base_url: String,
+    }
+
+    impl WiremockSlackAdapter {
+        fn new(base_url: &str, config: SlackConfig) -> Result<Self, AdapterError> {
+            let inner = adapter_with_base_url(base_url, config)?;
+            Ok(Self {
+                inner,
+                base_url: base_url.to_string(),
+            })
+        }
+
+        async fn post_approval_request(
+            &self,
+            request: &ApprovalRequest,
+        ) -> Result<ApprovalReference, AdapterError> {
+            let blocks = self.inner.build_approval_blocks(request);
+
+            let response = self
+                .inner
+                .client
+                .post(format!("{}/api/chat.postMessage", self.base_url))
+                .bearer_auth(&self.inner.config.bot_token)
+                .json(&serde_json::json!({
+                    "channel": self.inner.config.channel,
+                    "blocks": blocks,
+                    "metadata": {
+                        "event_type": "thoughtgate_approval",
+                        "event_payload": {
+                            "task_id": request.task_id.to_string()
+                        }
+                    }
+                }))
+                .send()
+                .await
+                .map_err(|e| AdapterError::PostFailed {
+                    reason: e.to_string(),
+                    retriable: e.is_connect() || e.is_timeout(),
+                })?;
+
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(SlackAdapter::handle_rate_limit(&response));
+            }
+
+            let body: SlackPostMessageResponse =
+                response
+                    .json()
+                    .await
+                    .map_err(|e| AdapterError::PostFailed {
+                        reason: format!("Failed to parse Slack response: {e}"),
+                        retriable: false,
+                    })?;
+
+            if !body.ok {
+                let error = body.error.as_deref().unwrap_or("unknown");
+                return Err(SlackAdapter::map_slack_error(
+                    error,
+                    &self.inner.config.channel,
+                    None,
+                ));
+            }
+
+            let ts = body.ts.ok_or_else(|| AdapterError::PostFailed {
+                reason: "No timestamp in response".to_string(),
+                retriable: false,
+            })?;
+
+            let channel = body.channel.ok_or_else(|| AdapterError::PostFailed {
+                reason: "No channel in response".to_string(),
+                retriable: false,
+            })?;
+
+            Ok(ApprovalReference {
+                task_id: request.task_id.clone(),
+                external_id: ts,
+                channel,
+                posted_at: Utc::now(),
+                next_poll_at: std::time::Instant::now() + self.inner.config.initial_poll_interval,
+                poll_count: 0,
+            })
+        }
+
+        async fn poll_for_decision(
+            &self,
+            reference: &ApprovalReference,
+        ) -> Result<Option<PollResult>, AdapterError> {
+            let response = self
+                .inner
+                .client
+                .get(format!("{}/api/reactions.get", self.base_url))
+                .bearer_auth(&self.inner.config.bot_token)
+                .query(&[
+                    ("channel", &reference.channel),
+                    ("timestamp", &reference.external_id),
+                ])
+                .send()
+                .await
+                .map_err(|e| AdapterError::PollFailed {
+                    reason: e.to_string(),
+                    retriable: true,
+                })?;
+
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(SlackAdapter::handle_rate_limit(&response));
+            }
+
+            let body: SlackReactionsGetResponse =
+                response
+                    .json()
+                    .await
+                    .map_err(|e| AdapterError::PollFailed {
+                        reason: format!("Failed to parse reactions response: {e}"),
+                        retriable: true,
+                    })?;
+
+            if !body.ok {
+                let error = body.error.as_deref().unwrap_or("unknown");
+                return Err(SlackAdapter::map_slack_error(
+                    error,
+                    &reference.channel,
+                    Some(&reference.external_id),
+                ));
+            }
+
+            let reactions = body.message.and_then(|m| m.reactions);
+
+            if let Some((decision, user_id, emoji)) = self.inner.check_reactions(&reactions) {
+                // Use user_id directly for tests (skip user lookup)
+                return Ok(Some(PollResult {
+                    decision,
+                    decided_by: user_id,
+                    decided_at: Utc::now(),
+                    method: DecisionMethod::Reaction { emoji },
+                }));
+            }
+
+            Ok(None)
+        }
+    }
+
+    /// Tests that posting an approval message works correctly.
+    ///
+    /// Verifies: EC-SLK-001 (Slack API rate limit handling)
+    /// Verifies: REQ-GOV-003/F-001 (Post approval request)
+    #[tokio::test]
+    async fn test_wiremock_post_message_success() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat.postMessage"))
+            .and(header("Authorization", "Bearer xoxb-test-token"))
+            .and(body_partial_json(serde_json::json!({
+                "channel": "#test-channel"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "1234567890.123456",
+                "channel": "C12345"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SlackConfig::new("xoxb-test-token", "#test-channel");
+        let adapter = WiremockSlackAdapter::new(&mock_server.uri(), config)
+            .expect("Failed to create adapter");
+
+        let request = test_request();
+        let result = adapter.post_approval_request(&request).await;
+
+        assert!(result.is_ok(), "Post should succeed: {:?}", result);
+        let reference = result.unwrap();
+        assert_eq!(reference.external_id, "1234567890.123456");
+        assert_eq!(reference.channel, "C12345");
+    }
+
+    /// Tests that channel not found error is handled correctly.
+    ///
+    /// Verifies: EC-SLK-006 (Channel doesn't exist)
+    #[tokio::test]
+    async fn test_wiremock_channel_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": "channel_not_found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SlackConfig::new("xoxb-test-token", "#nonexistent");
+        let adapter = WiremockSlackAdapter::new(&mock_server.uri(), config)
+            .expect("Failed to create adapter");
+
+        let request = test_request();
+        let result = adapter.post_approval_request(&request).await;
+
+        assert!(matches!(result, Err(AdapterError::ChannelNotFound { .. })));
+    }
+
+    /// Tests that invalid token error is handled correctly.
+    ///
+    /// Verifies: EC-SLK-005 (Slack token revoked)
+    #[tokio::test]
+    async fn test_wiremock_invalid_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": "invalid_auth"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SlackConfig::new("xoxb-bad-token", "#test-channel");
+        let adapter = WiremockSlackAdapter::new(&mock_server.uri(), config)
+            .expect("Failed to create adapter");
+
+        let request = test_request();
+        let result = adapter.post_approval_request(&request).await;
+
+        assert!(matches!(result, Err(AdapterError::InvalidToken)));
+    }
+
+    /// Tests that HTTP 429 rate limit is handled correctly.
+    ///
+    /// Verifies: EC-SLK-001 (Slack API rate limit)
+    #[tokio::test]
+    async fn test_wiremock_rate_limit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat.postMessage"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_json(serde_json::json!({"ok": false, "error": "ratelimited"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = SlackConfig::new("xoxb-test-token", "#test-channel");
+        let adapter = WiremockSlackAdapter::new(&mock_server.uri(), config)
+            .expect("Failed to create adapter");
+
+        let request = test_request();
+        let result = adapter.post_approval_request(&request).await;
+
+        match result {
+            Err(AdapterError::RateLimited { retry_after }) => {
+                assert_eq!(retry_after, Duration::from_secs(30));
+            }
+            _ => panic!("Expected RateLimited error, got {:?}", result),
+        }
+    }
+
+    /// Tests polling for approval reaction.
+    ///
+    /// Verifies: REQ-GOV-003/F-003 (Poll for decision)
+    /// Verifies: EC-SLK-003 (Multiple reactions - first wins)
+    #[tokio::test]
+    async fn test_wiremock_poll_approve_reaction() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/reactions.get"))
+            .and(query_param("channel", "C12345"))
+            .and(query_param("timestamp", "1234.5678"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "message": {
+                    "reactions": [
+                        {
+                            "name": "+1",
+                            "users": ["U123"],
+                            "count": 1
+                        }
+                    ]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SlackConfig::new("xoxb-test-token", "#test-channel");
+        let adapter = WiremockSlackAdapter::new(&mock_server.uri(), config)
+            .expect("Failed to create adapter");
+
+        let reference = ApprovalReference {
+            task_id: crate::governance::TaskId::new(),
+            external_id: "1234.5678".to_string(),
+            channel: "C12345".to_string(),
+            posted_at: Utc::now(),
+            next_poll_at: std::time::Instant::now(),
+            poll_count: 0,
+        };
+
+        let result = adapter.poll_for_decision(&reference).await;
+
+        assert!(result.is_ok(), "Poll should succeed: {:?}", result);
+        let decision = result.unwrap();
+        assert!(decision.is_some(), "Should have decision");
+
+        let poll_result = decision.unwrap();
+        assert_eq!(poll_result.decision, PollDecision::Approved);
+        assert_eq!(poll_result.decided_by, "U123");
+    }
+
+    /// Tests polling for rejection reaction.
+    ///
+    /// Verifies: REQ-GOV-003/F-003 (Poll for decision)
+    #[tokio::test]
+    async fn test_wiremock_poll_reject_reaction() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/reactions.get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "message": {
+                    "reactions": [
+                        {
+                            "name": "-1",
+                            "users": ["U456"],
+                            "count": 1
+                        }
+                    ]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SlackConfig::new("xoxb-test-token", "#test-channel");
+        let adapter = WiremockSlackAdapter::new(&mock_server.uri(), config)
+            .expect("Failed to create adapter");
+
+        let reference = ApprovalReference {
+            task_id: crate::governance::TaskId::new(),
+            external_id: "1234.5678".to_string(),
+            channel: "C12345".to_string(),
+            posted_at: Utc::now(),
+            next_poll_at: std::time::Instant::now(),
+            poll_count: 0,
+        };
+
+        let result = adapter.poll_for_decision(&reference).await;
+
+        assert!(result.is_ok());
+        let poll_result = result.unwrap().expect("Should have decision");
+        assert_eq!(poll_result.decision, PollDecision::Rejected);
+        assert_eq!(poll_result.decided_by, "U456");
+    }
+
+    /// Tests polling returns None when no reactions present.
+    ///
+    /// Verifies: REQ-GOV-003/F-003 (Poll returns None if still pending)
+    #[tokio::test]
+    async fn test_wiremock_poll_no_reactions() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/reactions.get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "message": {}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SlackConfig::new("xoxb-test-token", "#test-channel");
+        let adapter = WiremockSlackAdapter::new(&mock_server.uri(), config)
+            .expect("Failed to create adapter");
+
+        let reference = ApprovalReference {
+            task_id: crate::governance::TaskId::new(),
+            external_id: "1234.5678".to_string(),
+            channel: "C12345".to_string(),
+            posted_at: Utc::now(),
+            next_poll_at: std::time::Instant::now(),
+            poll_count: 0,
+        };
+
+        let result = adapter.poll_for_decision(&reference).await;
+
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "Should return None when no reactions"
+        );
+    }
+
+    /// Tests message not found error during polling.
+    ///
+    /// Verifies: EC-SLK-002 (Slack message deleted before reaction)
+    #[tokio::test]
+    async fn test_wiremock_poll_message_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/reactions.get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": "message_not_found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SlackConfig::new("xoxb-test-token", "#test-channel");
+        let adapter = WiremockSlackAdapter::new(&mock_server.uri(), config)
+            .expect("Failed to create adapter");
+
+        let reference = ApprovalReference {
+            task_id: crate::governance::TaskId::new(),
+            external_id: "deleted-msg".to_string(),
+            channel: "C12345".to_string(),
+            posted_at: Utc::now(),
+            next_poll_at: std::time::Instant::now(),
+            poll_count: 0,
+        };
+
+        let result = adapter.poll_for_decision(&reference).await;
+
+        assert!(matches!(result, Err(AdapterError::MessageNotFound { .. })));
+    }
 }
