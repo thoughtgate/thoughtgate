@@ -1,50 +1,80 @@
 //! Core proxy service implementation.
 //!
-//! # v0.1 Status: DEFERRED
+//! # Overview
 //!
-//! This module implements the Green Path (zero-copy streaming) which is **deferred**
-//! to v0.2+. In v0.1, requests are forwarded directly without streaming optimizations.
+//! ProxyService is the unified entry point for all HTTP traffic in ThoughtGate.
+//! It discriminates between MCP and regular HTTP traffic:
 //!
-//! The streaming infrastructure is retained for when LLM token streaming is needed.
+//! - **MCP Traffic** (POST /mcp/v1 with application/json):
+//!   - Buffered for inspection and policy evaluation
+//!   - Routed through McpHandler for Cedar policy + task handling
 //!
-//! # When to Activate (v0.2+)
+//! - **HTTP Traffic** (everything else):
+//!   - Zero-copy streaming passthrough to upstream
+//!   - No inspection or buffering overhead
 //!
-//! - When streaming LLM responses (SSE token streams)
-//! - When large file transfers need zero-copy optimization
-//! - When response inspection during streaming is required
+//! # Request Flow
+//!
+//! ```text
+//! Request<Incoming> ──► discriminate_traffic()
+//!                              │
+//!         ┌────────────────────┴────────────────────┐
+//!         │                                         │
+//!   TrafficType::Mcp                         TrafficType::Http
+//!   (POST /mcp/v1 with JSON)                 (everything else)
+//!         │                                         │
+//!         ▼                                         ▼
+//!   handle_mcp_request()                     handle_http_request()
+//!         │                                         │
+//!   Buffer body → McpHandler                 Zero-copy streaming
+//! ```
 //!
 //! # Traceability
-//! - Deferred: REQ-CORE-001 (Zero-Copy Peeking Strategy)
+//! - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy)
+//! - Implements: REQ-CORE-003/F-002 (MCP Traffic Detection)
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy_config::ProxyConfig;
+use crate::traffic::{TrafficType, discriminate_traffic};
+use crate::transport::server::McpHandler;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::Uri;
-use http_body_util::{BodyStream, StreamBody};
+use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use hyper::body::Incoming;
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode, header};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tower::Service;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 /// Type alias for the client's streaming body type.
 type ClientBody =
     http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Type alias for the unified response body type.
+///
+/// MCP responses use `Full<Bytes>` (buffered), HTTP responses use streaming.
+/// Both are boxed for a unified return type.
+pub type UnifiedBody = http_body_util::combinators::BoxBody<Bytes, ProxyError>;
+
 /// Main proxy service that handles HTTP and HTTPS requests with full TLS support.
 ///
-/// This service implements zero-copy streaming via `BodyStream` to minimize latency
-/// and memory overhead. It supports both forward proxy (HTTP_PROXY/HTTPS_PROXY) and
+/// This service implements:
+/// - **MCP Traffic**: Buffered inspection via `McpHandler` (Cedar policy + task handling)
+/// - **HTTP Traffic**: Zero-copy streaming via `BodyStream` to minimize latency
+///
+/// It supports both forward proxy (HTTP_PROXY/HTTPS_PROXY) and
 /// reverse proxy (UPSTREAM_URL) modes.
 ///
 /// # Traceability
 /// - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy)
+/// - Implements: REQ-CORE-003/F-002 (MCP Traffic Detection)
 pub struct ProxyService {
     /// HTTPS-capable client for upstream connections with streaming support.
     client: Client<HttpsConnector<HttpConnector>, ClientBody>,
@@ -52,6 +82,8 @@ pub struct ProxyService {
     upstream_url: Option<String>,
     /// Runtime configuration
     config: ProxyConfig,
+    /// MCP request handler (optional - for MCP traffic routing)
+    mcp_handler: Option<Arc<McpHandler>>,
 }
 
 impl Clone for ProxyService {
@@ -60,6 +92,7 @@ impl Clone for ProxyService {
             client: self.client.clone(),
             upstream_url: self.upstream_url.clone(),
             config: self.config.clone(),
+            mcp_handler: self.mcp_handler.clone(),
         }
     }
 }
@@ -117,12 +150,129 @@ impl ProxyService {
             client,
             upstream_url,
             config,
+            mcp_handler: None,
         })
+    }
+
+    /// Set the MCP handler for this proxy service.
+    ///
+    /// When set, MCP traffic (POST /mcp/v1 with application/json) will be
+    /// routed through this handler for Cedar policy evaluation and task handling.
+    ///
+    /// # Traceability
+    /// - Implements: REQ-CORE-003/F-002 (MCP Traffic Detection)
+    pub fn with_mcp_handler(mut self, handler: Arc<McpHandler>) -> Self {
+        self.mcp_handler = Some(handler);
+        self
+    }
+
+    /// Check if this proxy service has MCP handling enabled.
+    pub fn has_mcp_handler(&self) -> bool {
+        self.mcp_handler.is_some()
     }
 
     /// Get a reference to the proxy configuration.
     pub fn config(&self) -> &ProxyConfig {
         &self.config
+    }
+
+    /// Handle an incoming request, discriminating between MCP and HTTP traffic.
+    ///
+    /// This is the main entry point for all traffic. It:
+    /// 1. Discriminates traffic type (MCP vs HTTP)
+    /// 2. Routes MCP traffic through McpHandler (if configured)
+    /// 3. Routes HTTP traffic through zero-copy streaming
+    ///
+    /// # Traceability
+    /// - Implements: REQ-CORE-003/F-002 (MCP Traffic Detection)
+    /// - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy)
+    pub async fn handle_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> ProxyResult<Response<UnifiedBody>> {
+        let traffic_type = discriminate_traffic(&req);
+
+        match traffic_type {
+            TrafficType::Mcp => {
+                if let Some(ref mcp_handler) = self.mcp_handler {
+                    debug!(
+                        method = %req.method(),
+                        uri = %req.uri(),
+                        "MCP traffic detected, routing to McpHandler"
+                    );
+                    self.handle_mcp_request(req, mcp_handler.clone()).await
+                } else {
+                    // No MCP handler configured, fall through to HTTP passthrough
+                    debug!(
+                        method = %req.method(),
+                        uri = %req.uri(),
+                        "MCP traffic detected but no handler configured, using HTTP passthrough"
+                    );
+                    self.handle_http_request(req).await
+                }
+            }
+            TrafficType::Http => self.handle_http_request(req).await,
+        }
+    }
+
+    /// Handle MCP traffic by buffering the body and passing to McpHandler.
+    ///
+    /// # Traceability
+    /// - Implements: REQ-CORE-003 (MCP Transport & Routing)
+    async fn handle_mcp_request(
+        &self,
+        req: Request<Incoming>,
+        mcp_handler: Arc<McpHandler>,
+    ) -> ProxyResult<Response<UnifiedBody>> {
+        // Buffer the request body
+        let (_parts, body) = req.into_parts();
+
+        // Check body size limit before collecting
+        let max_body_size = mcp_handler.max_body_size();
+
+        // Collect body with size limit check
+        let body_bytes = match body.collect().await {
+            Ok(collected) => {
+                let bytes = collected.to_bytes();
+                if bytes.len() > max_body_size {
+                    warn!(
+                        size = bytes.len(),
+                        max = max_body_size,
+                        "MCP request body exceeds size limit"
+                    );
+                    let body = Full::new(Bytes::from(format!(
+                        r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32600,"message":"Request body exceeds maximum size of {} bytes"}}}}"#,
+                        max_body_size
+                    )));
+                    return Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(body.map_err(|e| match e {}).boxed())
+                        .map_err(|e| ProxyError::Connection(e.to_string()));
+                }
+                bytes
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to collect MCP request body");
+                return Err(ProxyError::Connection(format!(
+                    "Failed to read request body: {}",
+                    e
+                )));
+            }
+        };
+
+        debug!(size = body_bytes.len(), "Collected MCP request body");
+
+        // Handle the MCP request - returns (StatusCode, Bytes) directly
+        // This avoids double-buffering (Simplification #5)
+        let (status, response_bytes) = mcp_handler.handle(body_bytes).await;
+
+        // Build unified response directly from bytes
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(response_bytes).map_err(|e| match e {}).boxed())
+            .map_err(|e| ProxyError::Connection(e.to_string()))
     }
 
     /// Handle an incoming HTTP request with zero-copy streaming.
@@ -132,7 +282,10 @@ impl ProxyService {
     /// - Implements: REQ-CORE-001 F-002 (Fail-Fast Error Propagation)
     /// - Implements: REQ-CORE-001 F-003 (Transparency - preserve Content-Length/Transfer-Encoding)
     /// - Implements: REQ-CORE-001 F-004 (Protocol Upgrade Handling)
-    pub async fn handle_request(&self, req: Request<Incoming>) -> ProxyResult<Response<Incoming>> {
+    pub async fn handle_http_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> ProxyResult<Response<UnifiedBody>> {
         // Extract target URI from request
         let target_uri = self.extract_target_uri(&req)?;
 
@@ -192,7 +345,6 @@ impl ProxyService {
         });
 
         let stream_body = StreamBody::new(mapped_stream);
-        use http_body_util::BodyExt;
         let boxed_body: ClientBody = BodyExt::boxed(stream_body);
 
         let upstream_req = upstream_req.body(boxed_body).map_err(|e| {
@@ -269,7 +421,16 @@ impl ProxyService {
             // - Add integration test that verifies bidirectional data flow
         }
 
-        Ok(upstream_res)
+        // Convert the Incoming body to UnifiedBody for type unification
+        let (parts, body) = upstream_res.into_parts();
+        let body_stream = BodyStream::new(body);
+        let mapped_stream = body_stream.map(|result| {
+            result.map_err(|e| ProxyError::Connection(format!("Body stream error: {}", e)))
+        });
+        let stream_body = StreamBody::new(mapped_stream);
+        let boxed_body: UnifiedBody = BodyExt::boxed(stream_body);
+
+        Ok(Response::from_parts(parts, boxed_body))
     }
 
     /// Extract target URI from request.
@@ -334,7 +495,7 @@ impl ProxyService {
 }
 
 impl Service<Request<Incoming>> for ProxyService {
-    type Response = Response<Incoming>;
+    type Response = Response<UnifiedBody>;
     type Error = ProxyError;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,

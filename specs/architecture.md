@@ -86,7 +86,7 @@ Not all gates are executed for every request:
 │  │   ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐    │   │
 │  │   │  HTTP+SSE   │    │  JSON-RPC   │    │    Method Router        │    │   │
 │  │   │  Listener   │───►│   Parser    │───►│                         │    │   │
-│  │   │  (Port 8080)│    │             │    │  tools/call → 4-Gate    │    │   │
+│  │   │  (Port 7467)│    │             │    │  tools/call → 4-Gate    │    │   │
 │  │   └─────────────┘    └─────────────┘    │  tasks/*    → TaskMgr   │    │   │
 │  │                                         │  other      → Upstream  │    │   │
 │  │                                         └───────────┬─────────────┘    │   │
@@ -462,9 +462,13 @@ Environment variables can override specific settings but cannot define complex s
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `THOUGHTGATE_CONFIG` | `/etc/thoughtgate/config.yaml` | Config file path |
-| `THOUGHTGATE_PORT` | `8080` | Listen port |
+| `THOUGHTGATE_OUTBOUND_PORT` | `7467` | Outbound proxy port (MCP traffic) |
+| `THOUGHTGATE_ADMIN_PORT` | `7469` | Admin port (health, ready, metrics) |
+| `UPSTREAM_URL` | (required) | Upstream server URL (all traffic) |
 | `THOUGHTGATE_LOG_LEVEL` | `info` | Log level |
 | `THOUGHTGATE_LOG_FORMAT` | `json` | Log format (json/pretty) |
+
+**Note:** Port 7468 is reserved for future inbound callbacks.
 
 #### Cedar Policy Engine (REQ-POL-001)
 
@@ -578,7 +582,7 @@ Environment variables can override specific settings but cannot define complex s
 │   │   ┌─────────────────┐           ┌─────────────────────┐                │  │
 │   │   │                 │  localhost │                     │                │  │
 │   │   │    AI Agent     │───────────►│    ThoughtGate     │────────────────┼──┼──► MCP Server
-│   │   │   Container     │   :8080    │      Sidecar       │                │  │
+│   │   │   Container     │   :7467    │      Sidecar       │                │  │
 │   │   │                 │            │                     │                │  │
 │   │   └─────────────────┘            └─────────────────────┘                │  │
 │   │                                                                         │  │
@@ -616,12 +620,15 @@ spec:
     image: my-agent:latest
     env:
     - name: MCP_SERVER_URL
-      value: "http://localhost:8080"  # Points to sidecar
-      
+      value: "http://localhost:7467"  # Points to sidecar (outbound port)
+
   - name: thoughtgate
     image: thoughtgate:v0.2
     ports:
-    - containerPort: 8080
+    - containerPort: 7467  # Outbound (MCP traffic)
+      name: outbound
+    - containerPort: 7469  # Admin (health, ready, metrics)
+      name: admin
     env:
     - name: SLACK_BOT_TOKEN
       valueFrom:
@@ -924,12 +931,20 @@ Timeouts at different layers and their cascade effects:
 
 ### 14.1 Endpoints
 
+ThoughtGate uses a 3-port Envoy-style architecture:
+
+| Port | Env Variable | Default | Purpose |
+|------|--------------|---------|---------|
+| Outbound | `THOUGHTGATE_OUTBOUND_PORT` | 7467 | MCP traffic (agent → upstream) |
+| Inbound | (reserved) | 7468 | Future callbacks (not wired) |
+| Admin | `THOUGHTGATE_ADMIN_PORT` | 7469 | Health, ready, metrics |
+
 | Endpoint | Port | Purpose |
 |----------|------|---------|
-| `POST /mcp/v1` | 8080 | MCP JSON-RPC |
-| `GET /health` | 8080 | Liveness probe |
-| `GET /ready` | 8080 | Readiness probe |
-| `GET /metrics` | 8080 | Prometheus metrics |
+| `POST /mcp/v1` | 7467 | MCP JSON-RPC |
+| `GET /health` | 7469 | Liveness probe |
+| `GET /ready` | 7469 | Readiness probe |
+| `GET /metrics` | 7469 | Prometheus metrics |
 
 **Note:** No inbound callback endpoints required - approval uses outbound polling model.
 

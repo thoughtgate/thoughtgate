@@ -22,39 +22,43 @@ use hyper_util::server::conn::auto;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use thoughtgate::admin::AdminServer;
 use thoughtgate::error::ProxyError;
-use thoughtgate::lifecycle::{DrainResult, LifecycleConfig, LifecycleManager, health_router};
+use thoughtgate::lifecycle::{DrainResult, LifecycleConfig, LifecycleManager};
 use thoughtgate::logging_layer::LoggingLayer;
+use thoughtgate::ports::{admin_port, inbound_port, outbound_port};
 use thoughtgate::proxy_config::ProxyConfig;
 use thoughtgate::proxy_service::ProxyService;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
 
 /// Configuration for the proxy server.
 ///
+/// # Envoy-style 3-Port Model
+///
+/// | Port | Env Variable | Default | Purpose |
+/// |------|--------------|---------|---------|
+/// | 7467 | THOUGHTGATE_OUTBOUND_PORT | 7467 | Client requests → upstream (main proxy) |
+/// | 7468 | (reserved) | 7468 | Future inbound (dummy socket, not wired) |
+/// | 7469 | THOUGHTGATE_ADMIN_PORT | 7469 | Health checks, metrics, admin API |
+///
 /// # Traceability
 /// - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy - configuration)
+/// - Implements: REQ-CORE-005/§5.1 (Network Configuration)
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Config {
-    /// Port to listen on (default: 4141, or PROXY_PORT env var)
-    #[arg(short, long, env = "PROXY_PORT", default_value = "4141")]
-    port: u16,
-
-    /// Bind address (default: 127.0.0.1)
-    #[arg(short, long, default_value = "127.0.0.1")]
+    /// Bind address (default: 0.0.0.0)
+    #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
 
     /// Optional upstream URL for reverse proxy mode (e.g., "http://backend:8080")
     /// When set, all requests are forwarded to this upstream instead of using the request's target
     #[arg(long, env = "UPSTREAM_URL")]
     upstream_url: Option<String>,
-
-    /// Health endpoint port (default: same as main port via separate listener)
-    #[arg(long, env = "THOUGHTGATE_HEALTH_PORT")]
-    health_port: Option<u16>,
 }
 
 /// Main entry point for the ThoughtGate proxy.
@@ -99,66 +103,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let meter = global::meter("thoughtgate");
         metrics::init_metrics(&meter);
-
-        // Spawn metrics endpoint server
-        let metrics_port = proxy_config.metrics_port;
-        tokio::spawn(async move {
-            if let Err(e) = serve_metrics(metrics_port).await {
-                error!(error = %e, "Metrics server error");
-            }
-        });
-
-        info!(metrics_port = metrics_port, "Metrics endpoint started");
     }
 
-    // Phase 3: Start health endpoint server
-    // Implements: REQ-CORE-005/F-002, F-003
-    let health_port = cli_config.health_port.unwrap_or_else(|| {
-        // Validate that port + 1 won't overflow
-        if cli_config.port == 65535 {
-            warn!(
-                main_port = cli_config.port,
-                "Main port is 65535, health endpoint will use port 65534 instead of port+1"
-            );
-            65534
-        } else {
-            cli_config.port + 1
-        }
-    });
-    let health_bind = cli_config.bind.clone();
-    let health_lifecycle = lifecycle.clone();
-    let health_shutdown = lifecycle.shutdown_token();
+    // Phase 3: Create unified shutdown token
+    // Implements: REQ-CORE-005/F-004 (Unified Shutdown)
+    let shutdown = CancellationToken::new();
+
+    // Phase 4: Start admin server on dedicated port
+    // Implements: REQ-CORE-005/F-002, F-003, REQ-CORE-005/§5.1
+    let admin_port_val = admin_port();
+    let admin_shutdown = shutdown.clone();
+    let admin_lifecycle = lifecycle.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            serve_health_endpoints(health_bind, health_port, health_lifecycle, health_shutdown)
-                .await
-        {
-            error!(error = %e, "Health server error");
+        let admin_server = AdminServer::with_config(
+            admin_lifecycle,
+            thoughtgate::admin::AdminServerConfig {
+                port: admin_port_val,
+                bind_addr: "0.0.0.0".to_string(),
+            },
+        );
+        if let Err(e) = admin_server.run(admin_shutdown).await {
+            error!(error = %e, "Admin server error");
         }
     });
     info!(
-        health_port = health_port,
-        "Health endpoints started (/health, /ready)"
+        admin_port = admin_port_val,
+        "Admin server started (/health, /ready, /metrics)"
     );
 
-    // Phase 4: Bind main listener
-    let addr = format!("{}:{}", cli_config.bind, cli_config.port);
+    // Reserve inbound port (7468) - dummy socket, not wired to anything
+    // This reserves the port for future callback/webhook functionality
+    let inbound_port_val = inbound_port();
+    let _inbound_listener = TcpListener::bind(format!("0.0.0.0:{}", inbound_port_val)).await?;
+    info!(
+        inbound_port = inbound_port_val,
+        "Inbound port reserved (not wired)"
+    );
+
+    // Phase 5: Bind main listener (outbound port)
+    let outbound_port_val = outbound_port();
+    let addr = format!("{}:{}", cli_config.bind, outbound_port_val);
     let listener = TcpListener::bind(&addr).await?;
 
     info!(
         bind = %cli_config.bind,
-        port = cli_config.port,
-        health_port = health_port,
+        outbound_port = outbound_port_val,
+        inbound_port = inbound_port_val,
+        admin_port = admin_port_val,
         drain_timeout_secs = lifecycle.config().drain_timeout.as_secs(),
         addr = %addr,
         tcp_nodelay = proxy_config.tcp_nodelay,
         tcp_keepalive_secs = proxy_config.tcp_keepalive_secs,
         max_concurrent_streams = proxy_config.max_concurrent_streams,
         socket_buffer_size = proxy_config.socket_buffer_size,
-        "ThoughtGate Proxy starting"
+        "ThoughtGate Proxy starting (Envoy-style 3-port model)"
     );
 
-    // Phase 5: Create proxy service
+    // Phase 6: Create proxy service
     let proxy_service = Arc::new(ProxyService::new_with_config(
         cli_config.upstream_url.clone(),
         proxy_config.clone(),
@@ -167,19 +168,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(LoggingLayer)
         .service(proxy_service.as_ref().clone());
 
-    // Setup signal handlers
+    // Setup signal handlers with unified shutdown token
     // Implements: REQ-CORE-005/F-004 (Signal Handling)
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    setup_signal_handlers(shutdown_tx.clone(), lifecycle.clone());
+    setup_signal_handlers(shutdown.clone(), lifecycle.clone());
 
     let config_clone = proxy_config.clone();
 
     // Semaphore for concurrency limiting (REQ-CORE-001 Section 3.2)
     let semaphore = Arc::new(Semaphore::new(proxy_config.max_concurrent_streams));
 
-    let mut shutdown_rx = shutdown_tx.subscribe();
-
-    // Phase 6: Upstream connectivity check and health checker
+    // Phase 7: Upstream connectivity check and health checker
     // Implements: REQ-CORE-005/F-001.4, F-008
     let health_check_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -296,14 +294,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let service_stack = service_stack.clone();
-                        let mut conn_shutdown_rx = shutdown_tx.subscribe();
+                        let conn_shutdown = shutdown.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(
                                 stream,
                                 peer_addr,
                                 service_stack,
-                                &mut conn_shutdown_rx,
+                                conn_shutdown,
                             )
                             .await
                             {
@@ -321,7 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            _ = shutdown_rx.recv() => {
+            _ = shutdown.cancelled() => {
                 info!("Shutdown signal received, stopping new connections");
                 break;
             }
@@ -330,6 +328,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful shutdown sequence
     // Implements: REQ-CORE-005/F-004, F-005
+    // Note: admin_shutdown is the same token as shutdown, already cancelled by signal handler
+
     info!(
         active_requests = lifecycle.active_request_count(),
         drain_timeout_secs = lifecycle.config().drain_timeout.as_secs(),
@@ -366,19 +366,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Implements: REQ-CORE-005/§5.2 (Signal Handling)
 ///
+/// Uses a unified CancellationToken for all shutdown coordination.
+///
 /// - SIGINT (Ctrl+C): Begin graceful shutdown
 /// - SIGTERM: Begin graceful shutdown
 /// - SIGQUIT: Immediate shutdown (no drain)
-fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<LifecycleManager>) {
+fn setup_signal_handlers(shutdown: CancellationToken, lifecycle: Arc<LifecycleManager>) {
     // SIGINT handler
-    let shutdown_tx_sigint = shutdown_tx.clone();
+    let shutdown_sigint = shutdown.clone();
     let lifecycle_sigint = lifecycle.clone();
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
                 info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
                 lifecycle_sigint.begin_shutdown();
-                let _ = shutdown_tx_sigint.send(());
+                shutdown_sigint.cancel();
             }
             Err(e) => {
                 error!(error = %e, "Failed to listen for SIGINT");
@@ -389,7 +391,7 @@ fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<Life
     // SIGTERM handler (Unix only)
     #[cfg(unix)]
     {
-        let shutdown_tx_sigterm = shutdown_tx.clone();
+        let shutdown_sigterm = shutdown.clone();
         let lifecycle_sigterm = lifecycle.clone();
         tokio::spawn(async move {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -397,7 +399,7 @@ fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<Life
                     sigterm.recv().await;
                     info!("Received SIGTERM, initiating graceful shutdown");
                     lifecycle_sigterm.begin_shutdown();
-                    let _ = shutdown_tx_sigterm.send(());
+                    shutdown_sigterm.cancel();
                 }
                 Err(e) => {
                     error!(error = %e, "Failed to listen for SIGTERM");
@@ -431,29 +433,7 @@ fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>, lifecycle: Arc<Life
 
     // Prevent unused variable warning on non-Unix
     #[cfg(not(unix))]
-    let _ = (shutdown_tx, lifecycle);
-}
-
-/// Serve health endpoints on a dedicated port.
-///
-/// Implements: REQ-CORE-005/F-002, F-003
-async fn serve_health_endpoints(
-    bind: String,
-    port: u16,
-    lifecycle: Arc<LifecycleManager>,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = health_router(lifecycle);
-    let addr = format!("{}:{}", bind, port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-        })
-        .await?;
-
-    Ok(())
+    let _ = (shutdown, lifecycle);
 }
 
 /// Handle a single connection with HTTP protocol.
@@ -465,11 +445,14 @@ async fn handle_connection<S>(
     mut stream: TcpStream,
     _peer_addr: SocketAddr,
     service: S,
-    shutdown_rx: &mut broadcast::Receiver<()>,
+    shutdown: CancellationToken,
 ) -> Result<(), ProxyError>
 where
-    S: tower::Service<Request<Incoming>, Response = Response<Incoming>, Error = ProxyError>
-        + Clone
+    S: tower::Service<
+            Request<Incoming>,
+            Response = Response<thoughtgate::proxy_service::UnifiedBody>,
+            Error = ProxyError,
+        > + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
@@ -514,8 +497,13 @@ where
             // Implements: REQ-CORE-002 F-002 (Fail-Closed State)
             let result: Result<_, std::convert::Infallible> = match svc.call(req).await {
                 Ok(response) => {
-                    // Box the successful response body
-                    Ok(response.map(|body| body.boxed()))
+                    // UnifiedBody is already a BoxBody<Bytes, ProxyError>, convert to BoxBody<Bytes, hyper::Error>
+                    Ok(response.map(|body| {
+                        body.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(std::io::Error::other(e.to_string()))
+                        })
+                        .boxed()
+                    }))
                 }
                 Err(e) => {
                     error!(error = %e, "Service error");
@@ -543,7 +531,7 @@ where
                 error!(error = %e, "Connection error");
             }
         }
-        _ = shutdown_rx.recv() => {
+        _ = shutdown.cancelled() => {
             info!("Shutdown signal received, gracefully closing connection");
             conn.as_mut().graceful_shutdown();
             let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
@@ -626,50 +614,6 @@ async fn send_503_shutdown_response(mut stream: TcpStream) -> std::io::Result<()
 
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
-    Ok(())
-}
-
-/// Serve Prometheus metrics endpoint.
-///
-/// # Traceability
-/// - Implements: REQ-CORE-001 NFR-001 (Observability - Metrics Endpoint)
-#[cfg(feature = "metrics")]
-async fn serve_metrics(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    use axum::{Router, response::IntoResponse, routing::get};
-
-    async fn metrics_handler() -> impl IntoResponse {
-        use prometheus::{Encoder, TextEncoder};
-
-        let metrics = prometheus::default_registry().gather();
-        let encoder = TextEncoder::new();
-        let mut buffer = Vec::new();
-        if let Err(e) = encoder.encode(&metrics, &mut buffer) {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to encode metrics: {}", e),
-            )
-                .into_response();
-        }
-        (
-            axum::http::StatusCode::OK,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "text/plain; charset=utf-8",
-            )],
-            buffer,
-        )
-            .into_response()
-    }
-
-    let app = Router::new().route("/metrics", get(metrics_handler));
-
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-    info!(addr = %addr, "Metrics server listening");
-
-    axum::serve(listener, app).await?;
-
     Ok(())
 }
 
