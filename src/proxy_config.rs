@@ -57,8 +57,8 @@ pub struct ProxyConfig {
     /// Socket buffer size (SO_RCVBUF / SO_SNDBUF)
     pub socket_buffer_size: usize,
 
-    /// Prometheus metrics endpoint port
-    pub metrics_port: u16,
+    // NOTE: metrics_port removed - metrics are now served on the admin port (7469)
+    // via the AdminServer module. See src/admin.rs and src/ports.rs.
 
     // ─────────────────────────────────────────────────────────────────────────
     // Amber Path Configuration - DEFERRED TO v0.2+ (REQ-CORE-002)
@@ -103,7 +103,6 @@ impl Default for ProxyConfig {
             stream_total_timeout: Duration::from_secs(3600),
             max_concurrent_streams: 10000,
             socket_buffer_size: 262144, // 256 KB
-            metrics_port: 9090,
 
             // Amber Path defaults (REQ-CORE-002 Section 3.2)
             max_concurrent_buffers: 100,
@@ -126,7 +125,9 @@ impl ProxyConfig {
     /// - `THOUGHTGATE_STREAM_TOTAL_TIMEOUT_SECS` (default: 3600)
     /// - `THOUGHTGATE_MAX_CONCURRENT_STREAMS` (default: 10000)
     /// - `THOUGHTGATE_SOCKET_BUFFER_SIZE` (default: 262144)
-    /// - `THOUGHTGATE_METRICS_PORT` (default: 9090)
+    ///
+    /// Note: THOUGHTGATE_METRICS_PORT is no longer used. Metrics are served on
+    /// the admin port (default: 7469). See THOUGHTGATE_ADMIN_PORT.
     ///
     /// # Environment Variables (Amber Path - REQ-CORE-002)
     ///
@@ -181,11 +182,6 @@ impl ProxyConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default.socket_buffer_size),
 
-            metrics_port: std::env::var("THOUGHTGATE_METRICS_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default.metrics_port),
-
             // Amber Path configuration
             max_concurrent_buffers: std::env::var("THOUGHTGATE_MAX_CONCURRENT_BUFFERS")
                 .ok()
@@ -238,7 +234,6 @@ mod tests {
         let default_config = ProxyConfig::default();
         assert_eq!(default_config.max_concurrent_streams, 10000);
         assert!(default_config.tcp_nodelay);
-        assert_eq!(default_config.metrics_port, 9090);
         assert_eq!(default_config.socket_buffer_size, 262144);
 
         // Test 2: Environment variable override (test in isolation)

@@ -39,7 +39,15 @@ MOCK_CONTAINER="tg-constrained-mock"
 
 # Ports
 MOCK_LLM_PORT=8888
-PROXY_PORT=4141
+
+# ThoughtGate v0.2 uses 3-port Envoy-style model inside container:
+# - Outbound port (7467): Main proxy for client requests
+# - Admin port (7469): Health checks (/health, /ready)
+# Map container ports to host ports for testing
+CONTAINER_OUTBOUND_PORT=7467
+CONTAINER_ADMIN_PORT=7469
+HOST_PROXY_PORT=4141
+HOST_ADMIN_PORT=4143
 
 # k6 configuration
 K6_VUS=10
@@ -170,16 +178,18 @@ start_constrained_proxy() {
         host_ip=$(docker network inspect bridge --format='{{range .IPAM.Config}}{{.Gateway}}{{end}}')
     fi
     
+    # ThoughtGate v0.2 uses 3-port model - map outbound and admin ports
     docker run -d \
         --name "$PROXY_CONTAINER" \
         --cpus "$CPU_LIMIT" \
         --memory "$MEMORY_LIMIT" \
-        -p "${PROXY_PORT}:4141" \
+        -p "${HOST_PROXY_PORT}:${CONTAINER_OUTBOUND_PORT}" \
+        -p "${HOST_ADMIN_PORT}:${CONTAINER_ADMIN_PORT}" \
         -e THOUGHTGATE_UPSTREAM_URL="http://${host_ip}:${MOCK_LLM_PORT}" \
-        -e THOUGHTGATE_LISTEN_ADDR="0.0.0.0:4141" \
         "$DOCKER_IMAGE"
-    
-    wait_for_host_port $PROXY_PORT
+
+    # Wait for admin port (health endpoint) to be ready
+    wait_for_host_port $HOST_ADMIN_PORT
     log_success "Constrained proxy container started"
     
     # Show container resource limits
@@ -237,7 +247,7 @@ export const options = {
 const PAYLOAD = JSON.stringify({ prompt: "A".repeat(1000) });
 
 export default function () {
-  const res = http.post('http://127.0.0.1:${PROXY_PORT}/v1/chat/completions', PAYLOAD, {
+  const res = http.post('http://127.0.0.1:${HOST_PROXY_PORT}/v1/chat/completions', PAYLOAD, {
     headers: { 'Content-Type': 'application/json' },
     timeout: '10s',
   });

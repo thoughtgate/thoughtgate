@@ -43,6 +43,7 @@
 #[cfg(feature = "amber_path")]
 pub mod buffered_forwarder;
 
+pub mod admin;
 pub mod config;
 pub mod error;
 pub mod governance;
@@ -51,9 +52,11 @@ pub mod lifecycle;
 pub mod logging_layer;
 pub mod metrics;
 pub mod policy;
+pub mod ports;
 pub mod protocol;
 pub mod proxy_body;
 pub mod proxy_config;
 pub mod proxy_service;
 pub mod timeout;
+pub mod traffic;
 pub mod transport;

@@ -132,6 +132,14 @@ The system must:
 | `uuid` | Request ID generation | 1.x |
 | `glob` | Pattern matching for rules | 0.3.x |
 
+### 5.1.1 Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `THOUGHTGATE_OUTBOUND_PORT` | `7467` | Outbound proxy port (MCP traffic) |
+| `THOUGHTGATE_ADMIN_PORT` | `7469` | Admin port (health/ready/metrics) |
+| `UPSTREAM_URL` | (required) | Upstream server URL (all traffic) |
+
 ### 5.2 Protocol Compliance
 
 **JSON-RPC 2.0 Requirements:**
@@ -154,14 +162,29 @@ The system must:
 
 ### 5.3 Connection Management
 
-**Single-Port Architecture:**
-ThoughtGate exposes one port for all MCP traffic:
+**3-Port Envoy-Style Architecture:**
 
-| Port | Purpose |
-|------|---------|
-| 8080 (default) | MCP gateway (inbound from agents) |
+ThoughtGate uses a 3-port architecture inspired by Envoy proxy:
 
-Upstream MCP server URL is configured via `sources[].url` in YAML config.
+| Port | Env Variable | Default | Purpose |
+|------|--------------|---------|---------|
+| Outbound | `THOUGHTGATE_OUTBOUND_PORT` | 7467 | MCP traffic (agent → upstream) |
+| Inbound | (reserved) | 7468 | Future callbacks (not wired in v0.2) |
+| Admin | `THOUGHTGATE_ADMIN_PORT` | 7469 | Health, ready, metrics |
+
+**Traffic Flow:**
+- Agents connect to the **outbound port** (7467) for MCP requests
+- Health probes and metrics are served on the **admin port** (7469)
+- The **inbound port** (7468) is reserved for future callback functionality
+
+Upstream server URL is configured via `UPSTREAM_URL` environment variable. This URL is used as the target for **all traffic** in reverse proxy mode.
+
+**Traffic Discrimination:**
+ThoughtGate discriminates traffic on the outbound port:
+- **MCP traffic**: `POST /mcp/v1` with `Content-Type: application/json` → Buffered inspection via `McpHandler`
+- **HTTP passthrough**: All other requests → Zero-copy streaming to `UPSTREAM_URL`
+
+Both traffic types are forwarded to the same upstream URL, but MCP traffic is inspected and subject to policy evaluation.
 
 ### 5.4 v0.2 SEP-1686 Mode
 

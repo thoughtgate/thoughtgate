@@ -1,24 +1,26 @@
-//! MCP HTTP server with axum.
+//! MCP request handler and optional HTTP server.
 //!
 //! Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
 //!
-//! Provides the `POST /mcp/v1` endpoint for receiving MCP JSON-RPC requests.
+//! # Overview
 //!
-//! # Architecture
+//! This module provides two ways to handle MCP requests:
 //!
-//! The server uses axum for HTTP handling with:
-//! - Semaphore-based concurrency limiting
-//! - Body size limits
-//! - Proper JSON-RPC error responses
+//! 1. **`McpHandler`** - Direct handler that processes buffered request bodies.
+//!    Used by ProxyService for in-process MCP handling.
+//!
+//! 2. **`McpServer`** - Optional standalone Axum server for testing or
+//!    running MCP handling separately (deprecated in v0.2).
 //!
 //! # Request Flow
 //!
-//! 1. Receive POST request at `/mcp/v1`
+//! 1. Receive buffered request body (Bytes)
 //! 2. Check body size against limit
 //! 3. Acquire semaphore permit (or return 503)
 //! 4. Parse JSON-RPC request(s)
-//! 5. Route each request to appropriate handler
-//! 6. Return response(s)
+//! 5. Route each request via McpRouter
+//! 6. Execute policy evaluation (Cedar) or task handling
+//! 7. Return JSON-RPC response(s)
 
 use std::sync::Arc;
 
@@ -108,10 +110,11 @@ impl McpServerConfig {
     }
 }
 
-/// Shared application state.
+/// Shared MCP handler state.
 ///
-/// This state is shared across all request handlers via axum's State extractor.
-pub struct AppState {
+/// This state is shared across all request handlers. Used by both
+/// `McpHandler` (direct invocation) and `McpServer` (Axum server).
+pub struct McpState {
     /// Upstream client for forwarding requests
     pub upstream: Arc<dyn UpstreamForwarder>,
     /// Method router
@@ -126,12 +129,197 @@ pub struct AppState {
     pub max_body_size: usize,
 }
 
-/// The MCP server.
+/// Configuration for the MCP handler.
+///
+/// Implements: REQ-CORE-003/§5.3 (Configuration)
+#[derive(Debug, Clone)]
+pub struct McpHandlerConfig {
+    /// Maximum request body size in bytes
+    pub max_body_size: usize,
+    /// Maximum concurrent requests
+    pub max_concurrent_requests: usize,
+}
+
+impl Default for McpHandlerConfig {
+    fn default() -> Self {
+        Self {
+            max_body_size: 1024 * 1024, // 1MB
+            max_concurrent_requests: 10000,
+        }
+    }
+}
+
+impl McpHandlerConfig {
+    /// Load configuration from environment variables.
+    ///
+    /// # Environment Variables
+    ///
+    /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
+    /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
+    pub fn from_env() -> Self {
+        let max_body_size: usize = std::env::var("THOUGHTGATE_MAX_REQUEST_BODY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024 * 1024); // 1MB default
+
+        let max_concurrent_requests: usize = std::env::var("THOUGHTGATE_MAX_CONCURRENT_REQUESTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10000);
+
+        Self {
+            max_body_size,
+            max_concurrent_requests,
+        }
+    }
+}
+
+/// MCP request handler for direct invocation.
+///
+/// This handler processes buffered MCP request bodies and returns HTTP responses.
+/// It's designed to be called directly from ProxyService without going through
+/// a separate Axum server.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use thoughtgate::transport::server::{McpHandler, McpHandlerConfig};
+///
+/// let handler = McpHandler::new(
+///     upstream,
+///     cedar_engine,
+///     task_store,
+///     McpHandlerConfig::default(),
+/// )?;
+///
+/// let response = handler.handle(body_bytes).await;
+/// ```
+///
+/// # Traceability
+/// - Implements: REQ-CORE-003/F-002 (Method Routing)
+/// - Implements: REQ-POL-001/F-001 (Cedar Policy Evaluation)
+pub struct McpHandler {
+    state: Arc<McpState>,
+}
+
+impl McpHandler {
+    /// Create a new MCP handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `upstream` - Upstream forwarder for proxying requests
+    /// * `cedar_engine` - Cedar policy engine for authorization
+    /// * `task_store` - Task store for SEP-1686 task methods
+    /// * `config` - Handler configuration
+    ///
+    /// # Returns
+    ///
+    /// A new McpHandler ready to process requests.
+    pub fn new(
+        upstream: Arc<dyn UpstreamForwarder>,
+        cedar_engine: Arc<CedarEngine>,
+        task_store: Arc<TaskStore>,
+        config: McpHandlerConfig,
+    ) -> Self {
+        let task_handler = TaskHandler::new(task_store);
+        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
+
+        let state = Arc::new(McpState {
+            upstream,
+            router: McpRouter::new(),
+            task_handler,
+            cedar_engine,
+            semaphore,
+            max_body_size: config.max_body_size,
+        });
+
+        Self { state }
+    }
+
+    /// Create a new MCP handler with custom task handler.
+    ///
+    /// This is useful for testing with mock components.
+    pub fn with_task_handler(
+        upstream: Arc<dyn UpstreamForwarder>,
+        cedar_engine: Arc<CedarEngine>,
+        task_handler: TaskHandler,
+        config: McpHandlerConfig,
+    ) -> Self {
+        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
+
+        let state = Arc::new(McpState {
+            upstream,
+            router: McpRouter::new(),
+            task_handler,
+            cedar_engine,
+            semaphore,
+            max_body_size: config.max_body_size,
+        });
+
+        Self { state }
+    }
+
+    /// Get the maximum body size.
+    pub fn max_body_size(&self) -> usize {
+        self.state.max_body_size
+    }
+
+    /// Handle a buffered MCP request body.
+    ///
+    /// This is the main entry point for processing MCP requests. It:
+    /// 1. Checks body size
+    /// 2. Acquires concurrency permit
+    /// 3. Parses JSON-RPC
+    /// 4. Routes and executes the request(s)
+    ///
+    /// # Arguments
+    ///
+    /// * `body` - The buffered request body
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (StatusCode, response bytes) for direct use by ProxyService.
+    /// This avoids double-buffering when converting to UnifiedBody.
+    ///
+    /// # Traceability
+    /// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
+    pub async fn handle(&self, body: Bytes) -> (StatusCode, Bytes) {
+        handle_mcp_body_bytes(&self.state, body).await
+    }
+
+    /// Handle a buffered MCP request body and return a full Response.
+    ///
+    /// This is used by McpServer for backwards compatibility with Axum.
+    pub async fn handle_response(&self, body: Bytes) -> Response {
+        let (status, bytes) = self.handle(body).await;
+        (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+    }
+
+    /// Get a reference to the internal state (for testing).
+    #[cfg(test)]
+    pub fn state(&self) -> &Arc<McpState> {
+        &self.state
+    }
+}
+
+impl Clone for McpHandler {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
+    }
+}
+
+/// The MCP server (standalone Axum server).
+///
+/// **Note:** In v0.2, prefer using `McpHandler` via `ProxyService` for unified
+/// traffic handling. This standalone server is retained for testing and
+/// backwards compatibility.
 ///
 /// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
 pub struct McpServer {
     config: McpServerConfig,
-    state: Arc<AppState>,
+    state: Arc<McpState>,
 }
 
 /// Create governance components (TaskHandler + CedarEngine).
@@ -171,7 +359,7 @@ impl McpServer {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let (task_handler, cedar_engine) = create_governance_components()?;
 
-        let state = Arc::new(AppState {
+        let state = Arc::new(McpState {
             upstream,
             router: McpRouter::new(),
             task_handler,
@@ -200,7 +388,7 @@ impl McpServer {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let (task_handler, cedar_engine) = create_governance_components()?;
 
-        let state = Arc::new(AppState {
+        let state = Arc::new(McpState {
             upstream,
             router: McpRouter::new(),
             task_handler,
@@ -243,9 +431,25 @@ impl McpServer {
     }
 }
 
-/// Handle POST /mcp/v1 requests.
+/// Handle POST /mcp/v1 requests (Axum handler).
+///
+/// This is the Axum handler that extracts state and body, then delegates
+/// to `handle_mcp_body_bytes` for the actual processing.
 ///
 /// Implements: REQ-CORE-003/§10 (Request Handler Pattern)
+async fn handle_mcp_request(State(state): State<Arc<McpState>>, body: Bytes) -> Response {
+    let (status, bytes) = handle_mcp_body_bytes(&state, body).await;
+    (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+}
+
+/// Handle a buffered MCP request body, returning (StatusCode, Bytes).
+///
+/// This is the core MCP processing logic, used by both:
+/// - `McpHandler::handle()` (direct invocation from ProxyService)
+/// - `handle_mcp_request()` (Axum handler for standalone server)
+///
+/// Returns `(StatusCode, Bytes)` to avoid double-buffering when ProxyService
+/// converts to UnifiedBody.
 ///
 /// # Request Flow
 ///
@@ -254,7 +458,10 @@ impl McpServer {
 /// 3. Parse JSON-RPC request(s)
 /// 4. Route and handle each request
 /// 5. Return response(s)
-async fn handle_mcp_request(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+///
+/// # Traceability
+/// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
+async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, Bytes) {
     // Check body size limit
     if body.len() > state.max_body_size {
         let error = ThoughtGateError::InvalidRequest {
@@ -263,7 +470,7 @@ async fn handle_mcp_request(State(state): State<Arc<AppState>>, body: Bytes) -> 
                 state.max_body_size
             ),
         };
-        return error_response(None, &error, "size-limit");
+        return error_bytes(None, &error, "size-limit");
     }
 
     // Try to acquire semaphore permit (EC-MCP-011)
@@ -273,10 +480,10 @@ async fn handle_mcp_request(State(state): State<Arc<AppState>>, body: Bytes) -> 
             warn!("Max concurrent requests reached, returning 503");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                [(header::CONTENT_TYPE, "application/json")],
-                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32013,"message":"Service temporarily unavailable"}}"#,
-            )
-                .into_response();
+                Bytes::from_static(
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32013,"message":"Service temporarily unavailable"}}"#,
+                ),
+            );
         }
     };
 
@@ -284,27 +491,27 @@ async fn handle_mcp_request(State(state): State<Arc<AppState>>, body: Bytes) -> 
     let parsed = match parse_jsonrpc(&body) {
         Ok(p) => p,
         Err(e) => {
-            return error_response(None, &e, "parse-error");
+            return error_bytes(None, &e, "parse-error");
         }
     };
 
     match parsed {
-        ParsedRequests::Single(request) => handle_single_request(&state, request).await,
-        ParsedRequests::Batch(requests) => handle_batch_request(&state, requests).await,
+        ParsedRequests::Single(request) => handle_single_request_bytes(state, request).await,
+        ParsedRequests::Batch(requests) => handle_batch_request_bytes(state, requests).await,
     }
 }
 
-/// Handle a single JSON-RPC request.
+/// Handle a single JSON-RPC request, returning (StatusCode, Bytes).
 ///
 /// # Arguments
 ///
-/// * `state` - Application state
+/// * `state` - MCP handler state
 /// * `request` - The parsed MCP request
 ///
 /// # Returns
 ///
-/// HTTP response with JSON-RPC result or error.
-async fn handle_single_request(state: &AppState, request: McpRequest) -> Response {
+/// (StatusCode, Bytes) tuple with JSON-RPC result or error.
+async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (StatusCode, Bytes) {
     let correlation_id = request.correlation_id.to_string();
     let id = request.id.clone();
     let is_notification = request.is_notification();
@@ -335,7 +542,7 @@ async fn handle_single_request(state: &AppState, request: McpRequest) -> Respons
         RouteTarget::PassThrough { request } => state.upstream.forward(&request).await,
     };
 
-    // Handle notification - no response
+    // Handle notification - no response (empty body with 204)
     if is_notification {
         if let Err(e) = result {
             error!(
@@ -344,13 +551,13 @@ async fn handle_single_request(state: &AppState, request: McpRequest) -> Respons
                 "Notification processing failed"
             );
         }
-        return StatusCode::NO_CONTENT.into_response();
+        return (StatusCode::NO_CONTENT, Bytes::new());
     }
 
     // Return response
     match result {
-        Ok(response) => json_response(&response),
-        Err(e) => error_response(id, &e, &correlation_id),
+        Ok(response) => json_bytes(&response),
+        Err(e) => error_bytes(id, &e, &correlation_id),
     }
 }
 
@@ -514,7 +721,7 @@ fn task_error_to_thoughtgate(error: crate::governance::TaskError) -> ThoughtGate
 ///
 /// For other methods (tools/list, resources/*, prompts/*), passes through to upstream.
 async fn evaluate_with_cedar(
-    state: &AppState,
+    state: &McpState,
     request: McpRequest,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
     // Only evaluate tools/call requests with Cedar
@@ -581,18 +788,18 @@ async fn evaluate_with_cedar(
     }
 }
 
-/// Handle a batch JSON-RPC request.
+/// Handle a batch JSON-RPC request, returning (StatusCode, Bytes).
 ///
 /// Implements: REQ-CORE-003/F-007 (Batch Request Handling)
 ///
 /// # Arguments
 ///
-/// * `state` - Application state
+/// * `state` - MCP handler state
 /// * `requests` - The parsed MCP requests
 ///
 /// # Returns
 ///
-/// HTTP response with JSON-RPC batch response or 204 No Content if all notifications.
+/// (StatusCode, Bytes) with JSON-RPC batch response or 204 No Content if all notifications.
 ///
 /// # Design Note
 ///
@@ -601,7 +808,10 @@ async fn evaluate_with_cedar(
 ///    becomes task-augmented - requests are not independent
 /// 2. Sequential processing simplifies response ordering guarantees
 /// 3. The upstream connection pool handles actual HTTP request parallelism
-async fn handle_batch_request(state: &AppState, requests: Vec<McpRequest>) -> Response {
+async fn handle_batch_request_bytes(
+    state: &McpState,
+    requests: Vec<McpRequest>,
+) -> (StatusCode, Bytes) {
     let mut responses: Vec<JsonRpcResponse> = Vec::new();
 
     // Process each request sequentially - see Design Note above
@@ -641,76 +851,61 @@ async fn handle_batch_request(state: &AppState, requests: Vec<McpRequest>) -> Re
     // Return batch response
     if responses.is_empty() {
         // All were notifications
-        return StatusCode::NO_CONTENT.into_response();
+        return (StatusCode::NO_CONTENT, Bytes::new());
     }
 
     // Serialize batch response
-    match serde_json::to_string(&responses) {
-        Ok(json) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json,
-        )
-            .into_response(),
+    match serde_json::to_vec(&responses) {
+        Ok(bytes) => (StatusCode::OK, Bytes::from(bytes)),
         Err(e) => {
             error!(error = %e, "Failed to serialize batch response");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, "application/json")],
-                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error: failed to serialize response"}}"#,
+                Bytes::from_static(
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error: failed to serialize response"}}"#,
+                ),
             )
-                .into_response()
         }
     }
 }
 
-/// Build a JSON response from a JsonRpcResponse.
-fn json_response(response: &JsonRpcResponse) -> Response {
-    match serde_json::to_string(response) {
-        Ok(json) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json,
-        )
-            .into_response(),
+/// Build JSON bytes from a JsonRpcResponse.
+fn json_bytes(response: &JsonRpcResponse) -> (StatusCode, Bytes) {
+    match serde_json::to_vec(response) {
+        Ok(bytes) => (StatusCode::OK, Bytes::from(bytes)),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CONTENT_TYPE, "application/json")],
-            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#,
-        )
-            .into_response(),
+            Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#,
+            ),
+        ),
     }
 }
 
-/// Build an error response.
+/// Build error bytes from a ThoughtGateError.
 ///
 /// # Arguments
 ///
 /// * `id` - The request ID (may be None for parse errors)
 /// * `error` - The ThoughtGateError
 /// * `correlation_id` - Correlation ID for the error response
-fn error_response(
+fn error_bytes(
     id: Option<crate::transport::jsonrpc::JsonRpcId>,
     error: &ThoughtGateError,
     correlation_id: &str,
-) -> Response {
+) -> (StatusCode, Bytes) {
     let jsonrpc_error = error.to_jsonrpc_error(correlation_id);
     let response = JsonRpcResponse::error(id, jsonrpc_error);
 
     // JSON-RPC errors still return HTTP 200
-    match serde_json::to_string(&response) {
-        Ok(json) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json,
-        )
-            .into_response(),
+    match serde_json::to_vec(&response) {
+        Ok(bytes) => (StatusCode::OK, Bytes::from(bytes)),
         Err(_) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#,
-        )
-            .into_response(),
+            Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#,
+            ),
+        ),
     }
 }
 
@@ -749,12 +944,12 @@ mod tests {
         }
     }
 
-    fn create_test_state() -> Arc<AppState> {
+    fn create_test_state() -> Arc<McpState> {
         let task_store = Arc::new(TaskStore::with_defaults());
         let task_handler = TaskHandler::new(task_store);
         let cedar_engine = Arc::new(CedarEngine::new().expect("Failed to create Cedar engine"));
 
-        Arc::new(AppState {
+        Arc::new(McpState {
             upstream: Arc::new(MockUpstream),
             router: McpRouter::new(),
             task_handler,
@@ -922,7 +1117,7 @@ mod tests {
         let task_handler = TaskHandler::new(task_store);
         let cedar_engine = Arc::new(CedarEngine::new().expect("Failed to create Cedar engine"));
 
-        let state = Arc::new(AppState {
+        let state = Arc::new(McpState {
             upstream: Arc::new(MockUpstream),
             router: McpRouter::new(),
             task_handler,
@@ -957,7 +1152,7 @@ mod tests {
         let task_handler = TaskHandler::new(task_store);
         let cedar_engine = Arc::new(CedarEngine::new().expect("Failed to create Cedar engine"));
 
-        let state = Arc::new(AppState {
+        let state = Arc::new(McpState {
             upstream: Arc::new(MockUpstream),
             router: McpRouter::new(),
             task_handler,
@@ -1263,7 +1458,7 @@ mod tests {
     // ========================================================================
 
     /// Helper to create test state with custom Cedar policy.
-    fn create_test_state_with_policy(policy: &str) -> Arc<AppState> {
+    fn create_test_state_with_policy(policy: &str) -> Arc<McpState> {
         // Set policy env var (caller must use #[serial] and clean up)
         unsafe {
             std::env::set_var("THOUGHTGATE_DEV_MODE", "true");
@@ -1274,7 +1469,7 @@ mod tests {
         let task_handler = TaskHandler::new(task_store);
         let cedar_engine = Arc::new(CedarEngine::new().expect("Failed to create Cedar engine"));
 
-        Arc::new(AppState {
+        Arc::new(McpState {
             upstream: Arc::new(MockUpstream),
             router: McpRouter::new(),
             task_handler,

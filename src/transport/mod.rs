@@ -33,5 +33,5 @@ pub use jsonrpc::{
     JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpRequest, ParsedRequests, TaskMetadata,
 };
 pub use router::{McpRouter, RouteTarget, TaskMethod};
-pub use server::{AppState, McpServer, McpServerConfig};
+pub use server::{McpHandler, McpHandlerConfig, McpServer, McpServerConfig, McpState};
 pub use upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};

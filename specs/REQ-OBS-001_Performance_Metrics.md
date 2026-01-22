@@ -213,9 +213,10 @@ START=$(date +%s%N)
 PID=$!
 
 # Poll /health until 200 (with timeout)
+# Note: Health/ready endpoints are on admin port 7469 (separate from MCP traffic on 7467)
 MAX_ITER=1000
 ELAPSED=0
-while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+while ! curl -sf http://localhost:7469/health > /dev/null 2>&1; do
   sleep 0.01
   ELAPSED=$((ELAPSED + 1))
   if [ "$ELAPSED" -ge "$MAX_ITER" ]; then
@@ -230,7 +231,7 @@ STARTUP_HEALTHY_MS=$(( (HEALTHY_TIME - START) / 1000000 ))
 # M-START-003: Startup to ready (/ready returns 200 - policies loaded)
 # /ready includes: policies_loaded, upstream_reachable, task_store_initialized
 ELAPSED=0
-while ! curl -sf http://localhost:8080/ready > /dev/null 2>&1; do
+while ! curl -sf http://localhost:7469/ready > /dev/null 2>&1; do
   sleep 0.01
   ELAPSED=$((ELAPSED + 1))
   if [ "$ELAPSED" -ge "$MAX_ITER" ]; then
@@ -243,7 +244,7 @@ READY_TIME=$(date +%s%N)
 STARTUP_READY_MS=$(( (READY_TIME - START) / 1000000 ))
 ```
 
-**Note:** `/health` indicates the process is alive (liveness). `/ready` indicates policies are loaded and the system can serve traffic (readiness). See REQ-CORE-005 for probe semantics.
+**Note:** `/health` indicates the process is alive (liveness). `/ready` indicates policies are loaded and the system can serve traffic (readiness). Both endpoints are served on the admin port (default 7469), separate from the MCP traffic port (default 7467). See REQ-CORE-005 for probe semantics and 3-port architecture details.
 
 ### 7.3 Memory & CPU Metrics (During k6 Test)
 

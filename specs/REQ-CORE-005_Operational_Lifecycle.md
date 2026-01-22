@@ -91,12 +91,22 @@ The system must additionally:
 
 ### 5.1 Kubernetes Integration
 
+**Port Architecture:**
+
+ThoughtGate uses a 3-port Envoy-style architecture:
+
+| Port | Env Variable | Default | Purpose |
+|------|--------------|---------|---------|
+| Outbound | `THOUGHTGATE_OUTBOUND_PORT` | 7467 | MCP traffic (agent → upstream) |
+| Inbound | (reserved) | 7468 | Future callbacks (not wired) |
+| Admin | `THOUGHTGATE_ADMIN_PORT` | 7469 | Health, ready, metrics |
+
 **Probe Configuration:**
 ```yaml
 livenessProbe:
   httpGet:
     path: /health
-    port: 8080
+    port: 7469          # Admin port
   initialDelaySeconds: 5
   periodSeconds: 10
   failureThreshold: 3
@@ -104,7 +114,7 @@ livenessProbe:
 readinessProbe:
   httpGet:
     path: /ready
-    port: 8080
+    port: 7469          # Admin port
   initialDelaySeconds: 2
   periodSeconds: 5
   failureThreshold: 2
@@ -129,14 +139,18 @@ readinessProbe:
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
-| Health port | Same as main | `THOUGHTGATE_HEALTH_PORT` |
+| Outbound port | 7467 | `THOUGHTGATE_OUTBOUND_PORT` |
+| Admin port | 7469 | `THOUGHTGATE_ADMIN_PORT` |
 | Shutdown timeout | 30s | `THOUGHTGATE_SHUTDOWN_TIMEOUT_SECS` |
 | Drain timeout | 25s | `THOUGHTGATE_DRAIN_TIMEOUT_SECS` |
 | Startup timeout | 15s | `THOUGHTGATE_STARTUP_TIMEOUT_SECS` |
 | Require upstream at startup | false | `THOUGHTGATE_REQUIRE_UPSTREAM_AT_STARTUP` |
+| Upstream URL | (required) | `UPSTREAM_URL` (all traffic) |
 | Upstream health interval | 30s | `THOUGHTGATE_UPSTREAM_HEALTH_INTERVAL_SECS` |
 | Log level | info | `THOUGHTGATE_LOG_LEVEL` |
 | Log format | json | `THOUGHTGATE_LOG_FORMAT` |
+
+**Note:** Health, ready, and metrics endpoints are served on the admin port (default 7469), separate from the main proxy port (default 7467).
 
 **Log Levels:**
 - `error`: Unrecoverable failures, panics
@@ -281,8 +295,10 @@ The system MUST initialize in this order:
 │     • Verify upstream is reachable (if required)                │
 │     • Initialize HTTP client                                    │
 │                                                                 │
-│  5. Start HTTP server                                           │
-│     • Bind to listen address                                    │
+│  5. Start HTTP servers                                          │
+│     • Start admin server on port 7469 (health/ready/metrics)   │
+│     • Reserve inbound port 7468 (for future callbacks)         │
+│     • Bind outbound port 7467 (MCP traffic)                    │
 │     • Health endpoint available immediately                     │
 │     • Set state: Ready                                          │
 │     • Main endpoints accept traffic                             │
@@ -312,7 +328,9 @@ The system MUST initialize in this order:
 | 3b | Initialize Slack adapter (REQ-GOV-003) | **WARNING** | Start without approval capability |
 | 4 | Connect to upstream (REQ-CORE-003) | **WARNING** | Start, but NOT Ready |
 | 5 | Initialize Cedar engine (REQ-POL-001) | **FAIL FAST** (v0.3+) | Fix policies, restart |
-| 6 | Bind HTTP listener (REQ-CORE-003) | **FAIL FAST** | Check port conflicts |
+| 6a | Bind admin port 7469 (REQ-CORE-003) | **FAIL FAST** | Check port conflicts |
+| 6b | Reserve inbound port 7468 | **WARN** | Port may already be in use |
+| 6c | Bind outbound port 7467 (REQ-CORE-003) | **FAIL FAST** | Check port conflicts |
 | 7 | Set Ready state | Only after all above | — |
 
 **Key Principle:** Components that affect request routing (config, Cedar) must fail fast. Components that affect specific features (Slack, upstream) can degrade gracefully.

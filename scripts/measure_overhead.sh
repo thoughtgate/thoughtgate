@@ -28,7 +28,13 @@ K6_SCRIPT="${PROJECT_ROOT}/tests/benchmark-fast.js"
 OUTPUT_FILE="${PROJECT_ROOT}/overhead_metrics.json"
 
 MOCK_LLM_PORT=8888
-PROXY_PORT=4141
+
+# ThoughtGate v0.2 uses 3-port Envoy-style model:
+# - Outbound port: Main proxy for client requests (load test target)
+# - Admin port: Health checks (/health, /ready) - used for readiness
+PROXY_PORT="${THOUGHTGATE_OUTBOUND_PORT:-4141}"
+ADMIN_PORT="${THOUGHTGATE_ADMIN_PORT:-$((PROXY_PORT + 2))}"
+
 K6_VUS=10
 K6_DURATION="10s"
 
@@ -129,14 +135,17 @@ start_mock_llm() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 start_proxy() {
-    log_info "Starting ThoughtGate proxy on port $PROXY_PORT..."
-    
+    log_info "Starting ThoughtGate proxy (outbound: $PROXY_PORT, admin: $ADMIN_PORT)..."
+
+    # ThoughtGate v0.2 uses environment variables for port configuration
     THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:${MOCK_LLM_PORT}" \
-    THOUGHTGATE_LISTEN_ADDR="127.0.0.1:${PROXY_PORT}" \
+    THOUGHTGATE_OUTBOUND_PORT="${PROXY_PORT}" \
+    THOUGHTGATE_ADMIN_PORT="${ADMIN_PORT}" \
     "$THOUGHTGATE_BIN" &
     PROXY_PID=$!
-    
-    wait_for_port $PROXY_PORT
+
+    # Wait for admin port (health endpoint) to be ready
+    wait_for_port $ADMIN_PORT
     log_success "ThoughtGate proxy started (PID: $PROXY_PID)"
 }
 

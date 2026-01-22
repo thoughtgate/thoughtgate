@@ -165,7 +165,7 @@ Sensitive fields support `${VAR}` syntax:
 sources:
   - id: upstream
     kind: mcp
-    url: ${MCP_SERVER_URL}  # Substituted at load time
+    url: ${UPSTREAM_URL}  # Substituted at load time (required env var)
 
 approval:
   default:
@@ -290,7 +290,7 @@ schema: 1
 sources:
   - id: upstream
     kind: mcp
-    url: http://mcp-server:8080
+    url: ${UPSTREAM_URL}  # Required: set via UPSTREAM_URL env var
 
 governance:
   defaults:
@@ -307,6 +307,11 @@ approval:
       channel: "#approvals"
     timeout: 10m
     on_timeout: deny
+```
+
+**Required Environment Variable:**
+```bash
+export UPSTREAM_URL=http://mcp-server:3000
 ```
 
 ### 6.2 Output: Parsed Configuration
@@ -1210,11 +1215,16 @@ schema: 1
 sources:
   - id: upstream
     kind: mcp
-    url: http://mcp-server:8080
+    url: ${UPSTREAM_URL}  # Set via UPSTREAM_URL env var
 
 governance:
   defaults:
     action: forward
+```
+
+**Required environment variable:**
+```bash
+export UPSTREAM_URL=http://mcp-server:3000
 ```
 
 ### 13.2 With Approval
@@ -1225,7 +1235,7 @@ schema: 1
 sources:
   - id: upstream
     kind: mcp
-    url: http://mcp-server:8080
+    url: ${UPSTREAM_URL}
     description: "Primary MCP server"
 
 governance:
@@ -1261,7 +1271,7 @@ schema: 1
 sources:
   - id: upstream
     kind: mcp
-    url: http://mcp-server:8080
+    url: ${UPSTREAM_URL}
 
 governance:
   defaults:
@@ -1338,10 +1348,30 @@ v0.1 used environment variables and CLI flags. Migration:
 
 | v0.1 | v0.2 Config |
 |------|-------------|
-| `$MCP_SERVER_URL` | `sources[0].url` |
+| `$MCP_SERVER_URL` | `$UPSTREAM_URL` (substituted into `sources[0].url`) |
 | `$SLACK_CHANNEL` | `approval.default.destination.channel` |
 | `$APPROVAL_TIMEOUT_SECS` | `approval.default.timeout` |
 | Cedar policy path (CLI) | `cedar.policies` |
+
+### 14.3 Port Configuration
+
+ThoughtGate v0.2 uses a 3-port Envoy-style architecture:
+
+| Port | Env Variable | Default | Purpose |
+|------|--------------|---------|---------|
+| Outbound | `THOUGHTGATE_OUTBOUND_PORT` | 7467 | MCP traffic (agent → upstream) |
+| Inbound | (reserved) | 7468 | Future callbacks (not wired) |
+| Admin | `THOUGHTGATE_ADMIN_PORT` | 7469 | Health, ready, metrics |
+
+**Port environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `THOUGHTGATE_OUTBOUND_PORT` | `7467` | Main proxy port for MCP traffic |
+| `THOUGHTGATE_ADMIN_PORT` | `7469` | Admin port for health/ready/metrics |
+| `UPSTREAM_URL` | (required) | Upstream server URL (all traffic) |
+
+**Note:** Port 7468 is reserved for future inbound callback functionality.
 
 ### 14.2 Experimental Mode
 
@@ -1448,7 +1478,7 @@ This diagram shows how configuration controls the 4-gate request flow:
   ┌──────────────────────────────────────────────────────────────┐
   │ FORWARD TO UPSTREAM                                          │
   │                                                              │
-  │   sources[0].url: http://mcp-server:8080                     │
+  │   sources[0].url: ${UPSTREAM_URL}                            │
   │                                                              │
   │   → Execute tool call                                        │
   │   → Return result to agent                                   │

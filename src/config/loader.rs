@@ -281,7 +281,7 @@ pub fn validate(config: &Config, version: Version) -> Result<ValidationResult, C
         // V-006: approval workflow must exist
         if rule.action == Action::Approve {
             if let Some(ref workflow) = rule.approval {
-                if !workflow_names.contains(workflow.as_str()) && workflow != "default" {
+                if !workflow_names.contains(workflow.as_str()) {
                     return Err(ConfigError::UndefinedWorkflow {
                         workflow: workflow.clone(),
                         pattern: rule.pattern.clone(),
@@ -437,6 +437,35 @@ governance:
         let config: Config = serde_saphyr::from_str(yaml).unwrap();
         let result = validate(&config, Version::V0_2);
         assert!(matches!(result, Err(ConfigError::UndefinedWorkflow { .. })));
+    }
+
+    /// Regression test: "default" workflow name is NOT special-cased.
+    /// If a rule references `approval: default`, a workflow named "default" must be
+    /// explicitly defined in the approval section.
+    #[test]
+    fn test_validate_default_workflow_must_be_defined() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://localhost:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "test_*"
+      action: approve
+      approval: default
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        // Should fail because "default" workflow is not defined in approval section
+        assert!(
+            matches!(result, Err(ConfigError::UndefinedWorkflow { ref workflow, .. }) if workflow == "default"),
+            "Expected UndefinedWorkflow error for 'default', got: {:?}",
+            result
+        );
     }
 
     #[test]

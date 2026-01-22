@@ -25,7 +25,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY_PATH="${PROJECT_ROOT}/target/release/thoughtgate"
 OUTPUT_FILE="${PROJECT_ROOT}/bench_metrics.json"
-LISTEN_PORT="${THOUGHTGATE_LISTEN_PORT:-8080}"
+
+# ThoughtGate v0.2 uses a 3-port Envoy-style model:
+# - Outbound port (7467): Main proxy for client requests
+# - Inbound port (7468): Reserved, not wired yet
+# - Admin port (7469): Health checks (/health, /ready), metrics
+OUTBOUND_PORT="${THOUGHTGATE_OUTBOUND_PORT:-7467}"
+ADMIN_PORT="${THOUGHTGATE_ADMIN_PORT:-7469}"
+
 MAX_STARTUP_WAIT_MS=10000
 POLL_INTERVAL_MS=10
 
@@ -150,18 +157,20 @@ collect_startup_metrics() {
     
     # Start ThoughtGate in background
     local start_ns=$(get_time_ns)
-    
+
     # Use a temp config to avoid needing upstream
+    # ThoughtGate v0.2 uses 3-port model - configure via environment
     THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:19999" \
-    THOUGHTGATE_LISTEN_ADDR="127.0.0.1:${LISTEN_PORT}" \
+    THOUGHTGATE_OUTBOUND_PORT="${OUTBOUND_PORT}" \
+    THOUGHTGATE_ADMIN_PORT="${ADMIN_PORT}" \
     "$BINARY_PATH" &
     local pid=$!
-    
+
     # Ensure cleanup on exit
     trap "kill $pid 2>/dev/null || true" EXIT
-    
-    # M-START-001: Wait for /health (liveness)
-    local health_url="http://127.0.0.1:${LISTEN_PORT}/health"
+
+    # M-START-001: Wait for /health (liveness) - served on admin port
+    local health_url="http://127.0.0.1:${ADMIN_PORT}/health"
     local healthy_ms
     healthy_ms=$(wait_for_endpoint "$health_url") || {
         log_error "Health check timed out after ${MAX_STARTUP_WAIT_MS}ms"
@@ -169,9 +178,9 @@ collect_startup_metrics() {
         return 1
     }
     add_metric "startup/to_healthy" "$healthy_ms" "ms"
-    
-    # M-START-003: Wait for /ready (readiness - policies loaded)
-    local ready_url="http://127.0.0.1:${LISTEN_PORT}/ready"
+
+    # M-START-003: Wait for /ready (readiness - policies loaded) - served on admin port
+    local ready_url="http://127.0.0.1:${ADMIN_PORT}/ready"
     local ready_ms
     ready_ms=$(wait_for_endpoint "$ready_url") || {
         log_error "Readiness check timed out after ${MAX_STARTUP_WAIT_MS}ms"
