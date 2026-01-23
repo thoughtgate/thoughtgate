@@ -70,6 +70,25 @@ impl Config {
     pub fn get_workflow(&self, name: &str) -> Option<&HumanWorkflow> {
         self.approval.as_ref()?.get(name)
     }
+
+    /// Check if this configuration requires an approval engine.
+    ///
+    /// Returns true if any governance rules use `action: approve`, either
+    /// explicitly in a rule or as the default action. This can be used to
+    /// decide whether to initialize the ApprovalEngine and require Slack
+    /// credentials.
+    pub fn requires_approval_engine(&self) -> bool {
+        // Check if default action is approve
+        if self.governance.defaults.action == Action::Approve {
+            return true;
+        }
+
+        // Check if any rule uses approve action
+        self.governance
+            .rules
+            .iter()
+            .any(|rule| rule.action == Action::Approve)
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -317,6 +317,7 @@ impl ApprovalEngine {
     ///
     /// * `request` - The original tool call request
     /// * `principal` - Who is making the request
+    /// * `workflow_timeout` - Optional workflow-specific timeout (overrides engine config)
     ///
     /// # Returns
     ///
@@ -329,6 +330,7 @@ impl ApprovalEngine {
         &self,
         request: ToolCallRequest,
         principal: Principal,
+        workflow_timeout: Option<Duration>,
     ) -> Result<ApprovalStartResult, ApprovalEngineError> {
         let correlation_id = Uuid::new_v4().to_string();
 
@@ -349,13 +351,15 @@ impl ApprovalEngine {
             })?;
 
         // F-001.2: Create task with stored request
+        // Use workflow-specific timeout if provided, otherwise fall back to engine config
+        let timeout = workflow_timeout.unwrap_or(self.config.approval_timeout);
         let task = self
             .task_store
             .create(
                 request.clone(),
                 pre_result.transformed_request,
                 principal.clone(),
-                Some(self.config.approval_timeout),
+                Some(timeout),
             )
             .map_err(|e| ApprovalEngineError::TaskCreation {
                 details: e.to_string(),
@@ -836,7 +840,7 @@ mod tests {
         .expect("Failed to create engine");
 
         let result = engine
-            .start_approval(test_request(), test_principal())
+            .start_approval(test_request(), test_principal(), None)
             .await;
 
         assert!(result.is_ok(), "start_approval should succeed");
@@ -892,7 +896,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal())
+            .start_approval(test_request(), test_principal(), None)
             .await
             .unwrap();
 
@@ -924,7 +928,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal())
+            .start_approval(test_request(), test_principal(), None)
             .await
             .unwrap();
 
@@ -974,7 +978,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal())
+            .start_approval(test_request(), test_principal(), None)
             .await
             .unwrap();
 
@@ -1011,7 +1015,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal())
+            .start_approval(test_request(), test_principal(), None)
             .await
             .unwrap();
 
@@ -1046,7 +1050,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal())
+            .start_approval(test_request(), test_principal(), None)
             .await
             .unwrap();
 
@@ -1095,7 +1099,7 @@ mod tests {
             .expect("Failed to create engine");
 
         let result = engine
-            .start_approval(test_request(), test_principal())
+            .start_approval(test_request(), test_principal(), None)
             .await
             .unwrap();
 

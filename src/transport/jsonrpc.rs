@@ -253,6 +253,13 @@ impl JsonRpcResponse {
     /// * `task_id` - The created task ID
     /// * `status` - Initial task status
     /// * `poll_interval` - Recommended poll interval
+    ///
+    /// # SEP-1686 Compliance
+    ///
+    /// Returns camelCase fields per SEP-1686 specification:
+    /// - `taskId` - Task identifier
+    /// - `status` - Current status ("working", "input_required", etc.)
+    /// - `pollInterval` - Recommended poll interval in milliseconds
     pub fn task_created(
         id: Option<JsonRpcId>,
         task_id: String,
@@ -263,9 +270,9 @@ impl JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id,
             result: Some(serde_json::json!({
-                "task_id": task_id,
+                "taskId": task_id,
                 "status": status,
-                "poll_interval_ms": poll_interval.as_millis(),
+                "pollInterval": poll_interval.as_millis(),
             })),
             error: None,
         }
@@ -341,13 +348,29 @@ impl McpRequest {
     }
 }
 
+/// A single item in a batch request - either valid or invalid.
+///
+/// Implements: REQ-CORE-003/EC-MCP-006 (Mixed valid/invalid batch results)
+#[derive(Debug)]
+pub enum BatchItem {
+    /// Successfully parsed request
+    Valid(McpRequest),
+    /// Failed to parse - includes the original ID if extractable
+    Invalid {
+        /// The request ID if it could be extracted from malformed request
+        id: Option<JsonRpcId>,
+        /// The error that occurred during parsing
+        error: crate::error::ThoughtGateError,
+    },
+}
+
 /// Parse result that can be a single request, batch, or parse error.
 #[derive(Debug)]
 pub enum ParsedRequests {
     /// Single request
     Single(McpRequest),
-    /// Batch of requests
-    Batch(Vec<McpRequest>),
+    /// Batch of requests (may contain mix of valid and invalid per EC-MCP-006)
+    Batch(Vec<BatchItem>),
 }
 
 /// Parse JSON bytes into JSON-RPC 2.0 request(s).
@@ -393,11 +416,26 @@ pub fn parse_jsonrpc(bytes: &[u8]) -> Result<ParsedRequests, ThoughtGateError> {
                     details: "Empty batch is not allowed".to_string(),
                 });
             }
-            let mut requests = Vec::with_capacity(arr.len());
+            // EC-MCP-006: Collect mixed valid/invalid results
+            let mut items = Vec::with_capacity(arr.len());
             for item in arr {
-                requests.push(parse_single_request(item)?);
+                // Try to extract ID before parsing (for error responses)
+                let id = item
+                    .as_object()
+                    .and_then(|obj| obj.get("id"))
+                    .and_then(|v| match v {
+                        Value::Number(n) => n.as_i64().map(JsonRpcId::Number),
+                        Value::String(s) => Some(JsonRpcId::String(s.clone())),
+                        Value::Null => Some(JsonRpcId::Null),
+                        _ => None,
+                    });
+
+                match parse_single_request(item) {
+                    Ok(request) => items.push(BatchItem::Valid(request)),
+                    Err(error) => items.push(BatchItem::Invalid { id, error }),
+                }
             }
-            Ok(ParsedRequests::Batch(requests))
+            Ok(ParsedRequests::Batch(items))
         }
         Value::Object(_) => {
             // F-001.1: Single request
@@ -544,10 +582,19 @@ mod tests {
         let result = parse_jsonrpc(json);
         assert!(result.is_ok());
 
-        if let ParsedRequests::Batch(reqs) = result.expect("should parse") {
-            assert_eq!(reqs.len(), 2);
-            assert_eq!(reqs[0].method, "a");
-            assert_eq!(reqs[1].method, "b");
+        if let ParsedRequests::Batch(items) = result.expect("should parse") {
+            assert_eq!(items.len(), 2);
+            // Extract valid requests and check methods
+            let req0 = match &items[0] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 0"),
+            };
+            let req1 = match &items[1] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 1"),
+            };
+            assert_eq!(req0.method, "a");
+            assert_eq!(req1.method, "b");
         } else {
             panic!("Expected batch");
         }
@@ -765,24 +812,43 @@ mod tests {
         ]"#;
         let result = parse_jsonrpc(json);
 
-        if let Ok(ParsedRequests::Batch(reqs)) = result {
-            assert_eq!(reqs.len(), 3);
-            assert!(!reqs[0].is_notification());
-            assert!(reqs[1].is_notification());
-            assert!(!reqs[2].is_notification());
+        if let Ok(ParsedRequests::Batch(items)) = result {
+            assert_eq!(items.len(), 3);
+            // Extract valid requests and check notification status
+            let req0 = match &items[0] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 0"),
+            };
+            let req1 = match &items[1] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 1"),
+            };
+            let req2 = match &items[2] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 2"),
+            };
+            assert!(!req0.is_notification());
+            assert!(req1.is_notification());
+            assert!(!req2.is_notification());
         } else {
             panic!("Expected batch");
         }
     }
 
+    /// Verifies: EC-MCP-006 (Mixed validity batch - all invalid items become BatchItem::Invalid)
     #[test]
     fn test_json_array_not_object_in_batch() {
         let json = br#"[1, 2, 3]"#;
         let result = parse_jsonrpc(json);
-        assert!(matches!(
-            result,
-            Err(ThoughtGateError::InvalidRequest { .. })
-        ));
+        // Per EC-MCP-006, invalid items in batch become BatchItem::Invalid rather than failing the whole batch
+        if let Ok(ParsedRequests::Batch(items)) = result {
+            assert_eq!(items.len(), 3);
+            for item in items {
+                assert!(matches!(item, BatchItem::Invalid { .. }));
+            }
+        } else {
+            panic!("Expected batch with invalid items");
+        }
     }
 
     #[test]

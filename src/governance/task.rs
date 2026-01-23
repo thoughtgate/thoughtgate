@@ -109,7 +109,10 @@ pub struct ToolCallRequest {
 /// Result of a tool call execution.
 ///
 /// Implements: REQ-GOV-001/§6.1
+///
+/// Uses camelCase for MCP protocol compliance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     /// Result content from upstream
     pub content: serde_json::Value,
