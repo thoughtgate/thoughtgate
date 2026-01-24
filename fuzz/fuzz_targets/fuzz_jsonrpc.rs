@@ -234,19 +234,36 @@ fn test_response_serialization(input: &[u8]) {
                 // Create error response
                 let error = JsonRpcResponse::error(
                     req.id.clone(),
-                    -32600,
-                    "Test error".to_string(),
-                    None,
+                    thoughtgate::error::jsonrpc::JsonRpcError {
+                        code: -32600,
+                        message: "Test error".to_string(),
+                        data: None,
+                    },
                 );
                 let _ = serde_json::to_string(&error);
             }
             thoughtgate::transport::jsonrpc::ParsedRequests::Batch(requests) => {
-                for req in requests.iter().take(10) {
-                    let response = JsonRpcResponse::success(
-                        req.id.clone(),
-                        serde_json::json!(null),
-                    );
-                    let _ = serde_json::to_string(&response);
+                for item in requests.iter().take(10) {
+                    match item {
+                        thoughtgate::transport::jsonrpc::BatchItem::Valid(req) => {
+                            let response = JsonRpcResponse::success(
+                                req.id.clone(),
+                                serde_json::json!(null),
+                            );
+                            let _ = serde_json::to_string(&response);
+                        }
+                        thoughtgate::transport::jsonrpc::BatchItem::Invalid { id, error: _ } => {
+                            let response = JsonRpcResponse::error(
+                                id.clone(),
+                                thoughtgate::error::jsonrpc::JsonRpcError {
+                                    code: -32600,
+                                    message: "Invalid request".to_string(),
+                                    data: None,
+                                },
+                            );
+                            let _ = serde_json::to_string(&response);
+                        }
+                    }
                 }
             }
         }

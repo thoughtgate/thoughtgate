@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use thoughtgate::governance::{
-    Principal, Task, TaskId, TaskStatus, TaskStore, TaskStoreConfig, ToolCallRequest,
+    ApprovalDecision, FailureInfo, FailureStage, Principal, TaskId, TaskStatus, TaskStore,
+    TaskStoreConfig, ToolCallRequest, ToolCallResult,
 };
 
 /// Fuzz input for task lifecycle testing
@@ -114,11 +115,13 @@ async fn fuzz_task_lifecycle(input: FuzzTaskInput) {
         default_ttl: Duration::from_secs(300),
         max_ttl: Duration::from_secs(3600),
         min_ttl: Duration::from_secs(60),
-        max_tasks_per_principal: 100,
-        max_total_tasks: 1000,
+        cleanup_interval: Duration::from_secs(60),
+        max_pending_per_principal: 100,
+        max_pending_global: 1000,
+        terminal_grace_period: Duration::from_secs(300),
     };
 
-    let store = Arc::new(TaskStore::with_config(config));
+    let store = Arc::new(TaskStore::new(config));
 
     // Build principal
     let principal = build_principal(&input.principal);
@@ -131,10 +134,13 @@ async fn fuzz_task_lifecycle(input: FuzzTaskInput) {
     let mut task_ids: Vec<TaskId> = Vec::new();
 
     for _ in 0..task_count {
-        let task = Task::new(principal.clone(), tool_call.clone(), None);
-        let task_id = task.id.clone();
-        if store.insert(task).is_ok() {
-            task_ids.push(task_id);
+        if let Ok(task) = store.create(
+            tool_call.clone(),
+            tool_call.clone(),
+            principal.clone(),
+            Some(Duration::from_secs(600)),
+        ) {
+            task_ids.push(task.id.clone());
         }
     }
 
@@ -149,10 +155,13 @@ async fn fuzz_task_lifecycle(input: FuzzTaskInput) {
 
         match op {
             TaskOperation::Create => {
-                let task = Task::new(principal.clone(), tool_call.clone(), None);
-                let new_id = task.id.clone();
-                if store.insert(task).is_ok() {
-                    task_ids.push(new_id);
+                if let Ok(task) = store.create(
+                    tool_call.clone(),
+                    tool_call.clone(),
+                    principal.clone(),
+                    Some(Duration::from_secs(600)),
+                ) {
+                    task_ids.push(task.id.clone());
                 }
             }
 
@@ -169,43 +178,46 @@ async fn fuzz_task_lifecycle(input: FuzzTaskInput) {
             }
 
             TaskOperation::List => {
-                let _ = store.list_for_principal(&principal.rate_limit_key());
+                let _ = store.list_for_principal(&principal, 0, 100);
             }
 
             TaskOperation::SetResult { success } => {
-                if let Ok(mut task) = store.get(task_id) {
-                    if *success {
-                        task.result = Some(thoughtgate::governance::ToolCallResult {
-                            content: vec![],
+                // Use complete() or fail() to set results
+                if *success {
+                    let _ = store.complete(
+                        task_id,
+                        ToolCallResult {
+                            content: serde_json::json!({"status": "ok"}),
                             is_error: false,
-                        });
-                    } else {
-                        task.result = Some(thoughtgate::governance::ToolCallResult {
-                            content: vec![],
-                            is_error: true,
-                        });
-                    }
-                    let _ = store.update(task);
+                        },
+                    );
+                } else {
+                    let _ = store.fail(
+                        task_id,
+                        FailureInfo {
+                            stage: FailureStage::UpstreamError,
+                            reason: "Fuzz test failure".to_string(),
+                            retriable: false,
+                        },
+                    );
                 }
             }
 
             TaskOperation::SetApproval { approved } => {
-                if let Ok(mut task) = store.get(task_id) {
-                    task.approval = Some(thoughtgate::governance::ApprovalRecord {
-                        decision: if *approved {
-                            thoughtgate::governance::ApprovalDecision::Approved
-                        } else {
-                            thoughtgate::governance::ApprovalDecision::Rejected {
-                                reason: Some("fuzz test".to_string()),
-                            }
-                        },
-                        decided_by: "fuzz-approver".to_string(),
-                        decided_at: chrono::Utc::now(),
-                        approval_valid_until: chrono::Utc::now() + chrono::Duration::minutes(5),
-                        metadata: None,
-                    });
-                    let _ = store.update(task);
-                }
+                // Use record_approval() to set approval
+                let decision = if *approved {
+                    ApprovalDecision::Approved
+                } else {
+                    ApprovalDecision::Rejected {
+                        reason: Some("fuzz test".to_string()),
+                    }
+                };
+                let _ = store.record_approval(
+                    task_id,
+                    decision,
+                    "fuzz-approver".to_string(),
+                    Duration::from_secs(300),
+                );
             }
 
             TaskOperation::Complete => {
@@ -227,7 +239,8 @@ async fn fuzz_task_lifecycle(input: FuzzTaskInput) {
     }
 
     // Final cleanup - verify store is in consistent state
-    let _ = store.cleanup_expired();
+    let _ = store.expire_overdue();
+    let _ = store.cleanup_terminal();
 
     // Verify all tasks are retrievable or properly removed
     for task_id in &task_ids {
