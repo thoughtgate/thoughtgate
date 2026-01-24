@@ -268,14 +268,15 @@ pub enum ThoughtGateError {
     },
 
     // ═══════════════════════════════════════════════════════════
-    // SEP-1686 Protocol Compliance Errors
+    // MCP Tasks Protocol Errors (Protocol Revision 2025-11-25)
     // ═══════════════════════════════════════════════════════════
     /// Client called a task-required tool without `params.task`.
     ///
-    /// Implements: SEP-1686 Section 3.3 (-32018)
+    /// Implements: MCP Tasks Specification - Tool-Level Negotiation
+    /// Uses: -32600 (Invalid request) per MCP spec
     ///
-    /// Tools advertised with `taskSupport: "required"` MUST be called with
-    /// `params.task` metadata. This error is returned when the client omits it.
+    /// Tools advertised with `execution.taskSupport: "required"` MUST be called
+    /// with `params.task` metadata. This error is returned when the client omits it.
     #[error("Task metadata required for tool '{tool}'")]
     TaskRequired {
         /// The tool that requires task metadata
@@ -286,10 +287,12 @@ pub enum ThoughtGateError {
 
     /// Client sent `params.task` for a tool that forbids it.
     ///
-    /// Implements: SEP-1686 Section 3.3 (-32019)
+    /// Implements: MCP Tasks Specification - Tool-Level Negotiation
+    /// Uses: -32601 (Method not found) per MCP spec
     ///
-    /// Tools advertised with `taskSupport: "none"` MUST NOT receive `params.task`.
-    /// This error is returned when the client includes task metadata.
+    /// Tools advertised with `execution.taskSupport: "forbidden"` (or not present)
+    /// MUST NOT receive `params.task`. This error is returned when the client
+    /// includes task metadata for such tools.
     #[error("Task metadata forbidden for tool '{tool}'")]
     TaskForbidden {
         /// The tool that forbids task metadata
@@ -394,9 +397,11 @@ impl ThoughtGateError {
             // ThoughtGate custom codes: Configuration (-32016)
             Self::ConfigurationError { .. } => -32016,
 
-            // ThoughtGate custom codes: SEP-1686 Protocol (-32018, -32019)
-            Self::TaskRequired { .. } => -32018,
-            Self::TaskForbidden { .. } => -32019,
+            // MCP Tasks Protocol errors (standard JSON-RPC codes per MCP spec)
+            // TaskRequired: -32600 (Invalid request) - task augmentation required
+            // TaskForbidden: -32601 (Method not found) - task mode not supported
+            Self::TaskRequired { .. } => -32600,
+            Self::TaskForbidden { .. } => -32601,
         }
     }
 
@@ -1166,16 +1171,16 @@ mod tests {
 
     /// Tests TaskRequired error code and formatting.
     ///
-    /// Verifies: SEP-1686 Section 3.3 (TaskRequired error)
+    /// Verifies: MCP Tasks Specification - Tool-Level Negotiation
     #[test]
     fn test_task_required_error() {
         let err = ThoughtGateError::TaskRequired {
             tool: "delete_user".to_string(),
-            hint: "Include params.task per tools/list taskSupport annotation".to_string(),
+            hint: "Include params.task per tools/list execution.taskSupport annotation".to_string(),
         };
 
-        // Verify error code
-        assert_eq!(err.to_jsonrpc_code(), -32018);
+        // Verify error code: -32600 (Invalid request) per MCP spec
+        assert_eq!(err.to_jsonrpc_code(), -32600);
 
         // Verify error type name
         assert_eq!(err.error_type_name(), "task_required");
@@ -1190,15 +1195,15 @@ mod tests {
 
     /// Tests TaskForbidden error code and formatting.
     ///
-    /// Verifies: SEP-1686 Section 3.3 (TaskForbidden error)
+    /// Verifies: MCP Tasks Specification - Tool-Level Negotiation
     #[test]
     fn test_task_forbidden_error() {
         let err = ThoughtGateError::TaskForbidden {
             tool: "read_file".to_string(),
         };
 
-        // Verify error code
-        assert_eq!(err.to_jsonrpc_code(), -32019);
+        // Verify error code: -32601 (Method not found) per MCP spec
+        assert_eq!(err.to_jsonrpc_code(), -32601);
 
         // Verify error type name
         assert_eq!(err.error_type_name(), "task_forbidden");
@@ -1221,7 +1226,8 @@ mod tests {
 
         let jsonrpc_err = err.to_jsonrpc_error("test-correlation-id");
 
-        assert_eq!(jsonrpc_err.code, -32018);
+        // -32600 (Invalid request) per MCP spec
+        assert_eq!(jsonrpc_err.code, -32600);
         assert!(jsonrpc_err.message.contains("admin_action"));
 
         // Verify data field contains structured error info
@@ -1240,7 +1246,8 @@ mod tests {
 
         let jsonrpc_err = err.to_jsonrpc_error("test-correlation-id");
 
-        assert_eq!(jsonrpc_err.code, -32019);
+        // -32601 (Method not found) per MCP spec
+        assert_eq!(jsonrpc_err.code, -32601);
         assert!(jsonrpc_err.message.contains("simple_tool"));
     }
 }

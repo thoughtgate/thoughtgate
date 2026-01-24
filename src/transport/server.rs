@@ -48,7 +48,7 @@ use crate::policy::{CedarContext, CedarDecision, CedarRequest, CedarResource, Ti
 use crate::protocol::{TasksCancelRequest, TasksGetRequest, TasksListRequest, TasksResultRequest};
 use crate::transport::jsonrpc::{
     JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, TaskSupport, ToolDefinition,
-    parse_jsonrpc,
+    ToolExecution, parse_jsonrpc,
 };
 use crate::transport::router::{McpRouter, RouteTarget, TaskMethod};
 use crate::transport::upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};
@@ -842,16 +842,20 @@ async fn handle_list_method(
         }
     }
 
-    // Gate 2: Annotate taskSupport based on governance rules
+    // Gate 2: Annotate execution.taskSupport based on governance rules
+    // Per MCP Tasks Specification (Protocol Revision 2025-11-25)
     for tool in &mut tools {
         let match_result = config.governance.evaluate(&tool.name, source_id);
         match match_result.action {
             crate::config::Action::Approve | crate::config::Action::Policy => {
                 // ThoughtGate requires async task mode for approval/policy actions
-                tool.task_support = Some(TaskSupport::Required);
+                // Set execution.taskSupport = "required" per MCP spec
+                tool.execution = Some(ToolExecution {
+                    task_support: Some(TaskSupport::Required),
+                });
             }
             crate::config::Action::Forward | crate::config::Action::Deny => {
-                // Preserve upstream's taskSupport (don't modify)
+                // Preserve upstream's execution.taskSupport (don't modify)
                 // Note: Deny tools are visible but denied at call-time
             }
         }

@@ -22,15 +22,15 @@ use uuid::Uuid;
 use crate::error::ThoughtGateError;
 
 // ============================================================================
-// SEP-1686 Tool Definition Types
+// MCP Tasks Protocol Types (Protocol Revision 2025-11-25)
 // ============================================================================
 
 /// MCP tool definition as returned by `tools/list`.
 ///
-/// Implements: SEP-1686 (Task-based async execution)
+/// Implements: MCP Tasks Specification (Protocol Revision 2025-11-25)
 ///
-/// This struct represents a tool in the MCP catalog. The `task_support` field
-/// is added by ThoughtGate to indicate whether the tool requires async task mode.
+/// This struct represents a tool in the MCP catalog. The `execution` field
+/// contains task-related metadata including `taskSupport`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDefinition {
@@ -45,34 +45,55 @@ pub struct ToolDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
 
-    /// SEP-1686: Whether this tool requires task-based async execution
+    /// Execution-related metadata (MCP Tasks Protocol)
     ///
-    /// - `None` → preserve upstream value (transparent proxy)
-    /// - `Some(TaskSupport::Required)` → client MUST send `params.task`
-    /// - `Some(TaskSupport::Optional)` → client MAY send `params.task`
-    /// - `Some(TaskSupport::None)` → client MUST NOT send `params.task`
+    /// Contains `taskSupport` annotation per MCP spec:
+    /// - `forbidden` → client MUST NOT send `params.task`
+    /// - `optional` → client MAY send `params.task`
+    /// - `required` → client MUST send `params.task`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_support: Option<TaskSupport>,
+    pub execution: Option<ToolExecution>,
 
     /// Additional properties from upstream (preserved as-is)
     #[serde(flatten)]
     pub extra: Option<Value>,
 }
 
-/// SEP-1686 task support mode for tools.
+/// Execution metadata for a tool (MCP Tasks Protocol).
 ///
-/// Implements: SEP-1686 Section 3.2 (Tool Advertisement)
+/// Implements: MCP Tasks Specification - Tool-Level Negotiation
+///
+/// This struct is nested under `execution` in the tool definition
+/// to allow for future execution-related extensions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecution {
+    /// Whether this tool requires task-based async execution.
+    ///
+    /// Per MCP spec:
+    /// - `forbidden` (default if not present) → client MUST NOT attempt task mode
+    /// - `optional` → client MAY invoke as task or normal request
+    /// - `required` → client MUST invoke as task
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_support: Option<TaskSupport>,
+}
+
+/// MCP task support mode for tools.
+///
+/// Implements: MCP Tasks Specification - Tool-Level Negotiation
 ///
 /// This enum indicates whether a tool supports or requires async task execution.
 /// Clients use this to determine if they need to include `params.task` in requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskSupport {
-    /// Tool does not support task mode; `params.task` MUST NOT be sent
-    None,
+    /// Tool cannot be called with task metadata; `params.task` MUST NOT be sent.
+    /// Servers SHOULD return -32601 (Method not found) if client attempts.
+    Forbidden,
     /// Tool optionally supports task mode; `params.task` MAY be sent
     Optional,
-    /// Tool requires task mode; `params.task` MUST be sent
+    /// Tool requires task mode; `params.task` MUST be sent.
+    /// Servers MUST return -32601 (Method not found) if client does not.
     Required,
 }
 
@@ -964,15 +985,15 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // SEP-1686 Tool Definition Tests
+    // MCP Tasks Protocol Tests (Protocol Revision 2025-11-25)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Tests that TaskSupport serializes as camelCase.
+    /// Tests that TaskSupport serializes as lowercase strings per MCP spec.
     #[test]
     fn test_task_support_serialization() {
         use super::TaskSupport;
 
-        // Test all variants serialize correctly
+        // Test all variants serialize correctly per MCP spec
         assert_eq!(
             serde_json::to_string(&TaskSupport::Required).unwrap(),
             "\"required\""
@@ -982,8 +1003,8 @@ mod tests {
             "\"optional\""
         );
         assert_eq!(
-            serde_json::to_string(&TaskSupport::None).unwrap(),
-            "\"none\""
+            serde_json::to_string(&TaskSupport::Forbidden).unwrap(),
+            "\"forbidden\""
         );
     }
 
@@ -1001,15 +1022,15 @@ mod tests {
             TaskSupport::Optional
         );
         assert_eq!(
-            serde_json::from_str::<TaskSupport>("\"none\"").unwrap(),
-            TaskSupport::None
+            serde_json::from_str::<TaskSupport>("\"forbidden\"").unwrap(),
+            TaskSupport::Forbidden
         );
     }
 
-    /// Tests ToolDefinition serialization with taskSupport.
+    /// Tests ToolDefinition serialization with execution.taskSupport per MCP spec.
     #[test]
     fn test_tool_definition_serialization() {
-        use super::{TaskSupport, ToolDefinition};
+        use super::{TaskSupport, ToolDefinition, ToolExecution};
 
         let tool = ToolDefinition {
             name: "delete_user".to_string(),
@@ -1020,16 +1041,20 @@ mod tests {
                     "user_id": { "type": "string" }
                 }
             })),
-            task_support: Some(TaskSupport::Required),
+            execution: Some(ToolExecution {
+                task_support: Some(TaskSupport::Required),
+            }),
             extra: None,
         };
 
         let serialized = serde_json::to_string(&tool).expect("should serialize");
 
-        // Check camelCase field names
+        // Check camelCase field names and nested execution structure
         assert!(serialized.contains("\"name\":\"delete_user\""));
         assert!(serialized.contains("\"description\":\"Deletes a user\""));
         assert!(serialized.contains("\"inputSchema\""));
+        // Per MCP spec: execution.taskSupport (nested)
+        assert!(serialized.contains("\"execution\""));
         assert!(serialized.contains("\"taskSupport\":\"required\""));
     }
 
@@ -1053,7 +1078,27 @@ mod tests {
         assert_eq!(tool.name, "read_file");
         assert_eq!(tool.description, Some("Reads a file".to_string()));
         assert!(tool.input_schema.is_some());
-        assert!(tool.task_support.is_none()); // Not set by upstream
+        assert!(tool.execution.is_none()); // Not set by upstream
+    }
+
+    /// Tests ToolDefinition deserialization with execution.taskSupport from upstream.
+    #[test]
+    fn test_tool_definition_with_execution_deserialization() {
+        use super::{TaskSupport, ToolDefinition};
+
+        let json = r#"{
+            "name": "long_running_task",
+            "description": "A task that takes time",
+            "execution": {
+                "taskSupport": "required"
+            }
+        }"#;
+
+        let tool: ToolDefinition = serde_json::from_str(json).expect("should parse");
+        assert_eq!(tool.name, "long_running_task");
+        assert!(tool.execution.is_some());
+        let execution = tool.execution.unwrap();
+        assert_eq!(execution.task_support, Some(TaskSupport::Required));
     }
 
     /// Tests ToolDefinition preserves extra fields from upstream.
@@ -1077,20 +1122,24 @@ mod tests {
         assert!(reserialized.contains("\"anotherField\":123"));
     }
 
-    /// Tests ToolDefinition with taskSupport set to none.
+    /// Tests ToolDefinition with execution.taskSupport set to forbidden per MCP spec.
     #[test]
-    fn test_tool_definition_task_support_none() {
-        use super::{TaskSupport, ToolDefinition};
+    fn test_tool_definition_task_support_forbidden() {
+        use super::{TaskSupport, ToolDefinition, ToolExecution};
 
         let tool = ToolDefinition {
             name: "simple_tool".to_string(),
             description: None,
             input_schema: None,
-            task_support: Some(TaskSupport::None),
+            execution: Some(ToolExecution {
+                task_support: Some(TaskSupport::Forbidden),
+            }),
             extra: None,
         };
 
         let serialized = serde_json::to_string(&tool).expect("should serialize");
-        assert!(serialized.contains("\"taskSupport\":\"none\""));
+        // Per MCP spec: "forbidden" (not "none")
+        assert!(serialized.contains("\"execution\""));
+        assert!(serialized.contains("\"taskSupport\":\"forbidden\""));
     }
 }
