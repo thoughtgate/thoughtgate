@@ -500,12 +500,17 @@ impl ApprovalPipeline {
     /// Run post-approval amber phase.
     ///
     /// Implements: REQ-GOV-002/F-005
+    ///
+    /// Drift detection works by re-running inspectors on the original request
+    /// and comparing the output hash to the stored hash. This verifies that
+    /// inspector behavior hasn't changed between approval and execution.
+    ///
+    /// Flow: Inspect(original_request) → new_transformed → hash(new_transformed)
+    /// Compare: hash(new_transformed) == task.request_hash (which is hash(pre_approval_transformed))
     async fn post_approval_amber(&self, task: &Task) -> Result<ToolCallRequest, PipelineResult> {
-        // F-005.1: Run same inspector chain
-        let transformed = match self
-            .run_inspector_chain(&task.pre_approval_transformed)
-            .await
-        {
+        // F-005.1: Run same inspector chain on ORIGINAL request
+        // This produces a fresh transform that should match pre_approval_transformed
+        let transformed = match self.run_inspector_chain(&task.original_request).await {
             Ok(req) => req,
             Err(PipelineError::InspectionRejected { inspector, reason }) => {
                 // F-005.5: Rejection in post-approval fails the task

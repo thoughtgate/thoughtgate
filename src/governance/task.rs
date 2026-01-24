@@ -438,7 +438,9 @@ impl Task {
         let max_ttl = chrono::Duration::days(30);
         let chrono_ttl = chrono::Duration::from_std(ttl).unwrap_or(max_ttl);
         let expires_at = now + chrono_ttl;
-        let request_hash = hash_request(&original_request);
+        // Hash the transformed request - this is what the human approves
+        // The hash verifies integrity of the approved content, not the raw input
+        let request_hash = hash_request(&pre_approval_transformed);
         let poll_interval = compute_poll_interval(ttl);
 
         Self {
