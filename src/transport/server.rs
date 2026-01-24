@@ -1352,8 +1352,12 @@ fn task_error_to_thoughtgate(error: crate::governance::TaskError) -> ThoughtGate
         TaskError::Expired { task_id } => ThoughtGateError::TaskExpired {
             task_id: task_id.to_string(),
         },
-        TaskError::AlreadyTerminal { task_id, status } => ThoughtGateError::InvalidRequest {
-            details: format!("Task {} is already in terminal state: {}", task_id, status),
+        TaskError::AlreadyTerminal { task_id, status } => ThoughtGateError::InvalidParams {
+            // MCP spec: -32602 with message "Cannot cancel task: already in terminal status '{status}'"
+            details: format!(
+                "Cannot cancel task {}: already in terminal status '{}'",
+                task_id, status
+            ),
         },
         TaskError::InvalidTransition { task_id, from, to } => ThoughtGateError::InvalidRequest {
             details: format!(

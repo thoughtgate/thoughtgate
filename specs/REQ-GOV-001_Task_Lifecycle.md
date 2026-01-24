@@ -672,7 +672,7 @@ thoughtgate_task_data_bytes{quantile}  # Track task payload sizes
 | Shutdown with pending tasks | Cancel tasks, state → Failed(-32603) | EC-TASK-007 |
 | Task TTL expiry | Task state → Expired | EC-TASK-008 |
 | tasks/cancel on already-cancelled task | Return success (idempotent) | EC-TASK-009 |
-| tasks/cancel on Completed task | Return -32006 (not cancellable) | EC-TASK-010 |
+| tasks/cancel on Completed task | Return -32602 (Invalid params per MCP spec) | EC-TASK-010 |
 | tasks/result on InputRequired task | Block until terminal or return status | EC-TASK-011 |
 | Concurrent tasks/result calls | First gets result, others get error | EC-TASK-012 |
 | TTL cleanup runs during task access | Atomic check, return expired if race | EC-TASK-013 |
