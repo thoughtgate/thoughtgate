@@ -677,22 +677,6 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
 // Helper Functions for 4-Gate Model
 // ============================================================================
 
-/// Extract tool name from a tools/call request.
-///
-/// Implements: REQ-CFG-001 Section 9.2 (Rule Matching)
-fn extract_tool_name(request: &McpRequest) -> Option<String> {
-    if request.method == "tools/call" {
-        request
-            .params
-            .as_ref()?
-            .get("name")?
-            .as_str()
-            .map(String::from)
-    } else {
-        None
-    }
-}
-
 /// Extract the governable resource name from an MCP request.
 ///
 /// Implements: REQ-CORE-003/F-002 (Method Routing)
@@ -1199,6 +1183,7 @@ async fn start_approval_flow(
     };
 
     let tool_request = ToolCallRequest {
+        method: request.method.clone(),
         name: tool_name.to_string(),
         arguments: extract_tool_arguments(&request),
         mcp_request_id,
@@ -1248,11 +1233,17 @@ async fn start_approval_flow(
 ///
 /// Implements: REQ-POL-001/F-001 (Policy Evaluation)
 ///
-/// For `tools/call` requests, evaluates Cedar policy:
+/// Evaluates Cedar policy for governable MCP methods:
+/// - `tools/call` → uses CedarResource::ToolCall with name and arguments
+/// - `resources/read`, `resources/subscribe`, `prompts/get` → uses CedarResource::McpMethod
+///
+/// List methods (`tools/list`, `resources/list`, `prompts/list`) are forwarded to
+/// upstream without Cedar evaluation since they don't reference a specific resource.
+/// Response filtering for list methods is a v0.3+ enhancement.
+///
+/// Cedar decisions:
 /// - Permit → forward to upstream (or to Gate 4 if approval workflow specified)
 /// - Forbid → return PolicyDenied error
-///
-/// For other methods (tools/list, resources/*, prompts/*), passes through to upstream.
 ///
 /// # Arguments
 ///
@@ -1264,23 +1255,34 @@ async fn evaluate_with_cedar(
     request: McpRequest,
     match_result: Option<&MatchResult>,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
-    // Only evaluate tools/call requests with Cedar
-    if request.method != "tools/call" {
-        // For tools/list, resources/*, prompts/* - pass through to upstream
+    // List methods bypass Cedar - they don't reference a specific resource
+    // Response filtering for list methods is a v0.3+ enhancement
+    if !method_requires_gates(&request.method) {
+        debug!(
+            method = %request.method,
+            "Gate 3: Bypassing Cedar for list method - forwarding to upstream"
+        );
         return state.upstream.forward(&request).await;
     }
 
-    // Extract tool name and arguments from params
-    let tool_name = match extract_tool_name(&request) {
+    // Extract resource name for all governable methods
+    let resource_name = match extract_governable_name(&request) {
         Some(name) => name,
         None => {
-            // tools/call without name is invalid params per MCP spec
+            // Governable method without required identifier is invalid params
+            let field = match request.method.as_str() {
+                "tools/call" | "prompts/get" => "name",
+                "resources/read" | "resources/subscribe" => "uri",
+                _ => "identifier",
+            };
             return Err(ThoughtGateError::InvalidParams {
-                details: "Missing required field 'name' in tools/call params".to_string(),
+                details: format!(
+                    "Missing required field '{}' in {} params",
+                    field, request.method
+                ),
             });
         }
     };
-    let arguments = extract_tool_arguments(&request);
 
     // Infer principal from environment
     let policy_principal = infer_principal().map_err(|e| ThoughtGateError::ServiceUnavailable {
@@ -1293,14 +1295,26 @@ async fn evaluate_with_cedar(
         .unwrap_or_else(|| "default".to_string());
     let source_id = get_source_id(state).to_string();
 
+    // Build Cedar resource based on method type
+    let cedar_resource = if request.method == "tools/call" {
+        // tools/call includes arguments for fine-grained policy checks
+        CedarResource::ToolCall {
+            name: resource_name.clone(),
+            server: source_id.clone(),
+            arguments: extract_tool_arguments(&request),
+        }
+    } else {
+        // resources/read, resources/subscribe, prompts/get use McpMethod
+        CedarResource::McpMethod {
+            method: request.method.clone(),
+            server: source_id.clone(),
+        }
+    };
+
     // Build Cedar request
     let cedar_request = CedarRequest {
         principal: policy_principal,
-        resource: CedarResource::ToolCall {
-            name: tool_name.clone(),
-            server: source_id.clone(),
-            arguments,
-        },
+        resource: cedar_resource,
         context: CedarContext {
             policy_id: policy_id.clone(),
             source_id,
@@ -1320,17 +1334,19 @@ async fn evaluate_with_cedar(
                     .clone()
                     .unwrap_or_else(|| "default".to_string());
                 debug!(
-                    tool = %tool_name,
+                    resource = %resource_name,
+                    method = %request.method,
                     workflow = %workflow,
                     policy_id = %policy_id,
                     "Gate 3: Cedar permit → Gate 4 approval"
                 );
-                return start_approval_flow(state, request, &tool_name, match_result).await;
+                return start_approval_flow(state, request, &resource_name, match_result).await;
             }
 
             // Legacy mode (no Gate 2 result): Cedar permit → forward to upstream
             debug!(
-                tool = %tool_name,
+                resource = %resource_name,
+                method = %request.method,
                 policy_id = %policy_id,
                 "Gate 3: Cedar permit (legacy mode) - forwarding to upstream"
             );
@@ -1339,13 +1355,14 @@ async fn evaluate_with_cedar(
         CedarDecision::Forbid { reason, .. } => {
             // Cedar forbid → return PolicyDenied error
             warn!(
-                tool = %tool_name,
+                resource = %resource_name,
+                method = %request.method,
                 policy_id = %policy_id,
                 reason = %reason,
                 "Gate 3: Cedar forbid - denying request"
             );
             Err(ThoughtGateError::PolicyDenied {
-                tool: tool_name,
+                tool: resource_name,
                 policy_id: Some(policy_id),
                 reason: Some(reason),
             })

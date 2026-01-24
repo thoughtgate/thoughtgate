@@ -805,6 +805,7 @@ mod tests {
 
     fn test_request() -> ToolCallRequest {
         ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "delete_user".to_string(),
             arguments: serde_json::json!({"user_id": "123"}),
             mcp_request_id: JsonRpcId::Number(1),

@@ -96,11 +96,22 @@ impl Principal {
 /// A tool call request from the agent.
 ///
 /// Implements: REQ-GOV-001/§6.1
+///
+/// Note: Despite the name, this struct is used for all governable MCP methods:
+/// - `tools/call` - tool invocations
+/// - `resources/read` - resource access
+/// - `resources/subscribe` - resource subscriptions
+/// - `prompts/get` - prompt retrieval
+///
+/// The `method` field stores the original MCP method to ensure correct
+/// reconstruction when forwarding to upstream after approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRequest {
-    /// Tool name being invoked
+    /// Original MCP method (e.g., "tools/call", "resources/read", "prompts/get")
+    pub method: String,
+    /// Resource name being accessed (tool name, resource URI, or prompt name)
     pub name: String,
-    /// Tool arguments as JSON
+    /// Request arguments as JSON
     pub arguments: serde_json::Value,
     /// Original MCP request ID
     pub mcp_request_id: JsonRpcId,
@@ -1320,6 +1331,7 @@ mod tests {
 
     fn test_request() -> ToolCallRequest {
         ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "delete_user".to_string(),
             arguments: serde_json::json!({"user_id": "123"}),
             mcp_request_id: JsonRpcId::Number(1),
@@ -1868,6 +1880,7 @@ mod tests {
         let req1 = test_request();
         let req2 = test_request();
         let req3 = ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "other_tool".to_string(),
             arguments: serde_json::json!({}),
             mcp_request_id: JsonRpcId::Number(1),

@@ -534,6 +534,7 @@ mod tests {
 
         // Create a task in the store first
         let tool_request = ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "test_tool".to_string(),
             arguments: serde_json::json!({}),
             mcp_request_id: JsonRpcId::Null,
