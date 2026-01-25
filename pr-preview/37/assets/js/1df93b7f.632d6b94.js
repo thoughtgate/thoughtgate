@@ -1,1 +1,0 @@
-"use strict";(globalThis.webpackChunkthoughtgate_docs=globalThis.webpackChunkthoughtgate_docs||[]).push([[583],{6866(t,h,o){o.r(h),o.d(h,{default:()=>a});var s=o(6347),u=o(4848);function a(){return(0,u.jsx)(s.rd,{to:"/docs"})}}}]);
