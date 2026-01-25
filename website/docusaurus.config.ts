@@ -8,7 +8,7 @@ const config: Config = {
   favicon: 'img/favicon.ico',
 
   url: 'https://thoughtgate.io',
-  baseUrl: '/',
+  baseUrl: process.env.DOCUSAURUS_BASE_URL || '/',
 
   organizationName: 'thoughtgate',
   projectName: 'thoughtgate',
