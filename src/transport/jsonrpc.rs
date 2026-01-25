@@ -21,6 +21,136 @@ use uuid::Uuid;
 
 use crate::error::ThoughtGateError;
 
+// ============================================================================
+// MCP Tasks Protocol Types (Protocol Revision 2025-11-25)
+// ============================================================================
+
+/// MCP tool definition as returned by `tools/list`.
+///
+/// Implements: MCP Tasks Specification (Protocol Revision 2025-11-25)
+///
+/// This struct represents a tool in the MCP catalog. The `execution` field
+/// contains task-related metadata including `taskSupport`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDefinition {
+    /// The tool name (unique identifier)
+    pub name: String,
+
+    /// Human-readable description of the tool
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// JSON Schema for the tool's input parameters
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
+
+    /// Execution-related metadata (MCP Tasks Protocol)
+    ///
+    /// Contains `taskSupport` annotation per MCP spec:
+    /// - `forbidden` → client MUST NOT send `params.task`
+    /// - `optional` → client MAY send `params.task`
+    /// - `required` → client MUST send `params.task`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ToolExecution>,
+
+    /// Additional properties from upstream (preserved as-is)
+    #[serde(flatten)]
+    pub extra: Option<Value>,
+}
+
+/// Execution metadata for a tool (MCP Tasks Protocol).
+///
+/// Implements: MCP Tasks Specification - Tool-Level Negotiation
+///
+/// This struct is nested under `execution` in the tool definition
+/// to allow for future execution-related extensions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecution {
+    /// Whether this tool requires task-based async execution.
+    ///
+    /// Per MCP spec:
+    /// - `forbidden` (default if not present) → client MUST NOT attempt task mode
+    /// - `optional` → client MAY invoke as task or normal request
+    /// - `required` → client MUST invoke as task
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_support: Option<TaskSupport>,
+}
+
+/// MCP task support mode for tools.
+///
+/// Implements: MCP Tasks Specification - Tool-Level Negotiation
+///
+/// This enum indicates whether a tool supports or requires async task execution.
+/// Clients use this to determine if they need to include `params.task` in requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskSupport {
+    /// Tool cannot be called with task metadata; `params.task` MUST NOT be sent.
+    /// Servers SHOULD return -32601 (Method not found) if client attempts.
+    Forbidden,
+    /// Tool optionally supports task mode; `params.task` MAY be sent
+    Optional,
+    /// Tool requires task mode; `params.task` MUST be sent.
+    /// Servers MUST return -32601 (Method not found) if client does not.
+    Required,
+}
+
+/// MCP resource definition as returned by `resources/list`.
+///
+/// Implements: MCP Protocol - Resource Listing
+///
+/// Resources represent data that can be read by agents. The URI serves
+/// as both identifier and access path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceDefinition {
+    /// The resource URI (unique identifier and access path)
+    pub uri: String,
+
+    /// Human-readable name of the resource
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Human-readable description of the resource
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// MIME type of the resource content
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+
+    /// Additional properties from upstream (preserved as-is)
+    #[serde(flatten)]
+    pub extra: Option<Value>,
+}
+
+/// MCP prompt definition as returned by `prompts/list`.
+///
+/// Implements: MCP Protocol - Prompt Listing
+///
+/// Prompts are templates that can be used to generate messages.
+/// They may accept arguments that customize their output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptDefinition {
+    /// The prompt name (unique identifier)
+    pub name: String,
+
+    /// Human-readable description of the prompt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Arguments the prompt accepts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<Value>>,
+
+    /// Additional properties from upstream (preserved as-is)
+    #[serde(flatten)]
+    pub extra: Option<Value>,
+}
+
 /// JSON-RPC 2.0 request ID.
 ///
 /// The spec allows string or integer IDs. We preserve the exact type
@@ -242,6 +372,41 @@ impl JsonRpcResponse {
             error: Some(error),
         }
     }
+
+    /// Create a task-created response for SEP-1686 async workflows.
+    ///
+    /// Implements: REQ-GOV-002/F-002 (Task Response)
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The request ID to echo back
+    /// * `task_id` - The created task ID
+    /// * `status` - Initial task status
+    /// * `poll_interval` - Recommended poll interval
+    ///
+    /// # SEP-1686 Compliance
+    ///
+    /// Returns camelCase fields per SEP-1686 specification:
+    /// - `taskId` - Task identifier
+    /// - `status` - Current status ("working", "input_required", etc.)
+    /// - `pollInterval` - Recommended poll interval in milliseconds
+    pub fn task_created(
+        id: Option<JsonRpcId>,
+        task_id: String,
+        status: String,
+        poll_interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id,
+            result: Some(serde_json::json!({
+                "taskId": task_id,
+                "status": status,
+                "pollInterval": poll_interval.as_millis(),
+            })),
+            error: None,
+        }
+    }
 }
 
 /// SEP-1686 task metadata extracted from request params.
@@ -313,13 +478,29 @@ impl McpRequest {
     }
 }
 
+/// A single item in a batch request - either valid or invalid.
+///
+/// Implements: REQ-CORE-003/EC-MCP-006 (Mixed valid/invalid batch results)
+#[derive(Debug)]
+pub enum BatchItem {
+    /// Successfully parsed request
+    Valid(McpRequest),
+    /// Failed to parse - includes the original ID if extractable
+    Invalid {
+        /// The request ID if it could be extracted from malformed request
+        id: Option<JsonRpcId>,
+        /// The error that occurred during parsing
+        error: crate::error::ThoughtGateError,
+    },
+}
+
 /// Parse result that can be a single request, batch, or parse error.
 #[derive(Debug)]
 pub enum ParsedRequests {
     /// Single request
     Single(McpRequest),
-    /// Batch of requests
-    Batch(Vec<McpRequest>),
+    /// Batch of requests (may contain mix of valid and invalid per EC-MCP-006)
+    Batch(Vec<BatchItem>),
 }
 
 /// Parse JSON bytes into JSON-RPC 2.0 request(s).
@@ -365,11 +546,26 @@ pub fn parse_jsonrpc(bytes: &[u8]) -> Result<ParsedRequests, ThoughtGateError> {
                     details: "Empty batch is not allowed".to_string(),
                 });
             }
-            let mut requests = Vec::with_capacity(arr.len());
+            // EC-MCP-006: Collect mixed valid/invalid results
+            let mut items = Vec::with_capacity(arr.len());
             for item in arr {
-                requests.push(parse_single_request(item)?);
+                // Try to extract ID before parsing (for error responses)
+                let id = item
+                    .as_object()
+                    .and_then(|obj| obj.get("id"))
+                    .and_then(|v| match v {
+                        Value::Number(n) => n.as_i64().map(JsonRpcId::Number),
+                        Value::String(s) => Some(JsonRpcId::String(s.clone())),
+                        Value::Null => Some(JsonRpcId::Null),
+                        _ => None,
+                    });
+
+                match parse_single_request(item) {
+                    Ok(request) => items.push(BatchItem::Valid(request)),
+                    Err(error) => items.push(BatchItem::Invalid { id, error }),
+                }
             }
-            Ok(ParsedRequests::Batch(requests))
+            Ok(ParsedRequests::Batch(items))
         }
         Value::Object(_) => {
             // F-001.1: Single request
@@ -516,10 +712,19 @@ mod tests {
         let result = parse_jsonrpc(json);
         assert!(result.is_ok());
 
-        if let ParsedRequests::Batch(reqs) = result.expect("should parse") {
-            assert_eq!(reqs.len(), 2);
-            assert_eq!(reqs[0].method, "a");
-            assert_eq!(reqs[1].method, "b");
+        if let ParsedRequests::Batch(items) = result.expect("should parse") {
+            assert_eq!(items.len(), 2);
+            // Extract valid requests and check methods
+            let req0 = match &items[0] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 0"),
+            };
+            let req1 = match &items[1] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 1"),
+            };
+            assert_eq!(req0.method, "a");
+            assert_eq!(req1.method, "b");
         } else {
             panic!("Expected batch");
         }
@@ -737,24 +942,43 @@ mod tests {
         ]"#;
         let result = parse_jsonrpc(json);
 
-        if let Ok(ParsedRequests::Batch(reqs)) = result {
-            assert_eq!(reqs.len(), 3);
-            assert!(!reqs[0].is_notification());
-            assert!(reqs[1].is_notification());
-            assert!(!reqs[2].is_notification());
+        if let Ok(ParsedRequests::Batch(items)) = result {
+            assert_eq!(items.len(), 3);
+            // Extract valid requests and check notification status
+            let req0 = match &items[0] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 0"),
+            };
+            let req1 = match &items[1] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 1"),
+            };
+            let req2 = match &items[2] {
+                BatchItem::Valid(r) => r,
+                _ => panic!("Expected valid request at index 2"),
+            };
+            assert!(!req0.is_notification());
+            assert!(req1.is_notification());
+            assert!(!req2.is_notification());
         } else {
             panic!("Expected batch");
         }
     }
 
+    /// Verifies: EC-MCP-006 (Mixed validity batch - all invalid items become BatchItem::Invalid)
     #[test]
     fn test_json_array_not_object_in_batch() {
         let json = br#"[1, 2, 3]"#;
         let result = parse_jsonrpc(json);
-        assert!(matches!(
-            result,
-            Err(ThoughtGateError::InvalidRequest { .. })
-        ));
+        // Per EC-MCP-006, invalid items in batch become BatchItem::Invalid rather than failing the whole batch
+        if let Ok(ParsedRequests::Batch(items)) = result {
+            assert_eq!(items.len(), 3);
+            for item in items {
+                assert!(matches!(item, BatchItem::Invalid { .. }));
+            }
+        } else {
+            panic!("Expected batch with invalid items");
+        }
     }
 
     #[test]
@@ -812,5 +1036,164 @@ mod tests {
         assert!(serialized.contains("\"id\":null"));
         assert!(serialized.contains("\"error\""));
         assert!(serialized.contains("-32700"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // MCP Tasks Protocol Tests (Protocol Revision 2025-11-25)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Tests that TaskSupport serializes as lowercase strings per MCP spec.
+    #[test]
+    fn test_task_support_serialization() {
+        use super::TaskSupport;
+
+        // Test all variants serialize correctly per MCP spec
+        assert_eq!(
+            serde_json::to_string(&TaskSupport::Required).unwrap(),
+            "\"required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskSupport::Optional).unwrap(),
+            "\"optional\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskSupport::Forbidden).unwrap(),
+            "\"forbidden\""
+        );
+    }
+
+    /// Tests that TaskSupport deserializes from lowercase strings.
+    #[test]
+    fn test_task_support_deserialization() {
+        use super::TaskSupport;
+
+        assert_eq!(
+            serde_json::from_str::<TaskSupport>("\"required\"").unwrap(),
+            TaskSupport::Required
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskSupport>("\"optional\"").unwrap(),
+            TaskSupport::Optional
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskSupport>("\"forbidden\"").unwrap(),
+            TaskSupport::Forbidden
+        );
+    }
+
+    /// Tests ToolDefinition serialization with execution.taskSupport per MCP spec.
+    #[test]
+    fn test_tool_definition_serialization() {
+        use super::{TaskSupport, ToolDefinition, ToolExecution};
+
+        let tool = ToolDefinition {
+            name: "delete_user".to_string(),
+            description: Some("Deletes a user".to_string()),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "user_id": { "type": "string" }
+                }
+            })),
+            execution: Some(ToolExecution {
+                task_support: Some(TaskSupport::Required),
+            }),
+            extra: None,
+        };
+
+        let serialized = serde_json::to_string(&tool).expect("should serialize");
+
+        // Check camelCase field names and nested execution structure
+        assert!(serialized.contains("\"name\":\"delete_user\""));
+        assert!(serialized.contains("\"description\":\"Deletes a user\""));
+        assert!(serialized.contains("\"inputSchema\""));
+        // Per MCP spec: execution.taskSupport (nested)
+        assert!(serialized.contains("\"execution\""));
+        assert!(serialized.contains("\"taskSupport\":\"required\""));
+    }
+
+    /// Tests ToolDefinition deserialization from upstream response.
+    #[test]
+    fn test_tool_definition_deserialization() {
+        use super::ToolDefinition;
+
+        let json = r#"{
+            "name": "read_file",
+            "description": "Reads a file",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            }
+        }"#;
+
+        let tool: ToolDefinition = serde_json::from_str(json).expect("should parse");
+        assert_eq!(tool.name, "read_file");
+        assert_eq!(tool.description, Some("Reads a file".to_string()));
+        assert!(tool.input_schema.is_some());
+        assert!(tool.execution.is_none()); // Not set by upstream
+    }
+
+    /// Tests ToolDefinition deserialization with execution.taskSupport from upstream.
+    #[test]
+    fn test_tool_definition_with_execution_deserialization() {
+        use super::{TaskSupport, ToolDefinition};
+
+        let json = r#"{
+            "name": "long_running_task",
+            "description": "A task that takes time",
+            "execution": {
+                "taskSupport": "required"
+            }
+        }"#;
+
+        let tool: ToolDefinition = serde_json::from_str(json).expect("should parse");
+        assert_eq!(tool.name, "long_running_task");
+        assert!(tool.execution.is_some());
+        let execution = tool.execution.unwrap();
+        assert_eq!(execution.task_support, Some(TaskSupport::Required));
+    }
+
+    /// Tests ToolDefinition preserves extra fields from upstream.
+    #[test]
+    fn test_tool_definition_extra_fields() {
+        use super::ToolDefinition;
+
+        let json = r#"{
+            "name": "custom_tool",
+            "description": "A custom tool",
+            "customField": "custom_value",
+            "anotherField": 123
+        }"#;
+
+        let tool: ToolDefinition = serde_json::from_str(json).expect("should parse");
+        assert_eq!(tool.name, "custom_tool");
+
+        // Re-serialize and check extra fields are preserved
+        let reserialized = serde_json::to_string(&tool).expect("should serialize");
+        assert!(reserialized.contains("\"customField\":\"custom_value\""));
+        assert!(reserialized.contains("\"anotherField\":123"));
+    }
+
+    /// Tests ToolDefinition with execution.taskSupport set to forbidden per MCP spec.
+    #[test]
+    fn test_tool_definition_task_support_forbidden() {
+        use super::{TaskSupport, ToolDefinition, ToolExecution};
+
+        let tool = ToolDefinition {
+            name: "simple_tool".to_string(),
+            description: None,
+            input_schema: None,
+            execution: Some(ToolExecution {
+                task_support: Some(TaskSupport::Forbidden),
+            }),
+            extra: None,
+        };
+
+        let serialized = serde_json::to_string(&tool).expect("should serialize");
+        // Per MCP spec: "forbidden" (not "none")
+        assert!(serialized.contains("\"execution\""));
+        assert!(serialized.contains("\"taskSupport\":\"forbidden\""));
     }
 }

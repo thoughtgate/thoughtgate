@@ -344,9 +344,11 @@ impl ApprovalPipeline {
             })?;
 
             // Build synthetic request parts for InspectionContext
+            // Use the actual method from the request for proper context
+            let uri = format!("/{}", current.method);
             let fake_req = http::Request::builder()
                 .method("POST")
-                .uri("/tools/call")
+                .uri(&uri)
                 .header("content-type", "application/json")
                 .body(())
                 .map_err(|e| PipelineError::InternalError {
@@ -387,6 +389,7 @@ impl ApprovalPipeline {
                         })?;
 
                     current = ToolCallRequest {
+                        method: current.method.clone(),
                         name: parsed.name,
                         arguments: parsed.arguments,
                         mcp_request_id: current.mcp_request_id,
@@ -499,12 +502,17 @@ impl ApprovalPipeline {
     /// Run post-approval amber phase.
     ///
     /// Implements: REQ-GOV-002/F-005
+    ///
+    /// Drift detection works by re-running inspectors on the original request
+    /// and comparing the output hash to the stored hash. This verifies that
+    /// inspector behavior hasn't changed between approval and execution.
+    ///
+    /// Flow: Inspect(original_request) → new_transformed → hash(new_transformed)
+    /// Compare: hash(new_transformed) == task.request_hash (which is hash(pre_approval_transformed))
     async fn post_approval_amber(&self, task: &Task) -> Result<ToolCallRequest, PipelineResult> {
-        // F-005.1: Run same inspector chain
-        let transformed = match self
-            .run_inspector_chain(&task.pre_approval_transformed)
-            .await
-        {
+        // F-005.1: Run same inspector chain on ORIGINAL request
+        // This produces a fresh transform that should match pre_approval_transformed
+        let transformed = match self.run_inspector_chain(&task.original_request).await {
             Ok(req) => req,
             Err(PipelineError::InspectionRejected { inspector, reason }) => {
                 // F-005.5: Rejection in post-approval fails the task
@@ -711,6 +719,12 @@ impl ExecutionPipeline for ApprovalPipeline {
 // hashing between task creation and pipeline execution.
 
 /// Convert ToolCallRequest to McpRequest for upstream.
+///
+/// Reconstructs the correct params structure based on the original method:
+/// - `tools/call` → `{ name, arguments }`
+/// - `resources/read` → `{ uri }`
+/// - `resources/subscribe` → `{ uri }`
+/// - `prompts/get` → `{ name, arguments }`
 fn to_mcp_request(request: &ToolCallRequest) -> McpRequest {
     let id = match &request.mcp_request_id {
         super::JsonRpcId::Number(n) => Some(JsonRpcId::Number(*n)),
@@ -718,13 +732,39 @@ fn to_mcp_request(request: &ToolCallRequest) -> McpRequest {
         super::JsonRpcId::Null => None,
     };
 
-    McpRequest {
-        id,
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
+    // Build method-specific params structure
+    let params = match request.method.as_str() {
+        "tools/call" => Some(serde_json::json!({
             "name": request.name,
             "arguments": request.arguments,
         })),
+        "resources/read" | "resources/subscribe" => Some(serde_json::json!({
+            "uri": request.name,
+        })),
+        "prompts/get" => {
+            // prompts/get can have optional arguments
+            if request.arguments.is_null() || request.arguments == serde_json::json!({}) {
+                Some(serde_json::json!({
+                    "name": request.name,
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "name": request.name,
+                    "arguments": request.arguments,
+                }))
+            }
+        }
+        // Fallback for any other methods
+        _ => Some(serde_json::json!({
+            "name": request.name,
+            "arguments": request.arguments,
+        })),
+    };
+
+    McpRequest {
+        id,
+        method: request.method.clone(),
+        params,
         task_metadata: None,
         received_at: Instant::now(),
         correlation_id: Uuid::new_v4(),
@@ -794,6 +834,7 @@ mod tests {
     #[test]
     fn test_hash_request_deterministic() {
         let request = ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "delete_user".to_string(),
             arguments: serde_json::json!({"user_id": 123}),
             mcp_request_id: super::super::JsonRpcId::Number(1),
@@ -812,12 +853,14 @@ mod tests {
     #[test]
     fn test_hash_request_ignores_mcp_request_id() {
         let request1 = ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "delete_user".to_string(),
             arguments: serde_json::json!({"user_id": 123}),
             mcp_request_id: super::super::JsonRpcId::Number(1),
         };
 
         let request2 = ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "delete_user".to_string(),
             arguments: serde_json::json!({"user_id": 123}),
             mcp_request_id: super::super::JsonRpcId::Number(999),
@@ -830,12 +873,14 @@ mod tests {
     #[test]
     fn test_hash_request_different_content() {
         let request1 = ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "delete_user".to_string(),
             arguments: serde_json::json!({"user_id": 123}),
             mcp_request_id: super::super::JsonRpcId::Number(1),
         };
 
         let request2 = ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "delete_user".to_string(),
             arguments: serde_json::json!({"user_id": 456}),
             mcp_request_id: super::super::JsonRpcId::Number(1),
@@ -915,11 +960,13 @@ mod tests {
         Task {
             id: super::super::TaskId::new(),
             original_request: ToolCallRequest {
+                method: "tools/call".to_string(),
                 name: "test_tool".to_string(),
                 arguments: serde_json::json!({}),
                 mcp_request_id: super::super::JsonRpcId::Number(1),
             },
             pre_approval_transformed: ToolCallRequest {
+                method: "tools/call".to_string(),
                 name: "test_tool".to_string(),
                 arguments: serde_json::json!({}),
                 mcp_request_id: super::super::JsonRpcId::Number(1),
@@ -936,6 +983,7 @@ mod tests {
             approval: None,
             result: None,
             failure: None,
+            on_timeout: crate::governance::TimeoutAction::default(),
         }
     }
 

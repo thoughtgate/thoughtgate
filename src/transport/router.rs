@@ -61,6 +61,20 @@ pub enum RouteTarget {
         /// The request to forward
         request: McpRequest,
     },
+
+    /// Handle `initialize` method for capability injection.
+    ///
+    /// Implements: REQ-CORE-007/F-001 (Capability Injection)
+    ///
+    /// The initialize method is intercepted to:
+    /// 1. Forward to upstream and get response
+    /// 2. Extract and cache upstream capability detection
+    /// 3. Inject ThoughtGate's task capability
+    /// 4. Conditionally advertise SSE (only if upstream supports it)
+    InitializeHandler {
+        /// The initialize request to handle
+        request: McpRequest,
+    },
 }
 
 /// SEP-1686 task method variants.
@@ -132,6 +146,12 @@ impl McpRouter {
     /// 3. Everything else -> PassThrough
     pub fn route(&self, request: McpRequest) -> RouteTarget {
         let method = request.method.as_str();
+
+        // Initialize method - intercept for capability injection
+        // Implements: REQ-CORE-007/F-001 (Capability Injection)
+        if method == "initialize" {
+            return RouteTarget::InitializeHandler { request };
+        }
 
         // Task methods (SEP-1686) - handle internally
         if let Some(task_method) = Self::parse_task_method(method) {
@@ -304,13 +324,14 @@ mod tests {
         assert!(matches!(target, RouteTarget::PolicyEvaluation { .. }));
     }
 
+    /// Verifies: REQ-CORE-007/F-001 (initialize -> InitializeHandler)
     #[test]
-    fn test_route_initialize_passthrough() {
-        // initialize is not a policy-controlled method
+    fn test_route_initialize_handler() {
+        // initialize is intercepted for capability injection
         let router = McpRouter::new();
         let req = make_request("initialize");
         let target = router.route(req);
-        assert!(matches!(target, RouteTarget::PassThrough { .. }));
+        assert!(matches!(target, RouteTarget::InitializeHandler { .. }));
     }
 
     #[test]

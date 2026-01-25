@@ -134,11 +134,17 @@ impl TaskHandler {
     ///
     /// Returns a paginated list of tasks for the given principal.
     /// The cursor is an opaque string encoding the offset.
+    ///
+    /// Note: Per MCP Tasks Specification, page size is server-controlled.
+    /// Clients use cursor-only pagination without specifying limit.
     pub fn handle_tasks_list(
         &self,
         req: TasksListRequest,
         principal: &Principal,
     ) -> TasksListResponse {
+        // Fixed page size per MCP spec (server-controlled, no client limit)
+        const PAGE_SIZE: usize = 20;
+
         // Parse cursor as offset (simple numeric cursor for now)
         let offset = req
             .cursor
@@ -146,13 +152,13 @@ impl TaskHandler {
             .and_then(|c| c.parse::<usize>().ok())
             .unwrap_or(0);
 
-        let limit = req.limit.unwrap_or(20).min(100); // Cap at 100
-
-        let tasks = self.store.list_for_principal(principal, offset, limit + 1);
+        let tasks = self
+            .store
+            .list_for_principal(principal, offset, PAGE_SIZE + 1);
 
         // Check if there are more results
-        let has_more = tasks.len() > limit;
-        let tasks: Vec<_> = tasks.into_iter().take(limit).collect();
+        let has_more = tasks.len() > PAGE_SIZE;
+        let tasks: Vec<_> = tasks.into_iter().take(PAGE_SIZE).collect();
 
         // Build response entries
         let entries: Vec<Sep1686TaskListEntry> = tasks
@@ -170,7 +176,7 @@ impl TaskHandler {
         let mut response = TasksListResponse::new(entries);
 
         if has_more {
-            response = response.with_next_cursor((offset + limit).to_string());
+            response = response.with_next_cursor((offset + PAGE_SIZE).to_string());
         }
 
         response
@@ -229,7 +235,7 @@ fn task_to_metadata(task: &Task) -> Sep1686TaskMetadata {
 mod tests {
     use super::*;
     use crate::governance::task::JsonRpcId;
-    use crate::governance::{TaskId, TaskStatus, ToolCallRequest};
+    use crate::governance::{TaskId, TaskStatus, TimeoutAction, ToolCallRequest};
     use crate::protocol::Sep1686Status;
     use std::time::Duration;
 
@@ -243,6 +249,7 @@ mod tests {
 
     fn test_request() -> ToolCallRequest {
         ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "delete_user".to_string(),
             arguments: serde_json::json!({"user_id": "123"}),
             mcp_request_id: JsonRpcId::Number(1),
@@ -262,7 +269,13 @@ mod tests {
         let handler = TaskHandler::new(store.clone());
 
         let task = store
-            .create(test_request(), test_request(), test_principal(), None)
+            .create(
+                test_request(),
+                test_request(),
+                test_principal(),
+                None,
+                TimeoutAction::default(),
+            )
             .unwrap();
 
         let req = TasksGetRequest::new(task.id.clone());
@@ -297,7 +310,13 @@ mod tests {
         let handler = TaskHandler::new(store.clone());
 
         let task = store
-            .create(test_request(), test_request(), test_principal(), None)
+            .create(
+                test_request(),
+                test_request(),
+                test_principal(),
+                None,
+                TimeoutAction::default(),
+            )
             .unwrap();
 
         let req = TasksResultRequest::new(task.id.clone());
@@ -313,7 +332,13 @@ mod tests {
         let handler = TaskHandler::new(store.clone());
 
         let task = store
-            .create(test_request(), test_request(), test_principal(), None)
+            .create(
+                test_request(),
+                test_request(),
+                test_principal(),
+                None,
+                TimeoutAction::default(),
+            )
             .unwrap();
 
         // Complete the task
@@ -361,7 +386,13 @@ mod tests {
         // Create 3 tasks
         for _ in 0..3 {
             store
-                .create(test_request(), test_request(), principal.clone(), None)
+                .create(
+                    test_request(),
+                    test_request(),
+                    principal.clone(),
+                    None,
+                    TimeoutAction::default(),
+                )
                 .unwrap();
         }
 
@@ -372,41 +403,47 @@ mod tests {
         assert!(!response.has_more());
     }
 
-    /// Tests tasks/list pagination.
+    /// Tests tasks/list pagination with fixed server-controlled page size.
+    ///
+    /// Note: Per MCP spec, page size is server-controlled (PAGE_SIZE = 20).
+    /// This test creates enough tasks to test pagination behavior.
     #[test]
     fn test_tasks_list_pagination() {
-        let store = test_store();
+        use crate::governance::TaskStoreConfig;
+
+        // Use a custom store with higher limit for pagination testing
+        let config = TaskStoreConfig {
+            max_pending_per_principal: 30, // Allow enough for 25 tasks
+            ..Default::default()
+        };
+        let store = Arc::new(TaskStore::new(config));
         let handler = TaskHandler::new(store.clone());
         let principal = test_principal();
 
-        // Create 5 tasks
-        for _ in 0..5 {
+        // Create 25 tasks to exceed one page (PAGE_SIZE = 20)
+        for _ in 0..25 {
             store
-                .create(test_request(), test_request(), principal.clone(), None)
+                .create(
+                    test_request(),
+                    test_request(),
+                    principal.clone(),
+                    None,
+                    TimeoutAction::default(),
+                )
                 .unwrap();
         }
 
-        // Get first page
-        let req = TasksListRequest::new().with_limit(2);
+        // Get first page (should return 20 tasks with cursor for more)
+        let req = TasksListRequest::new();
         let page1 = handler.handle_tasks_list(req, &principal);
-        assert_eq!(page1.tasks.len(), 2);
+        assert_eq!(page1.tasks.len(), 20);
         assert!(page1.has_more());
 
-        // Get second page
-        let req = TasksListRequest::new()
-            .with_cursor(page1.next_cursor.unwrap())
-            .with_limit(2);
+        // Get second page using cursor (should return remaining 5 tasks)
+        let req = TasksListRequest::new().with_cursor(page1.next_cursor.unwrap());
         let page2 = handler.handle_tasks_list(req, &principal);
-        assert_eq!(page2.tasks.len(), 2);
-        assert!(page2.has_more());
-
-        // Get third page
-        let req = TasksListRequest::new()
-            .with_cursor(page2.next_cursor.unwrap())
-            .with_limit(2);
-        let page3 = handler.handle_tasks_list(req, &principal);
-        assert_eq!(page3.tasks.len(), 1);
-        assert!(!page3.has_more());
+        assert_eq!(page2.tasks.len(), 5);
+        assert!(!page2.has_more());
     }
 
     /// Tests tasks/list returns empty for different principal.
@@ -417,7 +454,13 @@ mod tests {
 
         // Create task for one principal
         store
-            .create(test_request(), test_request(), test_principal(), None)
+            .create(
+                test_request(),
+                test_request(),
+                test_principal(),
+                None,
+                TimeoutAction::default(),
+            )
             .unwrap();
 
         // List for different principal
@@ -441,7 +484,13 @@ mod tests {
         let handler = TaskHandler::new(store.clone());
 
         let task = store
-            .create(test_request(), test_request(), test_principal(), None)
+            .create(
+                test_request(),
+                test_request(),
+                test_principal(),
+                None,
+                TimeoutAction::default(),
+            )
             .unwrap();
 
         // Move to InputRequired (cancellable state)
@@ -467,7 +516,13 @@ mod tests {
         let handler = TaskHandler::new(store.clone());
 
         let task = store
-            .create(test_request(), test_request(), test_principal(), None)
+            .create(
+                test_request(),
+                test_request(),
+                test_principal(),
+                None,
+                TimeoutAction::default(),
+            )
             .unwrap();
 
         // Task is in Working state, not cancellable
@@ -485,7 +540,13 @@ mod tests {
         let store = test_store();
 
         let task = store
-            .create(test_request(), test_request(), test_principal(), None)
+            .create(
+                test_request(),
+                test_request(),
+                test_principal(),
+                None,
+                TimeoutAction::default(),
+            )
             .unwrap();
 
         // Task ID should start with "tg_"

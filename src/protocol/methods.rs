@@ -77,16 +77,15 @@ pub type TasksResultResponse = Sep1686TaskResult;
 /// Request parameters for `tasks/list`.
 ///
 /// Implements: REQ-CORE-007/§6.6
+///
+/// Note: Per MCP Tasks Specification, pagination uses cursor-only model.
+/// The server controls page size (no client-specified `limit` parameter).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TasksListRequest {
     /// Cursor for pagination (opaque string from previous response).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-
-    /// Maximum number of tasks to return per page.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
 }
 
 impl TasksListRequest {
@@ -100,13 +99,6 @@ impl TasksListRequest {
     #[must_use]
     pub fn with_cursor(mut self, cursor: impl Into<String>) -> Self {
         self.cursor = Some(cursor.into());
-        self
-    }
-
-    /// Sets the page limit.
-    #[must_use]
-    pub fn with_limit(mut self, limit: usize) -> Self {
-        self.limit = Some(limit);
         self
     }
 }
@@ -307,13 +299,13 @@ mod tests {
 
     #[test]
     fn test_tasks_list_request_with_pagination() {
-        let req = TasksListRequest::new().with_cursor("abc123").with_limit(10);
+        let req = TasksListRequest::new().with_cursor("abc123");
 
         let json = serde_json::to_string(&req).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed["cursor"], "abc123");
-        assert_eq!(parsed["limit"], 10);
+        // Note: No limit parameter per MCP spec - server controls page size
     }
 
     #[test]

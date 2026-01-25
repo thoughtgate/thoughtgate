@@ -28,11 +28,13 @@
 //! - `scheduler.rs` - Polling scheduler with rate limiting
 //! - `rate_limiter.rs` - Token bucket rate limiter
 
+pub mod mock;
 pub mod rate_limiter;
 pub mod scheduler;
 pub mod slack;
 
 // Re-exports
+pub use mock::MockAdapter;
 pub use rate_limiter::RateLimiter;
 pub use scheduler::PollingScheduler;
 pub use slack::{SlackAdapter, SlackConfig};

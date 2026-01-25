@@ -362,7 +362,9 @@ The transport layer MUST route methods to appropriate handlers:
 | Method Pattern | Route To | Notes |
 |----------------|----------|-------|
 | `tools/call` | Governance Engine (4-gate flow) | Primary interception point |
-| `tools/list` | Governance Engine | Filter by visibility (Gate 1) |
+| `tools/list` | Governance Engine | Gate 1 visibility filtering |
+| `resources/list` | Governance Engine | Gate 1 visibility filtering |
+| `prompts/list` | Governance Engine | Gate 1 visibility filtering |
 | `tasks/get` | Task Handler | SEP-1686 |
 | `tasks/result` | Task Handler | SEP-1686 |
 | `tasks/list` | Task Handler | SEP-1686 |

@@ -70,6 +70,32 @@ impl Config {
     pub fn get_workflow(&self, name: &str) -> Option<&HumanWorkflow> {
         self.approval.as_ref()?.get(name)
     }
+
+    /// Check if this configuration requires an approval engine.
+    ///
+    /// Returns true if any governance rules could lead to Gate 4 (approval):
+    /// - `action: approve` - directly requires approval
+    /// - `action: policy` - Cedar Permit routes to Gate 4 for approval
+    ///
+    /// This is used to decide whether to initialize the ApprovalEngine and
+    /// require Slack credentials.
+    pub fn requires_approval_engine(&self) -> bool {
+        // Check if default action could lead to approval
+        let default_needs_approval = matches!(
+            self.governance.defaults.action,
+            Action::Approve | Action::Policy
+        );
+        if default_needs_approval {
+            return true;
+        }
+
+        // Check if any rule uses approve or policy action
+        // (policy rules route to Gate 4 after Cedar permit)
+        self.governance
+            .rules
+            .iter()
+            .any(|rule| matches!(rule.action, Action::Approve | Action::Policy))
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

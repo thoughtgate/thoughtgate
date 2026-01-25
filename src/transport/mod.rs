@@ -30,7 +30,7 @@ pub mod upstream;
 
 // Re-export core types
 pub use jsonrpc::{
-    JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpRequest, ParsedRequests, TaskMetadata,
+    BatchItem, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpRequest, ParsedRequests, TaskMetadata,
 };
 pub use router::{McpRouter, RouteTarget, TaskMethod};
 pub use server::{McpHandler, McpHandlerConfig, McpServer, McpServerConfig, McpState};

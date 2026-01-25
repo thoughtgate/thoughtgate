@@ -142,13 +142,18 @@ impl PollingScheduler {
 
     /// Run the polling loop.
     ///
-    /// Implements: REQ-GOV-003/F-002
+    /// Implements: REQ-GOV-003/F-002, REQ-GOV-001/F-008
     ///
     /// This method runs until the shutdown token is cancelled.
-    /// It polls the next due task, handles decisions, and reschedules
-    /// pending tasks with backoff.
+    /// It polls the next due task, handles decisions, reschedules
+    /// pending tasks with backoff, and periodically expires overdue tasks.
     pub async fn run(&self) {
         info!(adapter = %self.adapter.name(), "Polling scheduler started");
+
+        // Interval for expiration sweeps (every 10 seconds)
+        let mut expiration_interval = tokio::time::interval(Duration::from_secs(10));
+        // Don't catch up on missed ticks
+        expiration_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -159,8 +164,22 @@ impl PollingScheduler {
                     break;
                 }
 
+                // Periodic expiration sweep (REQ-GOV-001/F-008)
+                _ = expiration_interval.tick() => {
+                    let expired_count = self.task_store.expire_overdue();
+                    if expired_count > 0 {
+                        info!(expired_count, "Expired overdue tasks");
+                    }
+                }
+
                 _ = self.poll_next() => {}
             }
+        }
+
+        // Final expiration sweep before shutdown
+        let expired_count = self.task_store.expire_overdue();
+        if expired_count > 0 {
+            info!(expired_count, "Expired overdue tasks during shutdown");
         }
 
         // Graceful shutdown: cancel all pending approvals
@@ -194,6 +213,29 @@ impl PollingScheduler {
                         status = ?task.status,
                         "Task already terminal, removing from polling queue"
                     );
+                    return;
+                }
+
+                // Check if task has expired (REQ-GOV-001/F-008)
+                if task.is_expired() {
+                    self.references.remove(&task_id);
+                    // Transition to Expired status
+                    if let Err(e) = self.task_store.transition(
+                        &task_id,
+                        crate::governance::TaskStatus::Expired,
+                        Some("TTL exceeded".to_string()),
+                    ) {
+                        warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "Failed to transition expired task"
+                        );
+                    } else {
+                        info!(
+                            task_id = %task_id,
+                            "Task expired, transitioned to Expired status"
+                        );
+                    }
                     return;
                 }
             }
@@ -534,6 +576,7 @@ mod tests {
 
         // Create a task in the store first
         let tool_request = ToolCallRequest {
+            method: "tools/call".to_string(),
             name: "test_tool".to_string(),
             arguments: serde_json::json!({}),
             mcp_request_id: JsonRpcId::Null,
@@ -544,6 +587,7 @@ mod tests {
                 tool_request,
                 Principal::new("test-app"),
                 None,
+                crate::governance::TimeoutAction::default(),
             )
             .expect("Failed to create task");
 

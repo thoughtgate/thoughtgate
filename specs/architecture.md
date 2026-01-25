@@ -160,7 +160,9 @@ Not all gates are executed for every request:
 │                                                                                 │
 │   2. Method Routing                                                             │
 │      • tools/call    → 4-Gate Decision Flow                                     │
-│      • tools/list    → Filter by visibility (Gate 1), forward rest              │
+│      • tools/list    → Filter by visibility (Gate 1), annotate taskSupport      │
+│      • resources/list → Filter by visibility (Gate 1)                           │
+│      • prompts/list  → Filter by visibility (Gate 1)                            │
 │      • tasks/*       → Task Manager (SEP-1686)                                  │
 │      • other         → Pass through to upstream                                 │
 │                                                                                 │
@@ -821,16 +823,23 @@ All metrics follow the pattern: `thoughtgate_<component>_<metric>_<unit>`
 
 ## 12. Cross-Cutting Concerns
 
-### 12.1 Batch Request Handling with Approval
+### 12.1 Batch Request Handling
 
-When a JSON-RPC batch request contains items that require different paths:
+JSON-RPC batch requests are handled **independently** per JSON-RPC 2.0 specification.
 
-**Policy:** If ANY request in a batch requires Approval, the ENTIRE batch is task-augmented.
+**Policy:** Each request in a batch is evaluated and routed through the 4-gate model independently.
 
-**Rationale:** 
-- Prevents partial execution that could leave system in inconsistent state
-- Human approver sees complete context of what agent is trying to do
-- Simplifies client handling (all-or-nothing)
+**Behavior:**
+- Forward actions → immediate response
+- Approve/Policy actions → task-augmented response (with task ID)
+- Deny actions → immediate error response
+- Each request gets its own response entry in the batch response array
+
+**Rationale:**
+- JSON-RPC 2.0 batches are NOT transactions - they're independent requests bundled for transport efficiency
+- Clients expect independent success/failure per request
+- Granular approval control - human can approve individual tools, not forced to approve unrelated operations
+- Agents wanting atomic behavior should use composite tools, not rely on batch semantics
 
 ### 12.2 Approval Handling (v0.2 SEP-1686 Mode)
 
@@ -985,13 +994,16 @@ SLACK_BOT_TOKEN=xoxb-your-bot-token
 ```
 Request → Parse JSON-RPC → Route by Method
                               │
-            ┌─────────────────┼─────────────────┐
-            │                 │                 │
-            ▼                 ▼                 ▼
-       tools/call        tasks/*           other
-            │                 │                 │
-            ▼                 ▼                 ▼
-       4-Gate Flow      Task Handler      Pass Through
+            ┌─────────────────┼─────────────────┬─────────────────┐
+            │                 │                 │                 │
+            ▼                 ▼                 ▼                 ▼
+       tools/call        list methods     tasks/*            other
+            │                 │                 │                 │
+            ▼                 ▼                 ▼                 ▼
+       4-Gate Flow    Gate 1 Filter     Task Handler      Pass Through
+                      (tools/list,
+                       resources/list,
+                       prompts/list)
             │                                   │
     ┌───────┼───────┬───────────┐               │
     │       │       │           │               │

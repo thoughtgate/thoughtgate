@@ -162,14 +162,13 @@ The system must additionally:
 | TTL cleanup background task | ✅ In Scope | Periodic expired task removal |
 | `tasks/get` | ✅ In Scope | Status retrieval |
 | `tasks/result` | ✅ In Scope | Result retrieval |
-| `tasks/list` | ✅ In Scope | Simple (no pagination) |
+| `tasks/list` | ✅ In Scope | MCP-compliant cursor pagination |
 | `tasks/cancel` | ✅ In Scope | Cancellation |
 | Capability advertisement | ✅ In Scope | During initialize (REQ-CORE-007) |
 | Tool annotation rewriting | ✅ In Scope | During tools/list (REQ-CORE-007) |
 | Task metadata validation | ✅ In Scope | On tools/call (REQ-CORE-007) |
 | Metrics and logging | ✅ In Scope | Observability |
 | Rate limiting | ❌ Deferred | v0.3+ (nice-to-have) |
-| `tasks/list` pagination | ❌ Deferred | v0.3+ (return all initially) |
 | SSE notifications | ❌ Deferred | v0.3+ (polling works for v0.2) |
 | Blocking mode | ❌ Removed | Replaced by SEP-1686 async |
 | Client disconnection detection | ❌ Removed | Less critical with async polling |
@@ -609,7 +608,6 @@ These features are implemented in v0.2:
 
 **Deferred to v0.3+:**
 - **F-012:** Rate limiting and capacity management
-- `tasks/list` pagination
 
 See §10 for state machine reference.
 
@@ -674,7 +672,7 @@ thoughtgate_task_data_bytes{quantile}  # Track task payload sizes
 | Shutdown with pending tasks | Cancel tasks, state → Failed(-32603) | EC-TASK-007 |
 | Task TTL expiry | Task state → Expired | EC-TASK-008 |
 | tasks/cancel on already-cancelled task | Return success (idempotent) | EC-TASK-009 |
-| tasks/cancel on Completed task | Return -32006 (not cancellable) | EC-TASK-010 |
+| tasks/cancel on Completed task | Return -32602 (Invalid params per MCP spec) | EC-TASK-010 |
 | tasks/result on InputRequired task | Block until terminal or return status | EC-TASK-011 |
 | Concurrent tasks/result calls | First gets result, others get error | EC-TASK-012 |
 | TTL cleanup runs during task access | Atomic check, return expired if race | EC-TASK-013 |

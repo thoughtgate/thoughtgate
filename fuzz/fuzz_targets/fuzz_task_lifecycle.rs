@@ -261,6 +261,8 @@ fn build_principal(input: &FuzzPrincipal) -> Principal {
 }
 
 fn build_tool_call(input: &FuzzToolCall) -> ToolCallRequest {
+    use thoughtgate::governance::task::JsonRpcId;
+
     let name = sanitize_string(&input.name, 256);
     let arguments = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&input.arguments) {
         json
@@ -269,13 +271,14 @@ fn build_tool_call(input: &FuzzToolCall) -> ToolCallRequest {
     };
 
     ToolCallRequest {
+        method: "tools/call".to_string(),
         name: if name.is_empty() {
             "fuzz_tool".to_string()
         } else {
             name
         },
         arguments,
-        metadata: None,
+        mcp_request_id: JsonRpcId::Null,
     }
 }
 
