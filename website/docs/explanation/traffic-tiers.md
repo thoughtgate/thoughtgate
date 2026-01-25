@@ -2,26 +2,26 @@
 sidebar_position: 3
 ---
 
-# Traffic Tiers
+# Traffic Routing
 
-ThoughtGate classifies all traffic into three tiers based on policy evaluation. Each tier has different handling characteristics.
+ThoughtGate routes all traffic based on governance rules and policy evaluation. Each request is classified and handled according to its action.
 
 ## Overview
 
-| Tier | Trust Level | Behavior | Latency |
-|------|-------------|----------|---------|
-| **Green** | High | Forward immediately | < 2 ms |
-| **Amber** | Medium | Inspect, then forward | < 5 ms |
-| **Red** | Low | Deny or require approval | Variable |
+| Action | Behavior | Latency |
+|--------|----------|---------|
+| **forward** | Send to upstream immediately | < 2 ms |
+| **deny** | Return error immediately | < 1 ms |
+| **approve** | Create task, wait for human | Variable |
+| **policy** | Evaluate Cedar, then route | < 5 ms |
 
-## Green Tier
+## Forward Action
 
 **Purpose:** Fast path for trusted, low-risk operations.
 
 ### Characteristics
 
 - Minimal processing
-- No content inspection
 - Direct forwarding to upstream
 - Responses passed through unchanged
 
@@ -32,85 +32,58 @@ ThoughtGate classifies all traffic into three tiers based on policy evaluation. 
 - Idempotent operations
 - Internal/trusted tool calls
 
-### Policy Example
+### Configuration
 
-```cedar
-permit(
-    principal,
-    action == Action::"tools/list",
-    resource
-);
-
-permit(
-    principal,
-    action == Action::"tools/call",
-    resource
-) when {
-    resource.tool_name in ["get_balance", "list_items", "search"]
-};
+```yaml
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "get_*"
+      action: forward
+    - match: "list_*"
+      action: forward
 ```
 
-## Amber Tier
+## Deny Action
 
-**Purpose:** Balanced path for operations that need inspection but not approval.
-
-### Characteristics
-
-- Request/response buffering
-- Content inspection (PII detection, schema validation)
-- Transformation possible
-- Slightly higher latency
-
-### Typical Use Cases
-
-- Responses containing user data
-- Operations with compliance requirements
-- Logging/audit requirements
-- Data transformation needs
-
-### Policy Example
-
-```cedar
-permit(
-    principal,
-    action == Action::"tools/call",
-    resource
-) when {
-    resource.tool_name == "get_user_profile"
-} advice {
-    "inspect": true,
-    "redact_pii": true
-};
-```
-
-:::note
-
-Amber tier inspection is planned for v0.2. In v0.1, Amber tier requests are treated as Green tier.
-
-:::
-
-## Red Tier
-
-**Purpose:** High-scrutiny path for sensitive operations.
+**Purpose:** Block dangerous or unauthorized operations.
 
 ### Characteristics
-
-Red tier has two sub-paths:
-
-#### Deny Path
 
 - Immediate rejection
 - No upstream communication
-- Clear error response
+- Clear error response (`-32003 PolicyDenied`)
 
-#### Approval Path
+### Typical Use Cases
 
-- Request blocks until human approval
-- Message posted to Slack
-- Human reacts with 👍 (approve) or 👎 (reject)
+- Administrative tools
+- Known attack patterns
+- Blocked tool categories
+
+### Configuration
+
+```yaml
+governance:
+  rules:
+    - match: "admin_*"
+      action: deny
+    - match: "debug_*"
+      action: deny
+```
+
+## Approve Action
+
+**Purpose:** Human-in-the-loop for sensitive operations.
+
+### Characteristics
+
+- Creates SEP-1686 task
+- Posts message to Slack
+- Agent receives task ID immediately
+- Agent polls for completion
 - On approval: forwards to upstream
 - On rejection: returns error
-- On timeout: returns error
 
 ### Typical Use Cases
 
@@ -118,111 +91,163 @@ Red tier has two sub-paths:
 - Financial transactions
 - PII modifications
 - Privilege escalation
-- Administrative actions
 
-### Policy Examples
+### Configuration
 
-**Deny outright:**
+```yaml
+governance:
+  rules:
+    - match: "delete_*"
+      action: approve
+      approval: ops-team
+    - match: "transfer_*"
+      action: approve
+      approval: finance-team
 
-```cedar
-forbid(
-    principal,
-    action == Action::"tools/call",
-    resource
-) when {
-    resource.tool_name.startsWith("admin_")
-};
+approval:
+  ops-team:
+    adapter: slack
+    channel: "#ops-approvals"
+    timeout: 5m
+  finance-team:
+    adapter: slack
+    channel: "#finance-approvals"
+    timeout: 10m
 ```
 
-**Require approval:**
+### SEP-1686 Task Flow
+
+1. Agent calls `tools/call` with sensitive tool
+2. ThoughtGate returns: `{taskId: "tg_abc123", status: "working"}`
+3. Slack message posted
+4. Agent polls `tasks/get` periodically
+5. Human reacts 👍 or 👎
+6. Task status changes to `completed` or `rejected`
+7. Agent calls `tasks/result` to get the response
+
+## Policy Action
+
+**Purpose:** Complex access control logic using Cedar.
+
+### Characteristics
+
+- Evaluates Cedar policy
+- Can check argument values
+- Returns forward, approve, or deny
+- Slightly higher latency
+
+### Typical Use Cases
+
+- Conditional approvals (e.g., amount > $10,000)
+- Role-based access control
+- Complex business rules
+
+### Configuration
+
+```yaml
+governance:
+  rules:
+    - match: "transfer_*"
+      action: policy
+      policy_id: transfer-rules
+
+cedar:
+  policy_path: /etc/thoughtgate/policies.cedar
+```
 
 ```cedar
+// Low-value: forward immediately
 permit(
     principal,
-    action == Action::"tools/call",
+    action == Action::"Forward",
     resource
 ) when {
-    resource.tool_name in ["delete_user", "transfer_funds"]
-} advice {
-    "require_approval": true
+    resource.tool_name == "transfer_funds" &&
+    resource.arguments.amount <= 1000
+};
+
+// High-value: require approval
+permit(
+    principal,
+    action == Action::"Approve",
+    resource
+) when {
+    resource.tool_name == "transfer_funds" &&
+    resource.arguments.amount > 1000
 };
 ```
 
-## Tier Selection Logic
-
-Policy evaluation determines the tier:
+## Action Selection Logic
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                  POLICY EVALUATION                       │
+│                  GOVERNANCE EVALUATION                   │
 │                                                         │
-│  1. Evaluate all policies in order                      │
-│  2. First matching forbid → RED (deny)                  │
-│  3. First matching permit with require_approval         │
-│     → RED (approval)                                    │
-│  4. First matching permit with inspect                  │
-│     → AMBER                                             │
-│  5. First matching permit (no advice)                   │
-│     → GREEN                                             │
-│  6. No match → RED (deny) [fail-safe]                  │
+│  1. Check Gate 1 (Visibility) - tool allowed?           │
+│  2. Evaluate rules in order (first match wins)          │
+│  3. If action: policy, evaluate Cedar                   │
+│  4. If no match, use defaults.action                    │
+│                                                         │
+│  Results:                                               │
+│    forward  → Send to upstream                          │
+│    deny     → Return -32003 error                       │
+│    approve  → Create task, post to Slack                │
+│    policy   → Cedar evaluation → forward|deny|approve   │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Choosing the Right Tier
+## Performance Implications
 
-### Use Green When
+| Action | p50 Latency | p99 Latency | Notes |
+|--------|-------------|-------------|-------|
+| forward | 1-2 ms | 5 ms | Network bound |
+| deny | < 1 ms | 2 ms | No upstream call |
+| approve (initial) | 3-5 ms | 15 ms | Task + Slack |
+| approve (total) | 10s-5m | Timeout | Human bound |
+| policy | 2-3 ms | 10 ms | Cedar evaluation |
+
+## Monitoring
+
+Prometheus metrics by action:
+
+```
+thoughtgate_requests_total{action="forward"}
+thoughtgate_requests_total{action="deny"}
+thoughtgate_requests_total{action="approve"}
+
+thoughtgate_request_duration_seconds{action="forward"}
+thoughtgate_request_duration_seconds{action="deny"}
+thoughtgate_request_duration_seconds{action="approve"}
+
+thoughtgate_approval_total{result="approved|rejected|timeout"}
+```
+
+## Choosing the Right Action
+
+### Use Forward When
 
 - Operation is read-only
 - Failure is easily recoverable
 - No sensitive data involved
 - High-frequency operation
 
-### Use Amber When
-
-- Need to inspect content
-- Compliance/audit requirements
-- Data transformation needed
-- Moderate sensitivity
-
-### Use Red (Deny) When
+### Use Deny When
 
 - Operation should never be allowed
 - Clear policy violation
 - Known attack pattern
 
-### Use Red (Approval) When
+### Use Approve When
 
 - Operation is legitimate but sensitive
 - Human judgment required
 - Irreversible consequences
 - High-value transactions
 
-## Performance Implications
+### Use Policy When
 
-| Tier | p50 Latency | p99 Latency | Notes |
-|------|-------------|-------------|-------|
-| Green | 1-2 ms | 5 ms | Network bound |
-| Amber | 3-5 ms | 15 ms | Inspection bound |
-| Red (deny) | < 1 ms | 2 ms | No upstream call |
-| Red (approve) | 10s-5m | Timeout | Human bound |
-
-## Monitoring Tiers
-
-Prometheus metrics by tier:
-
-```prometheus
-thoughtgate_requests_total{tier="green"}
-thoughtgate_requests_total{tier="amber"}
-thoughtgate_requests_total{tier="red"}
-
-thoughtgate_request_duration_seconds{tier="green"}
-thoughtgate_request_duration_seconds{tier="amber"}
-thoughtgate_request_duration_seconds{tier="red"}
-```
-
-Healthy distribution varies by use case, but typical patterns:
-
-- **High automation:** 90% green, 8% amber, 2% red
-- **High oversight:** 60% green, 20% amber, 20% red
-- **Strict governance:** 40% green, 30% amber, 30% red
+- Need conditional logic
+- Different handling based on arguments
+- Complex business rules
+- Role-based decisions

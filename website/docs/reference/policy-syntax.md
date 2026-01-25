@@ -4,9 +4,58 @@ sidebar_position: 2
 
 # Policy Syntax Reference
 
-ThoughtGate uses [Cedar](https://www.cedarpolicy.com/) for policy definitions.
+ThoughtGate supports two levels of policy configuration: YAML governance rules (primary) and Cedar policies (advanced).
 
-## Policy Structure
+## YAML Governance Rules
+
+The primary way to configure ThoughtGate.
+
+### Structure
+
+```yaml
+governance:
+  defaults:
+    action: forward  # Default when no rule matches
+  rules:
+    - match: "pattern"
+      action: forward|approve|deny|policy
+      approval: workflow-name  # For action: approve
+      policy_id: policy-name   # For action: policy
+```
+
+### Pattern Syntax
+
+Patterns use glob matching:
+
+| Pattern | Matches |
+|---------|---------|
+| `delete_user` | Exact match |
+| `delete_*` | `delete_user`, `delete_file`, etc. |
+| `*_dangerous` | `very_dangerous`, `somewhat_dangerous` |
+| `tool_?` | `tool_a`, `tool_1` (single char) |
+| `[abc]_tool` | `a_tool`, `b_tool`, `c_tool` |
+
+### Actions
+
+| Action | Behavior |
+|--------|----------|
+| `forward` | Send to upstream immediately |
+| `deny` | Return `-32003 PolicyDenied` error |
+| `approve` | Create SEP-1686 task, post to Slack |
+| `policy` | Evaluate Cedar policy for decision |
+
+## Cedar Policies (Advanced)
+
+For complex access control logic that can't be expressed in YAML.
+
+### When to Use Cedar
+
+- Conditional logic based on argument values
+- Complex boolean expressions
+- Role-based access control
+- Multi-factor decisions
+
+### Structure
 
 ```cedar
 permit|forbid(
@@ -15,50 +64,38 @@ permit|forbid(
     resource
 ) when {
     <conditions>
-} advice {
-    <metadata>
 };
 ```
 
-## Actions
+### Cedar Actions
 
-| Action | Description |
-|--------|-------------|
-| `Action::"tools/list"` | List available tools |
-| `Action::"tools/call"` | Call a specific tool |
-| `Action::"prompts/list"` | List available prompts |
-| `Action::"prompts/get"` | Get a specific prompt |
-| `Action::"resources/list"` | List available resources |
-| `Action::"resources/read"` | Read a specific resource |
+| Action | Result |
+|--------|--------|
+| `Action::"Forward"` | Send to upstream immediately |
+| `Action::"Approve"` | Require human approval |
+| `Action::"Deny"` | Return error |
 
-## Resource Attributes
+### Resource Attributes
 
-For `tools/call` actions:
+For `tools/call` requests:
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `resource.tool_name` | String | Name of the tool being called |
 | `resource.arguments` | Object | Tool arguments (JSON) |
+| `resource.method` | String | MCP method name |
 
-## Conditions
+### Conditions
 
-### String Comparisons
+#### String Comparisons
 
 ```cedar
 when { resource.tool_name == "delete_user" }
 when { resource.tool_name != "safe_tool" }
-when { resource.tool_name.startsWith("admin_") }
-when { resource.tool_name.endsWith("_dangerous") }
-when { resource.tool_name.contains("delete") }
+when { resource.tool_name like "admin_*" }
 ```
 
-### Set Membership
-
-```cedar
-when { resource.tool_name in ["delete_user", "drop_table", "send_email"] }
-```
-
-### Numeric Comparisons
+#### Numeric Comparisons
 
 ```cedar
 when { resource.arguments.amount > 10000 }
@@ -66,7 +103,7 @@ when { resource.arguments.count >= 5 }
 when { resource.arguments.priority < 3 }
 ```
 
-### Boolean Logic
+#### Boolean Logic
 
 ```cedar
 when {
@@ -78,128 +115,127 @@ when {
     resource.tool_name == "delete" ||
     resource.tool_name == "remove"
 }
-
-when {
-    !(resource.tool_name in ["safe_tool_1", "safe_tool_2"])
-}
 ```
 
-## Advice (Metadata)
+### Evaluation Order
 
-Advice tells ThoughtGate how to handle matching requests:
-
-```cedar
-advice {
-    "require_approval": true,
-    "approval_channel": "#high-value-ops",
-    "approval_timeout": "10m"
-}
-```
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `require_approval` | Boolean | Require human approval |
-| `approval_channel` | String | Override default Slack channel |
-| `approval_timeout` | String | Override default timeout (e.g., `5m`, `1h`) |
-
-## Policy Evaluation Order
-
-1. Policies are evaluated in file order
-2. First matching `forbid` denies the request
-3. First matching `permit` allows (with advice)
-4. No match = implicit deny
+1. All `forbid` policies evaluated first
+2. If any forbid matches → Deny
+3. All `permit` policies evaluated
+4. First matching permit → Use that action
+5. No match → Implicit deny
 
 ## Examples
 
-### Allow everything except admin tools
+### YAML: Basic Governance
 
-```cedar
-forbid(
-    principal,
-    action == Action::"tools/call",
-    resource
-) when {
-    resource.tool_name.startsWith("admin_")
-};
-
-permit(
-    principal,
-    action,
-    resource
-);
+```yaml
+governance:
+  defaults:
+    action: forward
+  rules:
+    # Block admin tools
+    - match: "admin_*"
+      action: deny
+    # Approve destructive ops
+    - match: "delete_*"
+      action: approve
+    - match: "drop_*"
+      action: approve
 ```
 
-### Tiered approval thresholds
+### YAML: Multiple Approval Channels
+
+```yaml
+governance:
+  rules:
+    - match: "delete_*"
+      action: approve
+      approval: ops
+    - match: "transfer_*"
+      action: approve
+      approval: finance
+
+approval:
+  ops:
+    adapter: slack
+    channel: "#ops"
+    timeout: 5m
+  finance:
+    adapter: slack
+    channel: "#finance"
+    timeout: 10m
+```
+
+### Cedar: Value-Based Routing
 
 ```cedar
-// High-value: requires approval
+// Low-value transfers: forward
 permit(
     principal,
-    action == Action::"tools/call",
+    action == Action::"Forward",
     resource
 ) when {
     resource.tool_name == "transfer_funds" &&
-    resource.arguments.amount > 10000
-} advice {
-    "require_approval": true,
-    "approval_channel": "#finance-approvals"
+    resource.arguments.amount <= 1000
 };
 
-// Medium-value: just log
+// High-value transfers: approve
 permit(
     principal,
-    action == Action::"tools/call",
+    action == Action::"Approve",
     resource
 ) when {
     resource.tool_name == "transfer_funds" &&
     resource.arguments.amount > 1000
 };
-
-// Low-value: allow
-permit(
-    principal,
-    action == Action::"tools/call",
-    resource
-) when {
-    resource.tool_name == "transfer_funds"
-};
 ```
 
-### Deny list with exceptions
+### Cedar: Deny with Exceptions
 
 ```cedar
-// Allow safe operations explicitly
+// Allow specific safe admin tools
 permit(
     principal,
-    action == Action::"tools/call",
+    action == Action::"Forward",
     resource
 ) when {
-    resource.tool_name in ["get_balance", "list_accounts"]
+    resource.tool_name == "admin_read_config"
 };
 
-// Deny all other tools/call
+// Deny all other admin tools
 forbid(
     principal,
-    action == Action::"tools/call",
+    action,
     resource
-);
-
-// Allow tools/list
-permit(
-    principal,
-    action == Action::"tools/list",
-    resource
-);
+) when {
+    resource.tool_name like "admin_*"
+};
 ```
 
 ## Validation
 
-Validate policies before deployment:
+### YAML Validation
 
 ```bash
+# Check YAML syntax
+cat thoughtgate.yaml | python -c "import sys, yaml; yaml.safe_load(sys.stdin)"
+```
+
+### Cedar Validation
+
+```bash
+# Validate Cedar syntax
 cedar validate --policies policy.cedar
 ```
 
 ## Hot Reload
 
-ThoughtGate watches the policy file and reloads on changes. No restart required.
+ThoughtGate watches configuration files and reloads on changes. No restart required.
+
+```bash
+# Modify config file
+vim thoughtgate.yaml
+
+# ThoughtGate logs: "Configuration reloaded successfully"
+```

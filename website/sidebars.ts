@@ -16,6 +16,7 @@ const sidebars: SidebarsConfig = {
         'how-to/install',
         'how-to/write-policies',
         'how-to/deploy-kubernetes',
+        'how-to/monitor',
         'how-to/troubleshoot',
       ],
     },

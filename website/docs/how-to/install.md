@@ -32,7 +32,7 @@ cargo install --path .
 ### Pull the Image
 
 ```bash
-docker pull ghcr.io/thoughtgate/thoughtgate:latest
+docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.0
 ```
 
 ### Available Tags
@@ -48,10 +48,11 @@ docker pull ghcr.io/thoughtgate/thoughtgate:latest
 ```bash
 docker run -d \
   --name thoughtgate \
-  -p 8080:8080 \
-  -p 8081:8081 \
-  -e THOUGHTGATE_UPSTREAM_URL=http://host.docker.internal:3000 \
-  ghcr.io/thoughtgate/thoughtgate:latest
+  -p 7467:7467 \
+  -p 7469:7469 \
+  -v $(pwd)/thoughtgate.yaml:/etc/thoughtgate/config.yaml \
+  -e THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml \
+  ghcr.io/thoughtgate/thoughtgate:v0.2.0
 ```
 
 ## Kubernetes
@@ -65,8 +66,18 @@ See [Deploy to Kubernetes](/docs/how-to/deploy-kubernetes) for Helm charts and m
 thoughtgate --version
 
 # Check health (after starting)
-curl http://localhost:8081/health
+curl http://localhost:7469/health
 ```
+
+## Port Model
+
+ThoughtGate uses an Envoy-inspired 3-port architecture:
+
+| Port | Name | Purpose |
+|------|------|---------|
+| 7467 | Outbound | Client requests → upstream (main proxy) |
+| 7468 | Inbound | Reserved for webhooks (v0.3+) |
+| 7469 | Admin | Health checks, metrics |
 
 ## System Requirements
 

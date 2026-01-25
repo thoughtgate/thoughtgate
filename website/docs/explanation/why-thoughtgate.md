@@ -42,29 +42,37 @@ Require human approval for every action.
 
 **Problem:** Humans become bottlenecks. Agent autonomy is eliminated.
 
+### Option 4: Framework-Specific Solutions
+
+Use LangChain's `interrupt()` or similar.
+
+**Problem:** Requires code changes. Doesn't work with closed-source agents.
+
 ## The ThoughtGate Approach
 
-ThoughtGate provides a **policy-based middle ground**:
+ThoughtGate provides a **policy-based middle ground** that works with any agent:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         THOUGHTGATE                              │
 │                                                                 │
-│   Request ──▶ Policy Evaluation ──▶ Tier Classification        │
+│   Request ──▶ 4-Gate Evaluation ──▶ Action                      │
 │                                                                 │
-│   Green (safe)      → Forward immediately                       │
-│   Amber (inspect)   → Check content, then forward               │
-│   Red (sensitive)   → Require human approval or deny            │
+│   Gate 1: Visibility  → Hide sensitive tools from agents        │
+│   Gate 2: YAML Rules  → Pattern-based routing                   │
+│   Gate 3: Cedar       → Complex access control logic            │
+│   Gate 4: Approval    → Human-in-the-loop via Slack             │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Principles
+### Key Differentiators
 
-1. **Declarative Policies**: Define rules once, apply consistently
-2. **Tiered Trust**: Not all actions are equal
-3. **Human-in-the-Loop**: Humans approve sensitive operations
-4. **Minimal Overhead**: Green path adds < 2ms latency
+1. **Works with any agent** — No SDK or code changes required
+2. **Declarative policies** — Define rules once, apply consistently
+3. **Tiered control** — Not all actions need the same scrutiny
+4. **Async approvals** — SEP-1686 tasks don't block agent execution
+5. **Minimal overhead** — < 2ms latency for forwarded requests
 
 ## When to Use ThoughtGate
 
@@ -74,6 +82,7 @@ ThoughtGate is valuable when:
 - You need **audit trails** of agent decisions
 - You want **human oversight** without blocking every request
 - You need to **enforce policies** across multiple agents
+- You're using **closed-source agents** that can't be modified
 
 ## When Not to Use ThoughtGate
 
@@ -82,6 +91,7 @@ ThoughtGate may be overkill when:
 - Agents only have read-only access
 - All actions are easily reversible
 - You're in a pure development/testing environment
+- You can modify agent code to add approval logic
 
 ## Design Philosophy
 
@@ -101,11 +111,15 @@ If ThoughtGate can't evaluate a request (policy error, connection issue), it den
 ThoughtGate is designed as a lightweight sidecar:
 - < 15 MB binary
 - < 20 MB memory footprint
-- < 2 ms latency overhead (green path)
-- Hot-reloadable policies
+- < 2 ms latency overhead (forward path)
+- Hot-reloadable configuration
+
+### 4. Zero-Config Identity
+
+In Kubernetes, ThoughtGate automatically infers agent identity from pod labels. No API keys or authentication setup required.
 
 ## Next Steps
 
 - Understand the [Architecture](/docs/explanation/architecture)
-- Learn about [Traffic Tiers](/docs/explanation/traffic-tiers)
 - See the [Security Model](/docs/explanation/security-model)
+- Get started with the [Quickstart](/docs/how-to/quickstart)

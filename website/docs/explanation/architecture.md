@@ -12,9 +12,36 @@ ThoughtGate is a transparent proxy that sits between AI agents and MCP servers.
 ┌─────────────┐     ┌─────────────────────────────────────┐     ┌─────────────┐
 │  AI Agent   │────▶│           ThoughtGate               │────▶│  MCP Server │
 │  (Claude,   │◀────│                                     │◀────│  (Tools)    │
-│   GPT, etc) │     │  Outbound: 8080    Admin: 8081      │     │             │
+│   GPT, etc) │     │  Outbound: 7467    Admin: 7469      │     │             │
 └─────────────┘     └─────────────────────────────────────┘     └─────────────┘
 ```
+
+## 4-Gate Decision Model
+
+ThoughtGate evaluates every request through a 4-gate pipeline:
+
+```
+                    ┌─────────────────────────────────────────────────────────┐
+                    │                    THOUGHTGATE                          │
+                    │                                                         │
+  MCP Request ─────▶│  ┌──────────┐    ┌──────────┐    ┌──────────────────┐  │
+                    │  │  Gate 1  │───▶│  Gate 2  │───▶│     Gate 3/4     │  │
+                    │  │Visibility│    │  Rules   │    │                  │  │
+                    │  └──────────┘    └──────────┘    │  forward ──▶ ✓   │  │
+                    │                                  │  deny ────▶ ✗   │  │
+                    │                                  │  approve ─▶ Task │  │
+                    │                                  │  policy ──▶ Cedar│  │
+                    │                                  └──────────────────┘  │
+                    │                                                         │
+                    └─────────────────────────────────────────────────────────┘
+```
+
+| Gate | Name | Purpose | Configuration |
+|------|------|---------|---------------|
+| **Gate 1** | Visibility | Filter which tools agents can see | `sources[].expose` |
+| **Gate 2** | Governance Rules | YAML pattern matching | `governance.rules[]` |
+| **Gate 3** | Cedar Policy | Complex access control | `cedar.policy_path` |
+| **Gate 4** | Human Approval | Slack-based approval workflow | `approval.*` |
 
 ## Components
 
@@ -27,25 +54,43 @@ Handles JSON-RPC 2.0 message parsing and routing:
 - Routes responses back to clients
 - Manages connection pooling to upstream
 
-### 2. Policy Engine
+### 2. Governance Engine
 
-Evaluates requests against Cedar policies:
+Evaluates requests against YAML rules:
 
-- Loads policies from file
-- Watches for policy changes (hot reload)
-- Returns tier classification (Green, Amber, Red)
-- Extracts advice metadata for approval routing
+- Pattern matching with glob syntax
+- First-match-wins evaluation
+- Routes to Cedar when `action: policy`
+- Creates tasks when `action: approve`
 
-### 3. Governance Layer
+### 3. Cedar Policy Engine (Optional)
 
-Manages approval workflows:
+For complex access control:
 
-- Creates approval tasks for Red-tier requests
-- Posts messages to Slack
-- Polls for reactions (👍/👎)
+- AWS Cedar policy language
+- Hot-reloadable policies
+- Attribute-based access control
+- Condition evaluation on arguments
+
+### 4. Task Manager
+
+Manages SEP-1686 async tasks:
+
+- Creates tasks for approval requests
+- Tracks task state (working, completed, failed, rejected)
 - Handles timeouts and cancellation
+- Stores results for retrieval
 
-### 4. Admin Server
+### 5. Approval Adapter
+
+Slack integration for human-in-the-loop:
+
+- Posts approval messages with Block Kit
+- Polls for reactions (👍/👎)
+- Resolves user display names
+- Handles rate limiting
+
+### 6. Admin Server
 
 Provides operational endpoints:
 
@@ -53,58 +98,79 @@ Provides operational endpoints:
 - `/ready` — Readiness probe
 - `/metrics` — Prometheus metrics
 
-## Request Flow
-
-```
-                    ┌──────────────────────────────────────────┐
-                    │               THOUGHTGATE                 │
-                    │                                          │
-  Request ─────────▶│  1. Parse JSON-RPC                       │
-                    │  2. Evaluate Cedar Policy                │
-                    │  3. Classify Tier                        │
-                    │                                          │
-                    │     ┌─────────────────────────────────┐  │
-                    │     │         TIER ROUTER             │  │
-                    │     │                                 │  │
-                    │     │  Green ──▶ Forward to upstream  │──┼──▶ Upstream
-                    │     │  Amber ──▶ Inspect, then fwd    │  │
-                    │     │  Red ────▶ Approval workflow    │  │
-                    │     │         ──▶ or Deny             │  │
-                    │     └─────────────────────────────────┘  │
-                    │                                          │
-  Response ◀────────│  4. Return upstream response or error   │
-                    │                                          │
-                    └──────────────────────────────────────────┘
-```
-
 ## Port Model
 
-ThoughtGate uses a two-port model:
+ThoughtGate uses an Envoy-inspired 3-port architecture:
 
 | Port | Name | Purpose |
 |------|------|---------|
-| 8080 | Outbound | Proxy traffic (agent → upstream) |
-| 8081 | Admin | Health checks, metrics |
+| 7467 | Outbound | Client requests → upstream (main proxy) |
+| 7468 | Inbound | Reserved for webhooks (v0.3+) |
+| 7469 | Admin | Health checks, metrics |
 
 This separation ensures health checks don't interfere with proxy traffic and allows different security policies per port.
 
+## Request Flow
+
+### Forward Path (No Approval)
+
+```
+Agent → ThoughtGate → Upstream → ThoughtGate → Agent
+       (Gate 1-2: forward)
+```
+
+1. Agent sends `tools/call` request
+2. Gate 1 checks visibility (pass)
+3. Gate 2 matches rule → `action: forward`
+4. Request forwarded to upstream
+5. Response returned to agent
+
+### Approval Path (SEP-1686)
+
+```
+Agent → ThoughtGate → Task Created → Slack → Human → ThoughtGate → Upstream
+       (Gate 1-2: approve)    (polls)   (reacts)  (executes)
+```
+
+1. Agent sends `tools/call` request
+2. Gate 1 checks visibility (pass)
+3. Gate 2 matches rule → `action: approve`
+4. Task created with ID `tg_abc123`
+5. Immediate response: `{taskId: "tg_abc123", status: "working"}`
+6. Slack message posted
+7. Agent polls `tasks/get`
+8. Human reacts 👍
+9. Task status → `completed`
+10. Agent calls `tasks/result` to get upstream response
+
 ## State Management
 
-### v0.1: In-Memory
+### v0.2: In-Memory
+
+:::warning Ephemeral State
+
+In v0.2, all task state is stored in an in-memory `DashMap`. This means:
+
+- **Pending approvals are lost on pod restart**
+- **Tasks cannot be shared across multiple instances**
+- **No persistence across deployments**
+
+Plan your deployment accordingly. For critical workflows, consider implementing retry logic in your agent to resubmit approval requests after ThoughtGate restarts.
+
+:::
 
 All state is held in memory:
-- Pending approval tasks
+- Pending approval tasks (DashMap)
 - Connection pools
-- Policy cache
+- Configuration cache
 
-**Implication:** Pending approvals are lost on restart.
+### Future: Persistent State (v0.3+)
 
-### Future: Persistent State
-
-Planned for v0.2:
+Planned improvements:
 - Redis-backed task storage
-- Approval state survives restarts
+- Task state survives restarts
 - Multi-instance coordination
+- Horizontal scaling support
 
 ## Deployment Model
 
@@ -121,16 +187,16 @@ Benefits:
 - No network hop (localhost)
 - Per-agent isolation
 - Independent scaling
-- Simple security model
+- Zero-config identity from pod labels
 
 ## Performance Characteristics
 
 | Path | Latency Overhead | Description |
 |------|------------------|-------------|
-| Green | < 2 ms | Policy eval + forward |
-| Amber | < 5 ms | Policy eval + inspect + forward |
-| Red (deny) | < 1 ms | Policy eval + error |
-| Red (approve) | Seconds to minutes | Waiting for human |
+| Forward | < 2 ms | Policy eval + forward |
+| Deny | < 1 ms | Policy eval + error |
+| Approve (initial) | < 5 ms | Task creation + Slack post |
+| Approve (total) | Seconds to minutes | Waiting for human |
 
 ## Failure Modes
 
@@ -148,11 +214,11 @@ Benefits:
 
 ### Slack Unavailable
 
-- Approval requests fail
-- Falls back to timeout behavior
+- Task created but approval stuck
+- Task eventually times out
 - Logged as error
 
 ## Next Steps
 
-- Understand [Traffic Tiers](/docs/explanation/traffic-tiers) in depth
-- Learn about the [Security Model](/docs/explanation/security-model)
+- Understand the [Security Model](/docs/explanation/security-model)
+- Learn to [write governance rules](/docs/how-to/write-policies)

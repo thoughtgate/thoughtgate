@@ -1,20 +1,20 @@
 # ThoughtGate
 
 [![CI](https://github.com/thoughtgate/thoughtgate/actions/workflows/ci.yml/badge.svg)](https://github.com/thoughtgate/thoughtgate/actions/workflows/ci.yml)
-[![Binary Size](https://bencher.dev/perf/thoughtgate/badge/binary-size)](https://bencher.dev/perf/thoughtgate)
-[![Latency p95](https://bencher.dev/perf/thoughtgate/badge/latency-p95)](https://bencher.dev/perf/thoughtgate)
-[![Throughput](https://bencher.dev/perf/thoughtgate/badge/throughput)](https://bencher.dev/perf/thoughtgate)
 
-**Human-in-the-loop approval workflows for MCP (Model Context Protocol) agents.**
+**Human-in-the-loop approval workflows for AI agents.**
 
-ThoughtGate is a sidecar proxy that intercepts MCP tool calls and routes them through policy-based approval workflows before execution. It ensures AI agents can't perform sensitive operations without human oversight.
+ThoughtGate is a high-performance Rust sidecar that acts as a governance layer for AI agents. It intercepts MCP (Model Context Protocol) tool calls and enforces human approval workflows without modifying your agent's code.
+
+Unlike framework-specific solutions like LangChain's `interrupt()`, ThoughtGate can govern closed-source vendor agents and doesn't require application code changes.
 
 ```
 ┌─────────────┐     ┌─────────────────────────────────────┐     ┌─────────────┐
 │  AI Agent   │────▶│           ThoughtGate               │────▶│  MCP Server │
-│  (Claude,   │◀────│  • Policy evaluation (Cedar)        │◀────│  (Tools)    │
-│   GPT, etc) │     │  • Approval workflows (Slack)       │     │             │
-└─────────────┘     │  • Request inspection               │     └─────────────┘
+│  (Claude,   │◀────│  • YAML governance rules            │◀────│  (Tools)    │
+│   GPT, etc) │     │  • Cedar policy engine              │     │             │
+└─────────────┘     │  • Slack approval workflows         │     └─────────────┘
+                    │  • SEP-1686 async tasks             │
                     └─────────────────────────────────────┘
 ```
 
@@ -22,35 +22,34 @@ ThoughtGate is a sidecar proxy that intercepts MCP tool calls and routes them th
 
 AI agents are increasingly capable of taking real-world actions—deleting files, sending emails, making purchases, modifying databases. ThoughtGate provides a governance layer that:
 
-- **Enforces policies** — Define which tools require approval using Cedar policies
+- **Enforces policies** — Define which tools require approval using YAML rules or Cedar policies
 - **Enables human oversight** — Route sensitive operations to Slack for approval
-- **Inspects requests** — Detect PII, validate schemas, apply transformations
+- **Works with any agent** — No SDK required; deploy as a sidecar proxy
 - **Maintains audit trails** — Log all tool calls and approval decisions
 
-## Features (v0.1 MVP)
+## Features (v0.2)
 
 | Feature | Status | Description |
 |---------|--------|-------------|
 | MCP Proxy | ✅ | JSON-RPC 2.0 compliant proxy for MCP traffic |
-| Cedar Policies | ✅ | Flexible policy engine for routing decisions |
-| Four-Path Routing | ✅ | Green (stream), Amber (inspect), Red (deny), Approval (human) |
-| Slack Approvals | ✅ | Post approval requests, detect 👍/👎 reactions |
-| Request Inspection | ✅ | PII detection, schema validation |
-| Blocking Mode | ✅ | Hold connection until approval (v0.1) |
+| YAML Rules | ✅ | Simple glob-based routing for quick setup |
+| Cedar Policies | ✅ | AWS Cedar engine for complex access control |
+| Async Approvals | ✅ | Native SEP-1686 task support for long-running workflows |
+| Slack Integration | ✅ | Post approval requests, detect 👍/👎 reactions |
+| K8s Native | ✅ | Designed as a sidecar with zero-config identity from Pod labels |
 
 ### Roadmap
 
 | Feature | Version | Description |
 |---------|---------|-------------|
-| SEP-1686 Tasks | v0.2 | Async task-based approval flow |
-| Persistent State | v0.2 | Redis-backed task storage |
-| Multi-Upstream | v0.2 | Route to multiple MCP servers |
-| A2A Approval | v1.0 | Agent-to-agent approval workflows |
-| Prompt Guard | v1.0 | ML-based prompt injection detection |
+| Response Inspection | v0.3 | Buffer and inspect responses for PII/schemas |
+| Persistent State | v0.3 | Redis-backed task storage |
+| Multi-Upstream | v0.3 | Route to multiple MCP servers |
+| A2A Protocol | v0.4 | Agent-to-agent approval workflows |
 
 ## Performance
 
-ThoughtGate is designed as a lightweight sidecar with minimal overhead:
+ThoughtGate is built for minimal overhead using `hyper`, `mimalloc`, and `socket2` TCP optimizations:
 
 | Metric | Target | Description |
 |--------|--------|-------------|
@@ -61,13 +60,11 @@ ThoughtGate is designed as a lightweight sidecar with minimal overhead:
 | **Policy evaluation** | < 100 µs | Fast Cedar evaluation |
 | **Startup time** | < 100 ms | Fast cold start |
 
-See the [Bencher.dev dashboard](https://bencher.dev/perf/thoughtgate) for live performance tracking.
-
 ## Quick Start
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.75+ (for building from source)
 - An MCP server to proxy
 - Slack workspace with bot token (for approvals)
 
@@ -79,58 +76,134 @@ git clone https://github.com/thoughtgate/thoughtgate
 cd thoughtgate
 cargo build --release
 
-# Binary will be at target/release/thoughtgate
+# Binary at target/release/thoughtgate
+```
+
+Or use the Docker image:
+
+```bash
+docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.0
 ```
 
 ### Basic Usage
 
-```bash
-# Start ThoughtGate proxying to an MCP server
-export THOUGHTGATE_UPSTREAM=http://localhost:3000
-export THOUGHTGATE_LISTEN=0.0.0.0:8080
+Create a configuration file `thoughtgate.yaml`:
 
+```yaml
+# The simplest config: proxy and log everything (zero-config mode)
+schema: 1
+
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://localhost:3000
+
+governance:
+  defaults:
+    action: forward
+```
+
+This passthrough mode is useful to validate your setup and gain observability before adding governance rules.
+
+To add governance, extend with rules:
+
+```yaml
+schema: 1
+
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://localhost:3000
+
+governance:
+  defaults:
+    action: forward
+  rules:
+    # Require approval for destructive operations
+    - match: "delete_*"
+      action: approve
+    - match: "drop_*"
+      action: approve
+    # Block admin tools
+    - match: "admin_*"
+      action: deny
+```
+
+Start ThoughtGate:
+
+```bash
+export THOUGHTGATE_CONFIG=./thoughtgate.yaml
 ./thoughtgate
 ```
 
-Point your MCP client at `http://localhost:8080` instead of the upstream server.
+Point your MCP client at `http://localhost:7467` (the default outbound port).
 
 ### With Slack Approvals
 
-```bash
-export THOUGHTGATE_UPSTREAM=http://localhost:3000
-export THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-token
-export THOUGHTGATE_SLACK_CHANNEL="#approvals"
-export THOUGHTGATE_CEDAR_POLICY_PATH=./policy.cedar
+```yaml
+schema: 1
 
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://localhost:3000
+
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: approve
+      approval: slack-ops
+
+approval:
+  slack-ops:
+    adapter: slack
+    channel: "#approvals"
+    timeout: 5m
+```
+
+```bash
+export THOUGHTGATE_CONFIG=./thoughtgate.yaml
+export SLACK_BOT_TOKEN=xoxb-your-token
 ./thoughtgate
 ```
 
 ## Architecture
 
-ThoughtGate classifies all traffic into one of four paths:
+ThoughtGate uses a 4-Gate decision model:
 
 ```
                     ┌─────────────────────────────────────────────────────────┐
                     │                    THOUGHTGATE                          │
                     │                                                         │
-  MCP Request ─────▶│  ┌──────────┐    ┌─────────────────────────────────┐   │
-                    │  │  Cedar   │───▶│         PATH ROUTER             │   │
-                    │  │  Policy  │    │                                 │   │
-                    │  └──────────┘    │  Green ──▶ Stream directly      │   │
-                    │                  │  Amber ──▶ Buffer & inspect     │   │
-                    │                  │  Red ────▶ Reject immediately   │   │
-                    │                  │  Approval ▶ Slack workflow      │   │
-                    │                  └─────────────────────────────────┘   │
+  MCP Request ─────▶│  ┌──────────┐    ┌──────────┐    ┌──────────────────┐  │
+                    │  │  Gate 1  │───▶│  Gate 2  │───▶│     Gate 3/4     │  │
+                    │  │Visibility│    │  Rules   │    │                  │  │
+                    │  └──────────┘    └──────────┘    │  forward ──▶ ✓   │  │
+                    │                                  │  deny ────▶ ✗   │  │
+                    │                                  │  approve ─▶ Slack│  │
+                    │                                  │  policy ──▶ Cedar│  │
+                    │                                  └──────────────────┘  │
                     │                                                         │
                     └─────────────────────────────────────────────────────────┘
 ```
 
-| Path | When | Behavior |
-|------|------|----------|
-| **Green** | Trusted traffic (e.g., `tools/list`) | Zero-copy streaming, minimal latency |
-| **Amber** | Needs inspection (e.g., responses with PII) | Buffer, run inspectors, then forward |
-| **Red** | Policy denied | Return error immediately |
-| **Approval** | Sensitive operations (e.g., `delete_user`) | Post to Slack, wait for 👍/👎 |
+| Gate | Purpose | Configuration |
+|------|---------|---------------|
+| **Gate 1** | Tool visibility filtering | `sources[].expose` allowlist/blocklist |
+| **Gate 2** | YAML rule matching | `governance.rules[]` with glob patterns |
+| **Gate 3** | Cedar policy evaluation | When `action: policy` |
+| **Gate 4** | Human approval workflow | When `action: approve` |
+
+### Actions
+
+| Action | Behavior |
+|--------|----------|
+| `forward` | Send to upstream immediately |
+| `deny` | Return error immediately |
+| `approve` | Post to Slack, wait for 👍/👎, then forward or reject |
+| `policy` | Evaluate Cedar policy, then forward/approve/deny based on result |
 
 ## Configuration
 
@@ -138,45 +211,52 @@ ThoughtGate classifies all traffic into one of four paths:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `THOUGHTGATE_UPSTREAM` | ✅ | — | Upstream MCP server URL |
-| `THOUGHTGATE_LISTEN` | | `0.0.0.0:8080` | Listen address |
-| `THOUGHTGATE_CEDAR_POLICY_PATH` | | (embedded) | Path to Cedar policy file |
-| `THOUGHTGATE_SLACK_BOT_TOKEN` | For approvals | — | Slack bot OAuth token |
-| `THOUGHTGATE_SLACK_CHANNEL` | For approvals | — | Channel for approval messages |
-| `THOUGHTGATE_APPROVAL_TIMEOUT_SECS` | | `300` | Max wait time for approval |
-| `THOUGHTGATE_REQUEST_TIMEOUT_SECS` | | `30` | Upstream request timeout |
+| `THOUGHTGATE_CONFIG` | ✅ | — | Path to YAML configuration file |
+| `THOUGHTGATE_OUTBOUND_PORT` | | `7467` | Main proxy port for client requests |
+| `THOUGHTGATE_ADMIN_PORT` | | `7469` | Admin port for health/metrics |
+| `SLACK_BOT_TOKEN` | For approvals | — | Slack bot OAuth token |
+| `SLACK_CHANNEL` | For approvals | `#approvals` | Default channel for approval messages |
 
-See [docs/configuration.md](docs/configuration.md) for the complete list.
+### Port Model
+
+ThoughtGate uses an Envoy-inspired 3-port architecture:
+
+| Port | Name | Purpose |
+|------|------|---------|
+| 7467 | Outbound | Client requests → upstream (main proxy) |
+| 7468 | Inbound | Reserved for webhooks (v0.3+) |
+| 7469 | Admin | Health checks (`/health`, `/ready`), metrics |
 
 ### Cedar Policy Example
+
+For complex access control, use Cedar policies:
 
 ```cedar
 // Allow tools/list without restrictions
 permit(
     principal,
-    action == Action::"tools/list",
+    action == Action::"Forward",
     resource
-);
+) when {
+    resource.method == "tools/list"
+};
 
 // Require approval for destructive operations
 permit(
     principal,
-    action == Action::"tools/call",
+    action == Action::"Approve",
     resource
 ) when {
-    resource.tool_name in ["delete_user", "drop_table", "send_email"]
-} advice {
-    "require_approval": true
+    resource.tool_name like "delete_*"
 };
 
-// Deny access to admin tools for non-admin roles
+// Deny access to admin tools
 forbid(
     principal,
-    action == Action::"tools/call",
+    action,
     resource
 ) when {
-    resource.tool_name == "admin_console" &&
-    !principal in Role::"admin"
+    resource.tool_name like "admin_*"
 };
 ```
 
@@ -184,44 +264,63 @@ forbid(
 
 ### Kubernetes Sidecar
 
-ThoughtGate is designed to run as a sidecar container:
+ThoughtGate is designed to run as a sidecar container. Identity is automatically inferred from Pod labels—no API keys required.
 
 ```yaml
 apiVersion: v1
 kind: Pod
 metadata:
   name: my-agent
+  labels:
+    app: my-agent  # Used for principal identity
 spec:
   containers:
     - name: agent
       image: my-agent:latest
       env:
         - name: MCP_SERVER_URL
-          value: "http://localhost:8080"  # Points to ThoughtGate
-    
+          value: "http://localhost:7467"  # Points to ThoughtGate
+
     - name: thoughtgate
-      image: thoughtgate:v0.1
+      image: ghcr.io/thoughtgate/thoughtgate:v0.2.0
       ports:
-        - containerPort: 8080
+        - containerPort: 7467  # Outbound (proxy)
+        - containerPort: 7469  # Admin (health)
       env:
-        - name: THOUGHTGATE_UPSTREAM
-          value: "http://mcp-server:3000"
-        - name: THOUGHTGATE_SLACK_BOT_TOKEN
+        - name: THOUGHTGATE_CONFIG
+          value: "/etc/thoughtgate/config.yaml"
+        - name: SLACK_BOT_TOKEN
           valueFrom:
             secretKeyRef:
               name: thoughtgate-secrets
               key: slack-token
+      volumeMounts:
+        - name: config
+          mountPath: /etc/thoughtgate
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 7469
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 7469
+  volumes:
+    - name: config
+      configMap:
+        name: thoughtgate-config
 ```
 
 ### Docker
 
 ```bash
 docker run -d \
-  -p 8080:8080 \
-  -e THOUGHTGATE_UPSTREAM=http://host.docker.internal:3000 \
-  -e THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-... \
-  -e THOUGHTGATE_SLACK_CHANNEL="#approvals" \
-  thoughtgate:v0.1
+  -p 7467:7467 \
+  -p 7469:7469 \
+  -v $(pwd)/thoughtgate.yaml:/etc/thoughtgate/config.yaml \
+  -e THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml \
+  -e SLACK_BOT_TOKEN=xoxb-... \
+  ghcr.io/thoughtgate/thoughtgate:v0.2.0
 ```
 
 ## Slack Setup
@@ -231,7 +330,8 @@ docker run -d \
 2. Add Bot Token Scopes:
    - `chat:write` — Post approval messages
    - `reactions:read` — Detect approval reactions
-   - `channels:history` — Read channel messages for polling
+   - `channels:history` — Poll channel for reaction updates
+   - `users:read` — Resolve user display names
 
 3. Install to workspace and copy the Bot OAuth Token
 
@@ -241,59 +341,69 @@ docker run -d \
 
 When a tool call requires approval:
 
-1. ThoughtGate posts a message to Slack:
+1. ThoughtGate creates an SEP-1686 task and posts a message to Slack:
    ```
-   🔔 Approval Required
-   
+   🔒 Approval Required: delete_user
+
    Tool: delete_user
-   Arguments: {"user_id": "12345"}
-   Requested by: agent-pod-abc
-   
-   React 👍 to approve or 👎 to reject
+   Principal: my-agent
+   Arguments:
+   {
+     "user_id": "12345"
+   }
+
+   React with 👍 to approve or 👎 to reject
+
+   Task ID: tg_abc123 • Expires: 2024-01-15 10:30 UTC
    ```
 
 2. A human reacts with 👍 or 👎
 
 3. ThoughtGate detects the reaction and either:
-   - **👍** Executes the tool, returns result to agent
-   - **👎** Returns `ApprovalRejected` error to agent
+   - **👍** Executes the tool, returns result via `tasks/result`
+   - **👎** Returns `ApprovalRejected` error
 
-## v0.1 Limitations
+4. The agent polls `tasks/get` to retrieve the result
+
+## v0.2 Limitations
 
 | Limitation | Impact | Future |
 |------------|--------|--------|
-| **Blocking mode** | HTTP connection held during approval (may timeout) | v0.2: SEP-1686 async tasks |
-| **In-memory state** | Pending approvals lost on restart | v0.2: Redis persistence |
-| **Single upstream** | One MCP server per ThoughtGate instance | v0.2: Multi-upstream routing |
-| **Polling-based** | 5s delay to detect Slack reactions | v0.2: Slack Events API |
+| **In-memory state** | Pending tasks lost on pod restart | v0.3: Redis persistence |
+| **Single upstream** | One MCP server per ThoughtGate instance | v0.3: Multi-upstream routing |
+| **Polling-based** | ~5s delay to detect Slack reactions | v0.3: Slack Events API |
+| **No response inspection** | Cannot inspect/redact response content | v0.3: Amber path buffering |
 
 ## Observability
 
-### Prometheus Metrics
-
-```
-thoughtgate_requests_total{path="green|amber|red|approval"}
-thoughtgate_request_duration_seconds{path="..."}
-thoughtgate_approval_total{result="approved|rejected|timeout"}
-thoughtgate_upstream_requests_total{status="success|error|timeout"}
-thoughtgate_policy_evaluations_total{decision="green|amber|red|approval"}
-```
-
 ### Health Endpoints
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /health` | Liveness probe |
-| `GET /ready` | Readiness probe |
-| `GET /metrics` | Prometheus metrics |
+| Endpoint | Port | Purpose |
+|----------|------|---------|
+| `GET /health` | 7469 | Liveness probe |
+| `GET /ready` | 7469 | Readiness probe |
+| `GET /metrics` | 7469 | Prometheus metrics |
+
+### Prometheus Metrics
+
+ThoughtGate exposes standard Prometheus counters on the admin port:
+
+```
+thoughtgate_requests_total{action="forward|approve|deny"}
+thoughtgate_request_duration_seconds{quantile="0.5|0.95|0.99"}
+thoughtgate_approval_total{result="approved|rejected|timeout"}
+thoughtgate_tasks_active
+thoughtgate_upstream_requests_total{status="success|error|timeout"}
+```
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture overview |
-| [RFC-001](docs/rfcs/RFC-001_Traffic_Model_Architecture.md) | Traffic model design |
-| [REQ-CORE-*](specs/) | Core requirements (transport, streaming, errors) |
-| [REQ-POL-*](specs/) | Policy engine requirements |
-| [REQ-GOV-*](specs/) | Governance/approval requirements |
-| [IMPLEMENTATION_PLAYBOOK.md](docs/IMPLEMENTATION_PLAYBOOK.md) | Developer guide |
+- [Architecture Spec](specs/architecture.md) — System design and 4-Gate model
+- [Configuration Spec](specs/REQ-CFG-001_Configuration.md) — YAML schema reference
+- [Policy Engine Spec](specs/REQ-POL-001_Cedar_Policy_Engine.md) — Cedar integration
+- [Task Lifecycle Spec](specs/REQ-GOV-001_Task_Lifecycle.md) — SEP-1686 implementation
+- [Approval Integration Spec](specs/REQ-GOV-003_Approval_Integration.md) — Slack adapter
+
+## License
+
+Apache 2.0

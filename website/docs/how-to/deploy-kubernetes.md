@@ -13,6 +13,8 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: my-agent
+  labels:
+    app: my-agent  # Used for principal identity
 spec:
   containers:
     # Your AI agent
@@ -20,26 +22,28 @@ spec:
       image: my-agent:latest
       env:
         - name: MCP_SERVER_URL
-          value: "http://localhost:8080"  # Points to ThoughtGate
+          value: "http://localhost:7467"  # Points to ThoughtGate
 
     # ThoughtGate sidecar
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:latest
+      image: ghcr.io/thoughtgate/thoughtgate:v0.2.0
       ports:
-        - containerPort: 8080
+        - containerPort: 7467
           name: proxy
-        - containerPort: 8081
+        - containerPort: 7469
           name: admin
       env:
-        - name: THOUGHTGATE_UPSTREAM_URL
-          value: "http://mcp-server:3000"
-        - name: THOUGHTGATE_SLACK_BOT_TOKEN
+        - name: THOUGHTGATE_CONFIG
+          value: "/etc/thoughtgate/config.yaml"
+        - name: SLACK_BOT_TOKEN
           valueFrom:
             secretKeyRef:
               name: thoughtgate-secrets
               key: slack-token
-        - name: THOUGHTGATE_SLACK_CHANNEL
-          value: "#approvals"
+      volumeMounts:
+        - name: config
+          mountPath: /etc/thoughtgate
+          readOnly: true
       livenessProbe:
         httpGet:
           path: /health
@@ -59,6 +63,10 @@ spec:
         limits:
           memory: "100Mi"
           cpu: "200m"
+  volumes:
+    - name: config
+      configMap:
+        name: thoughtgate-config
 ```
 
 ## Create the Secret
@@ -68,56 +76,49 @@ kubectl create secret generic thoughtgate-secrets \
   --from-literal=slack-token=xoxb-your-token
 ```
 
-## ConfigMap for Policies
+## ConfigMap for Configuration
 
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: thoughtgate-policy
+  name: thoughtgate-config
 data:
-  policy.cedar: |
-    permit(
-        principal,
-        action == Action::"tools/list",
-        resource
-    );
+  config.yaml: |
+    schema: 1
 
-    permit(
-        principal,
-        action == Action::"tools/call",
-        resource
-    ) when {
-        resource.tool_name in ["delete_user", "drop_table"]
-    } advice {
-        "require_approval": true
-    };
+    sources:
+      - id: upstream
+        kind: mcp
+        url: http://mcp-server:3000
 
-    permit(
-        principal,
-        action == Action::"tools/call",
-        resource
-    );
+    governance:
+      defaults:
+        action: forward
+      rules:
+        - match: "delete_*"
+          action: approve
+        - match: "drop_*"
+          action: approve
+        - match: "admin_*"
+          action: deny
+
+    approval:
+      default:
+        adapter: slack
+        channel: "#approvals"
+        timeout: 5m
 ```
 
-Mount the ConfigMap:
+## Port Model
 
-```yaml
-containers:
-  - name: thoughtgate
-    # ...
-    env:
-      - name: THOUGHTGATE_CEDAR_POLICY_PATH
-        value: "/etc/thoughtgate/policy.cedar"
-    volumeMounts:
-      - name: policy
-        mountPath: /etc/thoughtgate
-        readOnly: true
-volumes:
-  - name: policy
-    configMap:
-      name: thoughtgate-policy
-```
+ThoughtGate uses an Envoy-inspired 3-port architecture:
+
+| Port | Name | Purpose |
+|------|------|---------|
+| 7467 | Outbound | Client requests → upstream (main proxy) |
+| 7468 | Inbound | Reserved for webhooks (v0.3+) |
+| 7469 | Admin | Health checks, metrics |
 
 ## Health Checks
 
@@ -127,6 +128,7 @@ ThoughtGate exposes health endpoints on the admin port:
 |----------|---------|----------|
 | `/health` | Liveness | Process is running |
 | `/ready` | Readiness | Ready to accept traffic |
+| `/metrics` | Prometheus | Observability |
 
 ## Resource Recommendations
 
@@ -141,13 +143,95 @@ ThoughtGate exposes health endpoints on the admin port:
 Expose Prometheus metrics:
 
 ```yaml
-annotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "8081"
-  prometheus.io/path: "/metrics"
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "7469"
+    prometheus.io/path: "/metrics"
 ```
+
+## Zero-Config Identity
+
+ThoughtGate automatically infers agent identity from Kubernetes pod labels using the [Downward API](https://kubernetes.io/docs/concepts/workloads/pods/downward-api/). No API keys or external identity providers required.
+
+### How It Works
+
+1. **Pod labels** (like `app: my-agent`) are exposed to ThoughtGate via a downwardAPI volume
+2. ThoughtGate reads labels at startup and uses them as the **principal** in Cedar policy evaluation
+3. Policies can then grant different permissions to different agents
+
+### Configuration
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-agent
+  labels:
+    app: my-agent           # Used as principal name
+    team: data-engineering  # Can be used in policies
+spec:
+  containers:
+    - name: thoughtgate
+      image: ghcr.io/thoughtgate/thoughtgate:v0.2.0
+      env:
+        - name: THOUGHTGATE_CONFIG
+          value: "/etc/thoughtgate/config.yaml"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+      volumeMounts:
+        - name: config
+          mountPath: /etc/thoughtgate
+        - name: podinfo
+          mountPath: /etc/podinfo
+          readOnly: true
+  volumes:
+    - name: podinfo
+      downwardAPI:
+        items:
+          - path: "labels"
+            fieldRef:
+              fieldPath: metadata.labels
+```
+
+### Using Identity in Cedar Policies
+
+The principal is constructed from pod labels:
+
+```cedar
+// Allow data-engineering team to use transfer tools
+permit(
+    principal == Agent::"data-engineering/my-agent",
+    action == Action::"Forward",
+    resource
+) when {
+    resource.tool_name like "transfer_*"
+};
+
+// Require approval for all other agents
+permit(
+    principal,
+    action == Action::"Approve",
+    resource
+) when {
+    resource.tool_name like "transfer_*"
+};
+```
+
+### Benefits
+
+- **No secrets to manage** — Identity comes from K8s metadata
+- **Tamper-proof** — Pods can't change their own labels
+- **Audit-friendly** — Identity tied to K8s RBAC
+- **Multi-tenant** — Different policies per agent/team
 
 ## Next Steps
 
 - Review the [Configuration Reference](/docs/reference/configuration)
-- Learn about [traffic tiers](/docs/explanation/traffic-tiers)
+- Learn about the [4-Gate architecture](/docs/explanation/architecture)

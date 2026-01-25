@@ -21,7 +21,7 @@ docker logs thoughtgate 2>&1 | grep -i upstream
 ```
 
 **Fix:**
-- Verify `THOUGHTGATE_UPSTREAM_URL` is correct
+- Verify the `url` in your config's `sources` section is correct
 - In Kubernetes, ensure the service DNS is resolvable
 - Check network policies aren't blocking traffic
 
@@ -37,7 +37,6 @@ time curl http://your-upstream:3000/health
 ```
 
 **Fix:**
-- Increase `THOUGHTGATE_REQUEST_TIMEOUT_SECS`
 - Check upstream server performance
 - For approval requests, check Slack connectivity
 
@@ -45,20 +44,20 @@ time curl http://your-upstream:3000/health
 
 ### Approval messages not appearing
 
-**Symptom:** Requests block but no Slack message appears.
+**Symptom:** Requests return task IDs but no Slack message appears.
 
 **Check:**
 
 ```bash
 # Verify token is set
-echo $THOUGHTGATE_SLACK_BOT_TOKEN | head -c 10
+echo $SLACK_BOT_TOKEN | head -c 10
 
 # Check ThoughtGate logs for Slack errors
 docker logs thoughtgate 2>&1 | grep -i slack
 ```
 
 **Fix:**
-- Verify the bot token has required scopes: `chat:write`, `reactions:read`, `channels:history`
+- Verify the bot token has required scopes: `chat:write`, `reactions:read`, `channels:history`, `users:read`
 - Ensure the bot is invited to the channel: `/invite @YourBot`
 - Check the channel name includes `#`
 
@@ -74,38 +73,44 @@ docker logs thoughtgate 2>&1 | grep -i slack
 - Re-add the bot to the channel
 - Verify the reaction is on the correct message (not a thread reply)
 
-## Policy Issues
+## Configuration Issues
 
-### All requests denied
+### "Config file not found"
 
-**Symptom:** Every request returns "Policy denied".
+**Symptom:** ThoughtGate fails to start with config error.
 
 **Check:**
 
 ```bash
-# Validate Cedar syntax
-cedar validate --policies policy.cedar
+# Verify THOUGHTGATE_CONFIG is set
+echo $THOUGHTGATE_CONFIG
+
+# Verify file exists
+ls -la $THOUGHTGATE_CONFIG
+```
+
+**Fix:**
+- Set the `THOUGHTGATE_CONFIG` environment variable
+- Ensure the file path is absolute or relative to working directory
+
+### All requests denied
+
+**Symptom:** Every request returns "denied" or policy error.
+
+**Check:**
+
+```bash
+# Validate YAML syntax
+cat $THOUGHTGATE_CONFIG | python -c "import sys, yaml; yaml.safe_load(sys.stdin)"
 
 # Check ThoughtGate logs
 docker logs thoughtgate 2>&1 | grep -i policy
 ```
 
 **Fix:**
-- Ensure you have a `permit` rule that matches
-- Check for syntax errors in the policy file
-- Verify the policy file path is correct
-
-### Policy not reloading
-
-**Symptom:** Changes to policy file aren't applied.
-
-**Check:**
-- File is readable by ThoughtGate
-- No syntax errors in the updated policy
-
-**Fix:**
-- Check logs for "Policy reloaded" or error messages
-- Restart ThoughtGate if hot reload fails
+- Ensure you have `governance.defaults.action: forward` if you want default allow
+- Check for YAML syntax errors
+- Verify glob patterns in rules match your tool names
 
 ## Performance Issues
 
@@ -117,13 +122,13 @@ docker logs thoughtgate 2>&1 | grep -i policy
 
 ```bash
 # Measure overhead
-time curl -X POST http://localhost:8080 -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+time curl -X POST http://localhost:7467 -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
 ```
 
 **Fix:**
-- Enable connection pooling (default)
-- Check if policy evaluation is slow (complex policies)
+- Check if upstream is slow
 - Ensure adequate CPU resources
+- Review if complex Cedar policies are enabled
 
 ### Memory growing
 
@@ -137,8 +142,7 @@ docker stats thoughtgate
 ```
 
 **Fix:**
-- Check for stale pending approvals (timeout them)
-- Verify no request body buffering issues
+- Check for stale pending tasks (they timeout automatically)
 - Report if consistently growing (may be a bug)
 
 ## Health Check Failures
@@ -150,7 +154,7 @@ docker stats thoughtgate
 **Check:**
 
 ```bash
-curl http://localhost:8081/health
+curl http://localhost:7469/health
 ```
 
 **Fix:**
@@ -164,12 +168,38 @@ curl http://localhost:8081/health
 **Check:**
 
 ```bash
-curl http://localhost:8081/ready
+curl http://localhost:7469/ready
 ```
 
 **Fix:**
 - Verify upstream is reachable
-- Check policy file is loaded
+- Check config file is loaded correctly
+
+## SEP-1686 Task Issues
+
+### Task not found
+
+**Symptom:** `tasks/get` returns "task not found" error.
+
+**Check:**
+- Verify the task ID format starts with `tg_`
+- Check if the task has expired
+
+**Fix:**
+- Tasks expire after the configured timeout (default 5 minutes)
+- In-memory state is lost on pod restart (v0.2 limitation)
+
+### Task stuck in "working" state
+
+**Symptom:** Task never transitions to completed/failed.
+
+**Check:**
+- Verify Slack message was posted
+- Check if reactions are being detected
+
+**Fix:**
+- Ensure `channels:history` scope is granted
+- Check Slack polling is working (see logs)
 
 ## Getting Help
 

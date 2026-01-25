@@ -55,8 +55,7 @@ ThoughtGate is a security boundary between AI agents and the tools they can acce
 |--------|------------|
 | Prompt injection | Policy enforcement, human approval |
 | Agent hallucination | Same as above |
-| Unauthorized actions | Cedar policy deny rules |
-| Sensitive data exfiltration | Amber tier inspection |
+| Unauthorized actions | Governance rules deny |
 | Runaway automation | Rate limiting, approval requirements |
 
 ### Threats NOT Mitigated
@@ -64,9 +63,9 @@ ThoughtGate is a security boundary between AI agents and the tools they can acce
 | Threat | Why | Recommendation |
 |--------|-----|----------------|
 | Compromised upstream | ThoughtGate trusts upstream responses | Secure your MCP servers |
-| Malicious policies | Policies are trusted configuration | Protect policy files |
-| Insider threat | Approvers can approve anything | Multi-approver support (planned) |
-| Network eavesdropping | ThoughtGate doesn't enforce TLS | Use service mesh or TLS termination |
+| Malicious policies | Policies are trusted configuration | Protect config files |
+| Insider threat | Approvers can approve anything | Multi-approver (planned) |
+| Network eavesdropping | No built-in TLS | Use service mesh |
 
 ## Security Properties
 
@@ -77,7 +76,7 @@ If ThoughtGate cannot evaluate a request, it **denies** rather than allows:
 - Policy parse error → Deny
 - Policy evaluation error → Deny
 - Unknown action → Deny
-- No matching policy → Deny
+- No matching rule → Uses `defaults.action`
 
 ### 2. Policy Immutability
 
@@ -87,7 +86,7 @@ Policies cannot be modified by:
 - Slack messages
 
 Policies only change when:
-- The policy file on disk changes
+- The config file on disk changes
 - ThoughtGate restarts with a new file
 
 ### 3. Approval Independence
@@ -102,7 +101,7 @@ Approval decisions are made by humans through Slack, completely independent of:
 All decisions are logged:
 - Request details (method, tool name)
 - Policy evaluation result
-- Tier classification
+- Action taken
 - Approval outcome (if applicable)
 - Timing information
 
@@ -116,9 +115,9 @@ spec:
   containers:
     - name: thoughtgate
       ports:
-        - containerPort: 8080  # Proxy: localhost only
+        - containerPort: 7467  # Proxy: localhost only
           name: proxy
-        - containerPort: 8081  # Admin: internal network
+        - containerPort: 7469  # Admin: internal network
           name: admin
 ```
 
@@ -127,19 +126,19 @@ spec:
 ```yaml
 # Use Kubernetes secrets for Slack token
 env:
-  - name: THOUGHTGATE_SLACK_BOT_TOKEN
+  - name: SLACK_BOT_TOKEN
     valueFrom:
       secretKeyRef:
         name: thoughtgate-secrets
         key: slack-token
 ```
 
-### Policy Protection
+### Config Protection
 
 ```yaml
-# Mount policy as read-only
+# Mount config as read-only
 volumeMounts:
-  - name: policy
+  - name: config
     mountPath: /etc/thoughtgate
     readOnly: true
 ```
@@ -154,7 +153,8 @@ Minimize permissions:
 |-------|----------|---------|
 | `chat:write` | Yes | Post approval messages |
 | `reactions:read` | Yes | Detect approval reactions |
-| `channels:history` | Yes | Read reactions on messages |
+| `channels:history` | Yes | Poll for reactions |
+| `users:read` | Optional | Resolve display names |
 
 ### Channel Security
 
@@ -179,7 +179,7 @@ Currently, any user who can react to messages can approve. Planned improvements:
 - [ ] Use private Slack channel
 - [ ] Rotate Slack token regularly
 - [ ] Monitor approval patterns
-- [ ] Alert on policy load failures
+- [ ] Alert on config load failures
 - [ ] Enable structured logging
 - [ ] Use TLS for all network traffic
 
@@ -197,7 +197,7 @@ spec:
     fsGroup: 1000
   containers:
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:latest
+      image: ghcr.io/thoughtgate/thoughtgate:v0.2.0
       securityContext:
         readOnlyRootFilesystem: true
         allowPrivilegeEscalation: false
@@ -209,17 +209,19 @@ spec:
           memory: "100Mi"
           cpu: "200m"
       env:
-        - name: THOUGHTGATE_SLACK_BOT_TOKEN
+        - name: THOUGHTGATE_CONFIG
+          value: "/etc/thoughtgate/config.yaml"
+        - name: SLACK_BOT_TOKEN
           valueFrom:
             secretKeyRef:
               name: thoughtgate-secrets
               key: slack-token
       volumeMounts:
-        - name: policy
+        - name: config
           mountPath: /etc/thoughtgate
           readOnly: true
   volumes:
-    - name: policy
+    - name: config
       configMap:
-        name: thoughtgate-policy
+        name: thoughtgate-config
 ```

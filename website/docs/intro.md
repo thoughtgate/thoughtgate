@@ -5,33 +5,37 @@ slug: /
 
 # Introduction
 
-ThoughtGate is a sidecar proxy that intercepts MCP (Model Context Protocol) tool calls and routes them through policy-based approval workflows before execution. It ensures AI agents can't perform sensitive operations without human oversight.
+ThoughtGate is a high-performance Rust sidecar that acts as a governance layer for AI agents. It intercepts MCP (Model Context Protocol) tool calls and enforces human approval workflows without modifying your agent's code.
+
+Unlike framework-specific solutions like LangChain's `interrupt()`, ThoughtGate can govern closed-source vendor agents and doesn't require application code changes.
 
 ## What ThoughtGate Does
 
 ```
 ┌─────────────┐     ┌─────────────────────────────────────┐     ┌─────────────┐
 │  AI Agent   │────▶│           ThoughtGate               │────▶│  MCP Server │
-│  (Claude,   │◀────│  • Policy evaluation (Cedar)        │◀────│  (Tools)    │
-│   GPT, etc) │     │  • Approval workflows (Slack)       │     │             │
-└─────────────┘     │  • Traffic classification           │     └─────────────┘
+│  (Claude,   │◀────│  • YAML governance rules            │◀────│  (Tools)    │
+│   GPT, etc) │     │  • Cedar policy engine              │     │             │
+└─────────────┘     │  • Slack approval workflows         │     └─────────────┘
+                    │  • SEP-1686 async tasks             │
                     └─────────────────────────────────────┘
 ```
 
 When an AI agent attempts to call a tool, ThoughtGate:
 
-1. **Evaluates the request** against Cedar policies
-2. **Classifies the traffic** into Green, Amber, or Red tiers
-3. **Routes appropriately** — forward immediately, inspect first, require approval, or deny
+1. **Evaluates the request** through a 4-Gate decision model
+2. **Routes appropriately** — forward immediately, require approval, or deny
+3. **Manages async tasks** using the SEP-1686 protocol for long-running approvals
 4. **Maintains audit trails** of all decisions and outcomes
 
 ## Key Features
 
 | Feature | Description |
 |---------|-------------|
-| **Cedar Policies** | Flexible policy language for defining approval rules |
-| **Traffic Tiers** | Green (pass-through), Amber (inspect), Red (deny/approve) |
-| **Slack Approvals** | Human-in-the-loop approval via Slack reactions |
+| **YAML Governance Rules** | Simple glob-based routing for quick setup |
+| **Cedar Policies** | AWS Cedar engine for complex access control |
+| **Async Approvals** | SEP-1686 task-based approval flow (non-blocking) |
+| **Slack Integration** | Human-in-the-loop approval via Slack reactions |
 | **Low Overhead** | < 2ms p50 latency, < 20MB memory footprint |
 
 ## Quick Links

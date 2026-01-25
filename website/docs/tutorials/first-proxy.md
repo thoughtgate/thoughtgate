@@ -4,14 +4,14 @@ sidebar_position: 1
 
 # Your First ThoughtGate Proxy
 
-In this tutorial, you'll set up ThoughtGate to proxy requests between an AI agent and an MCP server, with a simple policy that requires approval for destructive operations.
+In this tutorial, you'll set up ThoughtGate to proxy requests between an AI agent and an MCP server, with governance rules that require approval for destructive operations.
 
 ## What You'll Learn
 
 - How to run ThoughtGate as a proxy
-- How to write a basic Cedar policy
+- How to write YAML governance rules
 - How to configure Slack approvals
-- How to test the approval workflow
+- How the SEP-1686 task flow works
 
 ## Prerequisites
 
@@ -42,41 +42,46 @@ cargo build --release --features mock
 
 This server responds to MCP tool calls with mock data.
 
-## Step 3: Write a Cedar Policy
+## Step 3: Create a Configuration File
 
-Create a file `policy.cedar` with a simple policy:
+Create `thoughtgate.yaml` with governance rules:
 
-```cedar
-// Allow all tools/list requests
-permit(
-    principal,
-    action == Action::"tools/list",
-    resource
-);
+```yaml
+schema: 1
 
-// Allow tools/call but require approval for destructive operations
-permit(
-    principal,
-    action == Action::"tools/call",
-    resource
-) when {
-    resource.tool_name in ["delete_user", "drop_table", "send_email"]
-} advice {
-    "require_approval": true
-};
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://localhost:3000
 
-// Allow all other tools/call requests
-permit(
-    principal,
-    action == Action::"tools/call",
-    resource
-);
+governance:
+  defaults:
+    action: forward  # Allow by default
+  rules:
+    # Require approval for destructive operations
+    - match: "delete_*"
+      action: approve
+    - match: "drop_*"
+      action: approve
+    # Block admin tools entirely
+    - match: "admin_*"
+      action: deny
+
+approval:
+  default:
+    adapter: slack
+    channel: "#thoughtgate-approvals"
+    timeout: 5m
 ```
 
 ## Step 4: Configure Slack Integration
 
 1. Create a Slack app at [api.slack.com/apps](https://api.slack.com/apps)
-2. Add Bot Token Scopes: `chat:write`, `reactions:read`, `channels:history`
+2. Add Bot Token Scopes:
+   - `chat:write` — Post approval messages
+   - `reactions:read` — Detect approval reactions
+   - `channels:history` — Poll channel for reactions
+   - `users:read` — Resolve user display names
 3. Install to your workspace
 4. Copy the Bot OAuth Token
 5. Create a channel for approvals (e.g., `#thoughtgate-approvals`)
@@ -87,12 +92,8 @@ permit(
 Set environment variables and start the proxy:
 
 ```bash
-export THOUGHTGATE_UPSTREAM_URL=http://localhost:3000
-export THOUGHTGATE_OUTBOUND_PORT=8080
-export THOUGHTGATE_ADMIN_PORT=8081
-export THOUGHTGATE_CEDAR_POLICY_PATH=./policy.cedar
-export THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-token
-export THOUGHTGATE_SLACK_CHANNEL="#thoughtgate-approvals"
+export THOUGHTGATE_CONFIG=./thoughtgate.yaml
+export SLACK_BOT_TOKEN=xoxb-your-token
 
 ./target/release/thoughtgate
 ```
@@ -100,25 +101,25 @@ export THOUGHTGATE_SLACK_CHANNEL="#thoughtgate-approvals"
 You should see:
 
 ```
-ThoughtGate listening on 0.0.0.0:8080
-Admin server on 0.0.0.0:8081
+ThoughtGate listening on 0.0.0.0:7467
+Admin server on 0.0.0.0:7469
 Upstream: http://localhost:3000
 ```
 
 ## Step 6: Test the Proxy
 
-Send a tools/list request (should pass through):
+Send a `tools/list` request (should pass through):
 
 ```bash
-curl -X POST http://localhost:8080 \
+curl -X POST http://localhost:7467 \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc": "2.0", "method": "tools/list", "id": 1}'
 ```
 
-Send a safe tools/call request (should pass through):
+Send a safe `tools/call` request (should pass through):
 
 ```bash
-curl -X POST http://localhost:8080 \
+curl -X POST http://localhost:7467 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -130,10 +131,10 @@ curl -X POST http://localhost:8080 \
 
 ## Step 7: Trigger an Approval
 
-Send a destructive tools/call request:
+Send a destructive `tools/call` request:
 
 ```bash
-curl -X POST http://localhost:8080 \
+curl -X POST http://localhost:7467 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -143,32 +144,102 @@ curl -X POST http://localhost:8080 \
   }'
 ```
 
-This request will block while waiting for approval.
+With SEP-1686 async tasks, you'll receive a task ID immediately:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "taskId": "tg_abc123xyz",
+    "status": "working"
+  },
+  "id": 3
+}
+```
 
 Check your Slack channel — you should see a message like:
 
 ```
-🔔 Approval Required
+🔒 Approval Required: delete_user
 
 Tool: delete_user
-Arguments: {"user_id": "12345"}
+Principal: unknown
+Arguments:
+{
+  "user_id": "12345"
+}
 
-React 👍 to approve or 👎 to reject
+React with 👍 to approve or 👎 to reject
+
+Task ID: tg_abc123xyz • Expires: 2024-01-15 10:30 UTC
 ```
 
-React with 👍 to approve the request. The curl command will complete with the response.
+## Step 8: Poll for the Result
 
-## Step 8: Verify Health
-
-Check the health endpoints:
+The agent polls for the result using `tasks/get`:
 
 ```bash
-curl http://localhost:8081/health
-curl http://localhost:8081/ready
+curl -X POST http://localhost:7467 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tasks/get",
+    "params": {"taskId": "tg_abc123xyz"},
+    "id": 4
+  }'
+```
+
+While waiting for approval:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "taskId": "tg_abc123xyz",
+    "status": "working",
+    "statusMessage": "Waiting for human approval"
+  },
+  "id": 4
+}
+```
+
+React with 👍 in Slack, then poll again:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "taskId": "tg_abc123xyz",
+    "status": "completed"
+  },
+  "id": 4
+}
+```
+
+Then fetch the result with `tasks/result`:
+
+```bash
+curl -X POST http://localhost:7467 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tasks/result",
+    "params": {"taskId": "tg_abc123xyz"},
+    "id": 5
+  }'
+```
+
+## Step 9: Verify Health
+
+Check the health endpoints on the admin port:
+
+```bash
+curl http://localhost:7469/health
+curl http://localhost:7469/ready
 ```
 
 ## What's Next?
 
 - Learn how to [write more complex policies](/docs/how-to/write-policies)
-- Understand [traffic tiers](/docs/explanation/traffic-tiers) in depth
+- Understand the [4-Gate architecture](/docs/explanation/architecture)
 - [Deploy to Kubernetes](/docs/how-to/deploy-kubernetes) for production
