@@ -79,7 +79,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # serde-saphyr is a panic-free YAML parser built on Saphyr
 # Replaces deprecated serde_yaml and unsound serde_yml
-serde-saphyr = "0.0.15"
+serde-saphyr = "0.0.16"
 
 # Configuration (REQ-CFG-001)
 glob = "0.3"
