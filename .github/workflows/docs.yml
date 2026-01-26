@@ -69,7 +69,7 @@ jobs:
 
       - name: Upload pages artifact (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: website/build
 
