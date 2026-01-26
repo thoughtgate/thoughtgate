@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use thoughtgate::governance::{
     ApprovalDecision, FailureInfo, FailureStage, Principal, TaskId, TaskStatus, TaskStore,
-    TaskStoreConfig, ToolCallRequest, ToolCallResult,
+    TaskStoreConfig, TimeoutAction, ToolCallRequest, ToolCallResult,
 };
 
 /// Fuzz input for task lifecycle testing
@@ -139,6 +139,7 @@ async fn fuzz_task_lifecycle(input: FuzzTaskInput) {
             tool_call.clone(),
             principal.clone(),
             Some(Duration::from_secs(600)),
+            TimeoutAction::Deny,
         ) {
             task_ids.push(task.id.clone());
         }
@@ -160,6 +161,7 @@ async fn fuzz_task_lifecycle(input: FuzzTaskInput) {
                     tool_call.clone(),
                     principal.clone(),
                     Some(Duration::from_secs(600)),
+                    TimeoutAction::Deny,
                 ) {
                     task_ids.push(task.id.clone());
                 }
