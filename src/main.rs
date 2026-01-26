@@ -220,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handler = McpHandler::with_governance(
             upstream,
             cedar_engine,
-            task_handler.task_store(), // Share TaskStore with ApprovalEngine
+            task_handler.shared_store(), // Share TaskStore with ApprovalEngine
             McpHandlerConfig::from_env(),
             Some(Arc::new(config.clone())),
             approval_engine,

@@ -40,17 +40,23 @@ impl TaskHandler {
     }
 
     /// Returns a reference to the underlying task store.
+    ///
+    /// Use this when you need temporary read access to the store.
+    /// For shared ownership, use [`shared_store()`](Self::shared_store) instead.
     #[must_use]
     pub fn store(&self) -> &TaskStore {
         &self.store
     }
 
-    /// Returns a clone of the underlying task store Arc.
+    /// Returns a clone of the underlying task store Arc for shared ownership.
     ///
     /// This is a cheap operation (Arc clone) and is safe to call frequently.
     /// The returned Arc shares ownership with the internal store.
+    ///
+    /// Use this when another component needs to share access to the same
+    /// TaskStore (e.g., ApprovalEngine needs shared access).
     #[must_use]
-    pub fn task_store(&self) -> Arc<TaskStore> {
+    pub fn shared_store(&self) -> Arc<TaskStore> {
         self.store.clone()
     }
 
