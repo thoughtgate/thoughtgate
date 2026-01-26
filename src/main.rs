@@ -65,8 +65,9 @@ struct Config {
     #[arg(long, env = "UPSTREAM_URL")]
     upstream_url: Option<String>,
 
-    /// Path to YAML configuration file for governance
-    /// When set, enables MCP governance with Cedar policies and approval workflows
+    /// Path to YAML configuration file for governance.
+    /// Enables the 4-gate governance model (visibility, rules, Cedar policy, approval).
+    /// If not specified, searches: THOUGHTGATE_CONFIG env, /etc/thoughtgate/config.yaml, ./config.yaml
     #[arg(long, env = "THOUGHTGATE_CONFIG")]
     config: Option<PathBuf>,
 }
@@ -177,7 +178,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let yaml_config: Option<config::Config> = if let Some(ref path) = cli_config.config {
         let path_display = path.display().to_string();
         info!(path = %path_display, "Loading configuration file");
-        let (config, _warnings) = load_and_validate(path, Version::V0_2)?;
+        let (config, result) = load_and_validate(path, Version::V0_2)?;
+        for warning in &result.warnings {
+            warn!(warning = %warning, "Configuration warning");
+        }
         Some(config)
     } else {
         // Try to find config in default locations
@@ -185,7 +189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(found_path) => {
                 let path_display = found_path.display().to_string();
                 info!(path = %path_display, "Found configuration file");
-                let (config, _warnings) = load_and_validate(&found_path, Version::V0_2)?;
+                let (config, result) = load_and_validate(&found_path, Version::V0_2)?;
+                for warning in &result.warnings {
+                    warn!(warning = %warning, "Configuration warning");
+                }
                 Some(config)
             }
             Err(_) => {
@@ -198,7 +205,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create MCP handler with governance if config exists
     let mcp_handler: Option<Arc<McpHandler>> = if let Some(ref config) = yaml_config {
         // Create upstream client for MCP handler
-        let upstream_config = UpstreamConfig::from_env()?;
+        let upstream_config = UpstreamConfig::from_env().map_err(|e| {
+            format!("MCP governance requires THOUGHTGATE_UPSTREAM environment variable: {e}")
+        })?;
         let upstream = Arc::new(UpstreamClient::new(upstream_config)?);
 
         // Create governance components (TaskHandler, CedarEngine, ApprovalEngine)
@@ -225,6 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Some(Arc::new(handler))
     } else {
+        info!("MCP governance disabled (no config file)");
         None
     };
 

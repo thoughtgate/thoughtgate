@@ -304,6 +304,7 @@ impl McpHandler {
     ///
     /// # Traceability
     /// - Implements: REQ-GOV-002 (Governance Pipeline)
+    #[must_use]
     pub fn with_governance(
         upstream: Arc<dyn UpstreamForwarder>,
         cedar_engine: Arc<CedarEngine>,

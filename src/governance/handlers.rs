@@ -46,6 +46,9 @@ impl TaskHandler {
     }
 
     /// Returns a clone of the underlying task store Arc.
+    ///
+    /// This is a cheap operation (Arc clone) and is safe to call frequently.
+    /// The returned Arc shares ownership with the internal store.
     #[must_use]
     pub fn task_store(&self) -> Arc<TaskStore> {
         self.store.clone()
