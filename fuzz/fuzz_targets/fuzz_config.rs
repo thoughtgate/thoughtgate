@@ -237,11 +237,14 @@ fn test_env_substitution(yaml_bytes: &[u8], env_vars: &[(Vec<u8>, Vec<u8>)]) {
     // Limit env var count to prevent issues
     for (key, value) in env_vars.iter().take(10) {
         let key_str = sanitize_env_var_name(key);
-        let value_str = String::from_utf8_lossy(value);
+        let value_str = sanitize_env_var_value(value);
 
         if !key_str.is_empty() {
             // Set env var (this is safe in fuzz tests)
-            std::env::set_var(&key_str, value_str.as_ref());
+            // SAFETY: Fuzz test environment with controlled access
+            unsafe {
+                std::env::set_var(&key_str, &value_str);
+            }
         }
     }
 
@@ -254,7 +257,10 @@ fn test_env_substitution(yaml_bytes: &[u8], env_vars: &[(Vec<u8>, Vec<u8>)]) {
     for (key, _) in env_vars.iter().take(10) {
         let key_str = sanitize_env_var_name(key);
         if !key_str.is_empty() {
-            std::env::remove_var(&key_str);
+            // SAFETY: Fuzz test environment with controlled access
+            unsafe {
+                std::env::remove_var(&key_str);
+            }
         }
     }
 }
@@ -303,10 +309,21 @@ fn sanitize_yaml_string(bytes: &[u8], max_len: usize) -> String {
 /// Sanitize an environment variable name
 fn sanitize_env_var_name(bytes: &[u8]) -> String {
     // Env var names should be UPPER_CASE with underscores
+    // Must also not contain NUL bytes
     String::from_utf8_lossy(bytes)
         .chars()
         .take(64)
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect::<String>()
         .to_uppercase()
+}
+
+/// Sanitize an environment variable value
+fn sanitize_env_var_value(bytes: &[u8]) -> String {
+    // Env var values cannot contain NUL bytes (\0)
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .take(256)
+        .filter(|c| *c != '\0')
+        .collect()
 }
