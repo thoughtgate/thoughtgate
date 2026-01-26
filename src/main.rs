@@ -20,20 +20,25 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thoughtgate::admin::AdminServer;
+use thoughtgate::config::{self, Version, find_config_file, load_and_validate};
 use thoughtgate::error::ProxyError;
 use thoughtgate::lifecycle::{DrainResult, LifecycleConfig, LifecycleManager};
 use thoughtgate::logging_layer::LoggingLayer;
 use thoughtgate::ports::{admin_port, inbound_port, outbound_port};
 use thoughtgate::proxy_config::ProxyConfig;
 use thoughtgate::proxy_service::ProxyService;
+use thoughtgate::transport::{
+    McpHandler, McpHandlerConfig, UpstreamClient, UpstreamConfig, create_governance_components,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Configuration for the proxy server.
 ///
@@ -59,6 +64,11 @@ struct Config {
     /// When set, all requests are forwarded to this upstream instead of using the request's target
     #[arg(long, env = "UPSTREAM_URL")]
     upstream_url: Option<String>,
+
+    /// Path to YAML configuration file for governance
+    /// When set, enables MCP governance with Cedar policies and approval workflows
+    #[arg(long, env = "THOUGHTGATE_CONFIG")]
+    config: Option<PathBuf>,
 }
 
 /// Main entry point for the ThoughtGate proxy.
@@ -162,11 +172,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ThoughtGate Proxy starting (Envoy-style 3-port model)"
     );
 
-    // Phase 6: Create proxy service
-    let proxy_service = Arc::new(ProxyService::new_with_config(
-        cli_config.upstream_url.clone(),
-        proxy_config.clone(),
-    )?);
+    // Phase 6: Load YAML config and create governance components
+    // Implements: REQ-GOV-002 (Governance Pipeline)
+    let yaml_config: Option<config::Config> = if let Some(ref path) = cli_config.config {
+        let path_display = path.display().to_string();
+        info!(path = %path_display, "Loading configuration file");
+        let (config, _warnings) = load_and_validate(path, Version::V0_2)?;
+        Some(config)
+    } else {
+        // Try to find config in default locations
+        match find_config_file(None) {
+            Ok(found_path) => {
+                let path_display = found_path.display().to_string();
+                info!(path = %path_display, "Found configuration file");
+                let (config, _warnings) = load_and_validate(&found_path, Version::V0_2)?;
+                Some(config)
+            }
+            Err(_) => {
+                debug!("No configuration file found, using passthrough mode");
+                None
+            }
+        }
+    };
+
+    // Create MCP handler with governance if config exists
+    let mcp_handler: Option<Arc<McpHandler>> = if let Some(ref config) = yaml_config {
+        // Create upstream client for MCP handler
+        let upstream_config = UpstreamConfig::from_env()?;
+        let upstream = Arc::new(UpstreamClient::new(upstream_config)?);
+
+        // Create governance components (TaskHandler, CedarEngine, ApprovalEngine)
+        // IMPORTANT: The TaskHandler contains the shared TaskStore that ApprovalEngine uses
+        let (task_handler, cedar_engine, approval_engine) =
+            create_governance_components(upstream.clone(), Some(config), shutdown.clone())?;
+
+        // Create MCP handler with full governance
+        // Use the same TaskStore that ApprovalEngine uses for task coordination
+        let handler = McpHandler::with_governance(
+            upstream,
+            cedar_engine,
+            task_handler.task_store(), // Share TaskStore with ApprovalEngine
+            McpHandlerConfig::from_env(),
+            Some(Arc::new(config.clone())),
+            approval_engine,
+        );
+
+        info!(
+            requires_approval = config.requires_approval_engine(),
+            rules_count = config.governance.rules.len(),
+            "MCP governance enabled (4-gate model)"
+        );
+
+        Some(Arc::new(handler))
+    } else {
+        None
+    };
+
+    // Phase 7: Create proxy service
+    let mut proxy_service =
+        ProxyService::new_with_config(cli_config.upstream_url.clone(), proxy_config.clone())?;
+
+    // Wire MCP handler if governance is enabled
+    if let Some(handler) = mcp_handler {
+        proxy_service = proxy_service.with_mcp_handler(handler);
+    }
+
+    let proxy_service = Arc::new(proxy_service);
     let service_stack = ServiceBuilder::new()
         .layer(LoggingLayer)
         .service(proxy_service.as_ref().clone());
@@ -180,7 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Semaphore for concurrency limiting (REQ-CORE-001 Section 3.2)
     let semaphore = Arc::new(Semaphore::new(proxy_config.max_concurrent_streams));
 
-    // Phase 7: Upstream connectivity check and health checker
+    // Phase 8: Upstream connectivity check and health checker
     // Implements: REQ-CORE-005/F-001.4, F-008
     let health_check_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

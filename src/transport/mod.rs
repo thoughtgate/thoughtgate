@@ -33,5 +33,8 @@ pub use jsonrpc::{
     BatchItem, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpRequest, ParsedRequests, TaskMetadata,
 };
 pub use router::{McpRouter, RouteTarget, TaskMethod};
-pub use server::{McpHandler, McpHandlerConfig, McpServer, McpServerConfig, McpState};
+pub use server::{
+    McpHandler, McpHandlerConfig, McpServer, McpServerConfig, McpState,
+    create_governance_components,
+};
 pub use upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};

@@ -45,6 +45,12 @@ impl TaskHandler {
         &self.store
     }
 
+    /// Returns a clone of the underlying task store Arc.
+    #[must_use]
+    pub fn task_store(&self) -> Arc<TaskStore> {
+        self.store.clone()
+    }
+
     // ========================================================================
     // tasks/get
     // ========================================================================

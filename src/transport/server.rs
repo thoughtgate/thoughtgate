@@ -284,6 +284,52 @@ impl McpHandler {
         Self { state }
     }
 
+    /// Create a new MCP handler with full 4-gate governance stack.
+    ///
+    /// This constructor is used when wiring governance into `ProxyService` in `main.rs`.
+    /// It accepts pre-built governance components from `create_governance_components()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `upstream` - Upstream forwarder for proxying requests
+    /// * `cedar_engine` - Cedar policy engine (Gate 3)
+    /// * `task_store` - Task store for SEP-1686 task methods
+    /// * `handler_config` - Handler configuration (body size, concurrency)
+    /// * `yaml_config` - Optional YAML configuration (Gates 1 & 2)
+    /// * `approval_engine` - Optional approval engine (Gate 4)
+    ///
+    /// # Returns
+    ///
+    /// A new McpHandler with full governance wiring.
+    ///
+    /// # Traceability
+    /// - Implements: REQ-GOV-002 (Governance Pipeline)
+    pub fn with_governance(
+        upstream: Arc<dyn UpstreamForwarder>,
+        cedar_engine: Arc<CedarEngine>,
+        task_store: Arc<TaskStore>,
+        handler_config: McpHandlerConfig,
+        yaml_config: Option<Arc<Config>>,
+        approval_engine: Option<Arc<ApprovalEngine>>,
+    ) -> Self {
+        let task_handler = TaskHandler::new(task_store);
+        let semaphore = Arc::new(Semaphore::new(handler_config.max_concurrent_requests));
+
+        let state = Arc::new(McpState {
+            upstream,
+            router: McpRouter::new(),
+            task_handler,
+            cedar_engine,
+            config: yaml_config,
+            approval_engine,
+            semaphore,
+            max_body_size: handler_config.max_body_size,
+            capability_cache: Arc::new(CapabilityCache::new()),
+        });
+
+        Self { state }
+    }
+
     /// Get the maximum body size.
     pub fn max_body_size(&self) -> usize {
         self.state.max_body_size
@@ -365,7 +411,7 @@ pub struct McpServer {
 ///
 /// Tuple of (TaskHandler, CedarEngine, optional ApprovalEngine)
 #[allow(clippy::type_complexity)]
-fn create_governance_components(
+pub fn create_governance_components(
     upstream: Arc<dyn UpstreamForwarder>,
     config: Option<&Config>,
     shutdown: CancellationToken,
