@@ -663,7 +663,7 @@ fn test_config_with_approval_parsing() {
         config
             .approval
             .as_ref()
-            .map_or(false, |a| a.contains_key("default"))
+            .is_some_and(|a| a.contains_key("default"))
     );
 
     unsafe {

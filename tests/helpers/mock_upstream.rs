@@ -2,6 +2,11 @@
 //!
 //! Provides a configurable mock server that responds to JSON-RPC requests
 //! with preconfigured responses, delays, and failures.
+//!
+//! Note: Some methods are provided for future test expansion and may not
+//! be used yet. They are marked with `#[allow(dead_code)]`.
+
+#![allow(dead_code)]
 
 use axum::{
     Router,

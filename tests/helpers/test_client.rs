@@ -1,6 +1,11 @@
 //! JSON-RPC test client for integration testing.
 //!
 //! Provides a high-level client for making MCP requests to ThoughtGate.
+//!
+//! Note: Some methods are provided for future test expansion and may not
+//! be used yet. They are marked with `#[allow(dead_code)]`.
+
+#![allow(dead_code)]
 
 use reqwest::Client;
 use serde_json::{Value, json};

@@ -1,6 +1,11 @@
 //! Test fixtures and data builders for integration testing.
 //!
 //! Provides common test data and configuration builders.
+//!
+//! Note: Some functions are provided for future test expansion and may not
+//! be used yet. They are marked with `#[allow(dead_code)]`.
+
+#![allow(dead_code)]
 
 use serde_json::{Value, json};
 use std::time::Duration;
