@@ -9,6 +9,10 @@
 //! - Implements: REQ-OBS-001 M-TTFB-001 (Time to first byte)
 //! - Implements: REQ-OBS-001 M-OH-001 (Proxy overhead measurement)
 //!
+//! # Metrics
+//! - `overhead/direct_baseline`: Direct to mock MCP (baseline for overhead calculation)
+//! - `ttfb/proxied`: Through ThoughtGate proxy (measures TTFB, enables overhead calc)
+//!
 //! # Prerequisites
 //!
 //! Both binaries must be built before running:
@@ -123,10 +127,11 @@ fn bench_ttfb(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     group.sample_size(100);
 
-    // Benchmark direct connection to mock MCP (baseline)
+    // Benchmark direct connection to mock MCP (baseline for overhead calculation)
+    // REQ-OBS-001 M-OH-001: Measures baseline latency for overhead calculation
     let mock_url = format!("http://127.0.0.1:{}/mcp/v1", env.mock_port);
     let payload_for_direct = mcp_payload.clone();
-    group.bench_function("direct_baseline", |b| {
+    group.bench_function("overhead/direct_baseline", |b| {
         b.to_async(&rt).iter(|| {
             let client = client.clone();
             let url = mock_url.clone();
@@ -136,8 +141,10 @@ fn bench_ttfb(c: &mut Criterion) {
     });
 
     // Benchmark through ThoughtGate proxy
+    // REQ-OBS-001 M-TTFB-001: Time to first byte through proxy (target: p95 < 10ms)
+    // REQ-OBS-001 M-OH-001: Proxy overhead = proxied - direct (target: < 2ms)
     let proxy_url = format!("http://127.0.0.1:{}/mcp/v1", env.proxy_port);
-    group.bench_function("proxied_thoughtgate", |b| {
+    group.bench_function("ttfb/proxied", |b| {
         b.to_async(&rt).iter(|| {
             let client = client.clone();
             let url = proxy_url.clone();

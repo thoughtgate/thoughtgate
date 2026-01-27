@@ -74,9 +74,9 @@ The system must:
 | M-MEM-001 | `memory/idle_rss` | bytes | < 20 MB | `/proc/<pid>/status` VmRSS at idle | "Low footprint" claim |
 | M-LAT-001 | `latency/p50` | ms | < 5 ms | k6 `http_req_duration` | Typical request latency |
 | M-LAT-002 | `latency/p95` | ms | < 15 ms | k6 `http_req_duration` | Tail latency |
-| M-TTFB-001 | `ttfb/p95` | ms | < 10 ms | k6 `http_req_waiting` | Time to first byte (REQ-CORE-001) |
+| M-TTFB-001 | `ttfb/proxied` | ms | < 10 ms | Criterion + k6 `http_req_waiting` | Time to first byte through proxy |
 | M-TP-001 | `throughput/rps_10vu` | req/s | > 10,000 | k6 `http_reqs` rate | Capacity claim |
-| M-OH-001 | `overhead/latency_p50` | ms | < 2 ms | `proxy_p50 - direct_p50` | "Minimal overhead" claim |
+| M-OH-001 | `overhead/direct_baseline` | ms | < 2 ms | Criterion (proxy - direct) | "Minimal overhead" baseline |
 
 ### 5.2 Tier 2: Should Have (Operational Insights)
 
@@ -88,7 +88,7 @@ The system must:
 | M-CPU-001 | `cpu/idle_percent` | % | < 1% | `/proc/<pid>/stat` at idle | Sidecar baseline CPU |
 | M-CPU-002 | `cpu/under_load_percent` | % | < 50% | `/proc/<pid>/stat` during k6 | K8s scheduling headroom |
 | M-LAT-003 | `latency/p99` | ms | < 50 ms | k6 `http_req_duration` | Worst-case tail |
-| M-POL-001 | `policy/eval_p50` | µs | < 100 µs | Criterion micro-benchmark | Per-request policy cost |
+| M-POL-001 | `policy/eval_v2` | µs | < 100 µs | Criterion `policy/eval_v2` | Per-request policy cost (v0.2 API) |
 | M-TP-002 | `throughput/rps_constrained` | req/s | > 5,000 | k6 with `--cpus 0.5 --memory 128m` | Sidecar-realistic capacity |
 | M-MEM-004 | `memory/constrained_rss` | bytes | < 100 MB | RSS under constrained test | Validates sidecar limits |
 
@@ -103,7 +103,7 @@ The system must:
 | M-MEM-003 | `memory/peak_rss` | bytes | < 150 MB | Peak RSS during test | Worst-case memory |
 | M-START-002 | `startup/policy_load` | ms | < 50 ms | Measure Cedar load time | Config reload speed |
 | M-POL-002 | `policy/eval_p99` | µs | < 500 µs | Criterion micro-benchmark | Policy tail latency |
-| M-POL-003 | `policy/reload_time` | ms | < 100 ms | Measure hot-reload | Zero-downtime updates |
+| M-POL-003 | `policy/reload` | ms | < 100 ms | Criterion `policy/reload` | Zero-downtime updates |
 | M-OH-002 | `overhead/percent_p50` | % | < 10% | `(proxy - direct) / direct * 100` | Relative overhead |
 | M-APPR-001 | `approval/overhead` | ms | < 500 ms | Time to Slack post | Approval system latency |
 
@@ -311,18 +311,55 @@ Calculate: `overhead = proxy_latency - direct_latency`
 
 ### 7.7 Policy Evaluation Metrics (Criterion)
 
-New Criterion benchmark (`benches/policy_eval.rs`):
+Criterion benchmark (`benches/policy_eval.rs`) using v0.2 API:
 
 ```rust
-fn bench_policy_eval(c: &mut Criterion) {
-    let engine = PolicyEngine::new_from_string(SAMPLE_POLICY).unwrap();
-    let context = create_test_context();
+fn bench_policy_eval_v2(c: &mut Criterion) {
+    let engine = CedarEngine::new().expect("Failed to create Cedar engine");
 
-    c.bench_function("policy_eval", |b| {
-        b.iter(|| engine.evaluate(&context))
+    // v0.2 API with tool arguments for argument inspection
+    let request = CedarRequest {
+        principal: create_test_principal(),
+        resource: CedarResource::ToolCall {
+            name: "transfer_funds".to_string(),
+            server: "mcp-server".to_string(),
+            arguments: json!({
+                "amount": 5000,
+                "currency": "USD",
+                "recipient": "user@example.com"
+            }),
+        },
+        context: CedarContext {
+            policy_id: "test-policy".to_string(),
+            source_id: "test-source".to_string(),
+            time: TimeContext::now(),
+        },
+    };
+
+    c.bench_function("policy/eval_v2", |b| {
+        b.iter(|| engine.evaluate_v2(&request))
     });
 }
+
+fn bench_policy_reload(c: &mut Criterion) {
+    let engine = CedarEngine::new().expect("...");
+    c.bench_function("policy/reload", |b| b.iter(|| engine.reload().ok()));
+}
 ```
+
+### 7.8 TTFB & Overhead Metrics (Criterion)
+
+Criterion benchmark (`benches/ttfb.rs`) tests actual proxy with real HTTP:
+
+```rust
+// Starts mock_mcp server and thoughtgate proxy as subprocesses
+// Measures:
+// - overhead/direct_baseline: Direct connection to mock MCP
+// - ttfb/proxied: Through ThoughtGate proxy
+// Overhead = ttfb/proxied - overhead/direct_baseline
+```
+
+**Note:** Criterion reports mean/median latency, not percentiles. For p50/p95/p99 percentiles, use k6 metrics from the k8s integration tests.
 
 ## 8. Output Format
 
