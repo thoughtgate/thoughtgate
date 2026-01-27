@@ -123,15 +123,22 @@ fn bench_ttfb(c: &mut Criterion) {
         }
     });
 
-    let mut group = c.benchmark_group("ttfb");
-    group.measurement_time(Duration::from_secs(10));
-    group.sample_size(100);
-
-    // Benchmark direct connection to mock MCP (baseline for overhead calculation)
-    // REQ-OBS-001 M-OH-001: Measures baseline latency for overhead calculation
     let mock_url = format!("http://127.0.0.1:{}/mcp/v1", env.mock_port);
-    let payload_for_direct = mcp_payload.clone();
-    group.bench_function("overhead/direct_baseline", |b| {
+    let proxy_url = format!("http://127.0.0.1:{}/mcp/v1", env.proxy_port);
+
+    // Warmup: establish connection pools before benchmarking
+    // This prevents first-request connection establishment from skewing results
+    rt.block_on(async {
+        for _ in 0..10 {
+            let _ = client.post(&mock_url).json(&mcp_payload).send().await;
+            let _ = client.post(&proxy_url).json(&mcp_payload).send().await;
+        }
+    });
+
+    // Note: No benchmark_group() to avoid metric path duplication
+    // Metrics will be: overhead/direct_baseline, ttfb/proxied (not ttfb/overhead/...)
+    c.bench_function("overhead/direct_baseline", |b| {
+        let payload_for_direct = mcp_payload.clone();
         b.to_async(&rt).iter(|| {
             let client = client.clone();
             let url = mock_url.clone();
@@ -140,11 +147,9 @@ fn bench_ttfb(c: &mut Criterion) {
         });
     });
 
-    // Benchmark through ThoughtGate proxy
     // REQ-OBS-001 M-TTFB-001: Time to first byte through proxy (target: p95 < 10ms)
     // REQ-OBS-001 M-OH-001: Proxy overhead = proxied - direct (target: < 2ms)
-    let proxy_url = format!("http://127.0.0.1:{}/mcp/v1", env.proxy_port);
-    group.bench_function("ttfb/proxied", |b| {
+    c.bench_function("ttfb/proxied", |b| {
         b.to_async(&rt).iter(|| {
             let client = client.clone();
             let url = proxy_url.clone();
@@ -152,8 +157,6 @@ fn bench_ttfb(c: &mut Criterion) {
             async move { client.post(&url).json(&payload).send().await }
         });
     });
-
-    group.finish();
 }
 
 criterion_group!(benches, bench_ttfb);

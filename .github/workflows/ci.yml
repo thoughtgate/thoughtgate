@@ -280,20 +280,18 @@ jobs:
           MOCK_PID=$!
           sleep 1
 
-          # Start ThoughtGate proxy
+          # Start ThoughtGate proxy (uses default ports: 7467 outbound, 7469 admin)
           THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:8888" \
-          THOUGHTGATE_OUTBOUND_PORT=4141 \
-          THOUGHTGATE_ADMIN_PORT=4143 \
           ./target/release/thoughtgate &
           PROXY_PID=$!
 
-          # Wait for proxy health
+          # Wait for proxy health on admin port (default: 7469)
           for i in {1..30}; do
-            curl -sf http://127.0.0.1:4143/health && break
+            curl -sf http://127.0.0.1:7469/health && break
             sleep 0.5
           done
 
-          # Run k6 benchmark
+          # Run k6 benchmark (uses default port 7467)
           k6 run --out json=k6_raw.json tests/benchmark-fast.js || true
 
           # Cleanup
