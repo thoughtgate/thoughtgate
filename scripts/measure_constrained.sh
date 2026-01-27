@@ -38,7 +38,7 @@ PROXY_CONTAINER="tg-constrained-proxy"
 MOCK_CONTAINER="tg-constrained-mock"
 
 # Ports
-MOCK_LLM_PORT=8888
+MOCK_MCP_PORT=8888
 
 # ThoughtGate v0.2 uses 3-port Envoy-style model inside container:
 # - Outbound port (7467): Main proxy for client requests
@@ -146,18 +146,18 @@ check_prerequisites() {
 # Start Mock LLM Container
 # ─────────────────────────────────────────────────────────────────────────────
 
-start_mock_llm() {
+start_mock_mcp() {
     log_info "Starting mock LLM container..."
     
     docker run -d \
         --name "$MOCK_CONTAINER" \
-        -p "${MOCK_LLM_PORT}:8080" \
-        -e MOCK_LLM_PORT=8080 \
+        -p "${MOCK_MCP_PORT}:8080" \
+        -e MOCK_MCP_PORT=8080 \
         --entrypoint /entrypoint.sh \
         "$DOCKER_IMAGE" \
-        /mock_llm
+        /mock_mcp
     
-    wait_for_host_port $MOCK_LLM_PORT
+    wait_for_host_port $MOCK_MCP_PORT
     log_success "Mock LLM container started"
 }
 
@@ -185,7 +185,7 @@ start_constrained_proxy() {
         --memory "$MEMORY_LIMIT" \
         -p "${HOST_PROXY_PORT}:${CONTAINER_OUTBOUND_PORT}" \
         -p "${HOST_ADMIN_PORT}:${CONTAINER_ADMIN_PORT}" \
-        -e THOUGHTGATE_UPSTREAM_URL="http://${host_ip}:${MOCK_LLM_PORT}" \
+        -e THOUGHTGATE_UPSTREAM_URL="http://${host_ip}:${MOCK_MCP_PORT}" \
         "$DOCKER_IMAGE"
 
     # Wait for admin port (health endpoint) to be ready
@@ -394,7 +394,7 @@ main() {
     check_prerequisites
     
     # Start containers
-    start_mock_llm
+    start_mock_mcp
     start_constrained_proxy
     
     # Collect idle memory

@@ -2,10 +2,10 @@
 apiVersion: v1
 kind: Service
 metadata: 
-  name: mock-llm
+  name: mock-mcp
 spec:
   selector: 
-    app: mock-llm
+    app: mock-mcp
   ports: 
     - port: 80
       targetPort: 8080
@@ -14,15 +14,15 @@ spec:
 apiVersion: v1
 kind: Pod
 metadata: 
-  name: mock-llm-pod
+  name: mock-mcp-pod
   labels: 
-    app: mock-llm
+    app: mock-mcp
 spec:
   containers:
     - name: server
       image: thoughtgate:test
       imagePullPolicy: Never
-      command: ["/mock_llm"]
+      command: ["/mock_mcp"]
       ports: 
         - containerPort: 8080
       # SAFETY: Readiness probe ensures pod is ready before receiving traffic
@@ -100,7 +100,7 @@ spec:
         - name: thoughtgate
           image: thoughtgate:test
           imagePullPolicy: Never
-          args: ["--port", "4141", "--bind", "0.0.0.0", "--upstream-url", "http://mock-llm"]
+          args: ["--port", "4141", "--bind", "0.0.0.0", "--upstream-url", "http://mock-mcp"]
           # Set high file descriptor limit for connection handling
           securityContext:
             capabilities:

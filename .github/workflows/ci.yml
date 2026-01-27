@@ -103,7 +103,7 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --release --bin thoughtgate
-          cargo build --release --bin mock_llm --features mock
+          cargo build --release --bin mock_mcp --features mock
 
       - name: Upload binaries as artifact
         uses: actions/upload-artifact@v6
@@ -111,7 +111,7 @@ jobs:
           name: binaries
           path: |
             target/release/thoughtgate
-            target/release/mock_llm
+            target/release/mock_mcp
           retention-days: 7
 
   # Stage 1c: Test Suite (parallel execution)
@@ -518,7 +518,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          # Use Dockerfile.test for K8s integration tests (includes mock_mcp)
+          file: ./Dockerfile.test
           platforms: linux/amd64
           tags: thoughtgate:test
           cache-from: type=gha

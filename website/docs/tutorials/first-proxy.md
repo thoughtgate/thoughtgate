@@ -36,8 +36,8 @@ The binary will be at `target/release/thoughtgate`.
 For testing, ThoughtGate includes a mock MCP server:
 
 ```bash
-cargo build --release --features mock
-./target/release/mock_llm --port 3000
+cargo build --release --bin mock_mcp --features mock
+MOCK_MCP_PORT=3000 ./target/release/mock_mcp
 ```
 
 This server responds to MCP tool calls with mock data.

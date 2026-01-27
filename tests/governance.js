@@ -85,7 +85,7 @@ export default function () {
 
   // 3. Query the spy endpoint to retrieve captured requests
   console.log(`[${testId}] Querying spy endpoint for captured requests...`);
-  const historyRes = http.get('http://mock-llm:8080/_admin/history', {
+  const historyRes = http.get('http://mock-mcp:8080/_admin/history', {
     timeout: '5s',
   });
 

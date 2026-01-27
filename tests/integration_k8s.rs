@@ -202,15 +202,15 @@ impl TestContext {
             Err(e) => eprintln!("⚠️  Failed to get k6 logs: {}", e),
         }
 
-        // Try to get mock-llm logs (from the separate mock-llm-pod)
-        eprintln!("\n📋 Mock LLM Container Logs:");
+        // Try to get mock-mcp logs (from the separate mock-mcp-pod)
+        eprintln!("\n📋 Mock MCP Container Logs:");
         eprintln!("================================");
         match Command::new("kubectl")
             .args([
                 "logs",
                 "-n",
                 &self.namespace,
-                "mock-llm-pod",
+                "mock-mcp-pod",
                 "-c",
                 "server",
             ])
@@ -223,7 +223,7 @@ impl TestContext {
                     eprintln!("STDERR: {}", String::from_utf8_lossy(&output.stderr));
                 }
             }
-            Err(e) => eprintln!("⚠️  Failed to get mock-llm logs: {}", e),
+            Err(e) => eprintln!("⚠️  Failed to get mock-mcp logs: {}", e),
         }
 
         eprintln!("\n🚨 === END OF LOG DUMP ===\n");

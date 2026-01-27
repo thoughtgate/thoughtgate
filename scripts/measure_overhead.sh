@@ -4,8 +4,8 @@
 # Implements: REQ-OBS-001 M-OH-001, M-OH-002 (Proxy Overhead Measurement)
 #
 # This script:
-# 1. Starts mock LLM server
-# 2. Runs k6 load test directly against mock LLM
+# 1. Starts mock MCP server
+# 2. Runs k6 load test directly against mock MCP
 # 3. Starts ThoughtGate proxy
 # 4. Runs k6 load test through proxy
 # 5. Calculates overhead difference
@@ -23,11 +23,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 THOUGHTGATE_BIN="${PROJECT_ROOT}/target/release/thoughtgate"
-MOCK_LLM_BIN="${PROJECT_ROOT}/target/release/mock_llm"
+MOCK_MCP_BIN="${PROJECT_ROOT}/target/release/mock_mcp"
 K6_SCRIPT="${PROJECT_ROOT}/tests/benchmark-fast.js"
 OUTPUT_FILE="${PROJECT_ROOT}/overhead_metrics.json"
 
-MOCK_LLM_PORT=8888
+MOCK_MCP_PORT=8888
 
 # ThoughtGate v0.2 uses 3-port Envoy-style model:
 # - Outbound port: Main proxy for client requests (load test target)
@@ -39,13 +39,13 @@ K6_VUS=10
 K6_DURATION="10s"
 
 # Initialize PIDs to avoid unset variable errors under set -u
-MOCK_LLM_PID=""
+MOCK_MCP_PID=""
 PROXY_PID=""
 
 # Cleanup function
 cleanup() {
     echo "🧹 Cleaning up..."
-    [ -n "$MOCK_LLM_PID" ] && kill "$MOCK_LLM_PID" 2>/dev/null || true
+    [ -n "$MOCK_MCP_PID" ] && kill "$MOCK_MCP_PID" 2>/dev/null || true
     [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
     rm -f direct_results.json proxy_results.json 2>/dev/null || true
 }
@@ -102,9 +102,9 @@ check_prerequisites() {
         exit 1
     fi
     
-    if [ ! -f "$MOCK_LLM_BIN" ]; then
-        log_error "Mock LLM binary not found at $MOCK_LLM_BIN"
-        log_info "Build with: cargo build --release --bin mock_llm --features mock"
+    if [ ! -f "$MOCK_MCP_BIN" ]; then
+        log_error "Mock LLM binary not found at $MOCK_MCP_BIN"
+        log_info "Build with: cargo build --release --bin mock_mcp --features mock"
         exit 1
     fi
     
@@ -120,14 +120,14 @@ check_prerequisites() {
 # Start Mock LLM
 # ─────────────────────────────────────────────────────────────────────────────
 
-start_mock_llm() {
-    log_info "Starting mock LLM server on port $MOCK_LLM_PORT..."
+start_mock_mcp() {
+    log_info "Starting mock MCP server on port $MOCK_MCP_PORT..."
     
-    MOCK_LLM_PORT=$MOCK_LLM_PORT "$MOCK_LLM_BIN" &
-    MOCK_LLM_PID=$!
+    MOCK_MCP_PORT=$MOCK_MCP_PORT "$MOCK_MCP_BIN" &
+    MOCK_MCP_PID=$!
     
-    wait_for_port $MOCK_LLM_PORT
-    log_success "Mock LLM started (PID: $MOCK_LLM_PID)"
+    wait_for_port $MOCK_MCP_PORT
+    log_success "Mock LLM started (PID: $MOCK_MCP_PID)"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,7 +138,7 @@ start_proxy() {
     log_info "Starting ThoughtGate proxy (outbound: $PROXY_PORT, admin: $ADMIN_PORT)..."
 
     # ThoughtGate v0.2 uses environment variables for port configuration
-    THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:${MOCK_LLM_PORT}" \
+    THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:${MOCK_MCP_PORT}" \
     THOUGHTGATE_OUTBOUND_PORT="${PROXY_PORT}" \
     THOUGHTGATE_ADMIN_PORT="${ADMIN_PORT}" \
     "$THOUGHTGATE_BIN" &
@@ -304,11 +304,11 @@ main() {
     
     check_prerequisites
     
-    # Start mock LLM
-    start_mock_llm
+    # Start mock MCP
+    start_mock_mcp
     
     # Run direct test
-    run_k6_test "http://127.0.0.1:${MOCK_LLM_PORT}" "direct_results.json" "direct"
+    run_k6_test "http://127.0.0.1:${MOCK_MCP_PORT}" "direct_results.json" "direct"
     
     # Start proxy
     start_proxy
