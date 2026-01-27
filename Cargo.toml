@@ -95,8 +95,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 axum = "0.8"
 
 [[bin]]
-name = "mock_llm"
-path = "src/bin/mock_llm.rs"
+name = "mock_mcp"
+path = "src/bin/mock_mcp.rs"
 required-features = ["mock"]
 
 [features]

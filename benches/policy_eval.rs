@@ -4,19 +4,21 @@
 //! - Implements: REQ-OBS-001 M-POL-001, M-POL-002 (Policy Evaluation Performance)
 //!
 //! # Metrics
-//! - `policy/eval_p50`: Median policy evaluation time (target: < 100µs)
-//! - `policy/eval_p99`: 99th percentile evaluation time (target: < 500µs)
+//! - `policy/eval_v2_with_args`: v0.2 API with tool arguments (target: < 100µs)
+//! - `policy/reload`: Policy hot-reload performance (target: < 100ms)
 //!
 //! # Usage
 //! ```bash
 //! cargo bench --bench policy_eval
 //! ```
 
-#![allow(deprecated)] // Using v0.1 API for benchmarking backward compatibility
-
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::time::Duration;
-use thoughtgate::policy::{PolicyRequest, Principal, Resource, engine::CedarEngine};
+use criterion::{Criterion, criterion_group, criterion_main};
+use serde_json::json;
+use thoughtgate::policy::{
+    Principal,
+    engine::CedarEngine,
+    types::{CedarContext, CedarRequest, CedarResource, TimeContext},
+};
 
 /// Create a test principal for benchmarking.
 fn create_test_principal() -> Principal {
@@ -28,100 +30,43 @@ fn create_test_principal() -> Principal {
     }
 }
 
-/// Create a test resource (tool call) for benchmarking.
-fn create_test_tool_call(name: &str) -> Resource {
-    Resource::ToolCall {
-        name: name.to_string(),
-        server: "mcp-server".to_string(),
-    }
-}
-
-/// Create a test policy request.
-fn create_test_request(tool_name: &str) -> PolicyRequest {
-    PolicyRequest {
-        principal: create_test_principal(),
-        resource: create_test_tool_call(tool_name),
-        context: None,
-    }
-}
-
-/// Benchmark simple policy evaluation (single tool, no context).
+/// Benchmark v0.2 API with tool arguments.
+///
+/// Tests the CedarRequest/CedarResource API that supports
+/// argument inspection in Cedar policies.
 ///
 /// # Traceability
-/// - Implements: REQ-OBS-001 M-POL-001 (Policy eval p50 < 100µs)
-fn bench_policy_eval_simple(c: &mut Criterion) {
-    // Create engine with default policies
+/// - Implements: REQ-OBS-001 M-POL-001 (Policy eval performance)
+/// - Implements: REQ-POL-001/F-003 (Argument inspection)
+fn bench_policy_eval_v2(c: &mut Criterion) {
     let engine = CedarEngine::new().expect("Failed to create Cedar engine");
-    let request = create_test_request("read_file");
 
-    c.bench_function("policy/eval_simple", |b| {
-        b.iter(|| engine.evaluate(&request))
+    // Create a request with complex arguments for argument inspection
+    let request = CedarRequest {
+        principal: create_test_principal(),
+        resource: CedarResource::ToolCall {
+            name: "transfer_funds".to_string(),
+            server: "mcp-server".to_string(),
+            arguments: json!({
+                "amount": 5000,
+                "currency": "USD",
+                "recipient": "user@example.com",
+                "metadata": {
+                    "reference": "INV-12345",
+                    "category": "payment"
+                }
+            }),
+        },
+        context: CedarContext {
+            policy_id: "financial_transfer".to_string(),
+            source_id: "test-source".to_string(),
+            time: TimeContext::now(),
+        },
+    };
+
+    c.bench_function("policy/eval_v2", |b| {
+        b.iter(|| engine.evaluate_v2(&request))
     });
-}
-
-/// Benchmark policy evaluation with various tool names.
-///
-/// Tests evaluation performance across different tool names to ensure
-/// consistent performance regardless of the resource being accessed.
-fn bench_policy_eval_various_tools(c: &mut Criterion) {
-    let engine = CedarEngine::new().expect("Failed to create Cedar engine");
-
-    let tool_names = [
-        "read_file",
-        "write_file",
-        "delete_file",
-        "execute_command",
-        "create_user",
-        "delete_user",
-        "send_email",
-        "database_query",
-    ];
-
-    let mut group = c.benchmark_group("policy/eval_tools");
-    group.measurement_time(Duration::from_secs(5));
-
-    for tool_name in &tool_names {
-        let request = create_test_request(tool_name);
-        group.bench_with_input(BenchmarkId::from_parameter(tool_name), tool_name, |b, _| {
-            b.iter(|| engine.evaluate(&request))
-        });
-    }
-
-    group.finish();
-}
-
-/// Benchmark policy evaluation with MCP method resources.
-///
-/// Tests evaluation performance for MCP methods (vs tool calls).
-fn bench_policy_eval_mcp_methods(c: &mut Criterion) {
-    let engine = CedarEngine::new().expect("Failed to create Cedar engine");
-
-    let methods = [
-        "resources/read",
-        "resources/list",
-        "tools/call",
-        "prompts/get",
-    ];
-
-    let mut group = c.benchmark_group("policy/eval_methods");
-    group.measurement_time(Duration::from_secs(5));
-
-    for method in &methods {
-        let request = PolicyRequest {
-            principal: create_test_principal(),
-            resource: Resource::McpMethod {
-                method: method.to_string(),
-                server: "mcp-server".to_string(),
-            },
-            context: None,
-        };
-
-        group.bench_with_input(BenchmarkId::from_parameter(method), method, |b, _| {
-            b.iter(|| engine.evaluate(&request))
-        });
-    }
-
-    group.finish();
 }
 
 /// Benchmark policy reload performance.
@@ -131,63 +76,8 @@ fn bench_policy_eval_mcp_methods(c: &mut Criterion) {
 fn bench_policy_reload(c: &mut Criterion) {
     let engine = CedarEngine::new().expect("Failed to create Cedar engine");
 
-    c.bench_function("policy/reload", |b| {
-        b.iter(|| {
-            // Reload returns Result, which we need to handle
-            engine.reload().ok()
-        })
-    });
+    c.bench_function("policy/reload", |b| b.iter(|| engine.reload().ok()));
 }
 
-/// Benchmark concurrent policy evaluation.
-///
-/// Tests that policy evaluation is thread-safe and performant
-/// under concurrent access (simulating multiple requests).
-fn bench_policy_eval_concurrent(c: &mut Criterion) {
-    use std::sync::Arc;
-    use std::thread;
-
-    let engine = Arc::new(CedarEngine::new().expect("Failed to create Cedar engine"));
-
-    let mut group = c.benchmark_group("policy/eval_concurrent");
-    group.measurement_time(Duration::from_secs(10));
-
-    for num_threads in [1, 2, 4] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_threads", num_threads)),
-            &num_threads,
-            |b, &num_threads| {
-                b.iter(|| {
-                    let handles: Vec<_> = (0..num_threads)
-                        .map(|i| {
-                            let engine = Arc::clone(&engine);
-                            let tool_name = format!("tool_{}", i);
-                            thread::spawn(move || {
-                                let request = create_test_request(&tool_name);
-                                for _ in 0..100 {
-                                    engine.evaluate(&request);
-                                }
-                            })
-                        })
-                        .collect();
-
-                    for handle in handles {
-                        handle.join().expect("Thread panicked");
-                    }
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_policy_eval_simple,
-    bench_policy_eval_various_tools,
-    bench_policy_eval_mcp_methods,
-    bench_policy_reload,
-    bench_policy_eval_concurrent,
-);
+criterion_group!(benches, bench_policy_eval_v2, bench_policy_reload,);
 criterion_main!(benches);

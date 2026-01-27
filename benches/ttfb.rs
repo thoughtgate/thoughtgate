@@ -1,164 +1,149 @@
-//! TTFB (Time-To-First-Byte) Benchmark for REQ-CORE-001
+//! TTFB (Time-To-First-Byte) Benchmark for REQ-OBS-001
+//!
+//! Tests actual ThoughtGate proxy latency with MCP traffic by:
+//! 1. Starting a mock MCP server as upstream
+//! 2. Starting ThoughtGate proxy pointing to the mock
+//! 3. Measuring request latency direct vs through proxy
 //!
 //! # Traceability
-//! - Implements: REQ-CORE-001 Section 5 (Benchmark - P95 TTFB < 10ms)
+//! - Implements: REQ-OBS-001 M-TTFB-001 (Time to first byte)
+//! - Implements: REQ-OBS-001 M-OH-001 (Proxy overhead measurement)
+//!
+//! # Prerequisites
+//!
+//! Both binaries must be built before running:
+//! ```bash
+//! cargo build --release --bin thoughtgate --bin mock_mcp --features mock
+//! cargo bench --bench ttfb
+//! ```
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 
-/// Benchmark Time-To-First-Byte for direct connection (baseline)
-///
-/// # Traceability
-/// - Implements: REQ-CORE-001 Section 5 (Benchmark baseline measurement)
-async fn measure_direct_ttfb() -> Duration {
-    // Start echo server
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buffer = vec![0u8; 1024];
-
-        loop {
-            match socket.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    socket.write_all(&buffer[..n]).await.unwrap();
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Connect and measure TTFB
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    let test_data = b"TTFB_TEST";
-
-    let start = std::time::Instant::now();
-    client.write_all(test_data).await.unwrap();
-
-    let mut buffer = vec![0u8; test_data.len()];
-    client.read_exact(&mut buffer).await.unwrap();
-
-    start.elapsed()
+/// Test environment with mock MCP server and ThoughtGate proxy.
+struct TestEnv {
+    mock_mcp: Child,
+    proxy: Child,
+    proxy_port: u16,
+    mock_port: u16,
 }
 
-/// Benchmark TTFB through proxy (simulated)
-///
-/// # Traceability
-/// - Implements: REQ-CORE-001 Section 5 (Benchmark proxied measurement)
-///
-/// Note: This simulates proxy overhead by adding a relay hop
-async fn measure_proxied_ttfb() -> Duration {
-    // Start origin server
-    let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin_addr = origin_listener.local_addr().unwrap();
+impl TestEnv {
+    /// Start the test environment with mock MCP and proxy.
+    fn start() -> Self {
+        let mock_port = 19999;
+        let proxy_port = 19467;
+        let admin_port = 19469;
 
-    tokio::spawn(async move {
-        let (mut socket, _) = origin_listener.accept().await.unwrap();
-        let mut buffer = vec![0u8; 1024];
+        // Start mock MCP server with zero delay for benchmarking
+        let mock_mcp = Command::new("./target/release/mock_mcp")
+            .env("MOCK_MCP_PORT", mock_port.to_string())
+            .env("MOCK_MCP_DELAY_MS", "0")
+            .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("Failed to start mock MCP server. Run: cargo build --release --bin mock_mcp --features mock");
 
-        loop {
-            match socket.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    socket.write_all(&buffer[..n]).await.unwrap();
-                }
-                Err(_) => break,
+        // Wait for mock to start
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Start ThoughtGate proxy
+        let proxy = Command::new("./target/release/thoughtgate")
+            .env(
+                "THOUGHTGATE_UPSTREAM_URL",
+                format!("http://127.0.0.1:{}", mock_port),
+            )
+            .env("THOUGHTGATE_OUTBOUND_PORT", proxy_port.to_string())
+            .env("THOUGHTGATE_ADMIN_PORT", admin_port.to_string())
+            .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect(
+                "Failed to start ThoughtGate proxy. Run: cargo build --release --bin thoughtgate",
+            );
+
+        // Wait for proxy health check to pass
+        for _ in 0..50 {
+            if Command::new("curl")
+                .args(["-sf", &format!("http://127.0.0.1:{}/health", admin_port)])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
-    });
 
-    // Start proxy relay
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy_listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (mut client_socket, _) = proxy_listener.accept().await.unwrap();
-        let mut origin_socket = TcpStream::connect(origin_addr).await.unwrap();
-
-        // Set TCP_NODELAY (REQ-CORE-001 F-001)
-        client_socket.set_nodelay(true).unwrap();
-        origin_socket.set_nodelay(true).unwrap();
-
-        // Bidirectional relay (zero-copy simulation)
-        let (mut client_read, mut client_write) = client_socket.split();
-        let (mut origin_read, mut origin_write) = origin_socket.split();
-
-        let client_to_origin = async move {
-            let mut buffer = vec![0u8; 8192];
-            loop {
-                match client_read.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if origin_write.write_all(&buffer[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        };
-
-        let origin_to_client = async move {
-            let mut buffer = vec![0u8; 8192];
-            loop {
-                match origin_read.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if client_write.write_all(&buffer[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        };
-
-        tokio::select! {
-            _ = client_to_origin => {},
-            _ = origin_to_client => {},
+        Self {
+            mock_mcp,
+            proxy,
+            proxy_port,
+            mock_port,
         }
-    });
-
-    // Give proxy time to start
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    // Connect through proxy and measure TTFB
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    client.set_nodelay(true).unwrap();
-
-    let test_data = b"TTFB_TEST";
-
-    let start = std::time::Instant::now();
-    client.write_all(test_data).await.unwrap();
-
-    let mut buffer = vec![0u8; test_data.len()];
-    client.read_exact(&mut buffer).await.unwrap();
-
-    start.elapsed()
+    }
 }
 
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        let _ = self.proxy.kill();
+        let _ = self.mock_mcp.kill();
+        // Wait for processes to terminate
+        let _ = self.proxy.wait();
+        let _ = self.mock_mcp.wait();
+    }
+}
+
+/// Benchmark TTFB for direct connection vs through proxy.
+///
+/// # Traceability
+/// - Implements: REQ-OBS-001 M-TTFB-001 (P95 TTFB < 10ms)
+/// - Implements: REQ-OBS-001 M-OH-001 (Overhead < 2ms)
 fn bench_ttfb(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("Failed to create Tokio runtime");
+    let env = TestEnv::start();
+    let client = reqwest::Client::new();
+
+    // MCP JSON-RPC request payload
+    let mcp_payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "benchmark_tool",
+            "arguments": {}
+        }
+    });
 
     let mut group = c.benchmark_group("ttfb");
     group.measurement_time(Duration::from_secs(10));
     group.sample_size(100);
 
-    // Benchmark direct connection (baseline)
-    group.bench_function(BenchmarkId::new("direct", "baseline"), |b| {
-        b.to_async(&rt)
-            .iter(|| async { measure_direct_ttfb().await });
+    // Benchmark direct connection to mock MCP (baseline)
+    let mock_url = format!("http://127.0.0.1:{}/mcp/v1", env.mock_port);
+    let payload_for_direct = mcp_payload.clone();
+    group.bench_function("direct_baseline", |b| {
+        b.to_async(&rt).iter(|| {
+            let client = client.clone();
+            let url = mock_url.clone();
+            let payload = payload_for_direct.clone();
+            async move { client.post(&url).json(&payload).send().await }
+        });
     });
 
-    // Benchmark proxied connection
-    group.bench_function(BenchmarkId::new("proxied", "with_relay"), |b| {
-        b.to_async(&rt)
-            .iter(|| async { measure_proxied_ttfb().await });
+    // Benchmark through ThoughtGate proxy
+    let proxy_url = format!("http://127.0.0.1:{}/mcp/v1", env.proxy_port);
+    group.bench_function("proxied_thoughtgate", |b| {
+        b.to_async(&rt).iter(|| {
+            let client = client.clone();
+            let url = proxy_url.clone();
+            let payload = mcp_payload.clone();
+            async move { client.post(&url).json(&payload).send().await }
+        });
     });
 
     group.finish();

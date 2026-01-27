@@ -182,8 +182,8 @@ jobs:
           shared-key: "bench"
           cache-on-failure: true
 
-      - name: Build release binary
-        run: cargo build --release --bin thoughtgate
+      - name: Build release binaries
+        run: cargo build --release --bin thoughtgate --bin mock_mcp --features mock
 
       - name: Run Criterion benchmarks
         run: |
@@ -265,6 +265,78 @@ jobs:
           EOF
           cat startup_metrics.json
 
+      - name: Install k6
+        run: |
+          curl -sL https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz | tar xz
+          sudo mv k6-v0.54.0-linux-amd64/k6 /usr/local/bin/
+          k6 version
+
+      - name: Run k6 latency benchmark
+        run: |
+          echo "Running k6 latency benchmark with MCP traffic..."
+
+          # Start mock MCP server (zero delay for benchmarking)
+          MOCK_MCP_PORT=8888 MOCK_MCP_DELAY_MS=0 ./target/release/mock_mcp &
+          MOCK_PID=$!
+          sleep 1
+
+          # Start ThoughtGate proxy
+          THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:8888" \
+          THOUGHTGATE_OUTBOUND_PORT=4141 \
+          THOUGHTGATE_ADMIN_PORT=4143 \
+          ./target/release/thoughtgate &
+          PROXY_PID=$!
+
+          # Wait for proxy health
+          for i in {1..30}; do
+            curl -sf http://127.0.0.1:4143/health && break
+            sleep 0.5
+          done
+
+          # Run k6 benchmark
+          k6 run --out json=k6_raw.json tests/benchmark-fast.js || true
+
+          # Cleanup
+          kill $PROXY_PID $MOCK_PID 2>/dev/null || true
+          wait $PROXY_PID 2>/dev/null || true
+          wait $MOCK_PID 2>/dev/null || true
+
+          # Parse k6 results to extract latency percentiles
+          python3 << 'PYEOF'
+          import json
+
+          durations = []
+          try:
+              with open("k6_raw.json") as f:
+                  for line in f:
+                      try:
+                          data = json.loads(line.strip())
+                          if data.get("type") == "Point" and data.get("metric") == "http_req_duration":
+                              value = data.get("data", {}).get("value")
+                              if value is not None:
+                                  durations.append(value)
+                      except:
+                          continue
+          except FileNotFoundError:
+              print("k6_raw.json not found, skipping k6 metrics")
+
+          metrics = {}
+          if durations:
+              durations.sort()
+              n = len(durations)
+              metrics["latency/k6_p50"] = {"latency": {"value": durations[n // 2]}}
+              metrics["latency/k6_p95"] = {"latency": {"value": durations[int(n * 0.95)]}}
+              metrics["latency/k6_p99"] = {"latency": {"value": durations[min(int(n * 0.99), n - 1)]}}
+              # 5 second test duration
+              metrics["throughput/k6_rps"] = {"throughput": {"value": len(durations) / 5}}
+              print(f"Extracted {len(durations)} latency samples from k6")
+
+          with open("k6_metrics.json", "w") as f:
+              json.dump(metrics, f, indent=2)
+          PYEOF
+
+          cat k6_metrics.json || echo "{}"
+
       - name: Parse and consolidate benchmark results
         run: |
           echo "Consolidating benchmark results for Bencher..."
@@ -330,7 +402,18 @@ jobs:
                               add_metric(f"ttfb/{bench_name}", mean_ns / 1_000_000, "latency")
                   except (KeyError, json.JSONDecodeError) as e:
                       print(f"Warning: Could not parse {estimates_file}: {e}")
-          
+
+          # Parse k6 metrics (already in BMF format)
+          k6_file = Path("k6_metrics.json")
+          if k6_file.exists():
+              try:
+                  with open(k6_file) as f:
+                      k6_data = json.load(f)
+                      metrics.update(k6_data)
+                      print(f"Added {len(k6_data)} k6 metrics")
+              except (json.JSONDecodeError, FileNotFoundError) as e:
+                  print(f"Warning: Could not parse k6_metrics.json: {e}")
+
           # Write consolidated results in Bencher BMF format
           with open("bench_metrics.json", "w") as f:
               json.dump(metrics, f, indent=2)

@@ -1,18 +1,32 @@
+// ThoughtGate k6 Load Test - Fast CI Version
+//
+// Reduced duration for faster CI feedback. Uses MCP JSON-RPC traffic.
+//
+// Usage:
+//   k6 run tests/benchmark-fast.js
+
 import http from 'k6/http';
 
 export const options = {
   vus: 10,
-  duration: '5s',  // Reduced from 10s for faster CI tests
+  duration: '5s', // Reduced from 10s for faster CI tests
 };
 
-const PAYLOAD = JSON.stringify({ prompt: "A".repeat(1000) });
+// MCP JSON-RPC tool call request
+const PAYLOAD = JSON.stringify({
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'tools/call',
+  params: {
+    name: 'benchmark_tool',
+    arguments: { data: 'A'.repeat(1000) },
+  },
+});
 
 export default function () {
-  // Hit the Proxy (port 4141).
-  // Path MUST match what the proxy forwards to the Mock LLM.
-  http.post('http://127.0.0.1:4141/v1/chat/completions', PAYLOAD, {
+  // Hit the ThoughtGate proxy MCP endpoint
+  http.post('http://127.0.0.1:4141/mcp/v1', PAYLOAD, {
     headers: { 'Content-Type': 'application/json' },
     timeout: '5s',
   });
 }
-
