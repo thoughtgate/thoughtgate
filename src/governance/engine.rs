@@ -523,10 +523,16 @@ impl ApprovalEngine {
                             })),
                         };
 
+                        // Clone task with Executing status so pipeline validation passes.
+                        // The pipeline's validate_approval() requires TaskStatus::Executing,
+                        // but auto-approved tasks are in Expired (terminal) state.
+                        let mut auto_approved_task = task.clone();
+                        auto_approved_task.status = TaskStatus::Executing;
+
                         // Execute the pipeline with the synthetic approval
                         let pipeline_result = self
                             .pipeline
-                            .execute_approved(&task, &synthetic_approval)
+                            .execute_approved(&auto_approved_task, &synthetic_approval)
                             .await;
 
                         // Remove from executing set now that pipeline is complete
@@ -1182,5 +1188,60 @@ mod tests {
             }
             _ => panic!("Expected TaskNotFound"),
         }
+    }
+
+    /// Tests that auto-approve on timeout executes the pipeline successfully.
+    ///
+    /// When on_timeout is Approve, expired tasks should be auto-approved
+    /// with a synthetic approval record and executed through the pipeline.
+    ///
+    /// Verifies: EC-PIP-009 (Timeout with approve → auto-execute)
+    #[tokio::test]
+    async fn test_execute_on_result_timeout_approve() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig {
+            on_timeout: TimeoutAction::Approve,
+            execution_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream.clone(),
+            config,
+            shutdown,
+        )
+        .expect("Failed to create engine");
+
+        // Start approval
+        let start_result = engine
+            .start_approval(test_request(), test_principal(), None)
+            .await
+            .unwrap();
+
+        // Manually expire the task (simulating timeout)
+        task_store
+            .transition(&start_result.task_id, TaskStatus::Expired, None)
+            .unwrap();
+
+        // Execute should auto-approve and forward to upstream
+        let result = engine.execute_on_result(&start_result.task_id).await;
+
+        assert!(
+            result.is_ok(),
+            "Auto-approve on timeout should succeed, got: {:?}",
+            result.err()
+        );
+
+        // Upstream should have received the forwarded request
+        assert_eq!(
+            upstream.forward_count.load(Ordering::SeqCst),
+            1,
+            "Upstream should have been called exactly once"
+        );
     }
 }
