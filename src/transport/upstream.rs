@@ -180,6 +180,7 @@ impl UpstreamClient {
             .pool_max_idle_per_host(config.pool_max_idle_per_host)
             .pool_idle_timeout(config.pool_idle_timeout)
             .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(60))
             .build()
             .map_err(|e| ThoughtGateError::InternalError {
                 correlation_id: format!("upstream-client-build-error: {}", e),
@@ -331,10 +332,7 @@ impl UpstreamClient {
                 status = %status,
                 "Upstream returned error status"
             );
-            return Err(ThoughtGateError::UpstreamError {
-                code: -32002,
-                message: format!("Upstream returned HTTP {}", status),
-            });
+            return Err(classify_upstream_http_error(status));
         }
 
         // Parse response body
@@ -416,10 +414,7 @@ impl UpstreamClient {
         }
 
         if !status.is_success() {
-            return Err(ThoughtGateError::UpstreamError {
-                code: -32002,
-                message: format!("Upstream returned HTTP {}", status),
-            });
+            return Err(classify_upstream_http_error(status));
         }
 
         let body: Vec<JsonRpcResponse> =
@@ -483,6 +478,25 @@ impl UpstreamClient {
                 message: error.to_string(),
             }
         }
+    }
+}
+
+/// Classify an upstream HTTP error status into the appropriate JSON-RPC error code.
+///
+/// - 4xx client errors -> -32602 (InvalidParams: upstream rejected our request)
+/// - 503 Service Unavailable -> -32013 (ServiceUnavailable)
+/// - Other 5xx server errors -> -32002 (UpstreamError)
+fn classify_upstream_http_error(status: reqwest::StatusCode) -> ThoughtGateError {
+    let (code, prefix) = if status.is_client_error() {
+        (-32602, "Client error")
+    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        (-32013, "Service unavailable")
+    } else {
+        (-32002, "Server error")
+    };
+    ThoughtGateError::UpstreamError {
+        code,
+        message: format!("{prefix}: upstream returned HTTP {status}"),
     }
 }
 
