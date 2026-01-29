@@ -209,10 +209,10 @@ impl ProxyError {
                         status.canonical_reason().unwrap_or("Unknown")
                     ))))
                     .unwrap_or_else(|_| {
-                        Response::builder()
-                            .status(*status)
-                            .body(Full::new(Bytes::from("Request rejected")))
-                            .unwrap()
+                        // Response::new() cannot fail; manually set status
+                        let mut resp = Response::new(Full::new(Bytes::from("Request rejected")));
+                        *resp.status_mut() = *status;
+                        resp
                     });
             }
             ProxyError::InspectorPanic(_) | ProxyError::InspectorError(_, _) => (
@@ -232,10 +232,10 @@ impl ProxyError {
             .header("Content-Type", "text/plain")
             .body(Full::new(Bytes::from(message)))
             .unwrap_or_else(|_| {
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from("500 Internal Server Error")))
-                    .unwrap()
+                // Response::new() cannot fail; manually set status
+                let mut resp = Response::new(Full::new(Bytes::from("500 Internal Server Error")));
+                *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                resp
             })
     }
 
