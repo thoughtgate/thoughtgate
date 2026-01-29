@@ -69,6 +69,8 @@ pub struct McpServerConfig {
     pub max_body_size: usize,
     /// Maximum concurrent requests
     pub max_concurrent_requests: usize,
+    /// Maximum number of requests in a JSON-RPC batch
+    pub max_batch_size: usize,
     /// Upstream client configuration
     pub upstream: UpstreamConfig,
 }
@@ -79,6 +81,7 @@ impl Default for McpServerConfig {
             listen_addr: "0.0.0.0:8080".to_string(),
             max_body_size: 1024 * 1024, // 1MB
             max_concurrent_requests: 10000,
+            max_batch_size: 100,
             upstream: UpstreamConfig::default(),
         }
     }
@@ -94,6 +97,7 @@ impl McpServerConfig {
     /// - `THOUGHTGATE_LISTEN` (default: "0.0.0.0:8080"): Listen address
     /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
     /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
+    /// - `THOUGHTGATE_MAX_BATCH_SIZE` (default: 100): Max JSON-RPC batch array length
     ///
     /// Plus all upstream configuration variables (see `UpstreamConfig::from_env`).
     ///
@@ -114,10 +118,16 @@ impl McpServerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
 
+        let max_batch_size: usize = std::env::var("THOUGHTGATE_MAX_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
         Ok(Self {
             listen_addr,
             max_body_size,
             max_concurrent_requests,
+            max_batch_size,
             upstream: UpstreamConfig::from_env()?,
         })
     }
@@ -144,6 +154,8 @@ pub struct McpState {
     pub semaphore: Arc<Semaphore>,
     /// Maximum body size in bytes
     pub max_body_size: usize,
+    /// Maximum number of requests in a JSON-RPC batch
+    pub max_batch_size: usize,
     /// Capability cache for upstream detection (REQ-CORE-007)
     pub capability_cache: Arc<CapabilityCache>,
 }
@@ -157,6 +169,8 @@ pub struct McpHandlerConfig {
     pub max_body_size: usize,
     /// Maximum concurrent requests
     pub max_concurrent_requests: usize,
+    /// Maximum number of requests in a JSON-RPC batch
+    pub max_batch_size: usize,
 }
 
 impl Default for McpHandlerConfig {
@@ -164,6 +178,7 @@ impl Default for McpHandlerConfig {
         Self {
             max_body_size: 1024 * 1024, // 1MB
             max_concurrent_requests: 10000,
+            max_batch_size: 100,
         }
     }
 }
@@ -186,9 +201,15 @@ impl McpHandlerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
 
+        let max_batch_size: usize = std::env::var("THOUGHTGATE_MAX_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
         Self {
             max_body_size,
             max_concurrent_requests,
+            max_batch_size,
         }
     }
 }
@@ -252,6 +273,7 @@ impl McpHandler {
             approval_engine: None,
             semaphore,
             max_body_size: config.max_body_size,
+            max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -278,6 +300,7 @@ impl McpHandler {
             approval_engine: None,
             semaphore,
             max_body_size: config.max_body_size,
+            max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -512,6 +535,7 @@ impl McpServer {
             approval_engine,
             semaphore,
             max_body_size: config.max_body_size,
+            max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -550,6 +574,7 @@ impl McpServer {
             approval_engine,
             semaphore,
             max_body_size: config.max_body_size,
+            max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -599,6 +624,7 @@ impl McpServer {
             approval_engine,
             semaphore,
             max_body_size: server_config.max_body_size,
+            max_batch_size: server_config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -745,6 +771,17 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
 
     match parsed {
         ParsedRequests::Single(request) => handle_single_request_bytes(state, request).await,
+        ParsedRequests::Batch(ref requests) if requests.len() > state.max_batch_size => {
+            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let error = ThoughtGateError::InvalidRequest {
+                details: format!(
+                    "Batch size {} exceeds maximum of {}",
+                    requests.len(),
+                    state.max_batch_size
+                ),
+            };
+            error_bytes(None, &error, &correlation_id)
+        }
         ParsedRequests::Batch(requests) => handle_batch_request_bytes(state, requests).await,
     }
 }
@@ -2027,6 +2064,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(100)),
             max_body_size: 1024 * 1024,
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         })
     }
@@ -2198,6 +2236,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(0)), // No permits available
             max_body_size: 1024 * 1024,
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -2237,6 +2276,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(100)),
             max_body_size: 10, // Very small limit
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -2571,6 +2611,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(100)),
             max_body_size: 1024 * 1024,
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         })
     }
@@ -2824,6 +2865,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(100)),
             max_body_size: 1024 * 1024,
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         })
     }
