@@ -1229,6 +1229,14 @@ impl TaskStore {
                 let principal_key = entry.task.principal.rate_limit_key();
                 if let Some(mut ids) = self.by_principal.get_mut(&principal_key) {
                     ids.retain(|id| id != &task_id);
+                    if ids.is_empty() {
+                        // Drop the mutable reference before removing to avoid deadlock
+                        drop(ids);
+                        // Use remove_if to avoid TOCTOU race (another thread may have
+                        // added a new ID between the drop and this remove)
+                        self.by_principal
+                            .remove_if(&principal_key, |_, v| v.is_empty());
+                    }
                 }
             }
         }
@@ -2225,5 +2233,79 @@ mod tests {
         let removed = store.cleanup_terminal();
         assert_eq!(removed, 1);
         assert_eq!(store.total_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_terminal_removes_empty_principal_entries() {
+        let config = TaskStoreConfig {
+            terminal_grace_period: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let store = TaskStore::new(config);
+
+        let principal = test_principal();
+
+        // Create two tasks for the same principal
+        let task1 = store
+            .create(
+                test_request(),
+                test_request(),
+                principal.clone(),
+                None,
+                TimeoutAction::default(),
+            )
+            .unwrap();
+        let task2 = store
+            .create(
+                test_request(),
+                test_request(),
+                principal.clone(),
+                None,
+                TimeoutAction::default(),
+            )
+            .unwrap();
+
+        // Principal should have entries
+        let key = principal.rate_limit_key();
+        assert!(
+            store.by_principal.contains_key(&key),
+            "by_principal should contain the principal"
+        );
+
+        // Complete both tasks
+        for task_id in [&task1.id, &task2.id] {
+            store
+                .transition(task_id, TaskStatus::InputRequired, None)
+                .unwrap();
+            store
+                .record_approval(
+                    task_id,
+                    ApprovalDecision::Approved,
+                    "test".to_string(),
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+            store
+                .complete(
+                    task_id,
+                    ToolCallResult {
+                        content: serde_json::json!({}),
+                        is_error: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        // Wait for grace period
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Cleanup should remove both tasks AND the empty principal entry
+        let removed = store.cleanup_terminal();
+        assert_eq!(removed, 2);
+        assert_eq!(store.total_count(), 0);
+        assert!(
+            !store.by_principal.contains_key(&key),
+            "by_principal should not contain the principal after all tasks cleaned up"
+        );
     }
 }
