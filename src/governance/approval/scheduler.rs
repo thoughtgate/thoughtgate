@@ -104,15 +104,17 @@ impl PollingScheduler {
     ///
     /// Returns `AdapterError` if posting fails.
     pub async fn submit(&self, request: ApprovalRequest) -> Result<(), AdapterError> {
-        // Check capacity
+        // Check capacity - reject if at limit to prevent unbounded growth
         if self.references.len() >= self.config.max_concurrent {
             warn!(
                 task_id = %request.task_id,
                 current = self.references.len(),
                 max = self.config.max_concurrent,
-                "Polling queue at capacity"
+                "Polling queue at capacity, rejecting submission"
             );
-            // Don't reject - oldest tasks will be polled first
+            return Err(AdapterError::RateLimited {
+                retry_after: Duration::from_secs(5),
+            });
         }
 
         // Rate limit the post operation
@@ -724,5 +726,45 @@ mod tests {
                 "Task {task_id} should be in references"
             );
         }
+    }
+
+    /// Tests that submit rejects when at max_concurrent capacity.
+    ///
+    /// Verifies: Scheduler returns RateLimited error when queue is full.
+    #[tokio::test]
+    async fn test_submit_rejects_at_capacity() {
+        let adapter = Arc::new(MockAdapter::new());
+        let task_store = Arc::new(TaskStore::new(TaskStoreConfig::default()));
+        let config = PollingConfig {
+            max_concurrent: 2,
+            ..PollingConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+
+        let scheduler = PollingScheduler::new(adapter, task_store, config, shutdown);
+
+        // Fill to capacity
+        for _ in 0..2 {
+            let request = test_request(TaskId::new());
+            scheduler
+                .submit(request)
+                .await
+                .expect("Submit should succeed");
+        }
+        assert_eq!(scheduler.pending_count(), 2);
+
+        // Next submit should be rejected with RateLimited
+        let request = test_request(TaskId::new());
+        let result = scheduler.submit(request).await;
+        assert!(result.is_err(), "Submit at capacity should fail");
+        match result.unwrap_err() {
+            AdapterError::RateLimited { retry_after } => {
+                assert_eq!(retry_after, Duration::from_secs(5));
+            }
+            other => panic!("Expected RateLimited, got: {other:?}"),
+        }
+
+        // Queue should still be at 2 (the rejected one was not added)
+        assert_eq!(scheduler.pending_count(), 2);
     }
 }
