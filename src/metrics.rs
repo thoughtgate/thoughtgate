@@ -332,12 +332,10 @@ impl ProxyMetrics {
 }
 
 /// Global metrics instance (Green Path only for backwards compatibility).
-static GREEN_METRICS: once_cell::sync::OnceCell<Arc<GreenPathMetrics>> =
-    once_cell::sync::OnceCell::new();
+static GREEN_METRICS: std::sync::OnceLock<Arc<GreenPathMetrics>> = std::sync::OnceLock::new();
 
 /// Global Amber Path metrics instance.
-static AMBER_METRICS: once_cell::sync::OnceCell<Arc<AmberPathMetrics>> =
-    once_cell::sync::OnceCell::new();
+static AMBER_METRICS: std::sync::OnceLock<Arc<AmberPathMetrics>> = std::sync::OnceLock::new();
 
 /// Initialize global metrics.
 pub fn init_metrics(meter: &Meter) {

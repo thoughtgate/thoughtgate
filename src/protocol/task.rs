@@ -20,8 +20,8 @@ use std::str::FromStr;
 ///
 /// Implements: REQ-CORE-007/§6.5
 ///
-/// Format: `tg_<nanoid>` where nanoid is 21 alphanumeric characters.
-/// Example: `tg_V1StGXR8_Z5jdHi6B-myT`
+/// Format: `tg_<hex>` where hex is 21 characters from a UUID v4.
+/// Example: `tg_a1b2c3d4e5f6a7b8c9d0e`
 ///
 /// The `tg_` prefix indicates ThoughtGate ownership. Task IDs without this
 /// prefix are assumed to be upstream-owned and should be passed through.
@@ -31,7 +31,7 @@ pub struct Sep1686TaskId(String);
 /// Prefix for ThoughtGate-owned task IDs.
 pub const TASK_ID_PREFIX: &str = "tg_";
 
-/// Length of the nanoid body (excluding prefix).
+/// Length of the UUID-derived body (excluding prefix).
 pub const TASK_ID_BODY_LENGTH: usize = 21;
 
 impl Sep1686TaskId {
@@ -39,11 +39,11 @@ impl Sep1686TaskId {
     ///
     /// Implements: REQ-CORE-007/§6.5
     ///
-    /// The generated ID uses nanoid with 21 characters, which provides
-    /// ~1 billion IDs before 1% collision probability.
+    /// The generated ID uses 21 hex characters from a UUID v4, which provides
+    /// sufficient uniqueness for task identification.
     #[must_use]
     pub fn new() -> Self {
-        let body = nanoid::nanoid!(TASK_ID_BODY_LENGTH);
+        let body = &uuid::Uuid::new_v4().simple().to_string()[..TASK_ID_BODY_LENGTH];
         Self(format!("{}{}", TASK_ID_PREFIX, body))
     }
 
@@ -410,12 +410,11 @@ mod tests {
             s
         );
 
-        // Should be alphanumeric with allowed special chars
+        // Body should be lowercase hex characters (from UUID v4)
         let body = &s[TASK_ID_PREFIX.len()..];
         assert!(
-            body.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-            "Body should be alphanumeric: {}",
+            body.chars().all(|c| c.is_ascii_hexdigit()),
+            "Body should be hex characters: {}",
             body
         );
     }

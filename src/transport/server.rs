@@ -348,6 +348,7 @@ impl McpHandler {
             approval_engine,
             semaphore,
             max_body_size: handler_config.max_body_size,
+            max_batch_size: handler_config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
