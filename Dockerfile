@@ -39,6 +39,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /app/target/release/thoughtgate /thoughtgate
 
 # nonroot image already runs as UID 65532
+# NOTE: Set file descriptor limits via container runtime (--ulimit nofile=65535:65535)
 
 # Expose default ports (outbound: 7467, inbound: 7468, admin: 7469)
 EXPOSE 7467 7468 7469
