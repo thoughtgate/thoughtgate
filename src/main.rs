@@ -283,20 +283,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 Ok(resp) => {
-                    error!(
-                        upstream = %upstream_url,
-                        status = %resp.status(),
-                        "Upstream returned non-success status at startup"
-                    );
-                    std::process::exit(1);
+                    return Err(format!(
+                        "Upstream {} returned non-success status {} at startup",
+                        upstream_url,
+                        resp.status()
+                    )
+                    .into());
                 }
                 Err(e) => {
-                    error!(
-                        upstream = %upstream_url,
-                        error = %e,
-                        "Cannot connect to upstream at startup"
-                    );
-                    std::process::exit(1);
+                    return Err(format!(
+                        "Cannot connect to upstream {} at startup: {}",
+                        upstream_url, e
+                    )
+                    .into());
                 }
             }
         } else {
@@ -320,11 +319,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check startup timeout before marking ready
     // Implements: REQ-CORE-005/F-001 (startup timeout enforcement)
     if std::time::Instant::now() > startup_deadline {
-        error!(
-            timeout_secs = lifecycle.config().startup_timeout.as_secs(),
-            "Startup timeout exceeded"
-        );
-        std::process::exit(1);
+        return Err(format!(
+            "Startup timeout exceeded ({}s)",
+            lifecycle.config().startup_timeout.as_secs()
+        )
+        .into());
     }
 
     // Mark as ready
@@ -506,6 +505,9 @@ fn setup_signal_handlers(shutdown: CancellationToken, lifecycle: Arc<LifecycleMa
                         "Received SIGQUIT, immediate shutdown (no drain)"
                     );
                     lifecycle_sigquit.mark_stopped();
+                    // Intentional process::exit: SIGQUIT demands immediate termination
+                    // without drain. This cannot return through main() because the
+                    // signal handler runs in a spawned task.
                     std::process::exit(1);
                 }
                 Err(e) => {
