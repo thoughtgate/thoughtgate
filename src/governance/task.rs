@@ -587,12 +587,45 @@ impl Task {
 /// - The hash verifies the *semantic content* of what was approved
 /// - Two requests with identical tool+arguments perform the same action
 ///   regardless of their request IDs
+///
+/// Arguments are serialized using canonical JSON (sorted keys) to ensure
+/// deterministic hashing regardless of key insertion order. This is necessary
+/// because `serde_json/preserve_order` is enabled transitively by
+/// `cedar-policy-core`, making `Value::to_string()` insertion-order dependent.
 #[must_use]
 pub fn hash_request(request: &ToolCallRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(request.name.as_bytes());
-    hasher.update(request.arguments.to_string().as_bytes());
+    hasher.update(canonical_json(&request.arguments).as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Produces a canonical JSON string with object keys sorted alphabetically.
+///
+/// This ensures deterministic serialization regardless of the key insertion
+/// order used by `serde_json::Value` (which depends on whether `preserve_order`
+/// is enabled via feature flags).
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            let entries: Vec<String> = sorted
+                .into_iter()
+                .map(|(k, v)| {
+                    let key_str = serde_json::to_string(k).unwrap_or_default();
+                    format!("{}:{}", key_str, canonical_json(v))
+                })
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        // Leaf values (strings, numbers, bools, null) serialize deterministically
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
 }
 
 /// Computes the suggested poll interval based on remaining TTL.
@@ -2029,6 +2062,56 @@ mod tests {
 
         // Hash is a valid hex string
         assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Tests that canonical JSON hashing produces identical hashes regardless of
+    /// key insertion order in `serde_json::Value` objects.
+    ///
+    /// This is critical because `serde_json/preserve_order` is transitively
+    /// enabled by `cedar-policy-core`, making `Value::to_string()` dependent
+    /// on insertion order.
+    ///
+    /// Verifies: REQ-GOV-001/F-002.3
+    #[test]
+    fn test_canonical_json_hash_key_order_independent() {
+        // Build two Value::Objects with different key insertion orders
+        let args_ab = serde_json::json!({"a": 1, "b": 2});
+        let args_ba = serde_json::json!({"b": 2, "a": 1});
+
+        let req_ab = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "test_tool".to_string(),
+            arguments: args_ab,
+            mcp_request_id: JsonRpcId::Number(1),
+        };
+        let req_ba = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "test_tool".to_string(),
+            arguments: args_ba,
+            mcp_request_id: JsonRpcId::Number(2),
+        };
+
+        // Must produce identical hashes despite different key orders
+        assert_eq!(hash_request(&req_ab), hash_request(&req_ba));
+
+        // Nested objects should also be order-independent
+        let nested_1 = serde_json::json!({"outer": {"z": 3, "a": 1}, "list": [1, 2]});
+        let nested_2 = serde_json::json!({"list": [1, 2], "outer": {"a": 1, "z": 3}});
+
+        let req_nested_1 = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "nested_tool".to_string(),
+            arguments: nested_1,
+            mcp_request_id: JsonRpcId::Number(3),
+        };
+        let req_nested_2 = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "nested_tool".to_string(),
+            arguments: nested_2,
+            mcp_request_id: JsonRpcId::Number(4),
+        };
+
+        assert_eq!(hash_request(&req_nested_1), hash_request(&req_nested_2));
     }
 
     /// Tests approval recording and state transition.
