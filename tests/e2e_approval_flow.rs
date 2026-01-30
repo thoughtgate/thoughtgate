@@ -21,6 +21,7 @@ use thoughtgate::governance::approval::{
 use thoughtgate::governance::engine::{ApprovalEngineConfig, TimeoutAction};
 use thoughtgate::governance::task::{JsonRpcId, ToolCallRequest};
 use thoughtgate::governance::{ApprovalEngine, Principal, TaskStatus, TaskStore};
+use thoughtgate::policy::engine::CedarEngine;
 use thoughtgate::transport::{JsonRpcResponse, McpRequest, UpstreamForwarder};
 
 // ============================================================================
@@ -186,14 +187,15 @@ async fn test_e2e_approval_flow() {
     let shutdown = CancellationToken::new();
 
     // Wire up the engine
+    let cedar_engine = Arc::new(CedarEngine::new().expect("Failed to create CedarEngine"));
     let engine = ApprovalEngine::new(
         task_store.clone(),
         adapter.clone(),
         upstream.clone(),
+        cedar_engine,
         config,
         shutdown.clone(),
-    )
-    .expect("Failed to create ApprovalEngine");
+    );
 
     // Spawn background polling
     engine.spawn_background_tasks();
@@ -333,14 +335,15 @@ async fn test_e2e_rejection_flow() {
     let config = ApprovalEngineConfig::default();
     let shutdown = CancellationToken::new();
 
+    let cedar_engine = Arc::new(CedarEngine::new().expect("Failed to create CedarEngine"));
     let engine = ApprovalEngine::new(
         task_store.clone(),
         adapter,
         upstream.clone(),
+        cedar_engine,
         config,
         shutdown.clone(),
-    )
-    .expect("Failed to create ApprovalEngine");
+    );
 
     engine.spawn_background_tasks();
 

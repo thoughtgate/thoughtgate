@@ -487,10 +487,14 @@ pub fn create_governance_components(
 
         let engine_config = ApprovalEngineConfig::from_env();
 
-        let engine = ApprovalEngine::new(task_store, adapter, upstream, engine_config, shutdown)
-            .map_err(|e| ThoughtGateError::ServiceUnavailable {
-                reason: format!("Failed to create ApprovalEngine: {}", e),
-            })?;
+        let engine = ApprovalEngine::new(
+            task_store,
+            adapter,
+            upstream,
+            cedar_engine.clone(),
+            engine_config,
+            shutdown,
+        );
 
         // Spawn background polling loop for approval decisions
         // Implements: REQ-GOV-003/F-002, REQ-GOV-001/F-008

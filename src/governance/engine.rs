@@ -249,19 +249,17 @@ impl ApprovalEngine {
     /// * `task_store` - Shared task store
     /// * `adapter` - Approval adapter (Slack, etc.)
     /// * `upstream` - Upstream client for executing approved requests
+    /// * `cedar_engine` - Shared Cedar policy engine (same instance used by Gate 3)
     /// * `config` - Engine configuration
     /// * `shutdown` - Cancellation token for graceful shutdown
-    ///
-    /// # Errors
-    ///
-    /// Returns error if Cedar policy engine fails to initialize.
     pub fn new(
         task_store: Arc<TaskStore>,
         adapter: Arc<dyn ApprovalAdapter>,
         upstream: Arc<dyn UpstreamForwarder>,
+        cedar_engine: Arc<crate::policy::engine::CedarEngine>,
         config: ApprovalEngineConfig,
         shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<Self, ApprovalEngineError> {
+    ) -> Self {
         // Create polling configuration from engine config
         let polling_config = PollingConfig {
             base_interval: Duration::from_secs(5),
@@ -285,28 +283,21 @@ impl ApprovalEngine {
             ..Default::default()
         };
 
-        // Create Cedar policy engine for pipeline
-        let cedar_engine = crate::policy::engine::CedarEngine::new().map_err(|e| {
-            ApprovalEngineError::Internal {
-                details: format!("Failed to create CedarEngine: {e}"),
-            }
-        })?;
-
         // Create pipeline with no inspectors for v0.2 (simplified)
         let pipeline = Arc::new(ApprovalPipeline::new(
             vec![], // No inspectors in v0.2
-            Arc::new(cedar_engine),
+            cedar_engine,
             upstream.clone(),
             pipeline_config,
         ));
 
-        Ok(Self {
+        Self {
             task_store,
             scheduler,
             pipeline,
             config,
             executing: dashmap::DashSet::new(),
-        })
+        }
     }
 
     /// Spawn background tasks for the approval engine.
@@ -855,6 +846,10 @@ mod tests {
         }
     }
 
+    fn test_cedar_engine() -> Arc<crate::policy::engine::CedarEngine> {
+        Arc::new(crate::policy::engine::CedarEngine::new().expect("Failed to create CedarEngine"))
+    }
+
     fn test_request() -> ToolCallRequest {
         ToolCallRequest {
             method: "tools/call".to_string(),
@@ -887,10 +882,10 @@ mod tests {
             task_store.clone(),
             adapter.clone(),
             upstream,
+            test_cedar_engine(),
             config,
             shutdown,
-        )
-        .expect("Failed to create engine");
+        );
 
         let result = engine
             .start_approval(test_request(), test_principal(), None)
@@ -921,8 +916,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store, adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store,
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         let result = engine.execute_on_result(&TaskId::new()).await;
 
@@ -944,8 +945,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -977,8 +984,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -1027,8 +1040,14 @@ mod tests {
         };
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -1064,8 +1083,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -1099,8 +1124,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -1149,8 +1180,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store, adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store,
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         let result = engine
             .start_approval(test_request(), test_principal(), None)
@@ -1212,10 +1249,10 @@ mod tests {
             task_store.clone(),
             adapter,
             upstream.clone(),
+            test_cedar_engine(),
             config,
             shutdown,
-        )
-        .expect("Failed to create engine");
+        );
 
         // Start approval
         let start_result = engine
