@@ -1234,24 +1234,20 @@ fn validate_task_metadata(
 /// # Returns
 ///
 /// (StatusCode, Bytes) tuple with JSON-RPC result or error.
-async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (StatusCode, Bytes) {
-    let correlation_id = request.correlation_id.to_string();
-    let id = request.id.clone();
-    let is_notification = request.is_notification();
-
-    debug!(
-        correlation_id = %correlation_id,
-        method = %request.method,
-        is_notification = is_notification,
-        is_task_augmented = request.is_task_augmented(),
-        "Processing single request"
-    );
-
-    // Route the request
-    let result = match state.router.route(request) {
+/// Routes a single MCP request through the appropriate handler.
+///
+/// Implements: REQ-CORE-003/F-002 (Method Routing)
+///
+/// Shared routing logic used by both single and batch request handlers.
+/// Dispatches to the 4-gate model, task handler, initialize handler,
+/// or pass-through based on the router's classification.
+async fn route_request(
+    state: &McpState,
+    request: McpRequest,
+) -> Result<JsonRpcResponse, ThoughtGateError> {
+    match state.router.route(request) {
         RouteTarget::PolicyEvaluation { request } => {
             // Apply 4-gate model for governable methods when config is present
-            // Implements: REQ-CORE-003/F-002 (Method Routing)
             if state.config.is_some() {
                 if method_requires_gates(&request.method) {
                     // Governable methods: tools/call, resources/read, etc.
@@ -1270,24 +1266,31 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
             }
         }
         RouteTarget::TaskHandler { method, request } => {
-            // Implements: REQ-GOV-001/F-003 through F-006 (SEP-1686 task methods)
-            debug!(
-                correlation_id = %correlation_id,
-                task_method = ?method,
-                "Handling task method"
-            );
             handle_task_method(state, method, &request).await
         }
         RouteTarget::InitializeHandler { request } => {
             // Implements: REQ-CORE-007/F-001 (Capability Injection)
-            debug!(
-                correlation_id = %correlation_id,
-                "Handling initialize method for capability injection"
-            );
             handle_initialize_method(state, request).await
         }
         RouteTarget::PassThrough { request } => state.upstream.forward(&request).await,
-    };
+    }
+}
+
+async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (StatusCode, Bytes) {
+    let correlation_id = request.correlation_id.to_string();
+    let id = request.id.clone();
+    let is_notification = request.is_notification();
+
+    debug!(
+        correlation_id = %correlation_id,
+        method = %request.method,
+        is_notification = is_notification,
+        is_task_augmented = request.is_task_augmented(),
+        "Processing single request"
+    );
+
+    // Route the request through shared routing logic
+    let result = route_request(state, request).await;
 
     // Handle notification - no response (empty body with 204)
     if is_notification {
@@ -1920,35 +1923,8 @@ async fn handle_batch_request_bytes(
                 let id = request.id.clone();
                 let correlation_id = request.correlation_id.to_string();
 
-                let result = match state.router.route(request) {
-                    RouteTarget::PolicyEvaluation { request } => {
-                        // Apply 4-gate model for governable methods when config is present
-                        // Implements: REQ-CORE-003/F-002 (Method Routing)
-                        if state.config.is_some() {
-                            if method_requires_gates(&request.method) {
-                                // Governable methods: tools/call, resources/read, etc.
-                                route_through_gates(state, request).await
-                            } else if is_list_method(&request.method) {
-                                // List methods: tools/list, resources/list, prompts/list
-                                handle_list_method(state, request).await
-                            } else {
-                                // Other methods: forward directly
-                                state.upstream.forward(&request).await
-                            }
-                        } else {
-                            // Legacy mode (no config): direct Cedar evaluation (Gate 3 only)
-                            evaluate_with_cedar(state, request, None).await
-                        }
-                    }
-                    RouteTarget::TaskHandler { method, request } => {
-                        handle_task_method(state, method, &request).await
-                    }
-                    RouteTarget::InitializeHandler { request } => {
-                        // Implements: REQ-CORE-007/F-001 (Capability Injection)
-                        handle_initialize_method(state, request).await
-                    }
-                    RouteTarget::PassThrough { request } => state.upstream.forward(&request).await,
-                };
+                // Route through shared routing logic
+                let result = route_request(state, request).await;
 
                 // F-007.4: Notifications don't produce response entries
                 if is_notification {
