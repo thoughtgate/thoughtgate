@@ -1891,13 +1891,22 @@ async fn evaluate_with_cedar(
 ///
 /// (StatusCode, Bytes) with JSON-RPC batch response or 204 No Content if all notifications.
 ///
-/// # Design Note
+/// # Design Note: Batch Concurrency
 ///
-/// Requests are processed sequentially rather than in parallel because:
-/// 1. F-007.5 requires that if ANY request needs approval, the entire batch
-///    becomes task-augmented - requests are not independent
-/// 2. Sequential processing simplifies response ordering guarantees
-/// 3. The upstream connection pool handles actual HTTP request parallelism
+/// Requests are processed sequentially (single-permit-per-batch) rather than
+/// in parallel. This design choice is intentional:
+///
+/// 1. **Approval coupling** (F-007.5): If ANY request needs approval, the
+///    entire batch becomes task-augmented — requests are not independent.
+/// 2. **Bounded resource usage**: With `max_batch_size` limiting array length,
+///    sequential processing bounds total work per request to O(max_batch_size).
+///    Parallel processing would require additional concurrency limits to
+///    prevent a single batch from monopolizing the connection pool.
+/// 3. **Deadlock prevention**: Parallel batch items competing for the same
+///    upstream connection pool under load could deadlock if the pool is
+///    exhausted by one batch while another waits.
+/// 4. **Response ordering**: Sequential processing trivially preserves
+///    response ordering without additional synchronization.
 async fn handle_batch_request_bytes(
     state: &McpState,
     items: Vec<crate::transport::jsonrpc::BatchItem>,

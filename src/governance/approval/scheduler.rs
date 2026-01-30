@@ -249,7 +249,13 @@ impl PollingScheduler {
             }
         }
 
-        // Rate limit
+        // Rate limit: gates one API call per poll_for_decision() invocation.
+        // The rate limiter uses a token bucket with rate_limit_per_sec (default 1.0),
+        // ensuring we respect external API rate limits (e.g., Slack's 1 req/sec Tier 3).
+        //
+        // TODO: For high-task-count deployments, consider batch-polling optimization:
+        // fetch multiple decisions in a single API call (e.g., conversations.history
+        // for Slack) rather than polling each task individually.
         self.rate_limiter.acquire().await;
 
         // Poll for decision
