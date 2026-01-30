@@ -173,6 +173,11 @@ impl CedarEngine {
     ///
     /// - `CedarDecision::Permit` - Continue to Gate 4
     /// - `CedarDecision::Forbid` - Deny with -32003 PolicyDenied
+    // NOTE: This is synchronous CPU-bound work on the Tokio runtime.
+    // Current benchmarks show p50 < 100µs for typical tool-level policies,
+    // which is faster than the ~10-20µs context switch overhead of spawn_blocking.
+    // If policy complexity increases and p99 exceeds 200µs, consider offloading
+    // to tokio::task::spawn_blocking. See REQ-OBS-001 policy eval metrics.
     pub fn evaluate_v2(&self, request: &CedarRequest) -> CedarDecision {
         let start = std::time::Instant::now();
         self.stats_v2
