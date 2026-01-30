@@ -435,6 +435,11 @@ impl ApprovalEngine {
             "Approval workflow started, task created"
         );
 
+        // Record governance metrics
+        if let Some(metrics) = crate::metrics::get_governance_metrics() {
+            metrics.record_task_created();
+        }
+
         // F-002.3: Return task ID immediately (scheduler polls in background)
         Ok(ApprovalStartResult {
             task_id: task.id,
@@ -668,12 +673,19 @@ impl ApprovalEngine {
             }
         };
 
-        // Handle pipeline result
+        // Handle pipeline result and record governance metrics
         match pipeline_result {
             PipelineResult::Success { result } => {
                 // Store result and mark complete
                 if let Err(e) = self.task_store.complete(task_id, result.clone()) {
                     error!(task_id = %task_id, error = %e, "Failed to complete task");
+                }
+                if let Some(metrics) = crate::metrics::get_governance_metrics() {
+                    metrics.record_task_terminal("completed");
+                    let latency = task.created_at.signed_duration_since(chrono::Utc::now());
+                    if let Ok(d) = (-latency).to_std() {
+                        metrics.record_approval_latency(d);
+                    }
                 }
                 Ok(result)
             }
@@ -690,6 +702,10 @@ impl ApprovalEngine {
                 };
                 if let Err(e) = self.task_store.fail(task_id, failure) {
                     error!(task_id = %task_id, error = %e, "Failed to record task failure");
+                }
+                if let Some(metrics) = crate::metrics::get_governance_metrics() {
+                    metrics.record_task_terminal("failed");
+                    metrics.record_pipeline_failure(&format!("{stage:?}"));
                 }
 
                 // Map failure to appropriate error
