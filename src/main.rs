@@ -332,6 +332,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     lifecycle.mark_approval_store_initialized(); // Approval store ready
     lifecycle.mark_ready();
 
+    // Per-request timeout for proxy connections
+    // Prevents indefinitely hanging connections from leaking resources
+    let request_timeout = Duration::from_secs(
+        std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+    );
+    info!(
+        timeout_secs = request_timeout.as_secs(),
+        "Per-request timeout configured"
+    );
+
     // Main accept loop
     loop {
         tokio::select! {
@@ -380,15 +393,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let conn_shutdown = shutdown.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(
-                                stream,
-                                peer_addr,
-                                service_stack,
-                                conn_shutdown,
+                            match tokio::time::timeout(
+                                request_timeout,
+                                handle_connection(
+                                    stream,
+                                    peer_addr,
+                                    service_stack,
+                                    conn_shutdown,
+                                ),
                             )
                             .await
                             {
-                                error!(error = %e, "Connection handling error");
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    error!(error = %e, "Connection handling error");
+                                }
+                                Err(_elapsed) => {
+                                    warn!(
+                                        peer = %peer_addr,
+                                        timeout_secs = request_timeout.as_secs(),
+                                        "Connection timed out, dropping"
+                                    );
+                                }
                             }
 
                             // Explicit drops for clarity (both happen automatically at scope end)
