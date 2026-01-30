@@ -216,6 +216,28 @@ pub struct ApprovalStartResult {
 
 /// The approval engine coordinates the v0.2 approval workflow.
 ///
+/// RAII guard that removes a task ID from the executing set on drop.
+///
+/// Ensures cleanup even on panic, early return, or timeout during pipeline
+/// execution. Without this guard, a panic during `execute_approved()` would
+/// permanently leak the task ID in the executing set, preventing retries.
+struct ExecutingGuard<'a> {
+    task_id: TaskId,
+    executing: &'a dashmap::DashSet<TaskId>,
+}
+
+impl<'a> ExecutingGuard<'a> {
+    fn new(task_id: TaskId, executing: &'a dashmap::DashSet<TaskId>) -> Self {
+        Self { task_id, executing }
+    }
+}
+
+impl Drop for ExecutingGuard<'_> {
+    fn drop(&mut self) {
+        self.executing.remove(&self.task_id);
+    }
+}
+
 /// Implements: REQ-GOV-002
 ///
 /// This is the main entry point for approval workflows. It:
@@ -493,6 +515,9 @@ impl ApprovalEngine {
                                 reason: "Task execution already in progress".to_string(),
                             });
                         }
+                        // RAII guard ensures executing set is cleaned up on all exit
+                        // paths (success, error, timeout, panic)
+                        let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
 
                         warn!(
                             task_id = %task_id,
@@ -520,14 +545,30 @@ impl ApprovalEngine {
                         let mut auto_approved_task = task.clone();
                         auto_approved_task.status = TaskStatus::Executing;
 
-                        // Execute the pipeline with the synthetic approval
-                        let pipeline_result = self
-                            .pipeline
-                            .execute_approved(&auto_approved_task, &synthetic_approval)
-                            .await;
-
-                        // Remove from executing set now that pipeline is complete
-                        self.executing.remove(task_id);
+                        // Execute the pipeline with timeout protection
+                        let pipeline_result = match tokio::time::timeout(
+                            self.config.execution_timeout,
+                            self.pipeline
+                                .execute_approved(&auto_approved_task, &synthetic_approval),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                error!(
+                                    task_id = %task_id,
+                                    timeout_secs = self.config.execution_timeout.as_secs(),
+                                    "Auto-approved task execution timed out"
+                                );
+                                return Err(ThoughtGateError::ServiceUnavailable {
+                                    reason: format!(
+                                        "Auto-approved task execution timed out after {}s",
+                                        self.config.execution_timeout.as_secs()
+                                    ),
+                                });
+                            }
+                        };
+                        // Guard drops here, cleaning up executing set
 
                         return match pipeline_result {
                             PipelineResult::Success { result } => {
@@ -591,20 +632,41 @@ impl ApprovalEngine {
                 reason: "Task execution already in progress".to_string(),
             });
         }
+        // RAII guard ensures executing set is cleaned up on all exit
+        // paths (success, error, timeout, panic)
+        let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
 
         // Execute the full pipeline (with approval record)
-        // Use a guard to ensure we clean up the executing set on all exit paths
-        let approval = task.approval.as_ref().ok_or_else(|| {
-            self.executing.remove(task_id);
-            ThoughtGateError::ServiceUnavailable {
-                reason: "Task approved but no approval record".to_string(),
+        let approval =
+            task.approval
+                .as_ref()
+                .ok_or_else(|| ThoughtGateError::ServiceUnavailable {
+                    reason: "Task approved but no approval record".to_string(),
+                })?;
+
+        let pipeline_result = match tokio::time::timeout(
+            self.config.execution_timeout,
+            self.pipeline.execute_approved(&task, approval),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                error!(
+                    task_id = %task_id,
+                    timeout_secs = self.config.execution_timeout.as_secs(),
+                    "Pipeline execution timed out"
+                );
+                PipelineResult::Failure {
+                    stage: FailureStage::UpstreamError,
+                    reason: format!(
+                        "Pipeline execution timed out after {}s",
+                        self.config.execution_timeout.as_secs()
+                    ),
+                    retriable: true,
+                }
             }
-        })?;
-
-        let pipeline_result = self.pipeline.execute_approved(&task, approval).await;
-
-        // Remove from executing set now that pipeline is complete
-        self.executing.remove(task_id);
+        };
 
         // Handle pipeline result
         match pipeline_result {
