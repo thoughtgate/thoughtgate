@@ -802,7 +802,7 @@ impl TaskStore {
     /// Implements: REQ-GOV-001/F-009.3
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.pending_count.load(Ordering::Relaxed)
+        self.pending_count.load(Ordering::Acquire)
     }
 
     /// Returns the total number of tasks (including terminal).
@@ -897,7 +897,7 @@ impl TaskStore {
             .push(task_id);
 
         // Increment pending count
-        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        self.pending_count.fetch_add(1, Ordering::Release);
 
         Ok(task_clone)
     }
@@ -936,7 +936,7 @@ impl TaskStore {
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Release);
             // Notify any waiters
             entry.notify.notify_waiters();
         }
@@ -969,7 +969,7 @@ impl TaskStore {
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Release);
             // Notify any waiters
             entry.notify.notify_waiters();
         }
@@ -1029,7 +1029,7 @@ impl TaskStore {
 
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Release);
             entry.notify.notify_waiters();
         }
 
@@ -1062,7 +1062,7 @@ impl TaskStore {
             Some("Execution completed".to_string()),
         )?;
         entry.terminal_at = Some(Utc::now());
-        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.pending_count.fetch_sub(1, Ordering::Release);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -1094,7 +1094,7 @@ impl TaskStore {
         entry.terminal_at = Some(Utc::now());
 
         if !was_terminal {
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Release);
         }
         entry.notify.notify_waiters();
 
@@ -1141,7 +1141,7 @@ impl TaskStore {
             Some("Cancelled by agent".to_string()),
         )?;
         entry.terminal_at = Some(Utc::now());
-        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.pending_count.fetch_sub(1, Ordering::Release);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -1181,7 +1181,7 @@ impl TaskStore {
                     .is_ok()
             {
                 entry.terminal_at = Some(now);
-                self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                self.pending_count.fetch_sub(1, Ordering::Release);
                 entry.notify.notify_waiters();
                 expired += 1;
                 tracing::warn!(
