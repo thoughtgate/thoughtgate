@@ -1343,6 +1343,9 @@ async fn handle_task_method(
                     details: format!("Invalid tasks/get params: {}", e),
                 })?;
 
+            // Verify caller owns this task (returns TaskNotFound on mismatch)
+            verify_task_principal(state, &req.task_id)?;
+
             let result = state
                 .task_handler
                 .handle_tasks_get(req)
@@ -1363,6 +1366,9 @@ async fn handle_task_method(
                 serde_json::from_value(params).map_err(|e| ThoughtGateError::InvalidParams {
                     details: format!("Invalid tasks/result params: {}", e),
                 })?;
+
+            // Verify caller owns this task (returns TaskNotFound on mismatch)
+            verify_task_principal(state, &req.task_id)?;
 
             // If we have an approval engine, use it to execute approved tasks
             if let Some(approval_engine) = &state.approval_engine {
@@ -1428,6 +1434,9 @@ async fn handle_task_method(
                     details: format!("Invalid tasks/cancel params: {}", e),
                 })?;
 
+            // Verify caller owns this task (returns TaskNotFound on mismatch)
+            verify_task_principal(state, &req.task_id)?;
+
             let result = state
                 .task_handler
                 .handle_tasks_cancel(req)
@@ -1441,6 +1450,44 @@ async fn handle_task_method(
             ))
         }
     }
+}
+
+/// Verify that the caller's principal matches the task's principal.
+///
+/// Returns TaskNotFound (not "access denied") to prevent information leakage
+/// about tasks owned by other principals.
+///
+/// If principal inference fails (no K8s identity and dev mode is off),
+/// verification is skipped. This is safe because task creation also requires
+/// principal inference — if identity cannot be established, no tasks will
+/// exist for the caller to access.
+///
+/// Implements: REQ-GOV-001/F-011 (Principal isolation)
+fn verify_task_principal(
+    state: &McpState,
+    task_id: &crate::governance::task::TaskId,
+) -> Result<(), ThoughtGateError> {
+    // If we can't infer principal, skip verification. This can happen in
+    // environments where identity is not configured. Task creation would
+    // also fail in such environments, providing defense-in-depth.
+    let caller_principal = match infer_principal() {
+        Ok(p) => Principal::new(&p.app_name),
+        Err(_) => return Ok(()),
+    };
+
+    let task = state
+        .task_handler
+        .store()
+        .get(task_id)
+        .map_err(task_error_to_thoughtgate)?;
+
+    if task.principal != caller_principal {
+        return Err(ThoughtGateError::TaskNotFound {
+            task_id: task_id.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Convert TaskError to ThoughtGateError.
