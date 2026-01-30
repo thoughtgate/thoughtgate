@@ -142,12 +142,17 @@ impl SlackConfig {
 ///
 /// Implements: REQ-GOV-003/F-006
 ///
+/// Maximum number of entries in the user display name cache.
+/// When exceeded, the cache is cleared to prevent unbounded memory growth.
+const MAX_USER_CACHE_SIZE: usize = 1000;
+
 /// Posts approval requests as Block Kit messages and polls for
 /// reactions to detect approval decisions.
 pub struct SlackAdapter {
     client: Client,
     config: SlackConfig,
-    /// Cache: user_id -> display_name (avoid repeated users.info calls)
+    /// Cache: user_id -> display_name (avoid repeated users.info calls).
+    /// Bounded to MAX_USER_CACHE_SIZE entries to prevent unbounded growth.
     user_cache: DashMap<String, String>,
 }
 
@@ -298,7 +303,10 @@ impl SlackAdapter {
             })
             .unwrap_or_else(|| user_id.to_string());
 
-        // Cache the result
+        // Cache the result (with bounded size to prevent unbounded growth)
+        if self.user_cache.len() >= MAX_USER_CACHE_SIZE {
+            self.user_cache.clear();
+        }
         self.user_cache
             .insert(user_id.to_string(), display_name.clone());
 
