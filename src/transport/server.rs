@@ -1051,7 +1051,11 @@ async fn handle_list_method(
             if let Some(obj) = new_result.as_object_mut() {
                 obj.insert(
                     "tools".to_string(),
-                    serde_json::to_value(&tools).unwrap_or(tools_value.clone()),
+                    serde_json::to_value(&tools).map_err(|e| {
+                        ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to serialize filtered tools: {e}"),
+                        }
+                    })?,
                 );
             }
 
@@ -1098,7 +1102,11 @@ async fn handle_list_method(
             if let Some(obj) = new_result.as_object_mut() {
                 obj.insert(
                     "resources".to_string(),
-                    serde_json::to_value(&resources).unwrap_or(resources_value.clone()),
+                    serde_json::to_value(&resources).map_err(|e| {
+                        ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to serialize filtered resources: {e}"),
+                        }
+                    })?,
                 );
             }
 
@@ -1145,7 +1153,11 @@ async fn handle_list_method(
             if let Some(obj) = new_result.as_object_mut() {
                 obj.insert(
                     "prompts".to_string(),
-                    serde_json::to_value(&prompts).unwrap_or(prompts_value.clone()),
+                    serde_json::to_value(&prompts).map_err(|e| {
+                        ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to serialize filtered prompts: {e}"),
+                        }
+                    })?,
                 );
             }
 
