@@ -7,6 +7,20 @@
 //! # Traceability
 //! - Implements: REQ-CFG-001/V-001 through V-014
 //! - Implements: REQ-CFG-001/9.1 (Configuration Loading Flow)
+//!
+//! # TODO: Config Hot-Reload (REQ-CFG-002, deferred to v0.2+)
+//!
+//! Current implementation loads configuration once at startup. Hot-reload
+//! would allow policy and configuration updates without restarting the sidecar.
+//!
+//! ## Implementation Plan
+//!
+//! 1. **File watcher**: Use `notify` crate to watch config file for changes
+//! 2. **Atomic swap**: Use `arc-swap::ArcSwap<Config>` for lock-free reads
+//! 3. **Reload flow**: On file change → parse → validate → swap atomically
+//! 4. **Cedar reload**: `CedarEngine` already uses `ArcSwap` for policy sets
+//! 5. **Metrics**: Emit `config_reload_total` and `config_reload_errors_total`
+//! 6. **Signal**: Support `SIGHUP` as manual reload trigger
 
 use regex::Regex;
 use std::collections::HashSet;
