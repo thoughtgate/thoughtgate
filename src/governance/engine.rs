@@ -257,6 +257,8 @@ pub struct ApprovalEngine {
     /// Tracks tasks currently being executed to prevent concurrent execution
     /// This ensures at-most-once semantics for upstream calls
     executing: dashmap::DashSet<TaskId>,
+    /// Handle for the background scheduler task, used to detect crashes
+    scheduler_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ApprovalEngine {
@@ -319,6 +321,7 @@ impl ApprovalEngine {
             pipeline,
             config,
             executing: dashmap::DashSet::new(),
+            scheduler_handle: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -331,11 +334,24 @@ impl ApprovalEngine {
     /// - Periodic expiration sweeps for overdue tasks
     ///
     /// The tasks will run until the shutdown token is cancelled.
-    pub fn spawn_background_tasks(&self) {
+    pub async fn spawn_background_tasks(&self) {
         let scheduler = self.scheduler.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             scheduler.run().await;
         });
+        *self.scheduler_handle.lock().await = Some(handle);
+    }
+
+    /// Check if the background scheduler task is still running.
+    ///
+    /// Returns `false` if the scheduler has panicked or completed unexpectedly.
+    /// Can be used by health checks to detect scheduler crashes.
+    pub async fn is_scheduler_running(&self) -> bool {
+        let guard = self.scheduler_handle.lock().await;
+        match guard.as_ref() {
+            Some(handle) => !handle.is_finished(),
+            None => false,
+        }
     }
 
     /// Start an approval workflow.

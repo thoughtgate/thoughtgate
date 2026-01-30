@@ -213,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create governance components (TaskHandler, CedarEngine, ApprovalEngine)
         // IMPORTANT: The TaskHandler contains the shared TaskStore that ApprovalEngine uses
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), Some(config), shutdown.clone())?;
+            create_governance_components(upstream.clone(), Some(config), shutdown.clone()).await?;
 
         // Create MCP handler with full governance
         // Use the same TaskStore that ApprovalEngine uses for task coordination

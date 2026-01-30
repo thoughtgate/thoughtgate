@@ -436,7 +436,7 @@ pub struct McpServer {
 ///
 /// Tuple of (TaskHandler, CedarEngine, optional ApprovalEngine)
 #[allow(clippy::type_complexity)]
-pub fn create_governance_components(
+pub async fn create_governance_components(
     upstream: Arc<dyn UpstreamForwarder>,
     config: Option<&Config>,
     shutdown: CancellationToken,
@@ -498,7 +498,7 @@ pub fn create_governance_components(
 
         // Spawn background polling loop for approval decisions
         // Implements: REQ-GOV-003/F-002, REQ-GOV-001/F-008
-        engine.spawn_background_tasks();
+        engine.spawn_background_tasks().await;
         info!("ApprovalEngine background tasks started");
 
         Some(Arc::new(engine))
@@ -524,12 +524,12 @@ impl McpServer {
     /// # Errors
     ///
     /// Returns error if the upstream client cannot be created.
-    pub fn new(config: McpServerConfig) -> Result<Self, ThoughtGateError> {
+    pub async fn new(config: McpServerConfig) -> Result<Self, ThoughtGateError> {
         let upstream = Arc::new(UpstreamClient::new(config.upstream.clone())?);
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let shutdown = CancellationToken::new();
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), None, shutdown.clone())?;
+            create_governance_components(upstream.clone(), None, shutdown.clone()).await?;
 
         let state = Arc::new(McpState {
             upstream,
@@ -561,14 +561,14 @@ impl McpServer {
     ///
     /// * `config` - Server configuration
     /// * `upstream` - Custom upstream forwarder implementation
-    pub fn with_upstream(
+    pub async fn with_upstream(
         config: McpServerConfig,
         upstream: Arc<dyn UpstreamForwarder>,
     ) -> Result<Self, ThoughtGateError> {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let shutdown = CancellationToken::new();
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), None, shutdown.clone())?;
+            create_governance_components(upstream.clone(), None, shutdown.clone()).await?;
 
         let state = Arc::new(McpState {
             upstream,
@@ -610,7 +610,7 @@ impl McpServer {
     /// # Errors
     ///
     /// Returns error if upstream client or approval engine cannot be created.
-    pub fn with_config(
+    pub async fn with_config(
         server_config: McpServerConfig,
         yaml_config: Config,
         shutdown: CancellationToken,
@@ -618,7 +618,8 @@ impl McpServer {
         let upstream = Arc::new(UpstreamClient::new(server_config.upstream.clone())?);
         let semaphore = Arc::new(Semaphore::new(server_config.max_concurrent_requests));
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), Some(&yaml_config), shutdown.clone())?;
+            create_governance_components(upstream.clone(), Some(&yaml_config), shutdown.clone())
+                .await?;
 
         let state = Arc::new(McpState {
             upstream,

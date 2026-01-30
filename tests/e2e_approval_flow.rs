@@ -198,7 +198,7 @@ async fn test_e2e_approval_flow() {
     );
 
     // Spawn background polling
-    engine.spawn_background_tasks();
+    engine.spawn_background_tasks().await;
 
     // Step 1: Start approval
     let request = ToolCallRequest {
@@ -345,7 +345,7 @@ async fn test_e2e_rejection_flow() {
         shutdown.clone(),
     );
 
-    engine.spawn_background_tasks();
+    engine.spawn_background_tasks().await;
 
     // Start approval
     let request = ToolCallRequest {
