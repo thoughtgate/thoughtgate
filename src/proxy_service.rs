@@ -40,7 +40,7 @@ use crate::transport::server::McpHandler;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::Uri;
-use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
+use http_body_util::{BodyExt, BodyStream, Full, Limited, StreamBody};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode, header};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -224,41 +224,30 @@ impl ProxyService {
         req: Request<Incoming>,
         mcp_handler: Arc<McpHandler>,
     ) -> ProxyResult<Response<UnifiedBody>> {
-        // Buffer the request body
+        // Buffer the request body with stream-level size enforcement.
+        // Using Limited prevents full memory allocation for oversized payloads —
+        // the read is aborted as soon as cumulative bytes exceed the limit.
         let (_parts, body) = req.into_parts();
-
-        // Check body size limit before collecting
         let max_body_size = mcp_handler.max_body_size();
+        let limited_body = Limited::new(body, max_body_size);
 
-        // Collect body with size limit check
-        let body_bytes = match body.collect().await {
-            Ok(collected) => {
-                let bytes = collected.to_bytes();
-                if bytes.len() > max_body_size {
-                    warn!(
-                        size = bytes.len(),
-                        max = max_body_size,
-                        "MCP request body exceeds size limit"
-                    );
-                    let body = Full::new(Bytes::from(format!(
-                        r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32600,"message":"Request body exceeds maximum size of {} bytes"}}}}"#,
-                        max_body_size
-                    )));
-                    return Response::builder()
-                        .status(StatusCode::PAYLOAD_TOO_LARGE)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        // Full<Bytes> has Infallible error - convert using absurd pattern
-                        .body(body.map_err(|e| match e {}).boxed())
-                        .map_err(|e| ProxyError::Connection(e.to_string()));
-                }
-                bytes
-            }
+        let body_bytes = match limited_body.collect().await {
+            Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                error!(error = %e, "Failed to collect MCP request body");
-                return Err(ProxyError::Connection(format!(
-                    "Failed to read request body: {}",
-                    e
+                warn!(
+                    max = max_body_size,
+                    "MCP request body exceeds size limit: {}", e
+                );
+                let body = Full::new(Bytes::from(format!(
+                    r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32600,"message":"Request body exceeds maximum size of {} bytes"}}}}"#,
+                    max_body_size
                 )));
+                return Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    // Full<Bytes> has Infallible error - convert using absurd pattern
+                    .body(body.map_err(|e| match e {}).boxed())
+                    .map_err(|e| ProxyError::Connection(e.to_string()));
             }
         };
 
