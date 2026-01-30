@@ -873,10 +873,9 @@ impl TaskStore {
     ///
     /// # Concurrency Note
     ///
-    /// The capacity and per-principal limit checks are not atomic with insertion.
-    /// Under high concurrency, limits may be temporarily exceeded. This is acceptable
-    /// for v0.1 in-memory blocking mode where tasks are short-lived. Future versions
-    /// may use atomic reservations (compare_exchange/fetch_update) for strict enforcement.
+    /// Global capacity uses a compare_exchange loop for atomic reservation.
+    /// The slot is reserved before insertion and rolled back if the per-principal
+    /// check fails, ensuring strict enforcement under concurrent access.
     pub fn create(
         &self,
         original_request: ToolCallRequest,
@@ -885,15 +884,28 @@ impl TaskStore {
         ttl: Option<Duration>,
         on_timeout: TimeoutAction,
     ) -> Result<Task, TaskError> {
-        // F-009.3, F-009.4: Check global capacity
-        if self.pending_count() >= self.config.max_pending_global {
-            return Err(TaskError::CapacityExceeded);
+        // F-009.3, F-009.4: Atomically reserve a global capacity slot
+        loop {
+            let current = self.pending_count.load(Ordering::Acquire);
+            if current >= self.config.max_pending_global {
+                return Err(TaskError::CapacityExceeded);
+            }
+            if self
+                .pending_count
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            // CAS failed — another thread changed pending_count, retry
         }
 
         // F-009.1, F-009.2: Check per-principal limit
+        // If this fails, rollback the global reservation
         let principal_key = principal.rate_limit_key();
         let pending = self.count_pending_for_principal(&principal_key);
         if pending >= self.config.max_pending_per_principal {
+            self.pending_count.fetch_sub(1, Ordering::Release);
             return Err(TaskError::RateLimited {
                 principal: principal_key,
                 retry_after: Duration::from_secs(60),
@@ -929,9 +941,7 @@ impl TaskStore {
             .or_default()
             .push(task_id);
 
-        // Increment pending count
-        self.pending_count.fetch_add(1, Ordering::Release);
-
+        // Global slot was already reserved via compare_exchange above
         Ok(task_clone)
     }
 
