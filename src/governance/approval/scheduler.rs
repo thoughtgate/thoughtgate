@@ -12,16 +12,28 @@
 
 use super::{
     AdapterError, ApprovalAdapter, ApprovalReference, ApprovalRequest, PollDecision, PollResult,
-    PollingConfig, RateLimiter,
+    PollingConfig,
 };
 use crate::governance::{ApprovalDecision, TaskId, TaskStore};
 use dashmap::DashMap;
+use governor::{Quota, RateLimiter as GovernorRateLimiter, clock, middleware, state};
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Governor-based rate limiter type alias for Slack API calls.
+///
+/// Implements: REQ-GOV-003/§5.3
+type SlackRateLimiter = GovernorRateLimiter<
+    state::NotKeyed,
+    state::InMemoryState,
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+>;
 
 // ============================================================================
 // Polling Scheduler
@@ -47,8 +59,8 @@ pub struct PollingScheduler {
     /// Task ID -> ApprovalReference mapping
     references: DashMap<TaskId, ApprovalReference>,
 
-    /// Rate limiter for API calls
-    rate_limiter: RateLimiter,
+    /// Rate limiter for API calls (governor GCRA algorithm)
+    rate_limiter: Arc<SlackRateLimiter>,
 
     /// Configuration
     config: PollingConfig,
@@ -79,7 +91,10 @@ impl PollingScheduler {
             task_store,
             pending: Mutex::new(BTreeMap::new()),
             references: DashMap::new(),
-            rate_limiter: RateLimiter::new(config.rate_limit_per_sec),
+            rate_limiter: Arc::new(GovernorRateLimiter::direct(Quota::per_second(
+                NonZeroU32::new(config.rate_limit_per_sec.ceil() as u32)
+                    .unwrap_or(NonZeroU32::new(1).expect("1 is non-zero")),
+            ))),
             config,
             shutdown,
         }
@@ -118,7 +133,7 @@ impl PollingScheduler {
         }
 
         // Rate limit the post operation
-        self.rate_limiter.acquire().await;
+        self.rate_limiter.until_ready().await;
 
         // Post to adapter
         let reference = self.adapter.post_approval_request(&request).await?;
@@ -256,7 +271,7 @@ impl PollingScheduler {
         // TODO: For high-task-count deployments, consider batch-polling optimization:
         // fetch multiple decisions in a single API call (e.g., conversations.history
         // for Slack) rather than polling each task individually.
-        self.rate_limiter.acquire().await;
+        self.rate_limiter.until_ready().await;
 
         // Poll for decision
         match self.adapter.poll_for_decision(&reference).await {

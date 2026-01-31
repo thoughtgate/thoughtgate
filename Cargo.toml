@@ -53,6 +53,7 @@ cedar-policy = "4.8.0"
 arc-swap = "1.8.0"
 
 # Task lifecycle (REQ-GOV-001)
+governor = "0.8"
 dashmap = "6"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 sha2 = "0.10"
