@@ -149,6 +149,11 @@ harness = false
 name = "policy_eval"
 harness = false
 
+# JSON-RPC parsing benchmark (tracks T-001 optimization)
+[[bench]]
+name = "jsonrpc_parse"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true
