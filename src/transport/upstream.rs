@@ -485,7 +485,7 @@ impl UpstreamClient {
 ///
 /// Maps specific HTTP status codes to semantically correct error types:
 /// - 401/403 → UpstreamError with -32002 (auth error from upstream, not client policy)
-/// - 404 → MethodNotFound (-32601)
+/// - 404 → UpstreamError with -32002 (resource/endpoint not found, NOT JSON-RPC method)
 /// - 429 → RateLimited (-32009)
 /// - Other 4xx → UpstreamError with -32602 (client error)
 /// - 503 → ServiceUnavailable (-32013)
@@ -496,8 +496,9 @@ fn classify_upstream_http_error(status: reqwest::StatusCode) -> ThoughtGateError
             code: -32002,
             message: format!("Upstream authentication error: HTTP {status}"),
         },
-        404 => ThoughtGateError::MethodNotFound {
-            method: "unknown (upstream returned 404)".to_string(),
+        404 => ThoughtGateError::UpstreamError {
+            code: -32002,
+            message: format!("Upstream resource not found: HTTP {status}"),
         },
         429 => ThoughtGateError::RateLimited {
             retry_after_secs: None,
