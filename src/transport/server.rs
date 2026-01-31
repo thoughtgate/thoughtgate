@@ -1414,7 +1414,12 @@ async fn handle_task_method(
                     policy_id: None,
                     reason: Some(format!("Identity unavailable: {}", e)),
                 })?;
-            let principal = Principal::new(&policy_principal.app_name);
+            let principal = Principal::from_policy(
+                &policy_principal.app_name,
+                &policy_principal.namespace,
+                &policy_principal.service_account,
+                policy_principal.roles.clone(),
+            );
 
             let result = state.task_handler.handle_tasks_list(req, &principal);
 
@@ -1741,8 +1746,13 @@ async fn start_approval_flow(
         mcp_request_id,
     };
 
-    // Create Principal for governance
-    let principal = Principal::new(&policy_principal.app_name);
+    // Create Principal for governance (preserve full K8s identity for re-evaluation)
+    let principal = Principal::from_policy(
+        &policy_principal.app_name,
+        &policy_principal.namespace,
+        &policy_principal.service_account,
+        policy_principal.roles.clone(),
+    );
 
     // Look up workflow-specific timeout from config
     let workflow_timeout = match_result

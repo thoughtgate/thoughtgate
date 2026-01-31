@@ -772,6 +772,10 @@ fn to_mcp_request(request: &ToolCallRequest) -> McpRequest {
 }
 
 /// Build PolicyRequest from task components.
+///
+/// Uses the real K8s identity stored on the governance Principal (populated
+/// via [`Principal::from_policy`] at Gate 4) to ensure post-approval policy
+/// re-evaluation sees the correct namespace, service_account, and roles.
 fn build_policy_request(
     request: &ToolCallRequest,
     principal: &Principal,
@@ -780,9 +784,9 @@ fn build_policy_request(
     PolicyRequest {
         principal: PolicyPrincipal {
             app_name: principal.app_name.clone(),
-            namespace: "default".to_string(),
-            service_account: "default".to_string(),
-            roles: vec![],
+            namespace: principal.namespace.clone(),
+            service_account: principal.service_account.clone(),
+            roles: principal.roles.clone(),
         },
         resource: Resource::ToolCall {
             name: request.name.clone(),
