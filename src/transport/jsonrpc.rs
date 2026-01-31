@@ -17,6 +17,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -326,9 +327,9 @@ pub struct JsonRpcRequest {
     pub id: Option<JsonRpcId>,
     /// Method name
     pub method: String,
-    /// Method parameters
+    /// Method parameters (Arc-wrapped for O(1) clone)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
+    pub params: Option<Arc<Value>>,
 }
 
 impl JsonRpcRequest {
@@ -465,8 +466,8 @@ pub struct McpRequest {
     pub id: Option<JsonRpcId>,
     /// Method name
     pub method: String,
-    /// Method parameters
-    pub params: Option<Value>,
+    /// Method parameters (Arc-wrapped for O(1) clone on the forward path)
+    pub params: Option<Arc<Value>>,
     /// SEP-1686 task metadata (if present)
     pub task_metadata: Option<TaskMetadata>,
     /// Timestamp when request was received
@@ -703,7 +704,7 @@ fn parse_single_from_raw(raw: RawJsonRpcRequest) -> Result<McpRequest, ThoughtGa
     Ok(McpRequest {
         id: raw.id,
         method,
-        params: raw.params,
+        params: raw.params.map(Arc::new),
         task_metadata,
         received_at: Instant::now(),
         correlation_id,
