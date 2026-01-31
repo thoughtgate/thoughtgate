@@ -46,7 +46,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 use crate::error::ThoughtGateError;
 use crate::transport::UpstreamForwarder;
@@ -382,7 +381,7 @@ impl ApprovalEngine {
         principal: Principal,
         workflow_timeout: Option<Duration>,
     ) -> Result<ApprovalStartResult, ApprovalEngineError> {
-        let correlation_id = Uuid::new_v4().to_string();
+        let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
 
         info!(
             tool = %request.name,

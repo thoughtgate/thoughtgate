@@ -71,14 +71,6 @@ impl Config {
         self.approval.as_ref()?.get(name)
     }
 
-    /// Check if this configuration requires an approval engine.
-    ///
-    /// Returns true if any governance rules could lead to Gate 4 (approval):
-    /// - `action: approve` - directly requires approval
-    /// - `action: policy` - Cedar Permit routes to Gate 4 for approval
-    ///
-    /// This is used to decide whether to initialize the ApprovalEngine and
-    /// require Slack credentials.
     /// Pre-compile all glob patterns for rules and exposure configs.
     ///
     /// Called once after config loading to avoid re-parsing glob strings
@@ -115,6 +107,14 @@ impl Config {
         }
     }
 
+    /// Check if this configuration requires an approval engine.
+    ///
+    /// Returns true if any governance rules could lead to Gate 4 (approval):
+    /// - `action: approve` - directly requires approval
+    /// - `action: policy` - Cedar Permit routes to Gate 4 for approval
+    ///
+    /// This is used to decide whether to initialize the ApprovalEngine and
+    /// require Slack credentials.
     pub fn requires_approval_engine(&self) -> bool {
         // Check if default action could lead to approval
         let default_needs_approval = matches!(
