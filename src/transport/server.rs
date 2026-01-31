@@ -1004,11 +1004,10 @@ async fn handle_list_method(
             let mut tools: Vec<ToolDefinition> = match serde_json::from_value(tools_value.clone()) {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed to parse tools from upstream response, returning as-is"
-                    );
-                    return Ok(response);
+                    // Fail closed: do not pass unfiltered tools to client (Gate 1 bypass)
+                    return Err(ThoughtGateError::ServiceUnavailable {
+                        reason: format!("Failed to parse upstream tools response: {e}"),
+                    });
                 }
             };
 
@@ -1073,11 +1072,10 @@ async fn handle_list_method(
                 match serde_json::from_value(resources_value.clone()) {
                     Ok(r) => r,
                     Err(e) => {
-                        warn!(
-                            error = %e,
-                            "Failed to parse resources from upstream response, returning as-is"
-                        );
-                        return Ok(response);
+                        // Fail closed: do not pass unfiltered resources to client (Gate 1 bypass)
+                        return Err(ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to parse upstream resources response: {e}"),
+                        });
                     }
                 };
 
@@ -1124,11 +1122,10 @@ async fn handle_list_method(
                 match serde_json::from_value(prompts_value.clone()) {
                     Ok(p) => p,
                     Err(e) => {
-                        warn!(
-                            error = %e,
-                            "Failed to parse prompts from upstream response, returning as-is"
-                        );
-                        return Ok(response);
+                        // Fail closed: do not pass unfiltered prompts to client (Gate 1 bypass)
+                        return Err(ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to parse upstream prompts response: {e}"),
+                        });
                     }
                 };
 
