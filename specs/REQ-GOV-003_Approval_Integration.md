@@ -300,6 +300,26 @@ impl SlackAdapter {
 - Slack API calls MUST use HTTPS
 - User identity from Slack is trusted (Slack authenticates users)
 - Token loaded from environment variable, never from config file directly
+- `tool_arguments` are redacted in `Debug` impl (manual implementation) to prevent
+  sensitive argument data from appearing in logs or debug output
+
+### 5.8 Slack User Cache Bounds
+
+The Slack adapter maintains an in-memory cache of user display names (user ID → name
+mapping) to avoid repeated `users.info` API calls. The cache is bounded:
+
+| Setting | Value | Behavior |
+|---------|-------|----------|
+| `MAX_USER_CACHE_SIZE` | 1000 | Cache is cleared entirely when limit is reached |
+
+This prevents unbounded memory growth in long-running instances with many unique
+Slack users approving/rejecting tasks.
+
+### 5.9 Scheduler Capacity Limit
+
+The polling scheduler enforces a `max_concurrent` limit (default: 100) on simultaneous
+polling tasks. When the scheduler reaches capacity, new approval tasks are rate-limited
+until existing polling tasks complete or expire.
 
 ## 6. Interfaces
 

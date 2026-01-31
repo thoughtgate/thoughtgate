@@ -145,8 +145,9 @@ readinessProbe:
 | Drain timeout | 25s | `THOUGHTGATE_DRAIN_TIMEOUT_SECS` |
 | Startup timeout | 15s | `THOUGHTGATE_STARTUP_TIMEOUT_SECS` |
 | Require upstream at startup | false | `THOUGHTGATE_REQUIRE_UPSTREAM_AT_STARTUP` |
-| Upstream URL | (required) | `UPSTREAM_URL` (all traffic) |
+| Upstream URL | (required) | `UPSTREAM_URL` / `THOUGHTGATE_UPSTREAM` |
 | Upstream health interval | 30s | `THOUGHTGATE_UPSTREAM_HEALTH_INTERVAL_SECS` |
+| Environment | `production` | `THOUGHTGATE_ENVIRONMENT` |
 | Log level | info | `THOUGHTGATE_LOG_LEVEL` |
 | Log format | json | `THOUGHTGATE_LOG_FORMAT` |
 

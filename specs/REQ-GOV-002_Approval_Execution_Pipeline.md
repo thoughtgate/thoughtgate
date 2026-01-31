@@ -172,9 +172,10 @@ The system must additionally:
 | Metrics and logging | ✅ In Scope | Observability |
 | Pre-Approval Amber | ❌ Out of Scope | v0.3+ |
 | Post-Approval Amber | ❌ Out of Scope | v0.3+ |
-| Policy re-evaluation | ❌ Out of Scope | v0.3+ |
-| Transform drift detection | ❌ Out of Scope | v0.3+ |
-| Request hashing | ❌ Out of Scope | v0.3+ |
+| Policy re-evaluation | ✅ In Scope | Post-approval re-evaluation with ApprovalGrant |
+| Transform drift detection | ✅ In Scope | Strict/permissive modes via `THOUGHTGATE_TRANSFORM_DRIFT_MODE` |
+| Request hashing | ✅ In Scope | Canonical JSON serialization for integrity verification |
+| RAII execution guard | ✅ In Scope | `ExecutingGuard` for cleanup on all exit paths |
 
 ### 4.2 v0.3+ Scope (Future)
 

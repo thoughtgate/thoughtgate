@@ -64,7 +64,7 @@ ThoughtGate is built for minimal overhead using `hyper`, `mimalloc`, and `socket
 
 ### Prerequisites
 
-- Rust 1.75+ (for building from source)
+- Rust 1.87+ (edition 2024, for building from source)
 - An MCP server to proxy
 - Slack workspace with bot token (for approvals)
 
@@ -82,7 +82,7 @@ cargo build --release
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.0
+docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.1
 ```
 
 ### Basic Usage
@@ -165,7 +165,7 @@ approval:
 
 ```bash
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
-export SLACK_BOT_TOKEN=xoxb-your-token
+export THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-token
 ./thoughtgate
 ```
 
@@ -214,8 +214,11 @@ ThoughtGate uses a 4-Gate decision model:
 | `THOUGHTGATE_CONFIG` | ✅ | — | Path to YAML configuration file |
 | `THOUGHTGATE_OUTBOUND_PORT` | | `7467` | Main proxy port for client requests |
 | `THOUGHTGATE_ADMIN_PORT` | | `7469` | Admin port for health/metrics |
-| `SLACK_BOT_TOKEN` | For approvals | — | Slack bot OAuth token |
-| `SLACK_CHANNEL` | For approvals | `#approvals` | Default channel for approval messages |
+| `THOUGHTGATE_SLACK_BOT_TOKEN` | For approvals | — | Slack bot OAuth token |
+| `THOUGHTGATE_SLACK_CHANNEL` | For approvals | `#approvals` | Default channel for approval messages |
+| `THOUGHTGATE_REQUEST_TIMEOUT_SECS` | | `300` | Per-request timeout for proxy connections |
+| `THOUGHTGATE_MAX_BATCH_SIZE` | | `100` | Maximum JSON-RPC batch array size |
+| `THOUGHTGATE_ENVIRONMENT` | | `production` | Environment name (`development` for dev mode) |
 
 ### Port Model
 
@@ -282,14 +285,14 @@ spec:
           value: "http://localhost:7467"  # Points to ThoughtGate
 
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:v0.2.0
+      image: ghcr.io/thoughtgate/thoughtgate:v0.2.1
       ports:
         - containerPort: 7467  # Outbound (proxy)
         - containerPort: 7469  # Admin (health)
       env:
         - name: THOUGHTGATE_CONFIG
           value: "/etc/thoughtgate/config.yaml"
-        - name: SLACK_BOT_TOKEN
+        - name: THOUGHTGATE_SLACK_BOT_TOKEN
           valueFrom:
             secretKeyRef:
               name: thoughtgate-secrets
@@ -319,8 +322,8 @@ docker run -d \
   -p 7469:7469 \
   -v $(pwd)/thoughtgate.yaml:/etc/thoughtgate/config.yaml \
   -e THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml \
-  -e SLACK_BOT_TOKEN=xoxb-... \
-  ghcr.io/thoughtgate/thoughtgate:v0.2.0
+  -e THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-... \
+  ghcr.io/thoughtgate/thoughtgate:v0.2.1
 ```
 
 ## Slack Setup
@@ -389,11 +392,14 @@ When a tool call requires approval:
 ThoughtGate exposes standard Prometheus counters on the admin port:
 
 ```
-thoughtgate_requests_total{action="forward|approve|deny"}
-thoughtgate_request_duration_seconds{quantile="0.5|0.95|0.99"}
-thoughtgate_approval_total{result="approved|rejected|timeout"}
-thoughtgate_tasks_active
-thoughtgate_upstream_requests_total{status="success|error|timeout"}
+mcp_requests_total{method, outcome}
+mcp_request_duration_seconds{method}
+mcp_policy_eval_duration_seconds
+governance_tasks_created_total
+governance_tasks_terminal_total{status}
+governance_approval_latency_seconds
+governance_pipeline_failures_total{stage}
+governance_scheduler_polls_total
 ```
 
 ## Documentation

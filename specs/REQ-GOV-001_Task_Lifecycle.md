@@ -168,7 +168,8 @@ The system must additionally:
 | Tool annotation rewriting | ✅ In Scope | During tools/list (REQ-CORE-007) |
 | Task metadata validation | ✅ In Scope | On tools/call (REQ-CORE-007) |
 | Metrics and logging | ✅ In Scope | Observability |
-| Rate limiting | ❌ Deferred | v0.3+ (nice-to-have) |
+| Rate limiting | ✅ In Scope | Via `governor` crate (lock-free) |
+| Admission control | ✅ In Scope | `max_pending_global` with atomic `compare_exchange` |
 | SSE notifications | ❌ Deferred | v0.3+ (polling works for v0.2) |
 | Blocking mode | ❌ Removed | Replaced by SEP-1686 async |
 | Client disconnection detection | ❌ Removed | Less critical with async polling |

@@ -1,6 +1,6 @@
 [package]
 name = "thoughtgate"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.87"
 authors = ["Oleg Mukhin <oleg.v.mukhin@gmail.com>"]
@@ -108,7 +108,7 @@ mock = []
 fuzzing = []
 metrics = []
 # Amber Path: Buffered inspection for PII detection, schema validation, etc.
-# Deferred to v0.2+ - enable when response inspection is needed
+# Deferred to v0.3+ - enable when response inspection is needed
 amber_path = []
 
 [dev-dependencies]

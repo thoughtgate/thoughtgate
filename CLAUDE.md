@@ -27,24 +27,24 @@ src/
 └── lifecycle/    # REQ-CORE-005: Startup, shutdown, health
 ```
 
-## Domain Model (v0.1 Simplified)
+## Domain Model
 
 Policy evaluates to ONE action:
 
 | Action | Trigger | Behavior |
 |--------|---------|----------|
 | **Forward** | `PolicyAction::Forward` | Send to upstream immediately |
-| **Approve** | `PolicyAction::Approve` | Block until Slack approval, then forward |
+| **Approve** | `PolicyAction::Approve` | Create SEP-1686 task, post to Slack, return task ID |
 | **Reject** | `PolicyAction::Reject` | Return error immediately |
+| **Policy** | `action: policy` | Delegate to Cedar engine, which returns Forward/Approve/Reject |
 
-**Response handling:** All responses are passed through directly. No inspection or streaming distinction in v0.1.
+**Response handling:** All responses are passed through directly. No inspection or streaming distinction.
 
-### v0.1 Constraints
-- **Blocking approval mode** - Hold HTTP connection until approval (no SEP-1686 tasks)
-- **Zombie prevention** - Check connection liveness before executing approved tools
+### Current Constraints
+- **SEP-1686 async mode** - Approvals use async tasks (agent polls `tasks/get` for result)
 - **Single upstream** - One `THOUGHTGATE_UPSTREAM` per instance
 - **In-memory state** - Tasks lost on restart
-- **No inspection** - Green/Amber paths deferred to v0.2+
+- **No inspection** - Green/Amber paths deferred to v0.3+
 
 ## Code Standards
 
@@ -134,7 +134,7 @@ pub enum ApprovalDecision { Approved, Rejected { reason: Option<String> } }
 | Category | Crates |
 |----------|--------|
 | Runtime | `tokio` (full) |
-| HTTP | `hyper` 1.x, `hyper-util`, `axum` 0.7, `tower`, `reqwest` |
+| HTTP | `hyper` 1.x, `hyper-util`, `axum` 0.8, `tower`, `reqwest` 0.12 |
 | Data | `bytes`, `serde`, `serde_json` |
 | Policy | `cedar-policy`, `arc-swap` |
 | Errors | `thiserror` (lib), `anyhow` (bin) |
@@ -160,7 +160,7 @@ cargo fuzz run fuzz_jsonrpc    # Fuzz JSON-RPC parser
 6. `REQ-GOV-002` - Execution pipeline
 7. `REQ-CORE-005` - Lifecycle management
 
-**Deferred to v0.2+:**
+**Deferred to v0.3+:**
 - `REQ-CORE-001` - Green path streaming
 - `REQ-CORE-002` - Amber path buffering/inspection
 - `REQ-CFG-002` - Config hot-reload (file watcher + ArcSwap + SIGHUP)
@@ -205,24 +205,32 @@ cargo bench --bench policy_eval
 
 ### Error Codes
 ```
--32700  ParseError           -32003  PolicyDenied (Reject action)
--32600  InvalidRequest       -32007  ApprovalRejected
--32601  MethodNotFound       -32008  ApprovalTimeout
--32602  InvalidParams        -32009  RateLimited
--32603  InternalError        -32013  ServiceUnavailable
--32000  UpstreamConnFailed
--32001  UpstreamTimeout
--32002  UpstreamError
+-32700  ParseError           -32003  PolicyDenied
+-32600  InvalidRequest       -32005  TaskExpired
+-32601  MethodNotFound       -32006  TaskCancelled
+-32602  InvalidParams        -32007  ApprovalRejected
+-32603  InternalError        -32008  ApprovalTimeout
+-32000  UpstreamConnFailed   -32009  RateLimited
+-32001  UpstreamTimeout      -32011  PolicyDrift
+-32002  UpstreamError        -32012  TransformDrift
+                             -32013  ServiceUnavailable
+                             -32014  GovernanceRuleDenied
+                             -32015  ToolNotExposed
+                             -32016  ConfigurationError
+                             -32017  WorkflowNotFound
 ```
 
 ### Environment Variables
 ```bash
 THOUGHTGATE_UPSTREAM=http://mcp-server:3000  # Required
 THOUGHTGATE_LISTEN=0.0.0.0:8080
-THOUGHTGATE_CEDAR_POLICY_PATH=/etc/thoughtgate/policy.cedar
+THOUGHTGATE_POLICIES=/etc/thoughtgate/policies/
 THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-...
 THOUGHTGATE_SLACK_CHANNEL=#approvals
 THOUGHTGATE_APPROVAL_TIMEOUT_SECS=300
+THOUGHTGATE_REQUEST_TIMEOUT_SECS=300
+THOUGHTGATE_MAX_BATCH_SIZE=100
+THOUGHTGATE_ENVIRONMENT=production
 ```
 
 ## Requirement-Specific Notes

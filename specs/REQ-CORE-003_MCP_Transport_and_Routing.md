@@ -126,8 +126,8 @@ The system must:
 | Crate | Purpose | Version |
 |-------|---------|---------|
 | `tokio` | Async runtime | 1.x (rt-multi-thread) |
-| `axum` | HTTP server | 0.7.x |
-| `reqwest` | Upstream HTTP client | 0.11.x |
+| `axum` | HTTP server | 0.8 |
+| `reqwest` | Upstream HTTP client | 0.12 |
 | `serde_json` | JSON parsing | 1.x |
 | `uuid` | Request ID generation | 1.x |
 | `glob` | Pattern matching for rules | 0.3.x |
@@ -138,7 +138,10 @@ The system must:
 |----------|---------|-------------|
 | `THOUGHTGATE_OUTBOUND_PORT` | `7467` | Outbound proxy port (MCP traffic) |
 | `THOUGHTGATE_ADMIN_PORT` | `7469` | Admin port (health/ready/metrics) |
-| `UPSTREAM_URL` | (required) | Upstream server URL (all traffic) |
+| `UPSTREAM_URL` | (required) | Upstream server URL (CLI reverse-proxy mode) |
+| `THOUGHTGATE_UPSTREAM` | (required) | Upstream server URL (MCP governance mode) |
+| `THOUGHTGATE_REQUEST_TIMEOUT_SECS` | `300` | Per-request timeout for proxy connections |
+| `THOUGHTGATE_MAX_BATCH_SIZE` | `100` | Maximum JSON-RPC batch array size |
 
 ### 5.2 Protocol Compliance
 
@@ -204,7 +207,7 @@ In v0.2, approval uses **SEP-1686 task mode**:
 ### 5.5 Upstream Client
 
 - **Connection Pooling:** Maintain persistent connections to upstream
-- **Retry Policy:** No automatic retry (let caller handle)
+- **Retry Policy:** `forward_with_retry()` with exponential backoff (100ms, 400ms) for transport-level connection failures only; application errors are not retried
 - **Timeout:** Per-request timeout from config
 - **TLS:** Support HTTPS upstreams, verify certificates by default
 
