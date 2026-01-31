@@ -12,16 +12,58 @@
 
 use super::{
     AdapterError, ApprovalAdapter, ApprovalReference, ApprovalRequest, PollDecision, PollResult,
-    PollingConfig, RateLimiter,
+    PollingConfig,
 };
 use crate::governance::{ApprovalDecision, TaskId, TaskStore};
 use dashmap::DashMap;
+use governor::{Quota, RateLimiter as GovernorRateLimiter, clock, middleware, state};
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{self, Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Governor-based rate limiter type alias for Slack API calls.
+///
+/// Implements: REQ-GOV-003/§5.3
+type SlackRateLimiter = GovernorRateLimiter<
+    state::NotKeyed,
+    state::InMemoryState,
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+>;
+
+/// Convert a rate (requests per second) to a `governor::Quota`.
+///
+/// Implements: REQ-GOV-003/§5.3
+///
+/// Handles fractional rates correctly:
+/// - `rate >= 1.0` → `Quota::per_second(ceil(rate))` with burst = ceil(rate)
+/// - `rate < 1.0`  → `Quota::with_period(1/rate)` with burst = 1
+/// - `rate <= 0.0`  → falls back to 1 req/sec
+fn quota_from_rate(rate_per_sec: f64) -> Quota {
+    if rate_per_sec >= 1.0 {
+        // Integer rate: e.g. 10.0 → 10 requests/sec with burst of 10
+        let n = rate_per_sec.ceil() as u32;
+        let n = NonZeroU32::new(n).unwrap_or(NonZeroU32::new(1).expect("1 is non-zero"));
+        Quota::per_second(n)
+    } else if rate_per_sec > 0.0 {
+        // Fractional rate: e.g. 0.5 → one request every 2 seconds
+        let period = time::Duration::from_secs_f64(1.0 / rate_per_sec);
+        Quota::with_period(period)
+            .expect("period is non-zero for positive rate")
+            .allow_burst(NonZeroU32::new(1).expect("1 is non-zero"))
+    } else {
+        // Invalid or zero rate: fall back to 1 req/sec
+        warn!(
+            rate_per_sec,
+            "Invalid rate_limit_per_sec, defaulting to 1.0"
+        );
+        Quota::per_second(NonZeroU32::new(1).expect("1 is non-zero"))
+    }
+}
 
 // ============================================================================
 // Polling Scheduler
@@ -47,8 +89,8 @@ pub struct PollingScheduler {
     /// Task ID -> ApprovalReference mapping
     references: DashMap<TaskId, ApprovalReference>,
 
-    /// Rate limiter for API calls
-    rate_limiter: RateLimiter,
+    /// Rate limiter for API calls (governor GCRA algorithm)
+    rate_limiter: Arc<SlackRateLimiter>,
 
     /// Configuration
     config: PollingConfig,
@@ -79,7 +121,9 @@ impl PollingScheduler {
             task_store,
             pending: Mutex::new(BTreeMap::new()),
             references: DashMap::new(),
-            rate_limiter: RateLimiter::new(config.rate_limit_per_sec),
+            rate_limiter: Arc::new(GovernorRateLimiter::direct(quota_from_rate(
+                config.rate_limit_per_sec,
+            ))),
             config,
             shutdown,
         }
@@ -103,6 +147,7 @@ impl PollingScheduler {
     /// # Errors
     ///
     /// Returns `AdapterError` if posting fails.
+    #[tracing::instrument(skip(self, request), fields(task_id = %request.task_id))]
     pub async fn submit(&self, request: ApprovalRequest) -> Result<(), AdapterError> {
         // Check capacity - reject if at limit to prevent unbounded growth
         if self.references.len() >= self.config.max_concurrent {
@@ -118,7 +163,7 @@ impl PollingScheduler {
         }
 
         // Rate limit the post operation
-        self.rate_limiter.acquire().await;
+        self.rate_limiter.until_ready().await;
 
         // Post to adapter
         let reference = self.adapter.post_approval_request(&request).await?;
@@ -256,7 +301,7 @@ impl PollingScheduler {
         // TODO: For high-task-count deployments, consider batch-polling optimization:
         // fetch multiple decisions in a single API call (e.g., conversations.history
         // for Slack) rather than polling each task individually.
-        self.rate_limiter.acquire().await;
+        self.rate_limiter.until_ready().await;
 
         // Poll for decision
         match self.adapter.poll_for_decision(&reference).await {

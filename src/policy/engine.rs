@@ -178,6 +178,7 @@ impl CedarEngine {
     // which is faster than the ~10-20µs context switch overhead of spawn_blocking.
     // If policy complexity increases and p99 exceeds 200µs, consider offloading
     // to tokio::task::spawn_blocking. See REQ-OBS-001 policy eval metrics.
+    #[tracing::instrument(skip(self, request))]
     pub fn evaluate_v2(&self, request: &CedarRequest) -> CedarDecision {
         let start = std::time::Instant::now();
         self.stats_v2
@@ -633,8 +634,14 @@ impl CedarEngine {
         let policies = self.policies.load();
         let annotations = self.annotations.load();
 
+        let source = self.source.load();
+        let paths = match source.as_ref() {
+            PolicySource::ConfigMap { path, .. } => vec![std::path::PathBuf::from(path)],
+            _ => vec![],
+        };
+
         PolicyInfo {
-            paths: vec![], // TODO: Track paths from loader
+            paths,
             policy_count: policies.policies().count(),
             last_reload: *self.stats.last_reload.load().as_ref(),
             annotated_policy_count: annotations.len(),

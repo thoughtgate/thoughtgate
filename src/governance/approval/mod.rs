@@ -25,17 +25,14 @@
 //!
 //! - `mod.rs` - Trait definitions, types, and configuration
 //! - `slack.rs` - Slack adapter implementation
-//! - `scheduler.rs` - Polling scheduler with rate limiting
-//! - `rate_limiter.rs` - Token bucket rate limiter
+//! - `scheduler.rs` - Polling scheduler with rate limiting (uses `governor` crate)
 
 pub mod mock;
-pub mod rate_limiter;
 pub mod scheduler;
 pub mod slack;
 
 // Re-exports
 pub use mock::MockAdapter;
-pub use rate_limiter::RateLimiter;
 pub use scheduler::PollingScheduler;
 pub use slack::{SlackAdapter, SlackConfig};
 

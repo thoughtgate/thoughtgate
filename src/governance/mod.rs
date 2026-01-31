@@ -40,8 +40,7 @@ pub use handlers::TaskHandler;
 // Re-export approval types
 pub use approval::{
     AdapterError, ApprovalAdapter, ApprovalReference, ApprovalRequest, DecisionMethod,
-    PollDecision, PollResult, PollingConfig, PollingScheduler, RateLimiter, SlackAdapter,
-    SlackConfig,
+    PollDecision, PollResult, PollingConfig, PollingScheduler, SlackAdapter, SlackConfig,
 };
 
 // Re-export pipeline types

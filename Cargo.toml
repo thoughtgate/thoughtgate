@@ -35,6 +35,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 
 # Middleware stack
 tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
 tower-service = "0.3"
 
 # Observability
@@ -52,7 +53,11 @@ uuid = { version = "1.20", features = ["v4", "serde"] }
 cedar-policy = "4.8.0"
 arc-swap = "1.8.0"
 
+# Base64 decoding for K8s JWT tokens (REQ-POL-001/F-006.1)
+base64 = "0.22"
+
 # Task lifecycle (REQ-GOV-001)
+governor = "0.8"
 dashmap = "6"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 sha2 = "0.10"

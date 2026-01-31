@@ -473,7 +473,15 @@ impl ApprovalPipeline {
         // Evaluate policy
         let action = self.policy_engine.evaluate(&policy_request);
 
-        // F-004.2: Any permit allows execution
+        // F-004.2: Both Forward and Approve are valid post-approval outcomes.
+        //
+        // Forward means "this tool no longer requires approval" — a policy
+        // relaxation. This is safe because:
+        // 1. The human already approved the request
+        // 2. Policy relaxation (Approve→Forward) means the tool could now
+        //    proceed without approval, which is strictly less restrictive
+        // 3. Only Reject constitutes policy drift that should block execution,
+        //    since it means the tool is now forbidden entirely
         match action {
             PolicyAction::Forward | PolicyAction::Approve { .. } => {
                 debug!(
@@ -557,13 +565,18 @@ impl ApprovalPipeline {
                     });
                 }
                 TransformDriftMode::Permissive => {
-                    // F-005.4: Permissive mode logs and continues
+                    // F-005.4: Permissive mode logs but uses the ORIGINAL
+                    // approved transformation, not the drifted one. This
+                    // preserves approval integrity: the human approved
+                    // pre_approval_transformed, so that's what gets executed.
                     warn!(
                         task_id = %task.id,
                         stored_hash = %task.request_hash,
                         new_hash = %new_hash,
-                        "Transform drift detected (permissive mode) - continuing"
+                        "Transform drift detected (permissive mode) - \
+                         using original approved request"
                     );
+                    return Ok(task.pre_approval_transformed.clone());
                 }
             }
         }
@@ -603,8 +616,18 @@ impl ApprovalPipeline {
                     }
                 } else {
                     // Success
+                    let content = match response.result {
+                        Some(value) => value,
+                        None => {
+                            warn!(
+                                task_id = %task.id,
+                                "Upstream response has neither result nor error — treating as null"
+                            );
+                            serde_json::Value::Null
+                        }
+                    };
                     let result = ToolCallResult {
-                        content: response.result.unwrap_or(serde_json::Value::Null),
+                        content,
                         is_error: false,
                     };
                     info!(
@@ -648,6 +671,7 @@ impl ApprovalPipeline {
 #[async_trait]
 impl ExecutionPipeline for ApprovalPipeline {
     /// Implements: REQ-GOV-002/F-001 (Pre-Approval Amber Phase)
+    #[tracing::instrument(skip(self, request, _principal), fields(tool = %request.name))]
     async fn pre_approval_amber(
         &self,
         request: &ToolCallRequest,
@@ -677,6 +701,7 @@ impl ExecutionPipeline for ApprovalPipeline {
     }
 
     /// Implements: REQ-GOV-002/F-002 (Execution Pipeline)
+    #[tracing::instrument(skip(self, task, approval), fields(task_id = %task.id))]
     async fn execute_approved(&self, task: &Task, approval: &ApprovalRecord) -> PipelineResult {
         let tool_name = &task.pre_approval_transformed.name;
 
@@ -772,6 +797,10 @@ fn to_mcp_request(request: &ToolCallRequest) -> McpRequest {
 }
 
 /// Build PolicyRequest from task components.
+///
+/// Uses the real K8s identity stored on the governance Principal (populated
+/// via [`Principal::from_policy`] at Gate 4) to ensure post-approval policy
+/// re-evaluation sees the correct namespace, service_account, and roles.
 fn build_policy_request(
     request: &ToolCallRequest,
     principal: &Principal,
@@ -780,9 +809,9 @@ fn build_policy_request(
     PolicyRequest {
         principal: PolicyPrincipal {
             app_name: principal.app_name.clone(),
-            namespace: "default".to_string(),
-            service_account: "default".to_string(),
-            roles: vec![],
+            namespace: principal.namespace.clone(),
+            service_account: principal.service_account.clone(),
+            roles: principal.roles.clone(),
         },
         resource: Resource::ToolCall {
             name: request.name.clone(),

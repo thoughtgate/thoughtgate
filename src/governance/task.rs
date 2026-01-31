@@ -51,6 +51,11 @@ pub use crate::transport::jsonrpc::JsonRpcId;
 /// Identity of the requesting agent/application.
 ///
 /// Implements: REQ-GOV-001/§6.1
+///
+/// Includes K8s identity fields (namespace, service_account, roles) to preserve
+/// principal context through the approval pipeline. These fields are populated
+/// from [`crate::policy::Principal`] during Gate 4 conversion and used during
+/// post-approval policy re-evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     /// Application or agent name
@@ -59,10 +64,19 @@ pub struct Principal {
     pub user_id: Option<String>,
     /// Optional session identifier
     pub session_id: Option<String>,
+    /// Kubernetes namespace (from ServiceAccount mount)
+    pub namespace: String,
+    /// Kubernetes service account name (from JWT token)
+    pub service_account: String,
+    /// RBAC roles (from policy or external source)
+    pub roles: Vec<String>,
 }
 
 impl Principal {
     /// Creates a new principal with only an app name.
+    ///
+    /// K8s fields default to `"default"` / empty. Use [`Principal::from_policy`]
+    /// in production code to preserve full identity context.
     ///
     /// Implements: REQ-GOV-001/§6.1
     #[must_use]
@@ -71,6 +85,32 @@ impl Principal {
             app_name: app_name.into(),
             user_id: None,
             session_id: None,
+            namespace: "default".to_string(),
+            service_account: "default".to_string(),
+            roles: vec![],
+        }
+    }
+
+    /// Creates a principal with full K8s identity from a policy principal.
+    ///
+    /// Preserves namespace, service_account, and roles so that post-approval
+    /// policy re-evaluation uses the correct identity context.
+    ///
+    /// Implements: REQ-GOV-001/§6.1, REQ-POL-001/F-006
+    #[must_use]
+    pub fn from_policy(
+        app_name: impl Into<String>,
+        namespace: impl Into<String>,
+        service_account: impl Into<String>,
+        roles: Vec<String>,
+    ) -> Self {
+        Self {
+            app_name: app_name.into(),
+            user_id: None,
+            session_id: None,
+            namespace: namespace.into(),
+            service_account: service_account.into(),
+            roles,
         }
     }
 

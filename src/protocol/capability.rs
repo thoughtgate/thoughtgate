@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Task Capability
@@ -290,15 +290,10 @@ impl CapabilityCache {
         self.upstream_supports_task_sse.load(Ordering::SeqCst)
     }
 
-    /// Returns the time of the last initialize, if any.
-    ///
-    /// Note: Returns `Some(Instant::now())` as an approximation when a timestamp
-    /// has been recorded. The actual stored value is epoch millis, but callers
-    /// only need to know whether initialization has occurred.
+    /// Returns whether the upstream has been initialized at least once.
     #[must_use]
-    pub fn last_initialize(&self) -> Option<Instant> {
-        let ms = self.last_initialize_epoch_ms.load(Ordering::Acquire);
-        if ms == 0 { None } else { Some(Instant::now()) }
+    pub fn has_initialized(&self) -> bool {
+        self.last_initialize_epoch_ms.load(Ordering::Acquire) != 0
     }
 
     /// Invalidates the cache (e.g., on upstream reconnect).
@@ -647,7 +642,7 @@ mod tests {
         let cache = CapabilityCache::new();
         assert!(!cache.upstream_supports_tasks());
         assert!(!cache.upstream_supports_task_sse());
-        assert!(cache.last_initialize().is_none());
+        assert!(!cache.has_initialized());
     }
 
     #[test]
@@ -656,7 +651,7 @@ mod tests {
 
         cache.set_upstream_supports_tasks(true);
         assert!(cache.upstream_supports_tasks());
-        assert!(cache.last_initialize().is_some());
+        assert!(cache.has_initialized());
 
         cache.set_upstream_supports_task_sse(true);
         assert!(cache.upstream_supports_task_sse());
@@ -672,7 +667,7 @@ mod tests {
 
         assert!(!cache.upstream_supports_tasks());
         assert!(!cache.upstream_supports_task_sse());
-        assert!(cache.last_initialize().is_none());
+        assert!(!cache.has_initialized());
     }
 
     // ========================================================================
