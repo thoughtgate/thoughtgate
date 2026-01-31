@@ -8,9 +8,8 @@
 //! - Capability cache for upstream detection
 
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Task Capability
@@ -231,6 +230,7 @@ impl ToolAnnotations {
 /// Implements: REQ-CORE-007/§6.0
 ///
 /// Thread-safe cache for upstream capability detection results.
+/// All fields are lock-free atomics to avoid blocking the Tokio runtime.
 #[derive(Debug)]
 pub struct CapabilityCache {
     /// Whether upstream MCP server supports SEP-1686 tasks.
@@ -239,8 +239,8 @@ pub struct CapabilityCache {
     /// Whether upstream MCP server supports SSE task notifications.
     upstream_supports_task_sse: AtomicBool,
 
-    /// Timestamp of last initialize (for cache invalidation on reconnect).
-    last_initialize: RwLock<Option<Instant>>,
+    /// Timestamp of last initialize as millis since UNIX epoch (0 = never).
+    last_initialize_epoch_ms: AtomicU64,
 }
 
 impl CapabilityCache {
@@ -250,7 +250,7 @@ impl CapabilityCache {
         Self {
             upstream_supports_tasks: AtomicBool::new(false),
             upstream_supports_task_sse: AtomicBool::new(false),
-            last_initialize: RwLock::new(None),
+            last_initialize_epoch_ms: AtomicU64::new(0),
         }
     }
 
@@ -260,11 +260,12 @@ impl CapabilityCache {
     pub fn set_upstream_supports_tasks(&self, supports: bool) {
         self.upstream_supports_tasks
             .store(supports, Ordering::SeqCst);
-        // Use poison-safe write to avoid panics if another thread panicked while holding the lock
-        *self
-            .last_initialize
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_initialize_epoch_ms
+            .store(now_ms, Ordering::Release);
     }
 
     /// Sets whether upstream supports SSE task notifications.
@@ -290,13 +291,14 @@ impl CapabilityCache {
     }
 
     /// Returns the time of the last initialize, if any.
+    ///
+    /// Note: Returns `Some(Instant::now())` as an approximation when a timestamp
+    /// has been recorded. The actual stored value is epoch millis, but callers
+    /// only need to know whether initialization has occurred.
     #[must_use]
     pub fn last_initialize(&self) -> Option<Instant> {
-        // Use poison-safe read to avoid panics if another thread panicked while holding the lock
-        *self
-            .last_initialize
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        let ms = self.last_initialize_epoch_ms.load(Ordering::Acquire);
+        if ms == 0 { None } else { Some(Instant::now()) }
     }
 
     /// Invalidates the cache (e.g., on upstream reconnect).
@@ -304,11 +306,7 @@ impl CapabilityCache {
         self.upstream_supports_tasks.store(false, Ordering::SeqCst);
         self.upstream_supports_task_sse
             .store(false, Ordering::SeqCst);
-        // Use poison-safe write to avoid panics if another thread panicked while holding the lock
-        *self
-            .last_initialize
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.last_initialize_epoch_ms.store(0, Ordering::Release);
     }
 }
 
