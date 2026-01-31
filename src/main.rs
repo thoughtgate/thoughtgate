@@ -89,6 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_config = Config::parse();
     let proxy_config = ProxyConfig::from_env();
 
+    // Phase 1b: Validate environment safety
+    // Implements: REQ-CORE-005/F-001 (Startup Safety)
+    if let Err(msg) = thoughtgate::lifecycle::validate_environment() {
+        error!(reason = %msg, "Unsafe configuration detected — refusing to start");
+        std::process::exit(1);
+    }
+
     // Phase 2: Initialize lifecycle manager
     // Implements: REQ-CORE-005/F-001
     let lifecycle_config = LifecycleConfig::from_env();
