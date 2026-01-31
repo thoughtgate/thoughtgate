@@ -483,20 +483,36 @@ impl UpstreamClient {
 
 /// Classify an upstream HTTP error status into the appropriate JSON-RPC error code.
 ///
-/// - 4xx client errors -> -32602 (InvalidParams: upstream rejected our request)
-/// - 503 Service Unavailable -> -32013 (ServiceUnavailable)
-/// - Other 5xx server errors -> -32002 (UpstreamError)
+/// Maps specific HTTP status codes to semantically correct error types:
+/// - 401/403 → UpstreamError with -32002 (auth error from upstream, not client policy)
+/// - 404 → MethodNotFound (-32601)
+/// - 429 → RateLimited (-32009)
+/// - Other 4xx → UpstreamError with -32602 (client error)
+/// - 503 → ServiceUnavailable (-32013)
+/// - Other 5xx → UpstreamError with -32002 (server error)
 fn classify_upstream_http_error(status: reqwest::StatusCode) -> ThoughtGateError {
-    let (code, prefix) = if status.is_client_error() {
-        (-32602, "Client error")
-    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        (-32013, "Service unavailable")
-    } else {
-        (-32002, "Server error")
-    };
-    ThoughtGateError::UpstreamError {
-        code,
-        message: format!("{prefix}: upstream returned HTTP {status}"),
+    match status.as_u16() {
+        401 | 403 => ThoughtGateError::UpstreamError {
+            code: -32002,
+            message: format!("Upstream authentication error: HTTP {status}"),
+        },
+        404 => ThoughtGateError::MethodNotFound {
+            method: "unknown (upstream returned 404)".to_string(),
+        },
+        429 => ThoughtGateError::RateLimited {
+            retry_after_secs: None,
+        },
+        400..=499 => ThoughtGateError::UpstreamError {
+            code: -32602,
+            message: format!("Upstream client error: HTTP {status}"),
+        },
+        503 => ThoughtGateError::ServiceUnavailable {
+            reason: format!("Upstream service unavailable: HTTP {status}"),
+        },
+        _ => ThoughtGateError::UpstreamError {
+            code: -32002,
+            message: format!("Upstream server error: HTTP {status}"),
+        },
     }
 }
 
