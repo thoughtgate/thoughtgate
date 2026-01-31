@@ -728,7 +728,7 @@ async fn handle_mcp_request(State(state): State<Arc<McpState>>, body: Bytes) -> 
 async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, Bytes) {
     // Check body size limit (generate unique correlation ID per REQ-CORE-004)
     if body.len() > state.max_body_size {
-        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
         let error = ThoughtGateError::InvalidRequest {
             details: format!(
                 "Request body exceeds maximum size of {} bytes",
@@ -743,7 +743,7 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
     let _permit = match state.semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
             warn!(
                 correlation_id = %correlation_id,
                 "Max concurrent requests reached, returning 503"
@@ -769,7 +769,7 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
     let parsed = match parse_jsonrpc(&body) {
         Ok(p) => p,
         Err(e) => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
             return error_bytes(None, &e, &correlation_id);
         }
     };
@@ -777,7 +777,7 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
     match parsed {
         ParsedRequests::Single(request) => handle_single_request_bytes(state, request).await,
         ParsedRequests::Batch(ref requests) if requests.len() > state.max_batch_size => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
             let error = ThoughtGateError::InvalidRequest {
                 details: format!(
                     "Batch size {} exceeds maximum of {}",
@@ -1985,7 +1985,7 @@ async fn handle_batch_request_bytes(
         match item {
             BatchItem::Invalid { id, error } => {
                 // EC-MCP-006: Include error response for invalid items
-                let correlation_id = uuid::Uuid::new_v4().to_string();
+                let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
                 responses.push(JsonRpcResponse::error(
                     id,
                     error.to_jsonrpc_error(&correlation_id),
