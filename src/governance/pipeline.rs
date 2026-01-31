@@ -789,7 +789,7 @@ fn to_mcp_request(request: &ToolCallRequest) -> McpRequest {
     McpRequest {
         id,
         method: request.method.clone(),
-        params,
+        params: params.map(std::sync::Arc::new),
         task_metadata: None,
         received_at: Instant::now(),
         correlation_id: Uuid::new_v4(),

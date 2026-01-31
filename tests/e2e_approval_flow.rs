@@ -136,7 +136,7 @@ impl UpstreamForwarder for E2eUpstream {
     async fn forward(&self, request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError> {
         self.forward_count.fetch_add(1, Ordering::SeqCst);
         *self.last_method.lock().await = Some(request.method.clone());
-        *self.last_params.lock().await = request.params.clone();
+        *self.last_params.lock().await = request.params.as_deref().cloned();
 
         let result = self.response.lock().await.clone();
         Ok(JsonRpcResponse {

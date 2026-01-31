@@ -1305,7 +1305,11 @@ async fn handle_task_method(
     request: &McpRequest,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
     // Extract params, defaulting to empty object
-    let params = request.params.clone().unwrap_or(serde_json::json!({}));
+    let params = request
+        .params
+        .as_deref()
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     match method {
         TaskMethod::Get => {
