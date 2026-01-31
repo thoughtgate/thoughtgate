@@ -17,10 +17,41 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::error::ThoughtGateError;
+
+// ============================================================================
+// Fast Correlation ID Generator
+// ============================================================================
+
+/// Startup prefix derived from a single Uuid::new_v4() call.
+/// The upper 64 bits provide process-level uniqueness.
+static CORRELATION_PREFIX: LazyLock<u64> = LazyLock::new(|| {
+    let seed = Uuid::new_v4().as_u128();
+    (seed >> 64) as u64
+});
+
+/// Monotonically increasing counter for the lower 64 bits.
+static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a fast correlation ID using a counter-based approach.
+///
+/// Combines a process-unique prefix (from a single Uuid::new_v4() at startup)
+/// with a monotonically increasing counter. This avoids the CSPRNG overhead
+/// of Uuid::new_v4() on every request while still producing unique 128-bit IDs.
+///
+/// Note: The result is not a valid v4 UUID, but correlation IDs are internal-only
+/// and never validated by external systems.
+pub fn fast_correlation_id() -> Uuid {
+    let prefix = *CORRELATION_PREFIX;
+    let counter = CORRELATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let combined = ((prefix as u128) << 64) | (counter as u128);
+    Uuid::from_u128(combined)
+}
 
 // ============================================================================
 // MCP Tasks Protocol Types (Protocol Revision 2025-11-25)
@@ -663,8 +694,8 @@ fn parse_single_from_raw(raw: RawJsonRpcRequest) -> Result<McpRequest, ThoughtGa
         details: "Missing required field: method".to_string(),
     })?;
 
-    // F-001.7: Generate correlation ID
-    let correlation_id = Uuid::new_v4();
+    // F-001.7: Generate correlation ID (counter-based, avoids CSPRNG per request)
+    let correlation_id = fast_correlation_id();
 
     // F-003: Extract SEP-1686 task metadata
     let task_metadata = extract_task_metadata(&raw.params);
