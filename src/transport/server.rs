@@ -1929,7 +1929,7 @@ async fn evaluate_with_cedar(
 ///
 /// # Returns
 ///
-/// (StatusCode, Bytes) with JSON-RPC batch response or 204 No Content if all notifications.
+/// (StatusCode, Bytes) with JSON-RPC batch response or empty array `[]` if all notifications.
 ///
 /// # Design Note: Batch Concurrency
 ///
@@ -1998,8 +1998,8 @@ async fn handle_batch_request_bytes(
 
     // Return batch response
     if responses.is_empty() {
-        // All were notifications
-        return (StatusCode::NO_CONTENT, Bytes::new());
+        // All were notifications — return empty JSON array per JSON-RPC 2.0 §6
+        return (StatusCode::OK, Bytes::from_static(b"[]"));
     }
 
     // Serialize batch response
@@ -2437,8 +2437,10 @@ mod tests {
             .expect("should build request");
 
         let response = router.oneshot(request).await.expect("should get response");
-        // All notifications = no content
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // All notifications in batch = empty JSON array per JSON-RPC 2.0 §6
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_str = response_body(response).await;
+        assert_eq!(body_str, "[]");
     }
 
     #[test]
