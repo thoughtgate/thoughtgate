@@ -54,7 +54,7 @@ use crate::transport::UpstreamForwarder;
 use super::approval::{ApprovalAdapter, ApprovalRequest, PollingConfig, PollingScheduler};
 use super::pipeline::{ApprovalPipeline, ExecutionPipeline, PipelineConfig, PipelineResult};
 use super::task::{FailureInfo, FailureStage, TaskStatus, ToolCallResult};
-use super::{Principal, TaskError, TaskId, TaskStore, ToolCallRequest};
+use super::{Principal, Task, TaskError, TaskId, TaskStore, ToolCallRequest};
 
 // ============================================================================
 // Approval Engine Configuration
@@ -458,7 +458,7 @@ impl ApprovalEngine {
 
         // F-002.3: Return task ID immediately (scheduler polls in background)
         Ok(ApprovalStartResult {
-            task_id: task.id,
+            task_id: task.id.clone(),
             status: TaskStatus::InputRequired,
             poll_interval: task.poll_interval,
         })
@@ -563,7 +563,7 @@ impl ApprovalEngine {
                         // Clone task with Executing status so pipeline validation passes.
                         // The pipeline's validate_approval() requires TaskStatus::Executing,
                         // but auto-approved tasks are in Expired (terminal) state.
-                        let mut auto_approved_task = task.clone();
+                        let mut auto_approved_task = Task::clone(&task);
                         auto_approved_task.status = TaskStatus::Executing;
 
                         // Execute the pipeline with timeout protection
@@ -628,8 +628,8 @@ impl ApprovalEngine {
             }
             TaskStatus::Completed => {
                 // Already completed - return cached result
-                if let Some(result) = task.result {
-                    return Ok(result);
+                if let Some(ref result) = task.result {
+                    return Ok(result.clone());
                 }
                 return Err(ThoughtGateError::ServiceUnavailable {
                     reason: "Task completed but no result available".to_string(),
