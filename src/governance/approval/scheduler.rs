@@ -20,7 +20,7 @@ use governor::{Quota, RateLimiter as GovernorRateLimiter, clock, middleware, sta
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{self, Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -34,6 +34,36 @@ type SlackRateLimiter = GovernorRateLimiter<
     clock::DefaultClock,
     middleware::NoOpMiddleware,
 >;
+
+/// Convert a rate (requests per second) to a `governor::Quota`.
+///
+/// Implements: REQ-GOV-003/§5.3
+///
+/// Handles fractional rates correctly:
+/// - `rate >= 1.0` → `Quota::per_second(ceil(rate))` with burst = ceil(rate)
+/// - `rate < 1.0`  → `Quota::with_period(1/rate)` with burst = 1
+/// - `rate <= 0.0`  → falls back to 1 req/sec
+fn quota_from_rate(rate_per_sec: f64) -> Quota {
+    if rate_per_sec >= 1.0 {
+        // Integer rate: e.g. 10.0 → 10 requests/sec with burst of 10
+        let n = rate_per_sec.ceil() as u32;
+        let n = NonZeroU32::new(n).unwrap_or(NonZeroU32::new(1).expect("1 is non-zero"));
+        Quota::per_second(n)
+    } else if rate_per_sec > 0.0 {
+        // Fractional rate: e.g. 0.5 → one request every 2 seconds
+        let period = time::Duration::from_secs_f64(1.0 / rate_per_sec);
+        Quota::with_period(period)
+            .expect("period is non-zero for positive rate")
+            .allow_burst(NonZeroU32::new(1).expect("1 is non-zero"))
+    } else {
+        // Invalid or zero rate: fall back to 1 req/sec
+        warn!(
+            rate_per_sec,
+            "Invalid rate_limit_per_sec, defaulting to 1.0"
+        );
+        Quota::per_second(NonZeroU32::new(1).expect("1 is non-zero"))
+    }
+}
 
 // ============================================================================
 // Polling Scheduler
@@ -91,9 +121,8 @@ impl PollingScheduler {
             task_store,
             pending: Mutex::new(BTreeMap::new()),
             references: DashMap::new(),
-            rate_limiter: Arc::new(GovernorRateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(config.rate_limit_per_sec.ceil() as u32)
-                    .unwrap_or(NonZeroU32::new(1).expect("1 is non-zero")),
+            rate_limiter: Arc::new(GovernorRateLimiter::direct(quota_from_rate(
+                config.rate_limit_per_sec,
             ))),
             config,
             shutdown,
