@@ -27,7 +27,7 @@ use thoughtgate::admin::AdminServer;
 use thoughtgate::config::{self, Version, find_config_file, load_and_validate};
 use thoughtgate::error::ProxyError;
 use thoughtgate::lifecycle::{DrainResult, LifecycleConfig, LifecycleManager};
-use thoughtgate::logging_layer::LoggingLayer;
+use thoughtgate::logging_layer::logging_layer;
 use thoughtgate::ports::{admin_port, inbound_port, outbound_port};
 use thoughtgate::proxy_config::ProxyConfig;
 use thoughtgate::proxy_service::ProxyService;
@@ -249,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let proxy_service = Arc::new(proxy_service);
     let service_stack = ServiceBuilder::new()
-        .layer(LoggingLayer)
+        .layer(logging_layer())
         .service(proxy_service.as_ref().clone());
 
     // Setup signal handlers with unified shutdown token
@@ -553,21 +553,20 @@ fn setup_signal_handlers(shutdown: CancellationToken, lifecycle: Arc<LifecycleMa
 /// # Traceability
 /// - Implements: REQ-CORE-001 F-001 (TCP_NODELAY enforcement)
 /// - Implements: REQ-CORE-002 (Conditional Termination - CONNECT rejection)
-async fn handle_connection<S>(
+async fn handle_connection<S, B>(
     mut stream: TcpStream,
     _peer_addr: SocketAddr,
     service: S,
     shutdown: CancellationToken,
 ) -> Result<(), ProxyError>
 where
-    S: tower::Service<
-            Request<Incoming>,
-            Response = Response<thoughtgate::proxy_service::UnifiedBody>,
-            Error = ProxyError,
-        > + Clone
+    S: tower::Service<Request<Incoming>, Response = Response<B>, Error = ProxyError>
+        + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
+    B: http_body::Body<Data = bytes::Bytes> + Send + Sync + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     // Peek to detect CONNECT method and reject it immediately
     // PERF(latency): Zero-copy peek avoids buffering overhead
@@ -609,13 +608,10 @@ where
             // Implements: REQ-CORE-002 F-002 (Fail-Closed State)
             let result: Result<_, std::convert::Infallible> = match svc.call(req).await {
                 Ok(response) => {
-                    // UnifiedBody is BoxBody<Bytes, ProxyError>. Convert to BoxBody<Bytes, Box<dyn Error>>
-                    // for hyper compatibility - hyper requires a boxed error type.
+                    // Convert body error to boxed error for hyper compatibility.
                     Ok(response.map(|body| {
-                        body.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                            Box::new(std::io::Error::other(e.to_string()))
-                        })
-                        .boxed()
+                        body.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
+                            .boxed()
                     }))
                 }
                 Err(e) => {
