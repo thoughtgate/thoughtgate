@@ -201,6 +201,7 @@ impl UpstreamClient {
     /// - `Ok(())` if the connection can be established
     /// - `Err(ThoughtGateError::UpstreamConnectionFailed)` if connection fails
     /// - `Err(ThoughtGateError::UpstreamTimeout)` if connection times out
+    #[tracing::instrument(skip(self))]
     pub async fn health_check(&self) -> Result<(), ThoughtGateError> {
         let url = match reqwest::Url::parse(&self.config.base_url) {
             Ok(u) => u,
@@ -283,6 +284,7 @@ impl UpstreamClient {
     /// (F-004.2) is not implemented as it requires security review - forwarding
     /// Authorization headers to upstream could leak credentials. For MCP traffic,
     /// the JSON-RPC body contains all necessary context.
+    #[tracing::instrument(skip(self, request), fields(method = %request.method, correlation_id = %request.correlation_id))]
     pub async fn forward(&self, request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError> {
         let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
         let correlation_id = request.correlation_id.to_string();
@@ -370,6 +372,7 @@ impl UpstreamClient {
     /// * `Ok(Vec<JsonRpcResponse>)` - Responses from upstream
     /// * `Err(ThoughtGateError::InvalidRequest)` - If the batch is empty
     /// * `Err(ThoughtGateError)` - If the batch request failed
+    #[tracing::instrument(skip(self, requests), fields(batch_size = requests.len()))]
     pub async fn forward_batch(
         &self,
         requests: &[McpRequest],

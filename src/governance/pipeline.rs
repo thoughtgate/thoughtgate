@@ -661,6 +661,7 @@ impl ApprovalPipeline {
 #[async_trait]
 impl ExecutionPipeline for ApprovalPipeline {
     /// Implements: REQ-GOV-002/F-001 (Pre-Approval Amber Phase)
+    #[tracing::instrument(skip(self, request, _principal), fields(tool = %request.name))]
     async fn pre_approval_amber(
         &self,
         request: &ToolCallRequest,
@@ -690,6 +691,7 @@ impl ExecutionPipeline for ApprovalPipeline {
     }
 
     /// Implements: REQ-GOV-002/F-002 (Execution Pipeline)
+    #[tracing::instrument(skip(self, task, approval), fields(task_id = %task.id))]
     async fn execute_approved(&self, task: &Task, approval: &ApprovalRecord) -> PipelineResult {
         let tool_name = &task.pre_approval_transformed.name;
 

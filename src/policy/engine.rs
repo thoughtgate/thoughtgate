@@ -178,6 +178,7 @@ impl CedarEngine {
     // which is faster than the ~10-20µs context switch overhead of spawn_blocking.
     // If policy complexity increases and p99 exceeds 200µs, consider offloading
     // to tokio::task::spawn_blocking. See REQ-OBS-001 policy eval metrics.
+    #[tracing::instrument(skip(self, request))]
     pub fn evaluate_v2(&self, request: &CedarRequest) -> CedarDecision {
         let start = std::time::Instant::now();
         self.stats_v2

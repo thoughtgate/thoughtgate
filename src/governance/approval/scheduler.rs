@@ -147,6 +147,7 @@ impl PollingScheduler {
     /// # Errors
     ///
     /// Returns `AdapterError` if posting fails.
+    #[tracing::instrument(skip(self, request), fields(task_id = %request.task_id))]
     pub async fn submit(&self, request: ApprovalRequest) -> Result<(), AdapterError> {
         // Check capacity - reject if at limit to prevent unbounded growth
         if self.references.len() >= self.config.max_concurrent {
