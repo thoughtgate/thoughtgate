@@ -140,7 +140,7 @@ impl UpstreamForwarder for E2eUpstream {
 
         let result = self.response.lock().await.clone();
         Ok(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: std::borrow::Cow::Borrowed("2.0"),
             id: Some(thoughtgate::transport::JsonRpcId::Number(1)),
             result: Some(result),
             error: None,
