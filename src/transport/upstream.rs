@@ -284,8 +284,64 @@ impl UpstreamClient {
     /// (F-004.2) is not implemented as it requires security review - forwarding
     /// Authorization headers to upstream could leak credentials. For MCP traffic,
     /// the JSON-RPC body contains all necessary context.
+    /// Maximum number of retry attempts for transport-level failures.
+    const MAX_TRANSPORT_RETRIES: u32 = 2;
+
+    /// Forward a single request with retry for transport-level failures.
+    ///
+    /// Retries on `UpstreamConnectionFailed` only (connection refused, DNS
+    /// failure). Does NOT retry on timeouts, HTTP errors, or JSON-RPC errors
+    /// to prevent duplicate side effects.
+    ///
+    /// Implements: REQ-CORE-003/F-004 (Upstream Forwarding with resilience)
+    pub async fn forward_with_retry(
+        &self,
+        request: &McpRequest,
+    ) -> Result<JsonRpcResponse, ThoughtGateError> {
+        let mut last_error = None;
+
+        for attempt in 0..=Self::MAX_TRANSPORT_RETRIES {
+            match self.forward_once(request).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    let is_retriable =
+                        matches!(&e, ThoughtGateError::UpstreamConnectionFailed { .. });
+
+                    if !is_retriable || attempt == Self::MAX_TRANSPORT_RETRIES {
+                        return Err(e);
+                    }
+
+                    // Exponential backoff: 100ms, 400ms
+                    let backoff = Duration::from_millis(100 * 4u64.pow(attempt));
+                    warn!(
+                        attempt = attempt + 1,
+                        max_retries = Self::MAX_TRANSPORT_RETRIES,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        correlation_id = %request.correlation_id,
+                        "Transport connection failure, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(
+            last_error.unwrap_or_else(|| ThoughtGateError::InternalError {
+                correlation_id: "retry-exhausted".to_string(),
+            }),
+        )
+    }
+
+    /// Forward a single request to upstream (single attempt, no retry).
+    ///
+    /// Implements: REQ-CORE-003/F-004 (Upstream Forwarding)
     #[tracing::instrument(skip(self, request), fields(method = %request.method, correlation_id = %request.correlation_id))]
-    pub async fn forward(&self, request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError> {
+    async fn forward_once(
+        &self,
+        request: &McpRequest,
+    ) -> Result<JsonRpcResponse, ThoughtGateError> {
         let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
         let correlation_id = request.correlation_id.to_string();
 
@@ -545,7 +601,7 @@ pub trait UpstreamForwarder: Send + Sync {
 #[async_trait::async_trait]
 impl UpstreamForwarder for UpstreamClient {
     async fn forward(&self, request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError> {
-        self.forward(request).await
+        self.forward_with_retry(request).await
     }
 
     async fn forward_batch(
