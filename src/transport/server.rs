@@ -1409,8 +1409,10 @@ async fn handle_task_method(
 
             // Infer principal from environment (same as other task operations)
             let policy_principal =
-                infer_principal().map_err(|e| ThoughtGateError::ServiceUnavailable {
-                    reason: format!("Failed to infer principal: {}", e),
+                infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
+                    tool: String::new(),
+                    policy_id: None,
+                    reason: Some(format!("Identity unavailable: {}", e)),
                 })?;
             let principal = Principal::new(&policy_principal.app_name);
 
@@ -1722,8 +1724,10 @@ async fn start_approval_flow(
             })?;
 
     // Infer principal from environment
-    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::ServiceUnavailable {
-        reason: format!("Failed to infer principal: {}", e),
+    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
+        tool: String::new(),
+        policy_id: None,
+        reason: Some(format!("Identity unavailable: {}", e)),
     })?;
 
     // Create ToolCallRequest for the approval engine
@@ -1833,8 +1837,10 @@ async fn evaluate_with_cedar(
     };
 
     // Infer principal from environment
-    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::ServiceUnavailable {
-        reason: format!("Failed to infer principal: {}", e),
+    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
+        tool: String::new(),
+        policy_id: None,
+        reason: Some(format!("Identity unavailable: {}", e)),
     })?;
 
     // Get policy_id and source_id from Gate 2 result, or use defaults

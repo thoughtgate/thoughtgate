@@ -1874,8 +1874,8 @@ mod tests {
     /// Tests task expiration.
     ///
     /// Verifies: EC-TASK-012, REQ-GOV-001/F-008
-    #[test]
-    fn test_task_expiration() {
+    #[tokio::test]
+    async fn test_task_expiration() {
         let config = TaskStoreConfig {
             min_ttl: Duration::from_millis(10),
             default_ttl: Duration::from_millis(10),
@@ -1899,7 +1899,7 @@ mod tests {
             .unwrap();
 
         // Wait for expiration (longer than TTL to ensure expiration)
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Run cleanup
         let expired = store.expire_overdue();
@@ -2268,8 +2268,8 @@ mod tests {
     }
 
     /// Tests terminal grace period cleanup.
-    #[test]
-    fn test_terminal_cleanup() {
+    #[tokio::test]
+    async fn test_terminal_cleanup() {
         let config = TaskStoreConfig {
             terminal_grace_period: Duration::from_millis(1),
             ..Default::default()
@@ -2311,7 +2311,7 @@ mod tests {
         assert_eq!(store.total_count(), 1);
 
         // Wait for grace period
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Cleanup
         let removed = store.cleanup_terminal();
@@ -2319,8 +2319,8 @@ mod tests {
         assert_eq!(store.total_count(), 0);
     }
 
-    #[test]
-    fn test_cleanup_terminal_removes_empty_principal_entries() {
+    #[tokio::test]
+    async fn test_cleanup_terminal_removes_empty_principal_entries() {
         let config = TaskStoreConfig {
             terminal_grace_period: Duration::from_millis(1),
             ..Default::default()
@@ -2381,7 +2381,7 @@ mod tests {
         }
 
         // Wait for grace period
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Cleanup should remove both tasks AND the empty principal entry
         let removed = store.cleanup_terminal();

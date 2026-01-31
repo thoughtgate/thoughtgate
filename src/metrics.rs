@@ -511,13 +511,13 @@ mod tests {
         assert_eq!(metrics.active_count(), 0);
     }
 
-    #[test]
-    fn test_inspector_timer() {
+    #[tokio::test]
+    async fn test_inspector_timer() {
         let meter = global::meter("test");
         let metrics = Arc::new(AmberPathMetrics::new(&meter));
 
         let timer = InspectorTimer::new(metrics.clone(), "test-inspector");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         timer.finish();
         // Duration recorded (can't easily assert the value)
     }
