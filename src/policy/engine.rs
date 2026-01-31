@@ -384,7 +384,7 @@ impl CedarEngine {
         use cedar_policy::RestrictedExpression;
 
         // Build time context record
-        let mut time_fields = HashMap::new();
+        let mut time_fields = HashMap::with_capacity(3);
         time_fields.insert(
             "hour".to_string(),
             RestrictedExpression::new_long(ctx.time.hour as i64),
@@ -404,7 +404,7 @@ impl CedarEngine {
             })?;
 
         // Build main context record
-        let mut context_fields = HashMap::new();
+        let mut context_fields = HashMap::with_capacity(3);
         context_fields.insert(
             "policy_id".to_string(),
             RestrictedExpression::new_string(ctx.policy_id.clone()),
@@ -428,10 +428,13 @@ impl CedarEngine {
     fn build_entities_v2(&self, request: &CedarRequest) -> Result<Entities, PolicyError> {
         use cedar_policy::{Entity, RestrictedExpression};
 
-        let mut entities = vec![];
+        // Pre-allocate: 1 principal + 1 resource + N roles
+        let num_roles = request.principal.roles.len();
+        let mut entities = Vec::with_capacity(2 + num_roles);
 
-        // Build role UIDs first (needed for principal parent membership)
-        let mut role_uids = std::collections::HashSet::new();
+        // Single pass over roles: build both UIDs (for principal parents)
+        // and role Entity objects (for the entity set) in one loop.
+        let mut role_uids = std::collections::HashSet::with_capacity(num_roles);
         for role in &request.principal.roles {
             let role_uid = EntityUid::from_type_name_and_id(
                 ENTITY_TYPE_ROLE.clone(),
@@ -439,6 +442,22 @@ impl CedarEngine {
                     details: format!("Invalid role ID: {}", e),
                 })?,
             );
+
+            let mut role_attrs = HashMap::with_capacity(1);
+            role_attrs.insert(
+                "name".to_string(),
+                RestrictedExpression::new_string(role.clone()),
+            );
+
+            let role_entity = Entity::new(
+                role_uid.clone(),
+                role_attrs,
+                std::collections::HashSet::new(),
+            )
+            .map_err(|e| PolicyError::CedarError {
+                details: format!("Failed to create role entity: {}", e),
+            })?;
+            entities.push(role_entity);
             role_uids.insert(role_uid);
         }
 
@@ -452,7 +471,7 @@ impl CedarEngine {
             })?,
         );
 
-        let mut principal_attrs = HashMap::new();
+        let mut principal_attrs = HashMap::with_capacity(3);
         principal_attrs.insert(
             "name".to_string(),
             RestrictedExpression::new_string(request.principal.app_name.clone()),
@@ -467,12 +486,10 @@ impl CedarEngine {
         );
 
         // Include role UIDs as parents so `principal in Role::"admin"` checks work
-        let principal_entity =
-            Entity::new(principal_uid.clone(), principal_attrs, role_uids.clone()).map_err(
-                |e| PolicyError::CedarError {
-                    details: format!("Failed to create principal entity: {}", e),
-                },
-            )?;
+        let principal_entity = Entity::new(principal_uid.clone(), principal_attrs, role_uids)
+            .map_err(|e| PolicyError::CedarError {
+                details: format!("Failed to create principal entity: {}", e),
+            })?;
         entities.push(principal_entity);
 
         // Build resource entity with attributes (including arguments for ToolCall)
@@ -482,7 +499,7 @@ impl CedarEngine {
                 server,
                 arguments,
             } => {
-                let mut attrs = HashMap::new();
+                let mut attrs = HashMap::with_capacity(3);
                 attrs.insert(
                     "name".to_string(),
                     RestrictedExpression::new_string(name.clone()),
@@ -499,7 +516,7 @@ impl CedarEngine {
                 (&*ENTITY_TYPE_TOOL_CALL, name.clone(), attrs)
             }
             CedarResource::McpMethod { method, server } => {
-                let mut attrs = HashMap::new();
+                let mut attrs = HashMap::with_capacity(2);
                 attrs.insert(
                     "method".to_string(),
                     RestrictedExpression::new_string(method.clone()),
@@ -528,28 +545,6 @@ impl CedarEngine {
             details: format!("Failed to create resource entity: {}", e),
         })?;
         entities.push(resource_entity);
-
-        // Add role entities (UIDs already built above)
-        for role in &request.principal.roles {
-            let role_uid = EntityUid::from_type_name_and_id(
-                ENTITY_TYPE_ROLE.clone(),
-                EntityId::from_str(role).map_err(|e| PolicyError::CedarError {
-                    details: format!("Invalid role ID: {}", e),
-                })?,
-            );
-
-            let mut role_attrs = HashMap::new();
-            role_attrs.insert(
-                "name".to_string(),
-                RestrictedExpression::new_string(role.clone()),
-            );
-
-            let role_entity = Entity::new(role_uid, role_attrs, std::collections::HashSet::new())
-                .map_err(|e| PolicyError::CedarError {
-                details: format!("Failed to create role entity: {}", e),
-            })?;
-            entities.push(role_entity);
-        }
 
         Entities::from_entities(entities, None).map_err(|e| PolicyError::CedarError {
             details: format!("Failed to create entities: {}", e),
