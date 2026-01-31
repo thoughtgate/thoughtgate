@@ -37,7 +37,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Action, Config, MatchResult};
 use crate::error::ThoughtGateError;
-use crate::governance::task::JsonRpcId as GovernanceJsonRpcId;
 use crate::governance::{
     ApprovalAdapter, ApprovalEngine, ApprovalEngineConfig, Principal, SlackAdapter, TaskHandler,
     TaskStore, ToolCallRequest,
@@ -1728,12 +1727,8 @@ async fn start_approval_flow(
     })?;
 
     // Create ToolCallRequest for the approval engine
-    // Convert transport JsonRpcId to governance JsonRpcId
-    let mcp_request_id = match request.id.clone() {
-        Some(JsonRpcId::Number(n)) => GovernanceJsonRpcId::Number(n),
-        Some(JsonRpcId::String(s)) => GovernanceJsonRpcId::String(s),
-        Some(JsonRpcId::Null) | None => GovernanceJsonRpcId::Null,
-    };
+    // Transport and governance now share the same JsonRpcId type
+    let mcp_request_id = request.id.clone().unwrap_or(JsonRpcId::Null);
 
     let tool_request = ToolCallRequest {
         method: request.method.clone(),

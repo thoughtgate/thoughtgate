@@ -39,19 +39,10 @@ use super::engine::TimeoutAction;
 // JSON-RPC ID (for MCP request tracking)
 // ============================================================================
 
-/// JSON-RPC 2.0 request ID.
-///
-/// Implements: REQ-CORE-003 (preserve exact ID type)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum JsonRpcId {
-    /// Numeric ID
-    Number(i64),
-    /// String ID
-    String(String),
-    /// Null ID (notification, no response expected)
-    Null,
-}
+// Re-export the canonical JsonRpcId from transport layer.
+// This ensures consistent serialization (manual Serialize/Deserialize impls)
+// and avoids divergent behavior between transport and governance.
+pub use crate::transport::jsonrpc::JsonRpcId;
 
 // ============================================================================
 // Principal
