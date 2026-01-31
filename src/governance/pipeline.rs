@@ -473,7 +473,15 @@ impl ApprovalPipeline {
         // Evaluate policy
         let action = self.policy_engine.evaluate(&policy_request);
 
-        // F-004.2: Any permit allows execution
+        // F-004.2: Both Forward and Approve are valid post-approval outcomes.
+        //
+        // Forward means "this tool no longer requires approval" — a policy
+        // relaxation. This is safe because:
+        // 1. The human already approved the request
+        // 2. Policy relaxation (Approve→Forward) means the tool could now
+        //    proceed without approval, which is strictly less restrictive
+        // 3. Only Reject constitutes policy drift that should block execution,
+        //    since it means the tool is now forbidden entirely
         match action {
             PolicyAction::Forward | PolicyAction::Approve { .. } => {
                 debug!(
