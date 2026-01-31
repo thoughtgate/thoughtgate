@@ -53,6 +53,9 @@ uuid = { version = "1.20", features = ["v4", "serde"] }
 cedar-policy = "4.8.0"
 arc-swap = "1.8.0"
 
+# Base64 decoding for K8s JWT tokens (REQ-POL-001/F-006.1)
+base64 = "0.22"
+
 # Task lifecycle (REQ-GOV-001)
 governor = "0.8"
 dashmap = "6"

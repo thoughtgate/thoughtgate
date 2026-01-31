@@ -3,6 +3,7 @@
 //! Implements: REQ-POL-001/F-006 (Identity Inference)
 
 use super::{PolicyError, Principal};
+use base64::Engine;
 use std::env;
 use std::fs;
 use tracing::{info, warn};
@@ -91,53 +92,31 @@ fn kubernetes_principal() -> Result<Principal, PolicyError> {
     })
 }
 
-/// Parse ServiceAccount name from JWT token.
+/// Parse ServiceAccount name from K8s JWT token.
 ///
 /// Implements: REQ-POL-001/F-006.1
 ///
-/// This is a best-effort extraction. The token is a JWT with the ServiceAccount
-/// name in the `kubernetes.io/serviceaccount/service-account.name` claim.
-/// We avoid full JWT parsing to keep dependencies minimal.
+/// Decodes the JWT payload (base64url) and extracts the
+/// `kubernetes.io/serviceaccount/service-account.name` claim.
+/// Signature is NOT verified — K8s ServiceAccount tokens on the
+/// mounted path (`/var/run/secrets/...`) are trusted by design.
 fn parse_service_account_from_token(token: &str) -> Option<String> {
-    // JWT tokens are base64-encoded JSON separated by dots
-    // Format: header.payload.signature
+    // JWT format: header.payload.signature
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return None;
     }
 
-    // Decode the payload (second part)
-    let payload = parts[1];
+    // Decode the payload (second part) using base64url-no-pad
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()?;
 
-    // JWT uses base64url encoding (no padding)
-    let decoded = base64_decode_no_pad(payload)?;
-    let json_str = String::from_utf8(decoded).ok()?;
-
-    // Parse JSON to extract service account name
-    // Expected structure: {"kubernetes.io/serviceaccount/service-account.name":"sa-name",...}
-    extract_sa_from_json(&json_str)
-}
-
-/// Simple base64 decoder for JWT payload (base64url, no padding).
-fn base64_decode_no_pad(_input: &str) -> Option<Vec<u8>> {
-    // TODO: Add proper base64 decoding or use a lightweight JWT crate
-    // For now, just return None - full JWT parsing not critical for v0.1
-    // The ServiceAccount name will default to "default" if parsing fails
-    None
-}
-
-/// Extract ServiceAccount name from JWT payload JSON.
-fn extract_sa_from_json(json: &str) -> Option<String> {
-    // Look for the service account name claim
-    // This is a simple string search, not full JSON parsing
-    let key = "\"kubernetes.io/serviceaccount/service-account.name\":\"";
-    if let Some(start) = json.find(key) {
-        let value_start = start + key.len();
-        if let Some(end) = json[value_start..].find('"') {
-            return Some(json[value_start..value_start + end].to_string());
-        }
-    }
-    None
+    // Parse as JSON and extract the ServiceAccount name claim
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims["kubernetes.io/serviceaccount/service-account.name"]
+        .as_str()
+        .map(String::from)
 }
 
 #[cfg(test)]
@@ -181,18 +160,40 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_sa_from_json() {
-        let json =
+    fn test_parse_service_account_from_jwt() {
+        // Build a real JWT-shaped token with base64url-encoded payload
+        use base64::Engine;
+        let payload =
             r#"{"kubernetes.io/serviceaccount/service-account.name":"my-sa","other":"value"}"#;
-        let result = extract_sa_from_json(json);
+        let encoded_payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        // header.payload.signature (header and signature are arbitrary for this test)
+        let token = format!("eyJhbGciOiJSUzI1NiJ9.{encoded_payload}.fake-signature");
+
+        let result = parse_service_account_from_token(&token);
         assert_eq!(result, Some("my-sa".to_string()));
     }
 
     #[test]
-    fn test_extract_sa_from_json_not_found() {
-        let json = r#"{"other":"value"}"#;
-        let result = extract_sa_from_json(json);
+    fn test_parse_service_account_from_jwt_missing_claim() {
+        use base64::Engine;
+        let payload = r#"{"other":"value"}"#;
+        let encoded_payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("eyJhbGciOiJSUzI1NiJ9.{encoded_payload}.fake-signature");
+
+        let result = parse_service_account_from_token(&token);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_service_account_invalid_token() {
+        // Not a valid JWT (no dots)
+        assert_eq!(parse_service_account_from_token("not-a-jwt"), None);
+        // Only 2 parts
+        assert_eq!(parse_service_account_from_token("a.b"), None);
+        // Invalid base64 in payload
+        assert_eq!(parse_service_account_from_token("a.!!!invalid!!!.c"), None);
     }
 
     // ═══════════════════════════════════════════════════════════
