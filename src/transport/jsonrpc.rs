@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -288,7 +289,7 @@ const JSONRPC_VERSION: &str = "2.0";
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcRequest {
     /// Always "2.0"
-    pub jsonrpc: String,
+    pub jsonrpc: Cow<'static, str>,
     /// Request ID (None for notifications)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<JsonRpcId>,
@@ -325,7 +326,7 @@ impl JsonRpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
     /// Always "2.0"
-    pub jsonrpc: String,
+    pub jsonrpc: Cow<'static, str>,
     /// Request ID - always serialized (None becomes null per JSON-RPC 2.0 spec)
     pub id: Option<JsonRpcId>,
     /// Result (mutually exclusive with error)
@@ -347,7 +348,7 @@ impl JsonRpcResponse {
     /// * `result` - The result value
     pub fn success(id: Option<JsonRpcId>, result: Value) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: Some(result),
             error: None,
@@ -366,7 +367,7 @@ impl JsonRpcResponse {
     /// * `error` - The JSON-RPC error object
     pub fn error(id: Option<JsonRpcId>, error: crate::error::jsonrpc::JsonRpcError) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: None,
             error: Some(error),
@@ -397,7 +398,7 @@ impl JsonRpcResponse {
         poll_interval: std::time::Duration,
     ) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: Some(serde_json::json!({
                 "taskId": task_id,
@@ -470,7 +471,7 @@ impl McpRequest {
     /// Implements: REQ-CORE-003/F-004 (Request Forwarding)
     pub fn to_jsonrpc_request(&self) -> JsonRpcRequest {
         JsonRpcRequest {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id: self.id.clone(),
             method: self.method.clone(),
             params: self.params.clone(),

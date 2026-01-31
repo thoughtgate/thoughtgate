@@ -921,7 +921,7 @@ mod tests {
             self.forward_count.fetch_add(1, Ordering::SeqCst);
             let result = self.response.lock().await.clone();
             Ok(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
+                jsonrpc: std::borrow::Cow::Borrowed("2.0"),
                 id: Some(crate::transport::JsonRpcId::Number(1)),
                 result,
                 error: None,
