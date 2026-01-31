@@ -616,8 +616,18 @@ impl ApprovalPipeline {
                     }
                 } else {
                     // Success
+                    let content = match response.result {
+                        Some(value) => value,
+                        None => {
+                            warn!(
+                                task_id = %task.id,
+                                "Upstream response has neither result nor error — treating as null"
+                            );
+                            serde_json::Value::Null
+                        }
+                    };
                     let result = ToolCallResult {
-                        content: response.result.unwrap_or(serde_json::Value::Null),
+                        content,
                         is_error: false,
                     };
                     info!(
