@@ -58,8 +58,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 sha2 = "0.10"
 hex = "0.4"
 
-# SEP-1686 Protocol (REQ-CORE-007)
-nanoid = "0.4"
+# SEP-1686 Protocol (REQ-CORE-007) - uses uuid for task ID generation
 
 # Async trait support (REQ-CORE-002 Inspector interface)
 async-trait = "0.1"
@@ -72,7 +71,6 @@ opentelemetry = { version = "0.31", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-prometheus = "0.31"
 prometheus = "0.14"
-once_cell = "1.19"
 
 # Serialization (required for transport layer)
 serde = { version = "1.0", features = ["derive"] }

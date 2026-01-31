@@ -1032,7 +1032,9 @@ async fn test_task_methods_handled_locally() {
     let cedar_engine = Arc::new(CedarEngine::new().unwrap());
     let task_store = Arc::new(TaskStore::with_defaults());
 
-    // Pre-create a task so we have something to query
+    // Pre-create a task so we have something to query.
+    // Use "dev-app" principal to match the dev mode principal from infer_principal()
+    // (THOUGHTGATE_DEV_MODE=true defaults to app_name="dev-app").
     let request = ToolCallRequest {
         method: "tools/call".to_string(),
         name: "test_tool".to_string(),
@@ -1043,7 +1045,7 @@ async fn test_task_methods_handled_locally() {
         .create(
             request.clone(),
             request,
-            Principal::new("test-app"),
+            Principal::new("dev-app"),
             None,
             TimeoutAction::Deny,
         )

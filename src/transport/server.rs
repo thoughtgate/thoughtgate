@@ -37,7 +37,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Action, Config, MatchResult};
 use crate::error::ThoughtGateError;
-use crate::governance::task::JsonRpcId as GovernanceJsonRpcId;
 use crate::governance::{
     ApprovalAdapter, ApprovalEngine, ApprovalEngineConfig, Principal, SlackAdapter, TaskHandler,
     TaskStore, ToolCallRequest,
@@ -69,6 +68,8 @@ pub struct McpServerConfig {
     pub max_body_size: usize,
     /// Maximum concurrent requests
     pub max_concurrent_requests: usize,
+    /// Maximum number of requests in a JSON-RPC batch
+    pub max_batch_size: usize,
     /// Upstream client configuration
     pub upstream: UpstreamConfig,
 }
@@ -79,6 +80,7 @@ impl Default for McpServerConfig {
             listen_addr: "0.0.0.0:8080".to_string(),
             max_body_size: 1024 * 1024, // 1MB
             max_concurrent_requests: 10000,
+            max_batch_size: 100,
             upstream: UpstreamConfig::default(),
         }
     }
@@ -94,6 +96,7 @@ impl McpServerConfig {
     /// - `THOUGHTGATE_LISTEN` (default: "0.0.0.0:8080"): Listen address
     /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
     /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
+    /// - `THOUGHTGATE_MAX_BATCH_SIZE` (default: 100): Max JSON-RPC batch array length
     ///
     /// Plus all upstream configuration variables (see `UpstreamConfig::from_env`).
     ///
@@ -114,10 +117,16 @@ impl McpServerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
 
+        let max_batch_size: usize = std::env::var("THOUGHTGATE_MAX_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
         Ok(Self {
             listen_addr,
             max_body_size,
             max_concurrent_requests,
+            max_batch_size,
             upstream: UpstreamConfig::from_env()?,
         })
     }
@@ -144,6 +153,8 @@ pub struct McpState {
     pub semaphore: Arc<Semaphore>,
     /// Maximum body size in bytes
     pub max_body_size: usize,
+    /// Maximum number of requests in a JSON-RPC batch
+    pub max_batch_size: usize,
     /// Capability cache for upstream detection (REQ-CORE-007)
     pub capability_cache: Arc<CapabilityCache>,
 }
@@ -157,6 +168,8 @@ pub struct McpHandlerConfig {
     pub max_body_size: usize,
     /// Maximum concurrent requests
     pub max_concurrent_requests: usize,
+    /// Maximum number of requests in a JSON-RPC batch
+    pub max_batch_size: usize,
 }
 
 impl Default for McpHandlerConfig {
@@ -164,6 +177,7 @@ impl Default for McpHandlerConfig {
         Self {
             max_body_size: 1024 * 1024, // 1MB
             max_concurrent_requests: 10000,
+            max_batch_size: 100,
         }
     }
 }
@@ -186,9 +200,15 @@ impl McpHandlerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
 
+        let max_batch_size: usize = std::env::var("THOUGHTGATE_MAX_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
         Self {
             max_body_size,
             max_concurrent_requests,
+            max_batch_size,
         }
     }
 }
@@ -252,6 +272,7 @@ impl McpHandler {
             approval_engine: None,
             semaphore,
             max_body_size: config.max_body_size,
+            max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -278,6 +299,7 @@ impl McpHandler {
             approval_engine: None,
             semaphore,
             max_body_size: config.max_body_size,
+            max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -325,6 +347,7 @@ impl McpHandler {
             approval_engine,
             semaphore,
             max_body_size: handler_config.max_body_size,
+            max_batch_size: handler_config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -412,7 +435,7 @@ pub struct McpServer {
 ///
 /// Tuple of (TaskHandler, CedarEngine, optional ApprovalEngine)
 #[allow(clippy::type_complexity)]
-pub fn create_governance_components(
+pub async fn create_governance_components(
     upstream: Arc<dyn UpstreamForwarder>,
     config: Option<&Config>,
     shutdown: CancellationToken,
@@ -463,14 +486,18 @@ pub fn create_governance_components(
 
         let engine_config = ApprovalEngineConfig::from_env();
 
-        let engine = ApprovalEngine::new(task_store, adapter, upstream, engine_config, shutdown)
-            .map_err(|e| ThoughtGateError::ServiceUnavailable {
-                reason: format!("Failed to create ApprovalEngine: {}", e),
-            })?;
+        let engine = ApprovalEngine::new(
+            task_store,
+            adapter,
+            upstream,
+            cedar_engine.clone(),
+            engine_config,
+            shutdown,
+        );
 
         // Spawn background polling loop for approval decisions
         // Implements: REQ-GOV-003/F-002, REQ-GOV-001/F-008
-        engine.spawn_background_tasks();
+        engine.spawn_background_tasks().await;
         info!("ApprovalEngine background tasks started");
 
         Some(Arc::new(engine))
@@ -496,12 +523,12 @@ impl McpServer {
     /// # Errors
     ///
     /// Returns error if the upstream client cannot be created.
-    pub fn new(config: McpServerConfig) -> Result<Self, ThoughtGateError> {
+    pub async fn new(config: McpServerConfig) -> Result<Self, ThoughtGateError> {
         let upstream = Arc::new(UpstreamClient::new(config.upstream.clone())?);
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let shutdown = CancellationToken::new();
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), None, shutdown.clone())?;
+            create_governance_components(upstream.clone(), None, shutdown.clone()).await?;
 
         let state = Arc::new(McpState {
             upstream,
@@ -512,6 +539,7 @@ impl McpServer {
             approval_engine,
             semaphore,
             max_body_size: config.max_body_size,
+            max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -532,14 +560,14 @@ impl McpServer {
     ///
     /// * `config` - Server configuration
     /// * `upstream` - Custom upstream forwarder implementation
-    pub fn with_upstream(
+    pub async fn with_upstream(
         config: McpServerConfig,
         upstream: Arc<dyn UpstreamForwarder>,
     ) -> Result<Self, ThoughtGateError> {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let shutdown = CancellationToken::new();
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), None, shutdown.clone())?;
+            create_governance_components(upstream.clone(), None, shutdown.clone()).await?;
 
         let state = Arc::new(McpState {
             upstream,
@@ -550,6 +578,7 @@ impl McpServer {
             approval_engine,
             semaphore,
             max_body_size: config.max_body_size,
+            max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -580,7 +609,7 @@ impl McpServer {
     /// # Errors
     ///
     /// Returns error if upstream client or approval engine cannot be created.
-    pub fn with_config(
+    pub async fn with_config(
         server_config: McpServerConfig,
         yaml_config: Config,
         shutdown: CancellationToken,
@@ -588,7 +617,8 @@ impl McpServer {
         let upstream = Arc::new(UpstreamClient::new(server_config.upstream.clone())?);
         let semaphore = Arc::new(Semaphore::new(server_config.max_concurrent_requests));
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), Some(&yaml_config), shutdown.clone())?;
+            create_governance_components(upstream.clone(), Some(&yaml_config), shutdown.clone())
+                .await?;
 
         let state = Arc::new(McpState {
             upstream,
@@ -599,6 +629,7 @@ impl McpServer {
             approval_engine,
             semaphore,
             max_body_size: server_config.max_body_size,
+            max_batch_size: server_config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -745,6 +776,17 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
 
     match parsed {
         ParsedRequests::Single(request) => handle_single_request_bytes(state, request).await,
+        ParsedRequests::Batch(ref requests) if requests.len() > state.max_batch_size => {
+            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let error = ThoughtGateError::InvalidRequest {
+                details: format!(
+                    "Batch size {} exceeds maximum of {}",
+                    requests.len(),
+                    state.max_batch_size
+                ),
+            };
+            error_bytes(None, &error, &correlation_id)
+        }
         ParsedRequests::Batch(requests) => handle_batch_request_bytes(state, requests).await,
     }
 }
@@ -961,11 +1003,10 @@ async fn handle_list_method(
             let mut tools: Vec<ToolDefinition> = match serde_json::from_value(tools_value.clone()) {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed to parse tools from upstream response, returning as-is"
-                    );
-                    return Ok(response);
+                    // Fail closed: do not pass unfiltered tools to client (Gate 1 bypass)
+                    return Err(ThoughtGateError::ServiceUnavailable {
+                        reason: format!("Failed to parse upstream tools response: {e}"),
+                    });
                 }
             };
 
@@ -1009,7 +1050,11 @@ async fn handle_list_method(
             if let Some(obj) = new_result.as_object_mut() {
                 obj.insert(
                     "tools".to_string(),
-                    serde_json::to_value(&tools).unwrap_or(tools_value.clone()),
+                    serde_json::to_value(&tools).map_err(|e| {
+                        ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to serialize filtered tools: {e}"),
+                        }
+                    })?,
                 );
             }
 
@@ -1026,11 +1071,10 @@ async fn handle_list_method(
                 match serde_json::from_value(resources_value.clone()) {
                     Ok(r) => r,
                     Err(e) => {
-                        warn!(
-                            error = %e,
-                            "Failed to parse resources from upstream response, returning as-is"
-                        );
-                        return Ok(response);
+                        // Fail closed: do not pass unfiltered resources to client (Gate 1 bypass)
+                        return Err(ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to parse upstream resources response: {e}"),
+                        });
                     }
                 };
 
@@ -1056,7 +1100,11 @@ async fn handle_list_method(
             if let Some(obj) = new_result.as_object_mut() {
                 obj.insert(
                     "resources".to_string(),
-                    serde_json::to_value(&resources).unwrap_or(resources_value.clone()),
+                    serde_json::to_value(&resources).map_err(|e| {
+                        ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to serialize filtered resources: {e}"),
+                        }
+                    })?,
                 );
             }
 
@@ -1073,11 +1121,10 @@ async fn handle_list_method(
                 match serde_json::from_value(prompts_value.clone()) {
                     Ok(p) => p,
                     Err(e) => {
-                        warn!(
-                            error = %e,
-                            "Failed to parse prompts from upstream response, returning as-is"
-                        );
-                        return Ok(response);
+                        // Fail closed: do not pass unfiltered prompts to client (Gate 1 bypass)
+                        return Err(ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to parse upstream prompts response: {e}"),
+                        });
                     }
                 };
 
@@ -1103,7 +1150,11 @@ async fn handle_list_method(
             if let Some(obj) = new_result.as_object_mut() {
                 obj.insert(
                     "prompts".to_string(),
-                    serde_json::to_value(&prompts).unwrap_or(prompts_value.clone()),
+                    serde_json::to_value(&prompts).map_err(|e| {
+                        ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Failed to serialize filtered prompts: {e}"),
+                        }
+                    })?,
                 );
             }
 
@@ -1180,24 +1231,20 @@ fn validate_task_metadata(
 /// # Returns
 ///
 /// (StatusCode, Bytes) tuple with JSON-RPC result or error.
-async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (StatusCode, Bytes) {
-    let correlation_id = request.correlation_id.to_string();
-    let id = request.id.clone();
-    let is_notification = request.is_notification();
-
-    debug!(
-        correlation_id = %correlation_id,
-        method = %request.method,
-        is_notification = is_notification,
-        is_task_augmented = request.is_task_augmented(),
-        "Processing single request"
-    );
-
-    // Route the request
-    let result = match state.router.route(request) {
+/// Routes a single MCP request through the appropriate handler.
+///
+/// Implements: REQ-CORE-003/F-002 (Method Routing)
+///
+/// Shared routing logic used by both single and batch request handlers.
+/// Dispatches to the 4-gate model, task handler, initialize handler,
+/// or pass-through based on the router's classification.
+async fn route_request(
+    state: &McpState,
+    request: McpRequest,
+) -> Result<JsonRpcResponse, ThoughtGateError> {
+    match state.router.route(request) {
         RouteTarget::PolicyEvaluation { request } => {
             // Apply 4-gate model for governable methods when config is present
-            // Implements: REQ-CORE-003/F-002 (Method Routing)
             if state.config.is_some() {
                 if method_requires_gates(&request.method) {
                     // Governable methods: tools/call, resources/read, etc.
@@ -1216,24 +1263,31 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
             }
         }
         RouteTarget::TaskHandler { method, request } => {
-            // Implements: REQ-GOV-001/F-003 through F-006 (SEP-1686 task methods)
-            debug!(
-                correlation_id = %correlation_id,
-                task_method = ?method,
-                "Handling task method"
-            );
             handle_task_method(state, method, &request).await
         }
         RouteTarget::InitializeHandler { request } => {
             // Implements: REQ-CORE-007/F-001 (Capability Injection)
-            debug!(
-                correlation_id = %correlation_id,
-                "Handling initialize method for capability injection"
-            );
             handle_initialize_method(state, request).await
         }
         RouteTarget::PassThrough { request } => state.upstream.forward(&request).await,
-    };
+    }
+}
+
+async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (StatusCode, Bytes) {
+    let correlation_id = request.correlation_id.to_string();
+    let id = request.id.clone();
+    let is_notification = request.is_notification();
+
+    debug!(
+        correlation_id = %correlation_id,
+        method = %request.method,
+        is_notification = is_notification,
+        is_task_augmented = request.is_task_augmented(),
+        "Processing single request"
+    );
+
+    // Route the request through shared routing logic
+    let result = route_request(state, request).await;
 
     // Handle notification - no response (empty body with 204)
     if is_notification {
@@ -1286,6 +1340,9 @@ async fn handle_task_method(
                     details: format!("Invalid tasks/get params: {}", e),
                 })?;
 
+            // Verify caller owns this task (returns TaskNotFound on mismatch)
+            verify_task_principal(state, &req.task_id)?;
+
             let result = state
                 .task_handler
                 .handle_tasks_get(req)
@@ -1306,6 +1363,9 @@ async fn handle_task_method(
                 serde_json::from_value(params).map_err(|e| ThoughtGateError::InvalidParams {
                     details: format!("Invalid tasks/result params: {}", e),
                 })?;
+
+            // Verify caller owns this task (returns TaskNotFound on mismatch)
+            verify_task_principal(state, &req.task_id)?;
 
             // If we have an approval engine, use it to execute approved tasks
             if let Some(approval_engine) = &state.approval_engine {
@@ -1349,8 +1409,10 @@ async fn handle_task_method(
 
             // Infer principal from environment (same as other task operations)
             let policy_principal =
-                infer_principal().map_err(|e| ThoughtGateError::ServiceUnavailable {
-                    reason: format!("Failed to infer principal: {}", e),
+                infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
+                    tool: String::new(),
+                    policy_id: None,
+                    reason: Some(format!("Identity unavailable: {}", e)),
                 })?;
             let principal = Principal::new(&policy_principal.app_name);
 
@@ -1371,6 +1433,9 @@ async fn handle_task_method(
                     details: format!("Invalid tasks/cancel params: {}", e),
                 })?;
 
+            // Verify caller owns this task (returns TaskNotFound on mismatch)
+            verify_task_principal(state, &req.task_id)?;
+
             let result = state
                 .task_handler
                 .handle_tasks_cancel(req)
@@ -1384,6 +1449,44 @@ async fn handle_task_method(
             ))
         }
     }
+}
+
+/// Verify that the caller's principal matches the task's principal.
+///
+/// Returns TaskNotFound (not "access denied") to prevent information leakage
+/// about tasks owned by other principals.
+///
+/// If principal inference fails (no K8s identity and dev mode is off),
+/// verification is skipped. This is safe because task creation also requires
+/// principal inference — if identity cannot be established, no tasks will
+/// exist for the caller to access.
+///
+/// Implements: REQ-GOV-001/F-011 (Principal isolation)
+fn verify_task_principal(
+    state: &McpState,
+    task_id: &crate::governance::task::TaskId,
+) -> Result<(), ThoughtGateError> {
+    // If we can't infer principal, skip verification. This can happen in
+    // environments where identity is not configured. Task creation would
+    // also fail in such environments, providing defense-in-depth.
+    let caller_principal = match infer_principal() {
+        Ok(p) => Principal::new(&p.app_name),
+        Err(_) => return Ok(()),
+    };
+
+    let task = state
+        .task_handler
+        .store()
+        .get(task_id)
+        .map_err(task_error_to_thoughtgate)?;
+
+    if task.principal != caller_principal {
+        return Err(ThoughtGateError::TaskNotFound {
+            task_id: task_id.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Convert TaskError to ThoughtGateError.
@@ -1621,17 +1724,15 @@ async fn start_approval_flow(
             })?;
 
     // Infer principal from environment
-    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::ServiceUnavailable {
-        reason: format!("Failed to infer principal: {}", e),
+    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
+        tool: String::new(),
+        policy_id: None,
+        reason: Some(format!("Identity unavailable: {}", e)),
     })?;
 
     // Create ToolCallRequest for the approval engine
-    // Convert transport JsonRpcId to governance JsonRpcId
-    let mcp_request_id = match request.id.clone() {
-        Some(JsonRpcId::Number(n)) => GovernanceJsonRpcId::Number(n),
-        Some(JsonRpcId::String(s)) => GovernanceJsonRpcId::String(s),
-        Some(JsonRpcId::Null) | None => GovernanceJsonRpcId::Null,
-    };
+    // Transport and governance now share the same JsonRpcId type
+    let mcp_request_id = request.id.clone().unwrap_or(JsonRpcId::Null);
 
     let tool_request = ToolCallRequest {
         method: request.method.clone(),
@@ -1736,8 +1837,10 @@ async fn evaluate_with_cedar(
     };
 
     // Infer principal from environment
-    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::ServiceUnavailable {
-        reason: format!("Failed to infer principal: {}", e),
+    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
+        tool: String::new(),
+        policy_id: None,
+        reason: Some(format!("Identity unavailable: {}", e)),
     })?;
 
     // Get policy_id and source_id from Gate 2 result, or use defaults
@@ -1832,15 +1935,24 @@ async fn evaluate_with_cedar(
 ///
 /// # Returns
 ///
-/// (StatusCode, Bytes) with JSON-RPC batch response or 204 No Content if all notifications.
+/// (StatusCode, Bytes) with JSON-RPC batch response or empty array `[]` if all notifications.
 ///
-/// # Design Note
+/// # Design Note: Batch Concurrency
 ///
-/// Requests are processed sequentially rather than in parallel because:
-/// 1. F-007.5 requires that if ANY request needs approval, the entire batch
-///    becomes task-augmented - requests are not independent
-/// 2. Sequential processing simplifies response ordering guarantees
-/// 3. The upstream connection pool handles actual HTTP request parallelism
+/// Requests are processed sequentially (single-permit-per-batch) rather than
+/// in parallel. This design choice is intentional:
+///
+/// 1. **Approval coupling** (F-007.5): If ANY request needs approval, the
+///    entire batch becomes task-augmented — requests are not independent.
+/// 2. **Bounded resource usage**: With `max_batch_size` limiting array length,
+///    sequential processing bounds total work per request to O(max_batch_size).
+///    Parallel processing would require additional concurrency limits to
+///    prevent a single batch from monopolizing the connection pool.
+/// 3. **Deadlock prevention**: Parallel batch items competing for the same
+///    upstream connection pool under load could deadlock if the pool is
+///    exhausted by one batch while another waits.
+/// 4. **Response ordering**: Sequential processing trivially preserves
+///    response ordering without additional synchronization.
 async fn handle_batch_request_bytes(
     state: &McpState,
     items: Vec<crate::transport::jsonrpc::BatchItem>,
@@ -1866,35 +1978,8 @@ async fn handle_batch_request_bytes(
                 let id = request.id.clone();
                 let correlation_id = request.correlation_id.to_string();
 
-                let result = match state.router.route(request) {
-                    RouteTarget::PolicyEvaluation { request } => {
-                        // Apply 4-gate model for governable methods when config is present
-                        // Implements: REQ-CORE-003/F-002 (Method Routing)
-                        if state.config.is_some() {
-                            if method_requires_gates(&request.method) {
-                                // Governable methods: tools/call, resources/read, etc.
-                                route_through_gates(state, request).await
-                            } else if is_list_method(&request.method) {
-                                // List methods: tools/list, resources/list, prompts/list
-                                handle_list_method(state, request).await
-                            } else {
-                                // Other methods: forward directly
-                                state.upstream.forward(&request).await
-                            }
-                        } else {
-                            // Legacy mode (no config): direct Cedar evaluation (Gate 3 only)
-                            evaluate_with_cedar(state, request, None).await
-                        }
-                    }
-                    RouteTarget::TaskHandler { method, request } => {
-                        handle_task_method(state, method, &request).await
-                    }
-                    RouteTarget::InitializeHandler { request } => {
-                        // Implements: REQ-CORE-007/F-001 (Capability Injection)
-                        handle_initialize_method(state, request).await
-                    }
-                    RouteTarget::PassThrough { request } => state.upstream.forward(&request).await,
-                };
+                // Route through shared routing logic
+                let result = route_request(state, request).await;
 
                 // F-007.4: Notifications don't produce response entries
                 if is_notification {
@@ -1919,8 +2004,8 @@ async fn handle_batch_request_bytes(
 
     // Return batch response
     if responses.is_empty() {
-        // All were notifications
-        return (StatusCode::NO_CONTENT, Bytes::new());
+        // All were notifications — return empty JSON array per JSON-RPC 2.0 §6
+        return (StatusCode::OK, Bytes::from_static(b"[]"));
     }
 
     // Serialize batch response
@@ -2027,6 +2112,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(100)),
             max_body_size: 1024 * 1024,
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         })
     }
@@ -2198,6 +2284,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(0)), // No permits available
             max_body_size: 1024 * 1024,
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -2237,6 +2324,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(100)),
             max_body_size: 10, // Very small limit
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         });
 
@@ -2355,8 +2443,10 @@ mod tests {
             .expect("should build request");
 
         let response = router.oneshot(request).await.expect("should get response");
-        // All notifications = no content
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // All notifications in batch = empty JSON array per JSON-RPC 2.0 §6
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_str = response_body(response).await;
+        assert_eq!(body_str, "[]");
     }
 
     #[test]
@@ -2571,6 +2661,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(100)),
             max_body_size: 1024 * 1024,
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         })
     }
@@ -2824,6 +2915,7 @@ mod tests {
             approval_engine: None,
             semaphore: Arc::new(Semaphore::new(100)),
             max_body_size: 1024 * 1024,
+            max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
         })
     }

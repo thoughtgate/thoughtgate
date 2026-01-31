@@ -213,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create governance components (TaskHandler, CedarEngine, ApprovalEngine)
         // IMPORTANT: The TaskHandler contains the shared TaskStore that ApprovalEngine uses
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), Some(config), shutdown.clone())?;
+            create_governance_components(upstream.clone(), Some(config), shutdown.clone()).await?;
 
         // Create MCP handler with full governance
         // Use the same TaskStore that ApprovalEngine uses for task coordination
@@ -283,20 +283,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 Ok(resp) => {
-                    error!(
-                        upstream = %upstream_url,
-                        status = %resp.status(),
-                        "Upstream returned non-success status at startup"
-                    );
-                    std::process::exit(1);
+                    return Err(format!(
+                        "Upstream {} returned non-success status {} at startup",
+                        upstream_url,
+                        resp.status()
+                    )
+                    .into());
                 }
                 Err(e) => {
-                    error!(
-                        upstream = %upstream_url,
-                        error = %e,
-                        "Cannot connect to upstream at startup"
-                    );
-                    std::process::exit(1);
+                    return Err(format!(
+                        "Cannot connect to upstream {} at startup: {}",
+                        upstream_url, e
+                    )
+                    .into());
                 }
             }
         } else {
@@ -320,11 +319,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check startup timeout before marking ready
     // Implements: REQ-CORE-005/F-001 (startup timeout enforcement)
     if std::time::Instant::now() > startup_deadline {
-        error!(
-            timeout_secs = lifecycle.config().startup_timeout.as_secs(),
-            "Startup timeout exceeded"
-        );
-        std::process::exit(1);
+        return Err(format!(
+            "Startup timeout exceeded ({}s)",
+            lifecycle.config().startup_timeout.as_secs()
+        )
+        .into());
     }
 
     // Mark as ready
@@ -332,6 +331,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     lifecycle.mark_config_loaded(); // Configuration loaded and validated
     lifecycle.mark_approval_store_initialized(); // Approval store ready
     lifecycle.mark_ready();
+
+    // Per-request timeout for proxy connections
+    // Prevents indefinitely hanging connections from leaking resources
+    let request_timeout = Duration::from_secs(
+        std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+    );
+    info!(
+        timeout_secs = request_timeout.as_secs(),
+        "Per-request timeout configured"
+    );
 
     // Main accept loop
     loop {
@@ -381,15 +393,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let conn_shutdown = shutdown.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(
-                                stream,
-                                peer_addr,
-                                service_stack,
-                                conn_shutdown,
+                            match tokio::time::timeout(
+                                request_timeout,
+                                handle_connection(
+                                    stream,
+                                    peer_addr,
+                                    service_stack,
+                                    conn_shutdown,
+                                ),
                             )
                             .await
                             {
-                                error!(error = %e, "Connection handling error");
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    error!(error = %e, "Connection handling error");
+                                }
+                                Err(_elapsed) => {
+                                    warn!(
+                                        peer = %peer_addr,
+                                        timeout_secs = request_timeout.as_secs(),
+                                        "Connection timed out, dropping"
+                                    );
+                                }
                             }
 
                             // Explicit drops for clarity (both happen automatically at scope end)
@@ -506,6 +531,9 @@ fn setup_signal_handlers(shutdown: CancellationToken, lifecycle: Arc<LifecycleMa
                         "Received SIGQUIT, immediate shutdown (no drain)"
                     );
                     lifecycle_sigquit.mark_stopped();
+                    // Intentional process::exit: SIGQUIT demands immediate termination
+                    // without drain. This cannot return through main() because the
+                    // signal handler runs in a spawned task.
                     std::process::exit(1);
                 }
                 Err(e) => {

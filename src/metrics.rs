@@ -331,20 +331,106 @@ impl ProxyMetrics {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Governance Pipeline Metrics (REQ-GOV-002)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Metrics collector for the governance approval pipeline.
+///
+/// # Traceability
+/// - Implements: REQ-GOV-002 NFR-001 (Governance Observability)
+#[derive(Clone)]
+pub struct GovernanceMetrics {
+    /// Total tasks created (by status outcome)
+    pub tasks_created_total: Counter<u64>,
+    /// Total tasks reaching terminal state (by status)
+    pub tasks_terminal_total: Counter<u64>,
+    /// Approval latency from creation to decision
+    pub approval_latency_seconds: Histogram<f64>,
+    /// Pipeline execution failures
+    pub pipeline_failures_total: Counter<u64>,
+    /// Currently pending tasks (gauge via atomic)
+    pub tasks_pending: Arc<AtomicI64>,
+    /// Total scheduler poll operations
+    pub scheduler_polls_total: Counter<u64>,
+}
+
+impl GovernanceMetrics {
+    /// Create new governance metrics collector.
+    pub fn new(meter: &Meter) -> Self {
+        Self {
+            tasks_created_total: meter
+                .u64_counter("governance_tasks_created_total")
+                .with_description("Total approval tasks created")
+                .build(),
+            tasks_terminal_total: meter
+                .u64_counter("governance_tasks_terminal_total")
+                .with_description("Total tasks reaching terminal state")
+                .build(),
+            approval_latency_seconds: meter
+                .f64_histogram("governance_approval_latency_seconds")
+                .with_description("Time from task creation to approval decision")
+                .build(),
+            pipeline_failures_total: meter
+                .u64_counter("governance_pipeline_failures_total")
+                .with_description("Total pipeline execution failures")
+                .build(),
+            tasks_pending: Arc::new(AtomicI64::new(0)),
+            scheduler_polls_total: meter
+                .u64_counter("governance_scheduler_polls_total")
+                .with_description("Total scheduler poll operations")
+                .build(),
+        }
+    }
+
+    /// Record task creation.
+    pub fn record_task_created(&self) {
+        self.tasks_created_total.add(1, &[]);
+        self.tasks_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record task reaching terminal state.
+    pub fn record_task_terminal(&self, status: &str) {
+        self.tasks_terminal_total
+            .add(1, &[KeyValue::new("status", status.to_string())]);
+        self.tasks_pending.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Record approval latency.
+    pub fn record_approval_latency(&self, duration: std::time::Duration) {
+        self.approval_latency_seconds
+            .record(duration.as_secs_f64(), &[]);
+    }
+
+    /// Record pipeline failure.
+    pub fn record_pipeline_failure(&self, stage: &str) {
+        self.pipeline_failures_total
+            .add(1, &[KeyValue::new("stage", stage.to_string())]);
+    }
+
+    /// Record scheduler poll.
+    pub fn record_scheduler_poll(&self) {
+        self.scheduler_polls_total.add(1, &[]);
+    }
+}
+
 /// Global metrics instance (Green Path only for backwards compatibility).
-static GREEN_METRICS: once_cell::sync::OnceCell<Arc<GreenPathMetrics>> =
-    once_cell::sync::OnceCell::new();
+static GREEN_METRICS: std::sync::OnceLock<Arc<GreenPathMetrics>> = std::sync::OnceLock::new();
 
 /// Global Amber Path metrics instance.
-static AMBER_METRICS: once_cell::sync::OnceCell<Arc<AmberPathMetrics>> =
-    once_cell::sync::OnceCell::new();
+static AMBER_METRICS: std::sync::OnceLock<Arc<AmberPathMetrics>> = std::sync::OnceLock::new();
+
+/// Global Governance metrics instance.
+static GOVERNANCE_METRICS: std::sync::OnceLock<Arc<GovernanceMetrics>> = std::sync::OnceLock::new();
 
 /// Initialize global metrics.
 pub fn init_metrics(meter: &Meter) {
     let green_metrics = Arc::new(GreenPathMetrics::new(meter));
     let amber_metrics = Arc::new(AmberPathMetrics::new(meter));
+    let governance_metrics = Arc::new(GovernanceMetrics::new(meter));
     let _ = GREEN_METRICS.set(green_metrics);
     let _ = AMBER_METRICS.set(amber_metrics);
+    let _ = GOVERNANCE_METRICS.set(governance_metrics);
 }
 
 /// Get global Green Path metrics instance.
@@ -358,6 +444,14 @@ pub fn get_metrics() -> Option<Arc<GreenPathMetrics>> {
 /// - Implements: REQ-CORE-002 NFR-001 (Observability)
 pub fn get_amber_metrics() -> Option<Arc<AmberPathMetrics>> {
     AMBER_METRICS.get().cloned()
+}
+
+/// Get global Governance metrics instance.
+///
+/// # Traceability
+/// - Implements: REQ-GOV-002 NFR-001 (Governance Observability)
+pub fn get_governance_metrics() -> Option<Arc<GovernanceMetrics>> {
+    GOVERNANCE_METRICS.get().cloned()
 }
 
 #[cfg(test)]
@@ -417,13 +511,13 @@ mod tests {
         assert_eq!(metrics.active_count(), 0);
     }
 
-    #[test]
-    fn test_inspector_timer() {
+    #[tokio::test]
+    async fn test_inspector_timer() {
         let meter = global::meter("test");
         let metrics = Arc::new(AmberPathMetrics::new(&meter));
 
         let timer = InspectorTimer::new(metrics.clone(), "test-inspector");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         timer.finish();
         // Duration recorded (can't easily assert the value)
     }

@@ -180,6 +180,7 @@ impl UpstreamClient {
             .pool_max_idle_per_host(config.pool_max_idle_per_host)
             .pool_idle_timeout(config.pool_idle_timeout)
             .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(60))
             .build()
             .map_err(|e| ThoughtGateError::InternalError {
                 correlation_id: format!("upstream-client-build-error: {}", e),
@@ -331,10 +332,7 @@ impl UpstreamClient {
                 status = %status,
                 "Upstream returned error status"
             );
-            return Err(ThoughtGateError::UpstreamError {
-                code: -32002,
-                message: format!("Upstream returned HTTP {}", status),
-            });
+            return Err(classify_upstream_http_error(status));
         }
 
         // Parse response body
@@ -416,10 +414,7 @@ impl UpstreamClient {
         }
 
         if !status.is_success() {
-            return Err(ThoughtGateError::UpstreamError {
-                code: -32002,
-                message: format!("Upstream returned HTTP {}", status),
-            });
+            return Err(classify_upstream_http_error(status));
         }
 
         let body: Vec<JsonRpcResponse> =
@@ -483,6 +478,41 @@ impl UpstreamClient {
                 message: error.to_string(),
             }
         }
+    }
+}
+
+/// Classify an upstream HTTP error status into the appropriate JSON-RPC error code.
+///
+/// Maps specific HTTP status codes to semantically correct error types:
+/// - 401/403 → UpstreamError with -32002 (auth error from upstream, not client policy)
+/// - 404 → MethodNotFound (-32601)
+/// - 429 → RateLimited (-32009)
+/// - Other 4xx → UpstreamError with -32602 (client error)
+/// - 503 → ServiceUnavailable (-32013)
+/// - Other 5xx → UpstreamError with -32002 (server error)
+fn classify_upstream_http_error(status: reqwest::StatusCode) -> ThoughtGateError {
+    match status.as_u16() {
+        401 | 403 => ThoughtGateError::UpstreamError {
+            code: -32002,
+            message: format!("Upstream authentication error: HTTP {status}"),
+        },
+        404 => ThoughtGateError::MethodNotFound {
+            method: "unknown (upstream returned 404)".to_string(),
+        },
+        429 => ThoughtGateError::RateLimited {
+            retry_after_secs: None,
+        },
+        400..=499 => ThoughtGateError::UpstreamError {
+            code: -32602,
+            message: format!("Upstream client error: HTTP {status}"),
+        },
+        503 => ThoughtGateError::ServiceUnavailable {
+            reason: format!("Upstream service unavailable: HTTP {status}"),
+        },
+        _ => ThoughtGateError::UpstreamError {
+            code: -32002,
+            message: format!("Upstream server error: HTTP {status}"),
+        },
     }
 }
 

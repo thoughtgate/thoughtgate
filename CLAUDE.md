@@ -163,6 +163,7 @@ cargo fuzz run fuzz_jsonrpc    # Fuzz JSON-RPC parser
 **Deferred to v0.2+:**
 - `REQ-CORE-001` - Green path streaming
 - `REQ-CORE-002` - Amber path buffering/inspection
+- `REQ-CFG-002` - Config hot-reload (file watcher + ArcSwap + SIGHUP)
 
 ## Performance Metrics (REQ-OBS-001)
 

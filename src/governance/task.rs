@@ -39,19 +39,10 @@ use super::engine::TimeoutAction;
 // JSON-RPC ID (for MCP request tracking)
 // ============================================================================
 
-/// JSON-RPC 2.0 request ID.
-///
-/// Implements: REQ-CORE-003 (preserve exact ID type)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum JsonRpcId {
-    /// Numeric ID
-    Number(i64),
-    /// String ID
-    String(String),
-    /// Null ID (notification, no response expected)
-    Null,
-}
+// Re-export the canonical JsonRpcId from transport layer.
+// This ensures consistent serialization (manual Serialize/Deserialize impls)
+// and avoids divergent behavior between transport and governance.
+pub use crate::transport::jsonrpc::JsonRpcId;
 
 // ============================================================================
 // Principal
@@ -587,12 +578,45 @@ impl Task {
 /// - The hash verifies the *semantic content* of what was approved
 /// - Two requests with identical tool+arguments perform the same action
 ///   regardless of their request IDs
+///
+/// Arguments are serialized using canonical JSON (sorted keys) to ensure
+/// deterministic hashing regardless of key insertion order. This is necessary
+/// because `serde_json/preserve_order` is enabled transitively by
+/// `cedar-policy-core`, making `Value::to_string()` insertion-order dependent.
 #[must_use]
 pub fn hash_request(request: &ToolCallRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(request.name.as_bytes());
-    hasher.update(request.arguments.to_string().as_bytes());
+    hasher.update(canonical_json(&request.arguments).as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Produces a canonical JSON string with object keys sorted alphabetically.
+///
+/// This ensures deterministic serialization regardless of the key insertion
+/// order used by `serde_json::Value` (which depends on whether `preserve_order`
+/// is enabled via feature flags).
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            let entries: Vec<String> = sorted
+                .into_iter()
+                .map(|(k, v)| {
+                    let key_str = serde_json::to_string(k).unwrap_or_default();
+                    format!("{}:{}", key_str, canonical_json(v))
+                })
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        // Leaf values (strings, numbers, bools, null) serialize deterministically
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
 }
 
 /// Computes the suggested poll interval based on remaining TTL.
@@ -802,7 +826,7 @@ impl TaskStore {
     /// Implements: REQ-GOV-001/F-009.3
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.pending_count.load(Ordering::Relaxed)
+        self.pending_count.load(Ordering::Acquire)
     }
 
     /// Returns the total number of tasks (including terminal).
@@ -840,10 +864,9 @@ impl TaskStore {
     ///
     /// # Concurrency Note
     ///
-    /// The capacity and per-principal limit checks are not atomic with insertion.
-    /// Under high concurrency, limits may be temporarily exceeded. This is acceptable
-    /// for v0.1 in-memory blocking mode where tasks are short-lived. Future versions
-    /// may use atomic reservations (compare_exchange/fetch_update) for strict enforcement.
+    /// Global capacity uses a compare_exchange loop for atomic reservation.
+    /// The slot is reserved before insertion and rolled back if the per-principal
+    /// check fails, ensuring strict enforcement under concurrent access.
     pub fn create(
         &self,
         original_request: ToolCallRequest,
@@ -852,15 +875,28 @@ impl TaskStore {
         ttl: Option<Duration>,
         on_timeout: TimeoutAction,
     ) -> Result<Task, TaskError> {
-        // F-009.3, F-009.4: Check global capacity
-        if self.pending_count() >= self.config.max_pending_global {
-            return Err(TaskError::CapacityExceeded);
+        // F-009.3, F-009.4: Atomically reserve a global capacity slot
+        loop {
+            let current = self.pending_count.load(Ordering::Acquire);
+            if current >= self.config.max_pending_global {
+                return Err(TaskError::CapacityExceeded);
+            }
+            if self
+                .pending_count
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            // CAS failed — another thread changed pending_count, retry
         }
 
         // F-009.1, F-009.2: Check per-principal limit
+        // If this fails, rollback the global reservation
         let principal_key = principal.rate_limit_key();
         let pending = self.count_pending_for_principal(&principal_key);
         if pending >= self.config.max_pending_per_principal {
+            self.pending_count.fetch_sub(1, Ordering::Release);
             return Err(TaskError::RateLimited {
                 principal: principal_key,
                 retry_after: Duration::from_secs(60),
@@ -896,9 +932,7 @@ impl TaskStore {
             .or_default()
             .push(task_id);
 
-        // Increment pending count
-        self.pending_count.fetch_add(1, Ordering::Relaxed);
-
+        // Global slot was already reserved via compare_exchange above
         Ok(task_clone)
     }
 
@@ -936,7 +970,7 @@ impl TaskStore {
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Release);
             // Notify any waiters
             entry.notify.notify_waiters();
         }
@@ -969,7 +1003,7 @@ impl TaskStore {
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Release);
             // Notify any waiters
             entry.notify.notify_waiters();
         }
@@ -1029,7 +1063,7 @@ impl TaskStore {
 
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Release);
             entry.notify.notify_waiters();
         }
 
@@ -1062,7 +1096,7 @@ impl TaskStore {
             Some("Execution completed".to_string()),
         )?;
         entry.terminal_at = Some(Utc::now());
-        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.pending_count.fetch_sub(1, Ordering::Release);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -1094,7 +1128,7 @@ impl TaskStore {
         entry.terminal_at = Some(Utc::now());
 
         if !was_terminal {
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Release);
         }
         entry.notify.notify_waiters();
 
@@ -1141,7 +1175,7 @@ impl TaskStore {
             Some("Cancelled by agent".to_string()),
         )?;
         entry.terminal_at = Some(Utc::now());
-        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.pending_count.fetch_sub(1, Ordering::Release);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -1181,7 +1215,7 @@ impl TaskStore {
                     .is_ok()
             {
                 entry.terminal_at = Some(now);
-                self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                self.pending_count.fetch_sub(1, Ordering::Release);
                 entry.notify.notify_waiters();
                 expired += 1;
                 tracing::warn!(
@@ -1229,6 +1263,14 @@ impl TaskStore {
                 let principal_key = entry.task.principal.rate_limit_key();
                 if let Some(mut ids) = self.by_principal.get_mut(&principal_key) {
                     ids.retain(|id| id != &task_id);
+                    if ids.is_empty() {
+                        // Drop the mutable reference before removing to avoid deadlock
+                        drop(ids);
+                        // Use remove_if to avoid TOCTOU race (another thread may have
+                        // added a new ID between the drop and this remove)
+                        self.by_principal
+                            .remove_if(&principal_key, |_, v| v.is_empty());
+                    }
                 }
             }
         }
@@ -1832,8 +1874,8 @@ mod tests {
     /// Tests task expiration.
     ///
     /// Verifies: EC-TASK-012, REQ-GOV-001/F-008
-    #[test]
-    fn test_task_expiration() {
+    #[tokio::test]
+    async fn test_task_expiration() {
         let config = TaskStoreConfig {
             min_ttl: Duration::from_millis(10),
             default_ttl: Duration::from_millis(10),
@@ -1857,7 +1899,7 @@ mod tests {
             .unwrap();
 
         // Wait for expiration (longer than TTL to ensure expiration)
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Run cleanup
         let expired = store.expire_overdue();
@@ -2023,6 +2065,56 @@ mod tests {
         assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// Tests that canonical JSON hashing produces identical hashes regardless of
+    /// key insertion order in `serde_json::Value` objects.
+    ///
+    /// This is critical because `serde_json/preserve_order` is transitively
+    /// enabled by `cedar-policy-core`, making `Value::to_string()` dependent
+    /// on insertion order.
+    ///
+    /// Verifies: REQ-GOV-001/F-002.3
+    #[test]
+    fn test_canonical_json_hash_key_order_independent() {
+        // Build two Value::Objects with different key insertion orders
+        let args_ab = serde_json::json!({"a": 1, "b": 2});
+        let args_ba = serde_json::json!({"b": 2, "a": 1});
+
+        let req_ab = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "test_tool".to_string(),
+            arguments: args_ab,
+            mcp_request_id: JsonRpcId::Number(1),
+        };
+        let req_ba = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "test_tool".to_string(),
+            arguments: args_ba,
+            mcp_request_id: JsonRpcId::Number(2),
+        };
+
+        // Must produce identical hashes despite different key orders
+        assert_eq!(hash_request(&req_ab), hash_request(&req_ba));
+
+        // Nested objects should also be order-independent
+        let nested_1 = serde_json::json!({"outer": {"z": 3, "a": 1}, "list": [1, 2]});
+        let nested_2 = serde_json::json!({"list": [1, 2], "outer": {"a": 1, "z": 3}});
+
+        let req_nested_1 = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "nested_tool".to_string(),
+            arguments: nested_1,
+            mcp_request_id: JsonRpcId::Number(3),
+        };
+        let req_nested_2 = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "nested_tool".to_string(),
+            arguments: nested_2,
+            mcp_request_id: JsonRpcId::Number(4),
+        };
+
+        assert_eq!(hash_request(&req_nested_1), hash_request(&req_nested_2));
+    }
+
     /// Tests approval recording and state transition.
     ///
     /// Verifies: REQ-GOV-001 (record_approval)
@@ -2176,8 +2268,8 @@ mod tests {
     }
 
     /// Tests terminal grace period cleanup.
-    #[test]
-    fn test_terminal_cleanup() {
+    #[tokio::test]
+    async fn test_terminal_cleanup() {
         let config = TaskStoreConfig {
             terminal_grace_period: Duration::from_millis(1),
             ..Default::default()
@@ -2219,11 +2311,85 @@ mod tests {
         assert_eq!(store.total_count(), 1);
 
         // Wait for grace period
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Cleanup
         let removed = store.cleanup_terminal();
         assert_eq!(removed, 1);
         assert_eq!(store.total_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_terminal_removes_empty_principal_entries() {
+        let config = TaskStoreConfig {
+            terminal_grace_period: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let store = TaskStore::new(config);
+
+        let principal = test_principal();
+
+        // Create two tasks for the same principal
+        let task1 = store
+            .create(
+                test_request(),
+                test_request(),
+                principal.clone(),
+                None,
+                TimeoutAction::default(),
+            )
+            .unwrap();
+        let task2 = store
+            .create(
+                test_request(),
+                test_request(),
+                principal.clone(),
+                None,
+                TimeoutAction::default(),
+            )
+            .unwrap();
+
+        // Principal should have entries
+        let key = principal.rate_limit_key();
+        assert!(
+            store.by_principal.contains_key(&key),
+            "by_principal should contain the principal"
+        );
+
+        // Complete both tasks
+        for task_id in [&task1.id, &task2.id] {
+            store
+                .transition(task_id, TaskStatus::InputRequired, None)
+                .unwrap();
+            store
+                .record_approval(
+                    task_id,
+                    ApprovalDecision::Approved,
+                    "test".to_string(),
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+            store
+                .complete(
+                    task_id,
+                    ToolCallResult {
+                        content: serde_json::json!({}),
+                        is_error: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        // Wait for grace period
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Cleanup should remove both tasks AND the empty principal entry
+        let removed = store.cleanup_terminal();
+        assert_eq!(removed, 2);
+        assert_eq!(store.total_count(), 0);
+        assert!(
+            !store.by_principal.contains_key(&key),
+            "by_principal should not contain the principal after all tasks cleaned up"
+        );
     }
 }

@@ -57,13 +57,14 @@ use crate::governance::{Principal, TaskId};
 ///
 /// Contains all information needed to construct an approval request
 /// message for human review.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApprovalRequest {
     /// The task ID this approval is for
     pub task_id: TaskId,
     /// Name of the tool being called
     pub tool_name: String,
     /// Arguments to the tool call (JSON)
+    /// SECURITY: Redacted in Debug output to prevent leaking sensitive data
     pub tool_arguments: serde_json::Value,
     /// Principal (app/user) requesting the action
     pub principal: Principal,
@@ -73,6 +74,20 @@ pub struct ApprovalRequest {
     pub created_at: DateTime<Utc>,
     /// Correlation ID for tracing
     pub correlation_id: String,
+}
+
+impl std::fmt::Debug for ApprovalRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApprovalRequest")
+            .field("task_id", &self.task_id)
+            .field("tool_name", &self.tool_name)
+            .field("tool_arguments", &"[REDACTED]")
+            .field("principal", &self.principal)
+            .field("expires_at", &self.expires_at)
+            .field("created_at", &self.created_at)
+            .field("correlation_id", &self.correlation_id)
+            .finish()
+    }
 }
 
 // ============================================================================

@@ -499,10 +499,8 @@ impl ThoughtGateError {
             // Gate 1: Visibility - No details (security)
             Self::ToolNotExposed { .. } => None,
 
-            // Gate 2: Governance - Rule pattern if safe to expose
-            Self::GovernanceRuleDenied { rule, .. } => {
-                rule.as_ref().map(|r| format!("Matched rule: {}", r))
-            }
+            // Gate 2: Governance - No details (security: don't expose rule patterns)
+            Self::GovernanceRuleDenied { .. } => None,
 
             // Gate 3: Policy - No details (security: don't expose policy internals)
             Self::PolicyDenied { .. } => None,
@@ -960,7 +958,8 @@ mod tests {
         let data = jsonrpc.data.unwrap();
         assert_eq!(data.gate, Some("governance".to_string()));
         assert_eq!(data.tool, Some("delete_all".to_string()));
-        assert_eq!(data.details, Some("Matched rule: *_all".to_string()));
+        // Security: rule pattern is redacted (don't expose governance internals)
+        assert!(data.details.is_none());
     }
 
     /// Tests Gate 3 (Policy) error format.

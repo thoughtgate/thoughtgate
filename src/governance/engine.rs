@@ -216,6 +216,28 @@ pub struct ApprovalStartResult {
 
 /// The approval engine coordinates the v0.2 approval workflow.
 ///
+/// RAII guard that removes a task ID from the executing set on drop.
+///
+/// Ensures cleanup even on panic, early return, or timeout during pipeline
+/// execution. Without this guard, a panic during `execute_approved()` would
+/// permanently leak the task ID in the executing set, preventing retries.
+struct ExecutingGuard<'a> {
+    task_id: TaskId,
+    executing: &'a dashmap::DashSet<TaskId>,
+}
+
+impl<'a> ExecutingGuard<'a> {
+    fn new(task_id: TaskId, executing: &'a dashmap::DashSet<TaskId>) -> Self {
+        Self { task_id, executing }
+    }
+}
+
+impl Drop for ExecutingGuard<'_> {
+    fn drop(&mut self) {
+        self.executing.remove(&self.task_id);
+    }
+}
+
 /// Implements: REQ-GOV-002
 ///
 /// This is the main entry point for approval workflows. It:
@@ -235,6 +257,8 @@ pub struct ApprovalEngine {
     /// Tracks tasks currently being executed to prevent concurrent execution
     /// This ensures at-most-once semantics for upstream calls
     executing: dashmap::DashSet<TaskId>,
+    /// Handle for the background scheduler task, used to detect crashes
+    scheduler_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ApprovalEngine {
@@ -249,19 +273,17 @@ impl ApprovalEngine {
     /// * `task_store` - Shared task store
     /// * `adapter` - Approval adapter (Slack, etc.)
     /// * `upstream` - Upstream client for executing approved requests
+    /// * `cedar_engine` - Shared Cedar policy engine (same instance used by Gate 3)
     /// * `config` - Engine configuration
     /// * `shutdown` - Cancellation token for graceful shutdown
-    ///
-    /// # Errors
-    ///
-    /// Returns error if Cedar policy engine fails to initialize.
     pub fn new(
         task_store: Arc<TaskStore>,
         adapter: Arc<dyn ApprovalAdapter>,
         upstream: Arc<dyn UpstreamForwarder>,
+        cedar_engine: Arc<crate::policy::engine::CedarEngine>,
         config: ApprovalEngineConfig,
         shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<Self, ApprovalEngineError> {
+    ) -> Self {
         // Create polling configuration from engine config
         let polling_config = PollingConfig {
             base_interval: Duration::from_secs(5),
@@ -285,28 +307,22 @@ impl ApprovalEngine {
             ..Default::default()
         };
 
-        // Create Cedar policy engine for pipeline
-        let cedar_engine = crate::policy::engine::CedarEngine::new().map_err(|e| {
-            ApprovalEngineError::Internal {
-                details: format!("Failed to create CedarEngine: {e}"),
-            }
-        })?;
-
         // Create pipeline with no inspectors for v0.2 (simplified)
         let pipeline = Arc::new(ApprovalPipeline::new(
             vec![], // No inspectors in v0.2
-            Arc::new(cedar_engine),
+            cedar_engine,
             upstream.clone(),
             pipeline_config,
         ));
 
-        Ok(Self {
+        Self {
             task_store,
             scheduler,
             pipeline,
             config,
             executing: dashmap::DashSet::new(),
-        })
+            scheduler_handle: tokio::sync::Mutex::new(None),
+        }
     }
 
     /// Spawn background tasks for the approval engine.
@@ -318,11 +334,24 @@ impl ApprovalEngine {
     /// - Periodic expiration sweeps for overdue tasks
     ///
     /// The tasks will run until the shutdown token is cancelled.
-    pub fn spawn_background_tasks(&self) {
+    pub async fn spawn_background_tasks(&self) {
         let scheduler = self.scheduler.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             scheduler.run().await;
         });
+        *self.scheduler_handle.lock().await = Some(handle);
+    }
+
+    /// Check if the background scheduler task is still running.
+    ///
+    /// Returns `false` if the scheduler has panicked or completed unexpectedly.
+    /// Can be used by health checks to detect scheduler crashes.
+    pub async fn is_scheduler_running(&self) -> bool {
+        let guard = self.scheduler_handle.lock().await;
+        match guard.as_ref() {
+            Some(handle) => !handle.is_finished(),
+            None => false,
+        }
     }
 
     /// Start an approval workflow.
@@ -422,6 +451,11 @@ impl ApprovalEngine {
             "Approval workflow started, task created"
         );
 
+        // Record governance metrics
+        if let Some(metrics) = crate::metrics::get_governance_metrics() {
+            metrics.record_task_created();
+        }
+
         // F-002.3: Return task ID immediately (scheduler polls in background)
         Ok(ApprovalStartResult {
             task_id: task.id,
@@ -502,6 +536,9 @@ impl ApprovalEngine {
                                 reason: "Task execution already in progress".to_string(),
                             });
                         }
+                        // RAII guard ensures executing set is cleaned up on all exit
+                        // paths (success, error, timeout, panic)
+                        let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
 
                         warn!(
                             task_id = %task_id,
@@ -523,14 +560,36 @@ impl ApprovalEngine {
                             })),
                         };
 
-                        // Execute the pipeline with the synthetic approval
-                        let pipeline_result = self
-                            .pipeline
-                            .execute_approved(&task, &synthetic_approval)
-                            .await;
+                        // Clone task with Executing status so pipeline validation passes.
+                        // The pipeline's validate_approval() requires TaskStatus::Executing,
+                        // but auto-approved tasks are in Expired (terminal) state.
+                        let mut auto_approved_task = task.clone();
+                        auto_approved_task.status = TaskStatus::Executing;
 
-                        // Remove from executing set now that pipeline is complete
-                        self.executing.remove(task_id);
+                        // Execute the pipeline with timeout protection
+                        let pipeline_result = match tokio::time::timeout(
+                            self.config.execution_timeout,
+                            self.pipeline
+                                .execute_approved(&auto_approved_task, &synthetic_approval),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                error!(
+                                    task_id = %task_id,
+                                    timeout_secs = self.config.execution_timeout.as_secs(),
+                                    "Auto-approved task execution timed out"
+                                );
+                                return Err(ThoughtGateError::ServiceUnavailable {
+                                    reason: format!(
+                                        "Auto-approved task execution timed out after {}s",
+                                        self.config.execution_timeout.as_secs()
+                                    ),
+                                });
+                            }
+                        };
+                        // Guard drops here, cleaning up executing set
 
                         return match pipeline_result {
                             PipelineResult::Success { result } => {
@@ -594,27 +653,55 @@ impl ApprovalEngine {
                 reason: "Task execution already in progress".to_string(),
             });
         }
+        // RAII guard ensures executing set is cleaned up on all exit
+        // paths (success, error, timeout, panic)
+        let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
 
         // Execute the full pipeline (with approval record)
-        // Use a guard to ensure we clean up the executing set on all exit paths
-        let approval = task.approval.as_ref().ok_or_else(|| {
-            self.executing.remove(task_id);
-            ThoughtGateError::ServiceUnavailable {
-                reason: "Task approved but no approval record".to_string(),
+        let approval =
+            task.approval
+                .as_ref()
+                .ok_or_else(|| ThoughtGateError::ServiceUnavailable {
+                    reason: "Task approved but no approval record".to_string(),
+                })?;
+
+        let pipeline_result = match tokio::time::timeout(
+            self.config.execution_timeout,
+            self.pipeline.execute_approved(&task, approval),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                error!(
+                    task_id = %task_id,
+                    timeout_secs = self.config.execution_timeout.as_secs(),
+                    "Pipeline execution timed out"
+                );
+                PipelineResult::Failure {
+                    stage: FailureStage::UpstreamError,
+                    reason: format!(
+                        "Pipeline execution timed out after {}s",
+                        self.config.execution_timeout.as_secs()
+                    ),
+                    retriable: true,
+                }
             }
-        })?;
+        };
 
-        let pipeline_result = self.pipeline.execute_approved(&task, approval).await;
-
-        // Remove from executing set now that pipeline is complete
-        self.executing.remove(task_id);
-
-        // Handle pipeline result
+        // Handle pipeline result and record governance metrics
         match pipeline_result {
             PipelineResult::Success { result } => {
                 // Store result and mark complete
                 if let Err(e) = self.task_store.complete(task_id, result.clone()) {
                     error!(task_id = %task_id, error = %e, "Failed to complete task");
+                }
+                if let Some(metrics) = crate::metrics::get_governance_metrics() {
+                    metrics.record_task_terminal("completed");
+                    let latency = task.created_at.signed_duration_since(chrono::Utc::now());
+                    if let Ok(d) = (-latency).to_std() {
+                        metrics.record_approval_latency(d);
+                    }
                 }
                 Ok(result)
             }
@@ -631,6 +718,10 @@ impl ApprovalEngine {
                 };
                 if let Err(e) = self.task_store.fail(task_id, failure) {
                     error!(task_id = %task_id, error = %e, "Failed to record task failure");
+                }
+                if let Some(metrics) = crate::metrics::get_governance_metrics() {
+                    metrics.record_task_terminal("failed");
+                    metrics.record_pipeline_failure(&format!("{stage:?}"));
                 }
 
                 // Map failure to appropriate error
@@ -849,6 +940,10 @@ mod tests {
         }
     }
 
+    fn test_cedar_engine() -> Arc<crate::policy::engine::CedarEngine> {
+        Arc::new(crate::policy::engine::CedarEngine::new().expect("Failed to create CedarEngine"))
+    }
+
     fn test_request() -> ToolCallRequest {
         ToolCallRequest {
             method: "tools/call".to_string(),
@@ -881,10 +976,10 @@ mod tests {
             task_store.clone(),
             adapter.clone(),
             upstream,
+            test_cedar_engine(),
             config,
             shutdown,
-        )
-        .expect("Failed to create engine");
+        );
 
         let result = engine
             .start_approval(test_request(), test_principal(), None)
@@ -915,8 +1010,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store, adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store,
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         let result = engine.execute_on_result(&TaskId::new()).await;
 
@@ -938,8 +1039,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -971,8 +1078,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -1021,8 +1134,14 @@ mod tests {
         };
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -1058,8 +1177,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -1093,8 +1218,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store.clone(), adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         // Start approval
         let start_result = engine
@@ -1143,8 +1274,14 @@ mod tests {
         let config = ApprovalEngineConfig::default();
         let shutdown = CancellationToken::new();
 
-        let engine = ApprovalEngine::new(task_store, adapter, upstream, config, shutdown)
-            .expect("Failed to create engine");
+        let engine = ApprovalEngine::new(
+            task_store,
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
 
         let result = engine
             .start_approval(test_request(), test_principal(), None)
@@ -1182,5 +1319,60 @@ mod tests {
             }
             _ => panic!("Expected TaskNotFound"),
         }
+    }
+
+    /// Tests that auto-approve on timeout executes the pipeline successfully.
+    ///
+    /// When on_timeout is Approve, expired tasks should be auto-approved
+    /// with a synthetic approval record and executed through the pipeline.
+    ///
+    /// Verifies: EC-PIP-009 (Timeout with approve → auto-execute)
+    #[tokio::test]
+    async fn test_execute_on_result_timeout_approve() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig {
+            on_timeout: TimeoutAction::Approve,
+            execution_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream.clone(),
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval
+        let start_result = engine
+            .start_approval(test_request(), test_principal(), None)
+            .await
+            .unwrap();
+
+        // Manually expire the task (simulating timeout)
+        task_store
+            .transition(&start_result.task_id, TaskStatus::Expired, None)
+            .unwrap();
+
+        // Execute should auto-approve and forward to upstream
+        let result = engine.execute_on_result(&start_result.task_id).await;
+
+        assert!(
+            result.is_ok(),
+            "Auto-approve on timeout should succeed, got: {:?}",
+            result.err()
+        );
+
+        // Upstream should have received the forwarded request
+        assert_eq!(
+            upstream.forward_count.load(Ordering::SeqCst),
+            1,
+            "Upstream should have been called exactly once"
+        );
     }
 }
