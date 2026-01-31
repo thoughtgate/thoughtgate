@@ -565,13 +565,18 @@ impl ApprovalPipeline {
                     });
                 }
                 TransformDriftMode::Permissive => {
-                    // F-005.4: Permissive mode logs and continues
+                    // F-005.4: Permissive mode logs but uses the ORIGINAL
+                    // approved transformation, not the drifted one. This
+                    // preserves approval integrity: the human approved
+                    // pre_approval_transformed, so that's what gets executed.
                     warn!(
                         task_id = %task.id,
                         stored_hash = %task.request_hash,
                         new_hash = %new_hash,
-                        "Transform drift detected (permissive mode) - continuing"
+                        "Transform drift detected (permissive mode) - \
+                         using original approved request"
                     );
+                    return Ok(task.pre_approval_transformed.clone());
                 }
             }
         }
