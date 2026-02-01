@@ -37,6 +37,27 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
+// Prometheus Metrics
+// ============================================================================
+
+/// Histogram for Cedar policy evaluation duration (seconds).
+/// Enables p99 monitoring per REQ-OBS-001.
+static CEDAR_EVAL_DURATION: LazyLock<prometheus::Histogram> = LazyLock::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "cedar_eval_duration_seconds",
+        "Duration of Cedar policy evaluation in seconds",
+    )
+    .buckets(vec![
+        0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+    ]);
+    let h = prometheus::Histogram::with_opts(opts).expect("BUG: invalid histogram opts");
+    prometheus::default_registry()
+        .register(Box::new(h.clone()))
+        .expect("BUG: failed to register cedar_eval_duration_seconds");
+    h
+});
+
+// ============================================================================
 // Cached Cedar Entity Type Names
 // ============================================================================
 // These are parsed once at first access and reused for every evaluation,
@@ -260,6 +281,9 @@ impl CedarEngine {
         self.stats_v2
             .total_eval_time_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+
+        // Record to Prometheus histogram for p99 monitoring
+        CEDAR_EVAL_DURATION.observe(elapsed.as_secs_f64());
 
         // Convert response to CedarDecision
         match response.decision() {
@@ -920,9 +944,46 @@ impl CedarEngine {
     pub fn reload(&self) -> Result<(), PolicyError> {
         info!("Reloading policies");
 
+        // Retry once on parse failure in case the file was partially written
         let (policy_str, source) = loader::load_policies();
-        let new_policies = Self::parse_policies(&policy_str, &self.schema)?;
-        let new_annotations = Self::parse_annotations(&new_policies);
+        let (new_policies, new_annotations) = match Self::parse_policies(&policy_str, &self.schema)
+        {
+            Ok(policies) => {
+                let annotations = Self::parse_annotations(&policies);
+                (policies, annotations)
+            }
+            Err(first_err) => {
+                warn!(
+                    error = %first_err,
+                    "Policy parse failed, retrying once in case of partial file write"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let (retry_str, retry_source) = loader::load_policies();
+                let policies =
+                    Self::parse_policies(&retry_str, &self.schema).map_err(|retry_err| {
+                        warn!(
+                            first_error = %first_err,
+                            retry_error = %retry_err,
+                            "Policy reload failed after retry, keeping existing policies"
+                        );
+                        retry_err
+                    })?;
+                let annotations = Self::parse_annotations(&policies);
+                // Use the retried source on success
+                drop(source);
+                return {
+                    self.policies.store(Arc::new(policies));
+                    self.annotations.store(Arc::new(annotations));
+                    self.source.store(Arc::new(retry_source));
+                    self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .last_reload
+                        .store(Arc::new(Some(std::time::SystemTime::now())));
+                    info!("Policies reloaded successfully (after retry)");
+                    Ok(())
+                };
+            }
+        };
 
         // Atomic swap
         self.policies.store(Arc::new(new_policies));
