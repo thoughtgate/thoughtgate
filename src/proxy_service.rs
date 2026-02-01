@@ -149,7 +149,7 @@ impl ProxyService {
             .http1_title_case_headers(true)
             .http1_allow_obsolete_multiline_headers_in_responses(true)
             .http2_keep_alive_while_idle(true)
-            .pool_max_idle_per_host(32)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build(https_connector);
 

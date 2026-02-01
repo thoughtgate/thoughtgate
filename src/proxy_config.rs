@@ -91,6 +91,10 @@ pub struct ProxyConfig {
     /// # Traceability
     /// - Implements: REQ-CORE-002 Section 3.2 (THOUGHTGATE_BUFFER_TIMEOUT_SECS)
     pub buffer_timeout: Duration,
+
+    /// Maximum number of idle connections per host in the connection pool.
+    /// Higher values reduce latency under load by keeping connections warm.
+    pub pool_max_idle_per_host: usize,
 }
 
 impl Default for ProxyConfig {
@@ -110,6 +114,7 @@ impl Default for ProxyConfig {
             req_buffer_max: 2 * 1024 * 1024,   // 2 MB
             resp_buffer_max: 10 * 1024 * 1024, // 10 MB
             buffer_timeout: Duration::from_secs(30),
+            pool_max_idle_per_host: 128,
         }
     }
 }
@@ -136,6 +141,10 @@ impl ProxyConfig {
     /// - `THOUGHTGATE_REQ_BUFFER_MAX` (default: 2097152 = 2MB)
     /// - `THOUGHTGATE_RESP_BUFFER_MAX` (default: 10485760 = 10MB)
     /// - `THOUGHTGATE_BUFFER_TIMEOUT_SECS` (default: 30)
+    ///
+    /// # Environment Variables (Connection Pool)
+    ///
+    /// - `THOUGHTGATE_POOL_MAX_IDLE` (default: 128)
     ///
     /// # Traceability
     /// - Implements: REQ-CORE-001 Section 3.2 (Config Loading)
@@ -191,6 +200,12 @@ impl ProxyConfig {
                 "THOUGHTGATE_BUFFER_TIMEOUT_SECS",
                 default.buffer_timeout.as_secs(),
             )),
+
+            // Connection pool configuration
+            pool_max_idle_per_host: parse_env_warn(
+                "THOUGHTGATE_POOL_MAX_IDLE",
+                default.pool_max_idle_per_host,
+            ),
         }
     }
 }
@@ -236,6 +251,9 @@ mod tests {
         assert_eq!(config.req_buffer_max, 2 * 1024 * 1024); // 2 MB
         assert_eq!(config.resp_buffer_max, 10 * 1024 * 1024); // 10 MB
         assert_eq!(config.buffer_timeout, Duration::from_secs(30));
+
+        // Connection pool defaults
+        assert_eq!(config.pool_max_idle_per_host, 128);
     }
 
     #[test]
