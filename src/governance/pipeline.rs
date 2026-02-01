@@ -213,12 +213,33 @@ impl PipelineConfig {
             })
             .unwrap_or(TransformDriftMode::Strict);
 
-        Self {
+        let config = Self {
             approval_validity,
             execution_timeout,
             inspector_timeout,
             transform_drift_mode,
+        };
+        if let Err(msg) = config.validate() {
+            warn!(reason = %msg, "Invalid PipelineConfig from env, using defaults");
+            return Self::default();
         }
+        config
+    }
+
+    /// Validate cross-field invariants.
+    ///
+    /// Returns an error message if the configuration is invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.inspector_timeout > self.execution_timeout {
+            return Err(format!(
+                "inspector_timeout ({:?}) must be <= execution_timeout ({:?})",
+                self.inspector_timeout, self.execution_timeout
+            ));
+        }
+        if self.approval_validity.is_zero() {
+            return Err("approval_validity must be > 0".to_string());
+        }
+        Ok(())
     }
 }
 
