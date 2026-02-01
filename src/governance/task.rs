@@ -612,12 +612,14 @@ impl Task {
 ///
 /// Implements: REQ-GOV-001/F-002.3
 ///
-/// The hash includes only the tool name and arguments, intentionally excluding
-/// the `mcp_request_id`. This is because:
+/// The hash includes the MCP method, tool name, and arguments, intentionally
+/// excluding the `mcp_request_id`. This is because:
 /// - The request ID is transport-layer metadata for JSON-RPC correlation
 /// - The hash verifies the *semantic content* of what was approved
-/// - Two requests with identical tool+arguments perform the same action
+/// - Two requests with identical method+tool+arguments perform the same action
 ///   regardless of their request IDs
+/// - Including `method` prevents collisions between different MCP operations
+///   (e.g., `tools/call` vs `resources/read`) with the same name/arguments
 ///
 /// Arguments are serialized using canonical JSON (sorted keys) to ensure
 /// deterministic hashing regardless of key insertion order. This is necessary
@@ -626,6 +628,7 @@ impl Task {
 #[must_use]
 pub fn hash_request(request: &ToolCallRequest) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(request.method.as_bytes());
     hasher.update(request.name.as_bytes());
     hasher.update(canonical_json(&request.arguments).as_bytes());
     format!("{:x}", hasher.finalize())
