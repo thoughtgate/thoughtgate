@@ -57,6 +57,10 @@ fn dev_mode_principal() -> Principal {
 /// - `$HOSTNAME` → app_name
 /// - `/var/run/secrets/kubernetes.io/serviceaccount/namespace` → namespace
 /// - `/var/run/secrets/kubernetes.io/serviceaccount/token` → service_account (parsed)
+///
+/// # Note
+/// Uses blocking I/O (`std::fs`). Called once at startup to infer
+/// the principal identity; blocking the runtime briefly is acceptable.
 fn kubernetes_principal() -> Result<Principal, PolicyError> {
     // Read hostname (pod name)
     let app_name = env::var("HOSTNAME").map_err(|_| PolicyError::IdentityError {
