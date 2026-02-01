@@ -592,8 +592,20 @@ impl ApprovalEngine {
 
                         return match pipeline_result {
                             PipelineResult::Success { result } => {
-                                // Note: We can't complete() the task since it's in Expired state
-                                // Just return the result
+                                // Record result on the expired task for audit trail.
+                                // We can't complete() since Expired is terminal, but we
+                                // record the result and approval to close the audit gap.
+                                if let Err(e) = self.task_store.record_auto_approve_result(
+                                    task_id,
+                                    result.clone(),
+                                    synthetic_approval.clone(),
+                                ) {
+                                    warn!(
+                                        task_id = %task_id,
+                                        error = %e,
+                                        "Failed to record auto-approve result on task"
+                                    );
+                                }
                                 info!(
                                     task_id = %task_id,
                                     "Auto-approved task executed successfully"
