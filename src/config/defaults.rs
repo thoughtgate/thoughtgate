@@ -6,6 +6,7 @@
 //! - Implements: REQ-CFG-001/5.6
 
 use std::time::Duration;
+use tracing::warn;
 
 /// Centralized default values for ThoughtGate configuration.
 ///
@@ -79,43 +80,35 @@ impl ThoughtGateDefaults {
         let default = Self::default();
 
         Self {
-            execution_timeout: std::env::var("THOUGHTGATE_EXECUTION_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.execution_timeout),
+            execution_timeout: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_EXECUTION_TIMEOUT_SECS",
+                default.execution_timeout.as_secs(),
+            )),
 
-            shutdown_timeout: std::env::var("THOUGHTGATE_SHUTDOWN_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.shutdown_timeout),
+            shutdown_timeout: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_SHUTDOWN_TIMEOUT_SECS",
+                default.shutdown_timeout.as_secs(),
+            )),
 
-            drain_timeout: std::env::var("THOUGHTGATE_DRAIN_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.drain_timeout),
+            drain_timeout: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_DRAIN_TIMEOUT_SECS",
+                default.drain_timeout.as_secs(),
+            )),
 
-            approval_poll_interval: std::env::var("THOUGHTGATE_APPROVAL_POLL_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.approval_poll_interval),
+            approval_poll_interval: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_APPROVAL_POLL_INTERVAL_SECS",
+                default.approval_poll_interval.as_secs(),
+            )),
 
-            approval_poll_max_interval: std::env::var(
+            approval_poll_max_interval: Duration::from_secs(parse_env_warn(
                 "THOUGHTGATE_APPROVAL_POLL_MAX_INTERVAL_SECS",
-            )
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(default.approval_poll_max_interval),
+                default.approval_poll_max_interval.as_secs(),
+            )),
 
-            health_check_interval: std::env::var("THOUGHTGATE_HEALTH_CHECK_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.health_check_interval),
+            health_check_interval: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_HEALTH_CHECK_INTERVAL_SECS",
+                default.health_check_interval.as_secs(),
+            )),
 
             // These are not typically overridden via env var
             default_approval_timeout: default.default_approval_timeout,
@@ -157,6 +150,25 @@ impl ThoughtGateDefaults {
         }
 
         Ok(())
+    }
+}
+
+/// Parse an environment variable with a warning on invalid values.
+fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(val) => match val.parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                warn!(
+                    env_var = name,
+                    value = %val,
+                    default = %default,
+                    "Invalid value for environment variable, using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
     }
 }
 

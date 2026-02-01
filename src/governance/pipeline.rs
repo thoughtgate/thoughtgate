@@ -35,6 +35,25 @@ use super::{
     hash_request,
 };
 
+/// Parse an environment variable with a warning on invalid values.
+fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(val) => match val.parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                warn!(
+                    env_var = name,
+                    value = %val,
+                    default = %default,
+                    "Invalid value for environment variable, using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 // ============================================================================
 // Pre-Approval Result
 // ============================================================================
@@ -164,17 +183,11 @@ impl PipelineConfig {
     /// - `THOUGHTGATE_TRANSFORM_DRIFT_MODE` (default: strict)
     #[must_use]
     pub fn from_env() -> Self {
-        let approval_validity = std::env::var("THOUGHTGATE_APPROVAL_VALIDITY_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(300));
+        let approval_validity =
+            Duration::from_secs(parse_env_warn("THOUGHTGATE_APPROVAL_VALIDITY_SECS", 300u64));
 
-        let execution_timeout = std::env::var("THOUGHTGATE_EXECUTION_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(30));
+        let execution_timeout =
+            Duration::from_secs(parse_env_warn("THOUGHTGATE_EXECUTION_TIMEOUT_SECS", 30u64));
 
         let transform_drift_mode = std::env::var("THOUGHTGATE_TRANSFORM_DRIFT_MODE")
             .ok()
