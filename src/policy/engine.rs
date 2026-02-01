@@ -551,6 +551,10 @@ impl CedarEngine {
         })
     }
 
+    /// Maximum recursion depth for JSON-to-Cedar conversion.
+    /// Prevents stack overflow from deeply nested JSON payloads.
+    const MAX_JSON_DEPTH: usize = 64;
+
     /// Convert JSON value to Cedar expression.
     ///
     /// Implements: REQ-POL-001/F-003 (Argument Inspection)
@@ -558,6 +562,27 @@ impl CedarEngine {
         &self,
         value: &serde_json::Value,
     ) -> Result<cedar_policy::RestrictedExpression, PolicyError> {
+        self.json_to_cedar_expr_depth(value, 0)
+    }
+
+    /// Convert JSON value to Cedar expression with depth tracking.
+    ///
+    /// Returns an error if recursion exceeds `MAX_JSON_DEPTH` to prevent
+    /// stack overflow from malicious deeply nested payloads.
+    fn json_to_cedar_expr_depth(
+        &self,
+        value: &serde_json::Value,
+        depth: usize,
+    ) -> Result<cedar_policy::RestrictedExpression, PolicyError> {
+        if depth > Self::MAX_JSON_DEPTH {
+            return Err(PolicyError::CedarError {
+                details: format!(
+                    "JSON nesting depth exceeds maximum of {}",
+                    Self::MAX_JSON_DEPTH
+                ),
+            });
+        }
+
         use cedar_policy::RestrictedExpression;
 
         match value {
@@ -573,15 +598,26 @@ impl CedarEngine {
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     Ok(RestrictedExpression::new_long(i))
+                } else if let Some(u) = n.as_u64() {
+                    // Value fits in u64 but exceeds i64::MAX — Cedar Long cannot represent it.
+                    // Convert to string for safe policy comparison.
+                    warn!(
+                        value = u,
+                        "u64 value exceeds i64::MAX, converting to string for Cedar"
+                    );
+                    Ok(RestrictedExpression::new_string(u.to_string()))
                 } else if let Some(f) = n.as_f64() {
-                    // Cedar doesn't have floats - round to nearest integer
+                    // Cedar doesn't have floats — reject fractional values to prevent
+                    // silent precision loss in policy evaluation.
                     let rounded = f.round() as i64;
                     if (f - rounded as f64).abs() > f64::EPSILON {
-                        warn!(
-                            original = f,
-                            rounded = rounded,
-                            "Float value rounded to integer for Cedar"
-                        );
+                        return Err(PolicyError::CedarError {
+                            details: format!(
+                                "Float value {} cannot be represented as Cedar Long; \
+                                 fractional values are not supported in policy evaluation",
+                                f
+                            ),
+                        });
                     }
                     Ok(RestrictedExpression::new_long(rounded))
                 } else {
@@ -592,14 +628,19 @@ impl CedarEngine {
             }
             serde_json::Value::String(s) => Ok(RestrictedExpression::new_string(s.clone())),
             serde_json::Value::Array(arr) => {
-                let exprs: Result<Vec<_>, _> =
-                    arr.iter().map(|v| self.json_to_cedar_expr(v)).collect();
+                let exprs: Result<Vec<_>, _> = arr
+                    .iter()
+                    .map(|v| self.json_to_cedar_expr_depth(v, depth + 1))
+                    .collect();
                 Ok(RestrictedExpression::new_set(exprs?))
             }
             serde_json::Value::Object(obj) => {
                 let fields: Result<HashMap<_, _>, _> = obj
                     .iter()
-                    .map(|(k, v)| self.json_to_cedar_expr(v).map(|e| (k.clone(), e)))
+                    .map(|(k, v)| {
+                        self.json_to_cedar_expr_depth(v, depth + 1)
+                            .map(|e| (k.clone(), e))
+                    })
                     .collect();
                 RestrictedExpression::new_record(fields?).map_err(|e| PolicyError::CedarError {
                     details: format!("Failed to create record: {}", e),
