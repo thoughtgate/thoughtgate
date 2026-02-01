@@ -8,8 +8,7 @@
 //! - Capability cache for upstream detection
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // Task Capability
@@ -239,8 +238,8 @@ pub struct CapabilityCache {
     /// Whether upstream MCP server supports SSE task notifications.
     upstream_supports_task_sse: AtomicBool,
 
-    /// Timestamp of last initialize as millis since UNIX epoch (0 = never).
-    last_initialize_epoch_ms: AtomicU64,
+    /// Whether the initialize handshake has been completed at least once.
+    has_initialized: AtomicBool,
 }
 
 impl CapabilityCache {
@@ -250,7 +249,7 @@ impl CapabilityCache {
         Self {
             upstream_supports_tasks: AtomicBool::new(false),
             upstream_supports_task_sse: AtomicBool::new(false),
-            last_initialize_epoch_ms: AtomicU64::new(0),
+            has_initialized: AtomicBool::new(false),
         }
     }
 
@@ -260,12 +259,7 @@ impl CapabilityCache {
     pub fn set_upstream_supports_tasks(&self, supports: bool) {
         self.upstream_supports_tasks
             .store(supports, Ordering::SeqCst);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.last_initialize_epoch_ms
-            .store(now_ms, Ordering::Release);
+        self.has_initialized.store(true, Ordering::Release);
     }
 
     /// Sets whether upstream supports SSE task notifications.
@@ -293,7 +287,7 @@ impl CapabilityCache {
     /// Returns whether the upstream has been initialized at least once.
     #[must_use]
     pub fn has_initialized(&self) -> bool {
-        self.last_initialize_epoch_ms.load(Ordering::Acquire) != 0
+        self.has_initialized.load(Ordering::Acquire)
     }
 
     /// Invalidates the cache (e.g., on upstream reconnect).
@@ -301,7 +295,7 @@ impl CapabilityCache {
         self.upstream_supports_tasks.store(false, Ordering::SeqCst);
         self.upstream_supports_task_sse
             .store(false, Ordering::SeqCst);
-        self.last_initialize_epoch_ms.store(0, Ordering::Release);
+        self.has_initialized.store(false, Ordering::Release);
     }
 }
 
