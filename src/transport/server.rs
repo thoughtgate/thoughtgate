@@ -1980,49 +1980,61 @@ async fn handle_batch_request_bytes(
     items: Vec<crate::transport::jsonrpc::BatchItem>,
 ) -> (StatusCode, Bytes) {
     use crate::transport::jsonrpc::BatchItem;
+    use futures_util::stream::{self, StreamExt};
 
-    let mut responses: Vec<JsonRpcResponse> = Vec::new();
-
-    // Process each item sequentially - see Design Note above
+    // Process batch items concurrently using buffer_unordered.
+    // JSON-RPC batch spec allows responses in any order (matched by id).
     // EC-MCP-006: Handle mixed valid/invalid items
-    for item in items {
-        match item {
-            BatchItem::Invalid { id, error } => {
-                // EC-MCP-006: Include error response for invalid items
-                let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
-                responses.push(JsonRpcResponse::error(
-                    id,
-                    error.to_jsonrpc_error(&correlation_id),
-                ));
-            }
-            BatchItem::Valid(request) => {
-                let is_notification = request.is_notification();
-                let id = request.id.clone();
-                let correlation_id = request.correlation_id.to_string();
+    let batch_concurrency = items.len().min(16); // Cap concurrent items
 
-                // Route through shared routing logic
-                let result = route_request(state, request).await;
-
-                // F-007.4: Notifications don't produce response entries
-                if is_notification {
-                    if let Err(e) = result {
-                        error!(
-                            correlation_id = %correlation_id,
-                            error = %e,
-                            "Notification in batch failed"
-                        );
-                    }
-                    continue;
+    let responses: Vec<Option<JsonRpcResponse>> = stream::iter(items)
+        .map(|item| async move {
+            match item {
+                BatchItem::Invalid { id, error } => {
+                    // EC-MCP-006: Include error response for invalid items
+                    let correlation_id =
+                        crate::transport::jsonrpc::fast_correlation_id().to_string();
+                    Some(JsonRpcResponse::error(
+                        id,
+                        error.to_jsonrpc_error(&correlation_id),
+                    ))
                 }
+                BatchItem::Valid(request) => {
+                    let is_notification = request.is_notification();
+                    let id = request.id.clone();
+                    let correlation_id = request.correlation_id.to_string();
 
-                let response = match result {
-                    Ok(r) => r,
-                    Err(e) => JsonRpcResponse::error(id, e.to_jsonrpc_error(&correlation_id)),
-                };
-                responses.push(response);
+                    // Route through shared routing logic
+                    let result = route_request(state, request).await;
+
+                    // F-007.4: Notifications don't produce response entries
+                    if is_notification {
+                        if let Err(e) = result {
+                            error!(
+                                correlation_id = %correlation_id,
+                                error = %e,
+                                "Notification in batch failed"
+                            );
+                        }
+                        return None;
+                    }
+
+                    let response = match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            JsonRpcResponse::error(id, e.to_jsonrpc_error(&correlation_id))
+                        }
+                    };
+                    Some(response)
+                }
             }
-        }
-    }
+        })
+        .buffer_unordered(batch_concurrency)
+        .collect()
+        .await;
+
+    // Filter out None entries (notifications)
+    let responses: Vec<JsonRpcResponse> = responses.into_iter().flatten().collect();
 
     // Return batch response
     if responses.is_empty() {
