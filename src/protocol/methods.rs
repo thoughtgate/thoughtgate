@@ -196,7 +196,7 @@ impl TasksCancelResponse {
 /// Implements: REQ-CORE-007/§5.1
 ///
 /// When the `task` field is present, the client is opting into async mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolsCallRequest {
     /// Name of the tool to call.
@@ -209,6 +209,17 @@ pub struct ToolsCallRequest {
     /// Optional task metadata for async execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<super::Sep1686TaskRequest>,
+}
+
+/// Custom Debug implementation that redacts arguments to prevent PII leakage.
+impl std::fmt::Debug for ToolsCallRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolsCallRequest")
+            .field("name", &self.name)
+            .field("arguments", &"<redacted>")
+            .field("task", &self.task)
+            .finish()
+    }
 }
 
 impl ToolsCallRequest {
