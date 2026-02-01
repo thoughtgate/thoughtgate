@@ -89,6 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_config = Config::parse();
     let proxy_config = ProxyConfig::from_env();
 
+    // Validate centralized defaults (REQ-CFG-001/5.6)
+    let defaults = thoughtgate::config::ThoughtGateDefaults::from_env();
+    if let Err(msg) = defaults.validate() {
+        error!(reason = %msg, "Invalid configuration defaults — refusing to start");
+        std::process::exit(1);
+    }
+
     // Phase 1b: Validate environment safety
     // Implements: REQ-CORE-005/F-001 (Startup Safety)
     if let Err(msg) = thoughtgate::lifecycle::validate_environment() {
@@ -341,12 +348,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Per-request timeout for proxy connections
     // Prevents indefinitely hanging connections from leaking resources
-    let request_timeout = Duration::from_secs(
-        std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(300),
-    );
+    let request_timeout =
+        Duration::from_secs(match std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS") {
+            Ok(val) => match val.parse::<u64>() {
+                Ok(secs) => secs,
+                Err(_) => {
+                    warn!(
+                        env_var = "THOUGHTGATE_REQUEST_TIMEOUT_SECS",
+                        value = %val,
+                        default = 300u64,
+                        "Invalid value for environment variable, using default"
+                    );
+                    300
+                }
+            },
+            Err(_) => 300,
+        });
     info!(
         timeout_secs = request_timeout.as_secs(),
         "Per-request timeout configured"
