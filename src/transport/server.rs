@@ -2138,8 +2138,10 @@ async fn handle_batch_request_bytes(
 
     // Return batch response
     if responses.is_empty() {
-        // All were notifications — return empty JSON array per JSON-RPC 2.0 §6
-        return (StatusCode::OK, Bytes::from_static(b"[]"));
+        // All were notifications — per JSON-RPC 2.0 §6: "The client MUST NOT
+        // expect the server to return any Response for a Batch that only
+        // contains Notification objects." Return 204 No Content.
+        return (StatusCode::NO_CONTENT, Bytes::new());
     }
 
     // Serialize batch response
@@ -2588,10 +2590,12 @@ mod tests {
             .expect("should build request");
 
         let response = router.oneshot(request).await.expect("should get response");
-        // All notifications in batch = empty JSON array per JSON-RPC 2.0 §6
-        assert_eq!(response.status(), StatusCode::OK);
+        // All notifications in batch = 204 No Content per JSON-RPC 2.0 §6:
+        // "The client MUST NOT expect the server to return any Response for
+        // a Batch that only contains Notification objects."
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let body_str = response_body(response).await;
-        assert_eq!(body_str, "[]");
+        assert!(body_str.is_empty());
     }
 
     #[test]
