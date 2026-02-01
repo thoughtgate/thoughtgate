@@ -71,6 +71,61 @@ impl Config {
         self.approval.as_ref()?.get(name)
     }
 
+    /// Pre-compile all glob patterns for rules and exposure configs.
+    ///
+    /// Called once after config loading to avoid re-parsing glob strings
+    /// on every request. Returns an error if any pattern is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::InvalidGlobPattern` if any glob pattern fails to compile.
+    pub fn compile_patterns(&mut self) -> Result<(), super::error::ConfigError> {
+        // Compile governance rule patterns
+        for rule in &mut self.governance.rules {
+            match glob::Pattern::new(&rule.pattern) {
+                Ok(compiled) => rule.compiled_pattern = Some(compiled),
+                Err(e) => {
+                    return Err(super::error::ConfigError::InvalidGlobPattern {
+                        pattern: rule.pattern.clone(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Compile expose config patterns for each source
+        for source in &mut self.sources {
+            if let Some(expose) = source.expose_mut() {
+                match expose {
+                    ExposeConfig::Allowlist {
+                        tools,
+                        compiled_tools,
+                    }
+                    | ExposeConfig::Blocklist {
+                        tools,
+                        compiled_tools,
+                    } => {
+                        let mut compiled = Vec::with_capacity(tools.len());
+                        for tool_pattern in tools.iter() {
+                            match glob::Pattern::new(tool_pattern) {
+                                Ok(p) => compiled.push(p),
+                                Err(e) => {
+                                    return Err(super::error::ConfigError::InvalidGlobPattern {
+                                        pattern: tool_pattern.clone(),
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        *compiled_tools = compiled;
+                    }
+                    ExposeConfig::All => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Check if this configuration requires an approval engine.
     ///
     /// Returns true if any governance rules could lead to Gate 4 (approval):
@@ -178,6 +233,13 @@ impl Source {
         }
     }
 
+    /// Get a mutable reference to the exposure configuration.
+    fn expose_mut(&mut self) -> Option<&mut ExposeConfig> {
+        match self {
+            Source::Mcp { expose, .. } => expose.as_mut(),
+        }
+    }
+
     /// Get the source kind as a string.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -205,11 +267,21 @@ pub enum ExposeConfig {
 
     /// Only listed patterns visible.
     #[serde(rename = "allowlist")]
-    Allowlist { tools: Vec<String> },
+    Allowlist {
+        tools: Vec<String>,
+        /// Pre-compiled glob patterns (populated by `Config::compile_patterns()`).
+        #[serde(skip)]
+        compiled_tools: Vec<glob::Pattern>,
+    },
 
     /// All except listed patterns visible.
     #[serde(rename = "blocklist")]
-    Blocklist { tools: Vec<String> },
+    Blocklist {
+        tools: Vec<String>,
+        /// Pre-compiled glob patterns (populated by `Config::compile_patterns()`).
+        #[serde(skip)]
+        compiled_tools: Vec<glob::Pattern>,
+    },
 }
 
 impl ExposeConfig {
@@ -220,16 +292,34 @@ impl ExposeConfig {
     pub fn is_visible(&self, tool_name: &str) -> bool {
         match self {
             ExposeConfig::All => true,
-            ExposeConfig::Allowlist { tools } => tools.iter().any(|pattern| {
-                glob::Pattern::new(pattern)
-                    .map(|p| p.matches(tool_name))
-                    .unwrap_or(false)
-            }),
-            ExposeConfig::Blocklist { tools } => !tools.iter().any(|pattern| {
-                glob::Pattern::new(pattern)
-                    .map(|p| p.matches(tool_name))
-                    .unwrap_or(false)
-            }),
+            ExposeConfig::Allowlist {
+                tools,
+                compiled_tools,
+            } => {
+                if !compiled_tools.is_empty() {
+                    compiled_tools.iter().any(|p| p.matches(tool_name))
+                } else {
+                    tools.iter().any(|pattern| {
+                        glob::Pattern::new(pattern)
+                            .map(|p| p.matches(tool_name))
+                            .unwrap_or(false)
+                    })
+                }
+            }
+            ExposeConfig::Blocklist {
+                tools,
+                compiled_tools,
+            } => {
+                if !compiled_tools.is_empty() {
+                    !compiled_tools.iter().any(|p| p.matches(tool_name))
+                } else {
+                    !tools.iter().any(|pattern| {
+                        glob::Pattern::new(pattern)
+                            .map(|p| p.matches(tool_name))
+                            .unwrap_or(false)
+                    })
+                }
+            }
         }
     }
 
@@ -239,8 +329,8 @@ impl ExposeConfig {
     pub fn patterns(&self) -> Option<&[String]> {
         match self {
             ExposeConfig::All => None,
-            ExposeConfig::Allowlist { tools } => Some(tools),
-            ExposeConfig::Blocklist { tools } => Some(tools),
+            ExposeConfig::Allowlist { tools, .. } => Some(tools),
+            ExposeConfig::Blocklist { tools, .. } => Some(tools),
         }
     }
 }
@@ -337,6 +427,11 @@ pub struct Rule {
     /// Inspector chain for this rule (v0.3+).
     #[serde(default)]
     pub inspectors: Option<Vec<String>>,
+
+    /// Pre-compiled glob pattern (populated by `Config::compile_patterns()`).
+    /// Avoids re-parsing the glob on every request evaluation.
+    #[serde(skip)]
+    pub compiled_pattern: Option<glob::Pattern>,
 }
 
 /// Source filter for rules.
@@ -386,16 +481,21 @@ impl Governance {
                 }
             }
 
-            // Check pattern match
-            if let Ok(pattern) = glob::Pattern::new(&rule.pattern) {
-                if pattern.matches(tool_name) {
-                    return MatchResult {
-                        action: rule.action,
-                        policy_id: rule.policy_id.clone(),
-                        approval_workflow: rule.approval.clone(),
-                        matched_rule: Some(rule.pattern.clone()),
-                    };
-                }
+            // Check pattern match (use pre-compiled if available)
+            let matches = if let Some(ref compiled) = rule.compiled_pattern {
+                compiled.matches(tool_name)
+            } else if let Ok(pattern) = glob::Pattern::new(&rule.pattern) {
+                pattern.matches(tool_name)
+            } else {
+                false
+            };
+            if matches {
+                return MatchResult {
+                    action: rule.action,
+                    policy_id: rule.policy_id.clone(),
+                    approval_workflow: rule.approval.clone(),
+                    matched_rule: Some(rule.pattern.clone()),
+                };
             }
         }
 
@@ -572,6 +672,7 @@ mod tests {
     fn test_expose_config_allowlist() {
         let expose = ExposeConfig::Allowlist {
             tools: vec!["read_*".to_string(), "list_*".to_string()],
+            compiled_tools: vec![],
         };
         assert!(expose.is_visible("read_file"));
         assert!(expose.is_visible("list_users"));
@@ -582,6 +683,7 @@ mod tests {
     fn test_expose_config_blocklist() {
         let expose = ExposeConfig::Blocklist {
             tools: vec!["delete_*".to_string(), "*_unsafe".to_string()],
+            compiled_tools: vec![],
         };
         assert!(expose.is_visible("read_file"));
         assert!(!expose.is_visible("delete_user"));
@@ -619,6 +721,7 @@ mod tests {
                     description: None,
                     limits: None,
                     inspectors: None,
+                    compiled_pattern: None,
                 },
                 Rule {
                     pattern: "*".to_string(),
@@ -629,6 +732,7 @@ mod tests {
                     description: None,
                     limits: None,
                     inspectors: None,
+                    compiled_pattern: None,
                 },
             ],
         };
@@ -653,6 +757,7 @@ mod tests {
                 description: None,
                 limits: None,
                 inspectors: None,
+                compiled_pattern: None,
             }],
         };
 
@@ -676,6 +781,7 @@ mod tests {
                 description: None,
                 limits: None,
                 inspectors: None,
+                compiled_pattern: None,
             }],
         };
 

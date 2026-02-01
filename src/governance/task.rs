@@ -829,6 +829,9 @@ pub struct TaskStore {
     config: TaskStoreConfig,
     /// Counter for pending (non-terminal) tasks
     pending_count: AtomicUsize,
+    /// Atomic counter of pending tasks per principal (keyed by rate_limit_key).
+    /// Prevents TOCTOU race between count check and insert in `create()`.
+    pending_by_principal: DashMap<String, AtomicUsize>,
 }
 
 impl TaskStore {
@@ -842,6 +845,7 @@ impl TaskStore {
             by_principal: DashMap::new(),
             config,
             pending_count: AtomicUsize::new(0),
+            pending_by_principal: DashMap::new(),
         }
     }
 
@@ -877,24 +881,6 @@ impl TaskStore {
         self.tasks.len()
     }
 
-    /// Counts pending tasks for a specific principal.
-    ///
-    /// Implements: REQ-GOV-001/F-009.1
-    fn count_pending_for_principal(&self, principal_key: &str) -> usize {
-        let task_ids = match self.by_principal.get(principal_key) {
-            Some(ids) => ids.clone(),
-            None => return 0,
-        };
-
-        task_ids
-            .iter()
-            .filter(|id| {
-                self.tasks
-                    .get(*id)
-                    .is_some_and(|entry| !entry.task.status.is_terminal())
-            })
-            .count()
-    }
 
     /// Creates and inserts a new task.
     ///
@@ -914,7 +900,7 @@ impl TaskStore {
         principal: Principal,
         ttl: Option<Duration>,
         on_timeout: TimeoutAction,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         // F-009.3, F-009.4: Atomically reserve a global capacity slot
         loop {
             let current = self.pending_count.load(Ordering::Acquire);
@@ -931,11 +917,18 @@ impl TaskStore {
             // CAS failed — another thread changed pending_count, retry
         }
 
-        // F-009.1, F-009.2: Check per-principal limit
-        // If this fails, rollback the global reservation
+        // F-009.1, F-009.2: Atomically check and reserve per-principal slot.
+        // Uses atomic increment + check to prevent TOCTOU race between
+        // count check and insert under concurrent access.
         let principal_key = principal.rate_limit_key();
-        let pending = self.count_pending_for_principal(&principal_key);
-        if pending >= self.config.max_pending_per_principal {
+        let principal_counter = self
+            .pending_by_principal
+            .entry(principal_key.clone())
+            .or_insert_with(|| AtomicUsize::new(0));
+        let prev = principal_counter.fetch_add(1, Ordering::AcqRel);
+        if prev >= self.config.max_pending_per_principal {
+            // Rollback both counters
+            principal_counter.fetch_sub(1, Ordering::Release);
             self.pending_count.fetch_sub(1, Ordering::Release);
             return Err(TaskError::RateLimited {
                 principal: principal_key,
@@ -956,7 +949,7 @@ impl TaskStore {
             on_timeout,
         );
         let task_id = task.id.clone();
-        let task_clone = task.clone();
+        let task_arc = Arc::new(task.clone());
 
         // Insert into store
         let entry = TaskEntry {
@@ -973,16 +966,16 @@ impl TaskStore {
             .push(task_id);
 
         // Global slot was already reserved via compare_exchange above
-        Ok(task_clone)
+        Ok(task_arc)
     }
 
     /// Gets a task by ID.
     ///
     /// Implements: REQ-GOV-001/F-003
-    pub fn get(&self, task_id: &TaskId) -> Result<Task, TaskError> {
+    pub fn get(&self, task_id: &TaskId) -> Result<Arc<Task>, TaskError> {
         self.tasks
             .get(task_id)
-            .map(|entry| entry.task.clone())
+            .map(|entry| Arc::new(entry.task.clone()))
             .ok_or_else(|| TaskError::NotFound {
                 task_id: task_id.clone(),
             })
@@ -996,7 +989,7 @@ impl TaskStore {
         task_id: &TaskId,
         new_status: TaskStatus,
         reason: Option<String>,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1011,11 +1004,16 @@ impl TaskStore {
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
             self.pending_count.fetch_sub(1, Ordering::Release);
+            // Decrement per-principal counter
+            let principal_key = entry.task.principal.rate_limit_key();
+            if let Some(counter) = self.pending_by_principal.get(&principal_key) {
+                counter.fetch_sub(1, Ordering::Release);
+            }
             // Notify any waiters
             entry.notify.notify_waiters();
         }
 
-        Ok(entry.task.clone())
+        Ok(Arc::new(entry.task.clone()))
     }
 
     /// Transitions a task with optimistic locking.
@@ -1027,7 +1025,7 @@ impl TaskStore {
         expected_status: TaskStatus,
         new_status: TaskStatus,
         reason: Option<String>,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1044,11 +1042,16 @@ impl TaskStore {
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
             self.pending_count.fetch_sub(1, Ordering::Release);
+            // Decrement per-principal counter
+            let principal_key = entry.task.principal.rate_limit_key();
+            if let Some(counter) = self.pending_by_principal.get(&principal_key) {
+                counter.fetch_sub(1, Ordering::Release);
+            }
             // Notify any waiters
             entry.notify.notify_waiters();
         }
 
-        Ok(entry.task.clone())
+        Ok(Arc::new(entry.task.clone()))
     }
 
     /// Records an approval decision on a task.
@@ -1060,7 +1063,7 @@ impl TaskStore {
         decision: ApprovalDecision,
         decided_by: String,
         approval_valid_for: Duration,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1107,13 +1110,17 @@ impl TaskStore {
             entry.notify.notify_waiters();
         }
 
-        Ok(entry.task.clone())
+        Ok(Arc::new(entry.task.clone()))
     }
 
     /// Marks a task as completed with a result.
     ///
     /// Implements: REQ-GOV-001 (called by REQ-GOV-002)
-    pub fn complete(&self, task_id: &TaskId, result: ToolCallResult) -> Result<Task, TaskError> {
+    pub fn complete(
+        &self,
+        task_id: &TaskId,
+        result: ToolCallResult,
+    ) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1139,13 +1146,42 @@ impl TaskStore {
         self.pending_count.fetch_sub(1, Ordering::Release);
         entry.notify.notify_waiters();
 
-        Ok(entry.task.clone())
+        Ok(Arc::new(entry.task.clone()))
+    }
+
+    /// Records an execution result on an auto-approved expired task.
+    ///
+    /// Unlike `complete()`, this does not transition the task status (it stays
+    /// `Expired`). It records the result and approval for audit purposes so
+    /// that the task shows evidence of execution after auto-approval.
+    pub fn record_auto_approve_result(
+        &self,
+        task_id: &TaskId,
+        result: ToolCallResult,
+        approval: super::ApprovalRecord,
+    ) -> Result<(), TaskError> {
+        let mut entry = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| TaskError::NotFound {
+                task_id: task_id.clone(),
+            })?;
+
+        entry.task.result = Some(result);
+        entry.task.approval = Some(approval);
+        entry.task.transitions.push(TaskTransition {
+            from: TaskStatus::Expired,
+            to: TaskStatus::Expired, // Status doesn't change (terminal)
+            at: Utc::now(),
+            reason: Some("Auto-approved after expiration; executed successfully".to_string()),
+        });
+        Ok(())
     }
 
     /// Marks a task as failed with failure info.
     ///
     /// Implements: REQ-GOV-001 (called by REQ-GOV-002)
-    pub fn fail(&self, task_id: &TaskId, failure: FailureInfo) -> Result<Task, TaskError> {
+    pub fn fail(&self, task_id: &TaskId, failure: FailureInfo) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1172,7 +1208,7 @@ impl TaskStore {
         }
         entry.notify.notify_waiters();
 
-        Ok(entry.task.clone())
+        Ok(Arc::new(entry.task.clone()))
     }
 
     /// Cancels a task (only from InputRequired state).
@@ -1181,7 +1217,7 @@ impl TaskStore {
     ///
     /// This operation is idempotent: cancelling an already-cancelled task
     /// returns success per SEP-1686 spec requirements.
-    pub fn cancel(&self, task_id: &TaskId) -> Result<Task, TaskError> {
+    pub fn cancel(&self, task_id: &TaskId) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1194,7 +1230,7 @@ impl TaskStore {
             if entry.task.status.is_terminal() {
                 // F-006.2: Idempotency - already cancelled returns success
                 if entry.task.status == TaskStatus::Cancelled {
-                    return Ok(entry.task.clone());
+                    return Ok(Arc::new(entry.task.clone()));
                 }
                 // F-006.2b: Other terminal states cannot be cancelled
                 return Err(TaskError::AlreadyTerminal {
@@ -1218,7 +1254,7 @@ impl TaskStore {
         self.pending_count.fetch_sub(1, Ordering::Release);
         entry.notify.notify_waiters();
 
-        Ok(entry.task.clone())
+        Ok(Arc::new(entry.task.clone()))
     }
 
     /// Expires non-terminal tasks that have exceeded their TTL.
@@ -1326,7 +1362,7 @@ impl TaskStore {
         principal: &Principal,
         offset: usize,
         limit: usize,
-    ) -> Vec<Task> {
+    ) -> Vec<Arc<Task>> {
         let principal_key = principal.rate_limit_key();
         let task_ids = match self.by_principal.get(&principal_key) {
             Some(ids) => ids.clone(),
@@ -1334,9 +1370,9 @@ impl TaskStore {
         };
 
         // Collect tasks, sorted by creation time (newest first)
-        let mut tasks: Vec<Task> = task_ids
+        let mut tasks: Vec<Arc<Task>> = task_ids
             .iter()
-            .filter_map(|id| self.tasks.get(id).map(|e| e.task.clone()))
+            .filter_map(|id| self.tasks.get(id).map(|e| Arc::new(e.task.clone())))
             .collect();
 
         tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -1359,7 +1395,7 @@ impl TaskStore {
         &self,
         task_id: &TaskId,
         timeout: Duration,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
@@ -1381,7 +1417,7 @@ impl TaskStore {
                 })?;
 
                 if entry.task.status.is_terminal() {
-                    return Ok(entry.task.clone());
+                    return Ok(Arc::new(entry.task.clone()));
                 }
             }
 
@@ -1402,7 +1438,7 @@ impl TaskStore {
                 })?;
 
                 if entry.task.status.is_terminal() {
-                    return Ok(entry.task.clone());
+                    return Ok(Arc::new(entry.task.clone()));
                 }
                 return Err(TaskError::ResultNotReady {
                     task_id: task_id.clone(),
@@ -2189,7 +2225,7 @@ mod tests {
 
         assert_eq!(approved.status, TaskStatus::Executing);
         assert!(approved.approval.is_some());
-        let approval = approved.approval.unwrap();
+        let approval = approved.approval.as_ref().unwrap();
         assert_eq!(approval.decision, ApprovalDecision::Approved);
         assert_eq!(approval.decided_by, "approver@example.com");
     }

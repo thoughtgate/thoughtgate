@@ -194,8 +194,21 @@ impl<'de> Deserialize<'de> for Sep1686Status {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        s.parse().map_err(serde::de::Error::custom)
+        struct StatusVisitor;
+
+        impl serde::de::Visitor<'_> for StatusVisitor {
+            type Value = Sep1686Status;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a SEP-1686 status string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                v.parse().map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(StatusVisitor)
     }
 }
 

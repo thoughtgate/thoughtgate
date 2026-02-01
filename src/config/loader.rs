@@ -124,8 +124,10 @@ pub fn load_and_validate(
     path: &Path,
     version: Version,
 ) -> Result<(Config, ValidationResult), ConfigError> {
-    let config = load_config(path)?;
+    let mut config = load_config(path)?;
     let result = validate(&config, version)?;
+    // Pre-compile glob patterns to avoid per-request pattern parsing
+    config.compile_patterns()?;
     Ok((config, result))
 }
 

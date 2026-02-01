@@ -108,6 +108,7 @@ approval:
     fn test_expose_filtering() {
         let allowlist = ExposeConfig::Allowlist {
             tools: vec!["read_*".to_string(), "list_*".to_string()],
+            compiled_tools: vec![],
         };
         assert!(allowlist.is_visible("read_file"));
         assert!(allowlist.is_visible("list_users"));
@@ -115,6 +116,7 @@ approval:
 
         let blocklist = ExposeConfig::Blocklist {
             tools: vec!["admin_*".to_string()],
+            compiled_tools: vec![],
         };
         assert!(blocklist.is_visible("read_file"));
         assert!(!blocklist.is_visible("admin_config"));

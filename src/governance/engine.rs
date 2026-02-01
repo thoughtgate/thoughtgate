@@ -46,7 +46,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 use crate::error::ThoughtGateError;
 use crate::transport::UpstreamForwarder;
@@ -54,7 +53,7 @@ use crate::transport::UpstreamForwarder;
 use super::approval::{ApprovalAdapter, ApprovalRequest, PollingConfig, PollingScheduler};
 use super::pipeline::{ApprovalPipeline, ExecutionPipeline, PipelineConfig, PipelineResult};
 use super::task::{FailureInfo, FailureStage, TaskStatus, ToolCallResult};
-use super::{Principal, TaskError, TaskId, TaskStore, ToolCallRequest};
+use super::{Principal, Task, TaskError, TaskId, TaskStore, ToolCallRequest};
 
 // ============================================================================
 // Approval Engine Configuration
@@ -382,7 +381,7 @@ impl ApprovalEngine {
         principal: Principal,
         workflow_timeout: Option<Duration>,
     ) -> Result<ApprovalStartResult, ApprovalEngineError> {
-        let correlation_id = Uuid::new_v4().to_string();
+        let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
 
         info!(
             tool = %request.name,
@@ -458,7 +457,7 @@ impl ApprovalEngine {
 
         // F-002.3: Return task ID immediately (scheduler polls in background)
         Ok(ApprovalStartResult {
-            task_id: task.id,
+            task_id: task.id.clone(),
             status: TaskStatus::InputRequired,
             poll_interval: task.poll_interval,
         })
@@ -563,7 +562,7 @@ impl ApprovalEngine {
                         // Clone task with Executing status so pipeline validation passes.
                         // The pipeline's validate_approval() requires TaskStatus::Executing,
                         // but auto-approved tasks are in Expired (terminal) state.
-                        let mut auto_approved_task = task.clone();
+                        let mut auto_approved_task = Task::clone(&task);
                         auto_approved_task.status = TaskStatus::Executing;
 
                         // Execute the pipeline with timeout protection
@@ -593,8 +592,20 @@ impl ApprovalEngine {
 
                         return match pipeline_result {
                             PipelineResult::Success { result } => {
-                                // Note: We can't complete() the task since it's in Expired state
-                                // Just return the result
+                                // Record result on the expired task for audit trail.
+                                // We can't complete() since Expired is terminal, but we
+                                // record the result and approval to close the audit gap.
+                                if let Err(e) = self.task_store.record_auto_approve_result(
+                                    task_id,
+                                    result.clone(),
+                                    synthetic_approval.clone(),
+                                ) {
+                                    warn!(
+                                        task_id = %task_id,
+                                        error = %e,
+                                        "Failed to record auto-approve result on task"
+                                    );
+                                }
                                 info!(
                                     task_id = %task_id,
                                     "Auto-approved task executed successfully"
@@ -628,8 +639,8 @@ impl ApprovalEngine {
             }
             TaskStatus::Completed => {
                 // Already completed - return cached result
-                if let Some(result) = task.result {
-                    return Ok(result);
+                if let Some(ref result) = task.result {
+                    return Ok(result.clone());
                 }
                 return Err(ThoughtGateError::ServiceUnavailable {
                     reason: "Task completed but no result available".to_string(),
@@ -921,7 +932,7 @@ mod tests {
             self.forward_count.fetch_add(1, Ordering::SeqCst);
             let result = self.response.lock().await.clone();
             Ok(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
+                jsonrpc: std::borrow::Cow::Borrowed("2.0"),
                 id: Some(crate::transport::JsonRpcId::Number(1)),
                 result,
                 error: None,

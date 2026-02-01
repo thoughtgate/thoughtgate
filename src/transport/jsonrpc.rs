@@ -16,10 +16,46 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::error::ThoughtGateError;
+
+// ============================================================================
+// Fast Correlation ID Generator
+// ============================================================================
+
+/// Startup prefix derived from a single Uuid::new_v4() call.
+/// The upper 64 bits provide process-level uniqueness.
+static CORRELATION_PREFIX: LazyLock<u64> = LazyLock::new(|| {
+    let seed = Uuid::new_v4().as_u128();
+    (seed >> 64) as u64
+});
+
+/// Monotonically increasing counter for the lower 64 bits.
+static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a fast correlation ID using a counter-based approach.
+///
+/// Combines a process-unique prefix (from a single Uuid::new_v4() at startup)
+/// with a monotonically increasing counter. This avoids the CSPRNG overhead
+/// of Uuid::new_v4() on every request while still producing unique 128-bit IDs.
+///
+/// The result has correct v4 version and RFC 4122 variant bits set.
+pub fn fast_correlation_id() -> Uuid {
+    let prefix = *CORRELATION_PREFIX;
+    let counter = CORRELATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut combined = ((prefix as u128) << 64) | (counter as u128);
+    // Set version 4 (bits 48-51 of the 128-bit value)
+    combined = (combined & !(0xF_u128 << 76)) | (0x4_u128 << 76);
+    // Set variant 1 - RFC 4122 (bits 64-65)
+    combined = (combined & !(0x3_u128 << 62)) | (0x2_u128 << 62);
+    Uuid::from_u128(combined)
+}
 
 // ============================================================================
 // MCP Tasks Protocol Types (Protocol Revision 2025-11-25)
@@ -288,15 +324,15 @@ const JSONRPC_VERSION: &str = "2.0";
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcRequest {
     /// Always "2.0"
-    pub jsonrpc: String,
+    pub jsonrpc: Cow<'static, str>,
     /// Request ID (None for notifications)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<JsonRpcId>,
     /// Method name
     pub method: String,
-    /// Method parameters
+    /// Method parameters (Arc-wrapped for O(1) clone)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
+    pub params: Option<Arc<Value>>,
 }
 
 impl JsonRpcRequest {
@@ -325,7 +361,7 @@ impl JsonRpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
     /// Always "2.0"
-    pub jsonrpc: String,
+    pub jsonrpc: Cow<'static, str>,
     /// Request ID - always serialized (None becomes null per JSON-RPC 2.0 spec)
     pub id: Option<JsonRpcId>,
     /// Result (mutually exclusive with error)
@@ -347,7 +383,7 @@ impl JsonRpcResponse {
     /// * `result` - The result value
     pub fn success(id: Option<JsonRpcId>, result: Value) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: Some(result),
             error: None,
@@ -366,7 +402,7 @@ impl JsonRpcResponse {
     /// * `error` - The JSON-RPC error object
     pub fn error(id: Option<JsonRpcId>, error: crate::error::jsonrpc::JsonRpcError) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: None,
             error: Some(error),
@@ -397,7 +433,7 @@ impl JsonRpcResponse {
         poll_interval: std::time::Duration,
     ) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: Some(serde_json::json!({
                 "taskId": task_id,
@@ -427,20 +463,34 @@ pub struct TaskMetadata {
 /// metadata for tracing and correlation.
 ///
 /// Implements: REQ-CORE-003/§6.3 (Internal: Parsed Request Structure)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpRequest {
     /// Original JSON-RPC ID (None for notifications)
     pub id: Option<JsonRpcId>,
     /// Method name
     pub method: String,
-    /// Method parameters
-    pub params: Option<Value>,
+    /// Method parameters (Arc-wrapped for O(1) clone on the forward path)
+    pub params: Option<Arc<Value>>,
     /// SEP-1686 task metadata (if present)
     pub task_metadata: Option<TaskMetadata>,
     /// Timestamp when request was received
     pub received_at: Instant,
     /// Unique correlation ID for tracing
     pub correlation_id: Uuid,
+}
+
+/// Custom Debug implementation that redacts params to prevent PII leakage
+/// (tool arguments, resource URIs, etc. may contain sensitive data).
+impl std::fmt::Debug for McpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpRequest")
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("params", &self.params.as_ref().map(|_| "<redacted>"))
+            .field("task_metadata", &self.task_metadata)
+            .field("correlation_id", &self.correlation_id)
+            .finish()
+    }
 }
 
 impl McpRequest {
@@ -470,7 +520,7 @@ impl McpRequest {
     /// Implements: REQ-CORE-003/F-004 (Request Forwarding)
     pub fn to_jsonrpc_request(&self) -> JsonRpcRequest {
         JsonRpcRequest {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id: self.id.clone(),
             method: self.method.clone(),
             params: self.params.clone(),
@@ -662,8 +712,8 @@ fn parse_single_from_raw(raw: RawJsonRpcRequest) -> Result<McpRequest, ThoughtGa
         details: "Missing required field: method".to_string(),
     })?;
 
-    // F-001.7: Generate correlation ID
-    let correlation_id = Uuid::new_v4();
+    // F-001.7: Generate correlation ID (counter-based, avoids CSPRNG per request)
+    let correlation_id = fast_correlation_id();
 
     // F-003: Extract SEP-1686 task metadata
     let task_metadata = extract_task_metadata(&raw.params);
@@ -671,7 +721,7 @@ fn parse_single_from_raw(raw: RawJsonRpcRequest) -> Result<McpRequest, ThoughtGa
     Ok(McpRequest {
         id: raw.id,
         method,
-        params: raw.params,
+        params: raw.params.map(Arc::new),
         task_metadata,
         received_at: Instant::now(),
         correlation_id,

@@ -153,8 +153,25 @@ impl McpRouter {
             return RouteTarget::InitializeHandler { request };
         }
 
-        // Task methods (SEP-1686) - handle internally
+        // Task methods (SEP-1686) - handle internally or forward to upstream
         if let Some(task_method) = Self::parse_task_method(method) {
+            // tasks/list always handled locally
+            // For get/result/cancel: peek at params.taskId — if it doesn't
+            // start with "tg_", it's an upstream task and should be forwarded.
+            if task_method != TaskMethod::List {
+                let is_local = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("taskId"))
+                    .and_then(|v| v.as_str())
+                    .map(|id| id.starts_with(crate::protocol::TASK_ID_PREFIX))
+                    .unwrap_or(false);
+
+                if !is_local {
+                    return RouteTarget::PassThrough { request };
+                }
+            }
+
             return RouteTarget::TaskHandler {
                 method: task_method,
                 request,
@@ -213,6 +230,20 @@ mod tests {
         }
     }
 
+    /// Create a test request with params containing a taskId.
+    fn make_task_request(method: &str, task_id: &str) -> McpRequest {
+        McpRequest {
+            id: Some(JsonRpcId::Number(1)),
+            method: method.to_string(),
+            params: Some(std::sync::Arc::new(serde_json::json!({
+                "taskId": task_id,
+            }))),
+            task_metadata: None,
+            received_at: Instant::now(),
+            correlation_id: Uuid::new_v4(),
+        }
+    }
+
     /// Verifies: F-002 (tools/call -> PolicyEvaluation)
     #[test]
     fn test_route_tools_call() {
@@ -231,31 +262,53 @@ mod tests {
         assert!(matches!(target, RouteTarget::PolicyEvaluation { .. }));
     }
 
-    /// Verifies: F-002 (tasks/get -> TaskHandler)
+    /// Verifies: F-002 (tasks/get with tg_ prefix -> TaskHandler)
     #[test]
     fn test_route_tasks_get() {
         let router = McpRouter::new();
-        let req = make_request("tasks/get");
+        let req = make_task_request("tasks/get", "tg_abc123");
         if let RouteTarget::TaskHandler { method, .. } = router.route(req) {
             assert_eq!(method, TaskMethod::Get);
         } else {
-            panic!("Expected TaskHandler");
+            panic!("Expected TaskHandler for tg_ task");
         }
     }
 
-    /// Verifies: F-002 (tasks/result -> TaskHandler)
+    /// Verifies: tasks/get with non-tg_ ID -> PassThrough
+    #[test]
+    fn test_route_tasks_get_upstream() {
+        let router = McpRouter::new();
+        let req = make_task_request("tasks/get", "upstream-task-id");
+        assert!(
+            matches!(router.route(req), RouteTarget::PassThrough { .. }),
+            "Expected PassThrough for upstream task"
+        );
+    }
+
+    /// Verifies: tasks/get with no params -> PassThrough
+    #[test]
+    fn test_route_tasks_get_no_params() {
+        let router = McpRouter::new();
+        let req = make_request("tasks/get");
+        assert!(
+            matches!(router.route(req), RouteTarget::PassThrough { .. }),
+            "Expected PassThrough when taskId missing"
+        );
+    }
+
+    /// Verifies: F-002 (tasks/result with tg_ prefix -> TaskHandler)
     #[test]
     fn test_route_tasks_result() {
         let router = McpRouter::new();
-        let req = make_request("tasks/result");
+        let req = make_task_request("tasks/result", "tg_def456");
         if let RouteTarget::TaskHandler { method, .. } = router.route(req) {
             assert_eq!(method, TaskMethod::Result);
         } else {
-            panic!("Expected TaskHandler");
+            panic!("Expected TaskHandler for tg_ task");
         }
     }
 
-    /// Verifies: F-002 (tasks/list -> TaskHandler)
+    /// Verifies: F-002 (tasks/list -> TaskHandler always local)
     #[test]
     fn test_route_tasks_list() {
         let router = McpRouter::new();
@@ -263,19 +316,19 @@ mod tests {
         if let RouteTarget::TaskHandler { method, .. } = router.route(req) {
             assert_eq!(method, TaskMethod::List);
         } else {
-            panic!("Expected TaskHandler");
+            panic!("Expected TaskHandler for tasks/list");
         }
     }
 
-    /// Verifies: F-002 (tasks/cancel -> TaskHandler)
+    /// Verifies: F-002 (tasks/cancel with tg_ prefix -> TaskHandler)
     #[test]
     fn test_route_tasks_cancel() {
         let router = McpRouter::new();
-        let req = make_request("tasks/cancel");
+        let req = make_task_request("tasks/cancel", "tg_ghi789");
         if let RouteTarget::TaskHandler { method, .. } = router.route(req) {
             assert_eq!(method, TaskMethod::Cancel);
         } else {
-            panic!("Expected TaskHandler");
+            panic!("Expected TaskHandler for tg_ task");
         }
     }
 
@@ -365,7 +418,7 @@ mod tests {
         let req = McpRequest {
             id: Some(JsonRpcId::String("test-id".to_string())),
             method: "tools/call".to_string(),
-            params: Some(serde_json::json!({"name": "test"})),
+            params: Some(std::sync::Arc::new(serde_json::json!({"name": "test"}))),
             task_metadata: None,
             received_at: Instant::now(),
             correlation_id,
