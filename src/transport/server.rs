@@ -737,34 +737,8 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
         return error_bytes(None, &error, &correlation_id);
     }
 
-    // Try to acquire semaphore permit (EC-MCP-011)
-    // Note: This returns HTTP 503 (not 200) to signal service overload at HTTP layer
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
-            warn!(
-                correlation_id = %correlation_id,
-                "Max concurrent requests reached, returning 503"
-            );
-            // Build JSON-RPC error response with correlation ID, but return HTTP 503
-            let error = ThoughtGateError::ServiceUnavailable {
-                reason: "Max concurrent requests exceeded".to_string(),
-            };
-            let jsonrpc_error = error.to_jsonrpc_error(&correlation_id);
-            let response = JsonRpcResponse::error(None, jsonrpc_error);
-            let bytes = serde_json::to_vec(&response)
-                .map(Bytes::from)
-                .unwrap_or_else(|_| {
-                    Bytes::from_static(
-                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32013,"message":"Service temporarily unavailable"}}"#,
-                    )
-                });
-            return (StatusCode::SERVICE_UNAVAILABLE, bytes);
-        }
-    };
-
-    // Parse JSON-RPC request(s) (generate unique correlation ID per REQ-CORE-004)
+    // Parse JSON-RPC request(s) first to determine permit count
+    // (generate unique correlation ID per REQ-CORE-004)
     let parsed = match parse_jsonrpc(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -773,19 +747,57 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
         }
     };
 
+    // Determine how many permits to acquire: 1 for single, batch_size for batch.
+    // This prevents a batch of N requests from consuming only 1 concurrency slot.
+    let permit_count = match &parsed {
+        ParsedRequests::Single(_) => 1,
+        ParsedRequests::Batch(requests) => {
+            if requests.len() > state.max_batch_size {
+                let correlation_id =
+                    crate::transport::jsonrpc::fast_correlation_id().to_string();
+                let error = ThoughtGateError::InvalidRequest {
+                    details: format!(
+                        "Batch size {} exceeds maximum of {}",
+                        requests.len(),
+                        state.max_batch_size
+                    ),
+                };
+                return error_bytes(None, &error, &correlation_id);
+            }
+            requests.len().max(1) as u32
+        }
+    };
+
+    // Try to acquire semaphore permits weighted by request count (EC-MCP-011)
+    let _permit = match state.semaphore.clone().try_acquire_many_owned(permit_count) {
+        Ok(permit) => permit,
+        Err(_) => {
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
+            warn!(
+                correlation_id = %correlation_id,
+                permits_requested = permit_count,
+                "Max concurrent requests reached, returning 503"
+            );
+            // Return HTTP 200 with JSON-RPC error per MCP spec.
+            // MCP clients expect JSON-RPC error frames over HTTP 200, not HTTP 503.
+            let error = ThoughtGateError::RateLimited {
+                    retry_after_secs: Some(1),
+                };
+            let jsonrpc_error = error.to_jsonrpc_error(&correlation_id);
+            let response = JsonRpcResponse::error(None, jsonrpc_error);
+            let bytes = serde_json::to_vec(&response)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| {
+                    Bytes::from_static(
+                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32009,"message":"Rate limited"}}"#,
+                    )
+                });
+            return (StatusCode::OK, bytes);
+        }
+    };
+
     match parsed {
         ParsedRequests::Single(request) => handle_single_request_bytes(state, request).await,
-        ParsedRequests::Batch(ref requests) if requests.len() > state.max_batch_size => {
-            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
-            let error = ThoughtGateError::InvalidRequest {
-                details: format!(
-                    "Batch size {} exceeds maximum of {}",
-                    requests.len(),
-                    state.max_batch_size
-                ),
-            };
-            error_bytes(None, &error, &correlation_id)
-        }
         ParsedRequests::Batch(requests) => handle_batch_request_bytes(state, requests).await,
     }
 }
@@ -1398,7 +1410,11 @@ async fn handle_task_method(
                     details: format!("Invalid tasks/list params: {}", e),
                 })?;
 
-            // Infer principal from environment (same as other task operations)
+            // Infer principal from environment (sidecar mode).
+            // TODO(gateway): In gateway/multi-tenant mode, extract principal from
+            // request headers (e.g. X-Forwarded-User, mTLS client cert CN) instead
+            // of the sidecar's own K8s identity. Without this, all tasks/list calls
+            // in gateway mode would return the same principal's tasks.
             let policy_principal =
                 infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
                     tool: String::new(),
@@ -2307,10 +2323,11 @@ mod tests {
             .expect("should build request");
 
         let response = router.oneshot(request).await.expect("should get response");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // MCP clients expect JSON-RPC errors over HTTP 200 (not HTTP 503)
+        assert_eq!(response.status(), StatusCode::OK);
 
         let body = response_body(response).await;
-        assert!(body.contains("-32013")); // Service unavailable
+        assert!(body.contains("-32009"), "Expected RateLimited error code (-32009), got: {}", body);
     }
 
     /// Verifies: EC-MCP-004 (Body size limit returns JSON-RPC error)
