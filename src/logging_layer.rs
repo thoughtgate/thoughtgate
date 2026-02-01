@@ -77,9 +77,7 @@ impl<B> tower_http::trace::MakeSpan<B> for CorrelationMakeSpan {
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned())
-            .unwrap_or_else(|| {
-                crate::transport::jsonrpc::fast_correlation_id().to_string()
-            });
+            .unwrap_or_else(|| crate::transport::jsonrpc::fast_correlation_id().to_string());
 
         tracing::info_span!(
             "request",

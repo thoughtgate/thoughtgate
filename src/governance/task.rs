@@ -804,10 +804,14 @@ impl Default for TaskStoreConfig {
 // ============================================================================
 
 /// Internal task entry with metadata for cleanup.
+///
+/// Stores `Arc<Task>` to avoid deep clones on reads. Mutations use
+/// `Arc::make_mut` which clones only when other references exist
+/// (copy-on-write semantics).
 #[derive(Debug)]
 struct TaskEntry {
-    /// The task itself
-    task: Task,
+    /// The task itself (Arc for cheap reads, make_mut for writes)
+    task: Arc<Task>,
     /// When the task became terminal (for grace period cleanup)
     terminal_at: Option<DateTime<Utc>>,
     /// Notifier for waiters on this task
@@ -881,7 +885,6 @@ impl TaskStore {
         self.tasks.len()
     }
 
-
     /// Creates and inserts a new task.
     ///
     /// Implements: REQ-GOV-001/F-002, F-009
@@ -949,11 +952,11 @@ impl TaskStore {
             on_timeout,
         );
         let task_id = task.id.clone();
-        let task_arc = Arc::new(task.clone());
+        let task_arc = Arc::new(task);
 
         // Insert into store
         let entry = TaskEntry {
-            task,
+            task: task_arc.clone(),
             terminal_at: None,
             notify: Arc::new(Notify::new()),
         };
@@ -975,7 +978,7 @@ impl TaskStore {
     pub fn get(&self, task_id: &TaskId) -> Result<Arc<Task>, TaskError> {
         self.tasks
             .get(task_id)
-            .map(|entry| Arc::new(entry.task.clone()))
+            .map(|entry| entry.task.clone())
             .ok_or_else(|| TaskError::NotFound {
                 task_id: task_id.clone(),
             })
@@ -998,7 +1001,7 @@ impl TaskStore {
             })?;
 
         let was_terminal = entry.task.status.is_terminal();
-        entry.task.transition(new_status, reason)?;
+        Arc::make_mut(&mut entry.task).transition(new_status, reason)?;
 
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
@@ -1013,7 +1016,7 @@ impl TaskStore {
             entry.notify.notify_waiters();
         }
 
-        Ok(Arc::new(entry.task.clone()))
+        Ok(entry.task.clone())
     }
 
     /// Transitions a task with optimistic locking.
@@ -1034,9 +1037,7 @@ impl TaskStore {
             })?;
 
         let was_terminal = entry.task.status.is_terminal();
-        entry
-            .task
-            .transition_if(expected_status, new_status, reason)?;
+        Arc::make_mut(&mut entry.task).transition_if(expected_status, new_status, reason)?;
 
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
@@ -1051,7 +1052,7 @@ impl TaskStore {
             entry.notify.notify_waiters();
         }
 
-        Ok(Arc::new(entry.task.clone()))
+        Ok(entry.task.clone())
     }
 
     /// Records an approval decision on a task.
@@ -1084,25 +1085,27 @@ impl TaskStore {
         let approval_valid_until = now
             + chrono::Duration::from_std(approval_valid_for).unwrap_or(chrono::Duration::zero());
 
-        entry.task.approval = Some(ApprovalRecord {
-            decision: decision.clone(),
-            decided_by,
-            decided_at: now,
-            approval_valid_until,
-            metadata: None,
-        });
-
         // Transition based on decision
-        let (new_status, reason) = match decision {
+        let (new_status, reason) = match &decision {
             ApprovalDecision::Approved => (TaskStatus::Executing, Some("Approved".to_string())),
             ApprovalDecision::Rejected { reason } => (
                 TaskStatus::Rejected,
-                reason.or_else(|| Some("Rejected".to_string())),
+                reason.clone().or_else(|| Some("Rejected".to_string())),
             ),
         };
 
         let was_terminal = entry.task.status.is_terminal();
-        entry.task.transition(new_status, reason)?;
+        {
+            let task = Arc::make_mut(&mut entry.task);
+            task.approval = Some(ApprovalRecord {
+                decision,
+                decided_by,
+                decided_at: now,
+                approval_valid_until,
+                metadata: None,
+            });
+            task.transition(new_status, reason)?;
+        }
 
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
@@ -1110,7 +1113,7 @@ impl TaskStore {
             entry.notify.notify_waiters();
         }
 
-        Ok(Arc::new(entry.task.clone()))
+        Ok(entry.task.clone())
     }
 
     /// Marks a task as completed with a result.
@@ -1137,16 +1140,19 @@ impl TaskStore {
             });
         }
 
-        entry.task.result = Some(result);
-        entry.task.transition(
-            TaskStatus::Completed,
-            Some("Execution completed".to_string()),
-        )?;
+        {
+            let task = Arc::make_mut(&mut entry.task);
+            task.result = Some(result);
+            task.transition(
+                TaskStatus::Completed,
+                Some("Execution completed".to_string()),
+            )?;
+        }
         entry.terminal_at = Some(Utc::now());
         self.pending_count.fetch_sub(1, Ordering::Release);
         entry.notify.notify_waiters();
 
-        Ok(Arc::new(entry.task.clone()))
+        Ok(entry.task.clone())
     }
 
     /// Records an execution result on an auto-approved expired task.
@@ -1167,9 +1173,10 @@ impl TaskStore {
                 task_id: task_id.clone(),
             })?;
 
-        entry.task.result = Some(result);
-        entry.task.approval = Some(approval);
-        entry.task.transitions.push(TaskTransition {
+        let task = Arc::make_mut(&mut entry.task);
+        task.result = Some(result);
+        task.approval = Some(approval);
+        task.transitions.push(TaskTransition {
             from: TaskStatus::Expired,
             to: TaskStatus::Expired, // Status doesn't change (terminal)
             at: Utc::now(),
@@ -1197,10 +1204,11 @@ impl TaskStore {
             });
         }
 
-        entry.task.failure = Some(failure.clone());
-        entry
-            .task
-            .transition(TaskStatus::Failed, Some(failure.reason))?;
+        {
+            let task = Arc::make_mut(&mut entry.task);
+            task.failure = Some(failure.clone());
+            task.transition(TaskStatus::Failed, Some(failure.reason))?;
+        }
         entry.terminal_at = Some(Utc::now());
 
         if !was_terminal {
@@ -1208,7 +1216,7 @@ impl TaskStore {
         }
         entry.notify.notify_waiters();
 
-        Ok(Arc::new(entry.task.clone()))
+        Ok(entry.task.clone())
     }
 
     /// Cancels a task (only from InputRequired state).
@@ -1230,7 +1238,7 @@ impl TaskStore {
             if entry.task.status.is_terminal() {
                 // F-006.2: Idempotency - already cancelled returns success
                 if entry.task.status == TaskStatus::Cancelled {
-                    return Ok(Arc::new(entry.task.clone()));
+                    return Ok(entry.task.clone());
                 }
                 // F-006.2b: Other terminal states cannot be cancelled
                 return Err(TaskError::AlreadyTerminal {
@@ -1246,7 +1254,7 @@ impl TaskStore {
             });
         }
 
-        entry.task.transition(
+        Arc::make_mut(&mut entry.task).transition(
             TaskStatus::Cancelled,
             Some("Cancelled by agent".to_string()),
         )?;
@@ -1254,7 +1262,7 @@ impl TaskStore {
         self.pending_count.fetch_sub(1, Ordering::Release);
         entry.notify.notify_waiters();
 
-        Ok(Arc::new(entry.task.clone()))
+        Ok(entry.task.clone())
     }
 
     /// Expires non-terminal tasks that have exceeded their TTL.
@@ -1282,24 +1290,24 @@ impl TaskStore {
 
         // Expire each task
         for task_id in to_expire {
-            if let Some(mut entry) = self.tasks.get_mut(&task_id)
-                && !entry.task.status.is_terminal()
-                && now > entry.task.expires_at
-                && entry
-                    .task
-                    .transition(TaskStatus::Expired, Some("TTL exceeded".to_string()))
-                    .is_ok()
-            {
-                entry.terminal_at = Some(now);
-                self.pending_count.fetch_sub(1, Ordering::Release);
-                entry.notify.notify_waiters();
-                expired += 1;
-                tracing::warn!(
-                    task_id = %task_id,
-                    tool = %entry.task.original_request.name,
-                    age_seconds = (now - entry.task.created_at).num_seconds(),
-                    "Task expired"
-                );
+            if let Some(mut entry) = self.tasks.get_mut(&task_id) {
+                if !entry.task.status.is_terminal()
+                    && now > entry.task.expires_at
+                    && Arc::make_mut(&mut entry.task)
+                        .transition(TaskStatus::Expired, Some("TTL exceeded".to_string()))
+                        .is_ok()
+                {
+                    entry.terminal_at = Some(now);
+                    self.pending_count.fetch_sub(1, Ordering::Release);
+                    entry.notify.notify_waiters();
+                    expired += 1;
+                    tracing::warn!(
+                        task_id = %task_id,
+                        tool = %entry.task.original_request.name,
+                        age_seconds = (now - entry.task.created_at).num_seconds(),
+                        "Task expired"
+                    );
+                }
             }
         }
 
@@ -1372,7 +1380,7 @@ impl TaskStore {
         // Collect tasks, sorted by creation time (newest first)
         let mut tasks: Vec<Arc<Task>> = task_ids
             .iter()
-            .filter_map(|id| self.tasks.get(id).map(|e| Arc::new(e.task.clone())))
+            .filter_map(|id| self.tasks.get(id).map(|e| e.task.clone()))
             .collect();
 
         tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -1417,7 +1425,7 @@ impl TaskStore {
                 })?;
 
                 if entry.task.status.is_terminal() {
-                    return Ok(Arc::new(entry.task.clone()));
+                    return Ok(entry.task.clone());
                 }
             }
 
@@ -1438,7 +1446,7 @@ impl TaskStore {
                 })?;
 
                 if entry.task.status.is_terminal() {
-                    return Ok(Arc::new(entry.task.clone()));
+                    return Ok(entry.task.clone());
                 }
                 return Err(TaskError::ResultNotReady {
                     task_id: task_id.clone(),
