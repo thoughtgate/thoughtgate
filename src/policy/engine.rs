@@ -781,7 +781,15 @@ impl CedarEngine {
                     "Approve" => PolicyAction::Approve {
                         timeout: Duration::from_secs(300), // Default 5 minutes
                     },
-                    _ => unreachable!(),
+                    _ => {
+                        error!(
+                            action = action_name,
+                            "Unknown policy action, failing closed"
+                        );
+                        PolicyAction::Reject {
+                            reason: format!("Unknown action: {}", action_name),
+                        }
+                    }
                 };
             }
         }
