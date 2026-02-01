@@ -74,13 +74,22 @@ impl Config {
     /// Pre-compile all glob patterns for rules and exposure configs.
     ///
     /// Called once after config loading to avoid re-parsing glob strings
-    /// on every request. Invalid patterns are silently skipped (they will
-    /// fall through to the runtime `Pattern::new()` fallback).
-    pub fn compile_patterns(&mut self) {
+    /// on every request. Returns an error if any pattern is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::InvalidGlobPattern` if any glob pattern fails to compile.
+    pub fn compile_patterns(&mut self) -> Result<(), super::error::ConfigError> {
         // Compile governance rule patterns
         for rule in &mut self.governance.rules {
-            if let Ok(compiled) = glob::Pattern::new(&rule.pattern) {
-                rule.compiled_pattern = Some(compiled);
+            match glob::Pattern::new(&rule.pattern) {
+                Ok(compiled) => rule.compiled_pattern = Some(compiled),
+                Err(e) => {
+                    return Err(super::error::ConfigError::InvalidGlobPattern {
+                        pattern: rule.pattern.clone(),
+                        message: e.to_string(),
+                    });
+                }
             }
         }
 
@@ -96,15 +105,25 @@ impl Config {
                         tools,
                         compiled_tools,
                     } => {
-                        *compiled_tools = tools
-                            .iter()
-                            .filter_map(|s| glob::Pattern::new(s).ok())
-                            .collect();
+                        let mut compiled = Vec::with_capacity(tools.len());
+                        for tool_pattern in tools.iter() {
+                            match glob::Pattern::new(tool_pattern) {
+                                Ok(p) => compiled.push(p),
+                                Err(e) => {
+                                    return Err(super::error::ConfigError::InvalidGlobPattern {
+                                        pattern: tool_pattern.clone(),
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        *compiled_tools = compiled;
                     }
                     ExposeConfig::All => {}
                 }
             }
         }
+        Ok(())
     }
 
     /// Check if this configuration requires an approval engine.

@@ -127,7 +127,7 @@ pub fn load_and_validate(
     let mut config = load_config(path)?;
     let result = validate(&config, version)?;
     // Pre-compile glob patterns to avoid per-request pattern parsing
-    config.compile_patterns();
+    config.compile_patterns()?;
     Ok((config, result))
 }
 
