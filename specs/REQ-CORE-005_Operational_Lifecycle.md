@@ -176,7 +176,7 @@ Content-Type: application/json
 
 {
   "status": "healthy",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "uptime_seconds": 3600
 }
 ```
@@ -576,7 +576,7 @@ thoughtgate_approvals_cancelled_shutdown   # v0.2
 
 **Logging:**
 ```json
-{"level":"info","message":"Starting ThoughtGate","version":"0.2.0"}
+{"level":"info","message":"Starting ThoughtGate","version":"0.2.2"}
 {"level":"info","message":"Configuration loaded","source":"config.yaml","workflows":3}
 {"level":"info","message":"Upstream connected","url":"http://mcp-server:3000"}
 {"level":"info","message":"ThoughtGate ready","startup_duration_ms":1234}

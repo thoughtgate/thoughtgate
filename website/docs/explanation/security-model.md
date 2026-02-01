@@ -197,7 +197,7 @@ spec:
     fsGroup: 1000
   containers:
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:v0.2.0
+      image: ghcr.io/thoughtgate/thoughtgate:v0.2.2
       securityContext:
         readOnlyRootFilesystem: true
         allowPrivilegeEscalation: false
