@@ -963,9 +963,8 @@ impl CedarEngine {
             Err(first_err) => {
                 warn!(
                     error = %first_err,
-                    "Policy parse failed, retrying once in case of partial file write"
+                    "Policy parse failed, retrying immediately in case of partial file write"
                 );
-                std::thread::sleep(std::time::Duration::from_millis(100));
                 let (retry_str, retry_source) = loader::load_policies();
                 let policies =
                     Self::parse_policies(&retry_str, &self.schema).map_err(|retry_err| {
