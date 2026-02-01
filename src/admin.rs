@@ -29,7 +29,7 @@ use crate::ports::admin_port;
 pub struct AdminServerConfig {
     /// Port to listen on (default: 7469)
     pub port: u16,
-    /// Bind address (default: 0.0.0.0)
+    /// Bind address (default: 127.0.0.1)
     pub bind_addr: String,
 }
 
