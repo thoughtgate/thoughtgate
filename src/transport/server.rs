@@ -1422,7 +1422,7 @@ async fn handle_task_method(
                 })?;
 
             // Verify caller owns this task (returns TaskNotFound on mismatch)
-            verify_task_principal(state, &req.task_id)?;
+            verify_task_principal(state, &req.task_id).await?;
 
             let result = state
                 .task_handler
@@ -1446,7 +1446,7 @@ async fn handle_task_method(
                 })?;
 
             // Verify caller owns this task (returns TaskNotFound on mismatch)
-            verify_task_principal(state, &req.task_id)?;
+            verify_task_principal(state, &req.task_id).await?;
 
             // If we have an approval engine, use it to execute approved tasks
             if let Some(approval_engine) = &state.approval_engine {
@@ -1493,8 +1493,12 @@ async fn handle_task_method(
             // request headers (e.g. X-Forwarded-User, mTLS client cert CN) instead
             // of the sidecar's own K8s identity. Without this, all tasks/list calls
             // in gateway mode would return the same principal's tasks.
-            let policy_principal =
-                infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
+            let policy_principal = tokio::task::spawn_blocking(infer_principal)
+                .await
+                .map_err(|e| ThoughtGateError::ServiceUnavailable {
+                    reason: format!("Principal inference task failed: {}", e),
+                })?
+                .map_err(|e| ThoughtGateError::PolicyDenied {
                     tool: String::new(),
                     policy_id: None,
                     reason: Some(format!("Identity unavailable: {}", e)),
@@ -1524,7 +1528,7 @@ async fn handle_task_method(
                 })?;
 
             // Verify caller owns this task (returns TaskNotFound on mismatch)
-            verify_task_principal(state, &req.task_id)?;
+            verify_task_principal(state, &req.task_id).await?;
 
             let result = state
                 .task_handler
@@ -1552,16 +1556,16 @@ async fn handle_task_method(
 /// exist for the caller to access.
 ///
 /// Implements: REQ-GOV-001/F-011 (Principal isolation)
-fn verify_task_principal(
+async fn verify_task_principal(
     state: &McpState,
     task_id: &crate::governance::task::TaskId,
 ) -> Result<(), ThoughtGateError> {
     // If we can't infer principal, skip verification. This can happen in
     // environments where identity is not configured. Task creation would
     // also fail in such environments, providing defense-in-depth.
-    let caller_principal = match infer_principal() {
-        Ok(p) => Principal::new(&p.app_name),
-        Err(_) => return Ok(()),
+    let caller_principal = match tokio::task::spawn_blocking(infer_principal).await {
+        Ok(Ok(p)) => Principal::new(&p.app_name),
+        _ => return Ok(()),
     };
 
     let task = state
@@ -1818,12 +1822,17 @@ async fn start_approval_flow(
                 reason: "Approval engine not configured".to_string(),
             })?;
 
-    // Infer principal from environment
-    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
-        tool: String::new(),
-        policy_id: None,
-        reason: Some(format!("Identity unavailable: {}", e)),
-    })?;
+    // Infer principal from environment (uses spawn_blocking for file I/O)
+    let policy_principal = tokio::task::spawn_blocking(infer_principal)
+        .await
+        .map_err(|e| ThoughtGateError::ServiceUnavailable {
+            reason: format!("Principal inference task failed: {}", e),
+        })?
+        .map_err(|e| ThoughtGateError::PolicyDenied {
+            tool: String::new(),
+            policy_id: None,
+            reason: Some(format!("Identity unavailable: {}", e)),
+        })?;
 
     // Create ToolCallRequest for the approval engine
     // Transport and governance now share the same JsonRpcId type
@@ -1936,12 +1945,17 @@ async fn evaluate_with_cedar(
         }
     };
 
-    // Infer principal from environment
-    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
-        tool: String::new(),
-        policy_id: None,
-        reason: Some(format!("Identity unavailable: {}", e)),
-    })?;
+    // Infer principal from environment (uses spawn_blocking for file I/O)
+    let policy_principal = tokio::task::spawn_blocking(infer_principal)
+        .await
+        .map_err(|e| ThoughtGateError::ServiceUnavailable {
+            reason: format!("Principal inference task failed: {}", e),
+        })?
+        .map_err(|e| ThoughtGateError::PolicyDenied {
+            tool: String::new(),
+            policy_id: None,
+            reason: Some(format!("Identity unavailable: {}", e)),
+        })?;
 
     // Get policy_id and source_id from Gate 2 result, or use defaults
     let policy_id = match_result

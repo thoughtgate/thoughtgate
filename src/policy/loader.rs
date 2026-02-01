@@ -21,10 +21,10 @@ use tracing::{info, warn};
 /// Tuple of (policy_text, source)
 ///
 /// # Note
-/// Uses blocking I/O (`std::fs`). Called only at startup and during rare
-/// hot-reload events, so blocking the tokio runtime briefly is acceptable.
-/// Converting to async would cascade through `CedarEngine::new()` and 30+
-/// test call sites for negligible practical benefit.
+/// Uses blocking I/O (`std::fs`). Called only at startup (via `CedarEngine::new()`)
+/// and during rare hot-reload events (via `reload()`), so blocking is acceptable.
+/// Production callers that run on the Tokio runtime should wrap calls in
+/// `tokio::task::spawn_blocking` if needed.
 pub fn load_policies() -> (String, PolicySource) {
     // 1. Try ConfigMap
     let config_path = env::var("THOUGHTGATE_POLICY_FILE")
