@@ -47,6 +47,9 @@ pub struct UpstreamConfig {
     pub pool_max_idle_per_host: usize,
     /// Idle connection timeout
     pub pool_idle_timeout: Duration,
+    /// Maximum response body size in bytes (default: 10MB).
+    /// Prevents unbounded memory allocation from oversized upstream responses.
+    pub max_response_size: usize,
 }
 
 impl Default for UpstreamConfig {
@@ -57,6 +60,7 @@ impl Default for UpstreamConfig {
             connect_timeout: Duration::from_secs(5),
             pool_max_idle_per_host: 32,
             pool_idle_timeout: Duration::from_secs(90),
+            max_response_size: 10 * 1024 * 1024, // 10 MB
         }
     }
 }
@@ -401,11 +405,13 @@ impl UpstreamClient {
             return Err(classify_upstream_http_error(status));
         }
 
-        // Parse response body
-        let body: JsonRpcResponse = response.json().await.map_err(|e| {
+        // Read response body with size limit, then parse
+        let body_bytes = self.read_body_limited(response, &correlation_id).await?;
+        let body: JsonRpcResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
             error!(
                 correlation_id = %correlation_id,
                 error = %e,
+                body_size = body_bytes.len(),
                 "Failed to parse upstream response"
             );
             ThoughtGateError::UpstreamError {
@@ -484,19 +490,81 @@ impl UpstreamClient {
             return Err(classify_upstream_http_error(status));
         }
 
+        let body_bytes = self.read_body_limited(response, "batch").await?;
         let body: Vec<JsonRpcResponse> =
-            response
-                .json()
-                .await
-                .map_err(|e| ThoughtGateError::UpstreamError {
-                    code: -32002,
-                    message: format!("Failed to parse upstream batch response: {}", e),
-                })?;
+            serde_json::from_slice(&body_bytes).map_err(|e| ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: format!("Failed to parse upstream batch response: {}", e),
+            })?;
 
         debug!(
             response_count = body.len(),
             "Received upstream batch response"
         );
+
+        Ok(body)
+    }
+
+    /// Read the response body with a size limit.
+    ///
+    /// Checks the `Content-Length` header first (if present) for early rejection,
+    /// then reads the body up to `max_response_size`. Returns an error if the
+    /// response exceeds the limit.
+    async fn read_body_limited(
+        &self,
+        response: reqwest::Response,
+        correlation_id: &str,
+    ) -> Result<bytes::Bytes, ThoughtGateError> {
+        let max_size = self.config.max_response_size;
+
+        // Early reject if Content-Length exceeds limit
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > max_size {
+                warn!(
+                    correlation_id = %correlation_id,
+                    content_length = content_length,
+                    max_response_size = max_size,
+                    "Upstream response exceeds size limit (Content-Length)"
+                );
+                return Err(ThoughtGateError::UpstreamError {
+                    code: -32002,
+                    message: format!(
+                        "Upstream response too large: {} bytes exceeds {} byte limit",
+                        content_length, max_size
+                    ),
+                });
+            }
+        }
+
+        // Read body with size limit (handles chunked responses without Content-Length)
+        let body = response.bytes().await.map_err(|e| {
+            error!(
+                correlation_id = %correlation_id,
+                error = %e,
+                "Failed to read upstream response body"
+            );
+            ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: format!("Failed to read upstream response: {}", e),
+            }
+        })?;
+
+        if body.len() > max_size {
+            warn!(
+                correlation_id = %correlation_id,
+                body_size = body.len(),
+                max_response_size = max_size,
+                "Upstream response exceeds size limit (actual body)"
+            );
+            return Err(ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: format!(
+                    "Upstream response too large: {} bytes exceeds {} byte limit",
+                    body.len(),
+                    max_size
+                ),
+            });
+        }
 
         Ok(body)
     }
