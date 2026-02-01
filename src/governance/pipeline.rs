@@ -136,6 +136,15 @@ pub enum PipelineError {
         details: String,
     },
 
+    /// Inspector timed out
+    #[error("Inspector '{inspector}' timed out after {timeout_secs}s")]
+    InspectorTimeout {
+        /// Name of the timed-out inspector
+        inspector: String,
+        /// Timeout duration in seconds
+        timeout_secs: u64,
+    },
+
     /// Request serialization/deserialization error
     #[error("Serialization error: {details}")]
     SerializationError {
@@ -157,6 +166,8 @@ pub struct PipelineConfig {
     pub approval_validity: Duration,
     /// Timeout for upstream execution
     pub execution_timeout: Duration,
+    /// Timeout for individual inspector execution
+    pub inspector_timeout: Duration,
     /// Transform drift handling mode
     pub transform_drift_mode: TransformDriftMode,
 }
@@ -166,6 +177,7 @@ impl Default for PipelineConfig {
         Self {
             approval_validity: Duration::from_secs(300),
             execution_timeout: Duration::from_secs(30),
+            inspector_timeout: Duration::from_secs(30),
             transform_drift_mode: TransformDriftMode::Strict,
         }
     }
@@ -180,6 +192,7 @@ impl PipelineConfig {
     ///
     /// - `THOUGHTGATE_APPROVAL_VALIDITY_SECS` (default: 300)
     /// - `THOUGHTGATE_EXECUTION_TIMEOUT_SECS` (default: 30)
+    /// - `THOUGHTGATE_INSPECTOR_TIMEOUT_SECS` (default: 30)
     /// - `THOUGHTGATE_TRANSFORM_DRIFT_MODE` (default: strict)
     #[must_use]
     pub fn from_env() -> Self {
@@ -188,6 +201,9 @@ impl PipelineConfig {
 
         let execution_timeout =
             Duration::from_secs(parse_env_warn("THOUGHTGATE_EXECUTION_TIMEOUT_SECS", 30u64));
+
+        let inspector_timeout =
+            Duration::from_secs(parse_env_warn("THOUGHTGATE_INSPECTOR_TIMEOUT_SECS", 30u64));
 
         let transform_drift_mode = std::env::var("THOUGHTGATE_TRANSFORM_DRIFT_MODE")
             .ok()
@@ -200,6 +216,7 @@ impl PipelineConfig {
         Self {
             approval_validity,
             execution_timeout,
+            inspector_timeout,
             transform_drift_mode,
         }
     }
@@ -369,14 +386,20 @@ impl ApprovalPipeline {
             let (parts, _) = fake_req.into_parts();
             let ctx = InspectionContext::Request(&parts);
 
-            // Run inspector
-            let decision =
-                inspector
-                    .inspect(&bytes, ctx)
-                    .await
-                    .map_err(|e| PipelineError::InternalError {
-                        details: format!("Inspector '{}' error: {}", inspector_name, e),
-                    })?;
+            // Run inspector with timeout to prevent hung inspectors from
+            // blocking the pipeline indefinitely.
+            let decision = tokio::time::timeout(
+                self.config.inspector_timeout,
+                inspector.inspect(&bytes, ctx),
+            )
+            .await
+            .map_err(|_| PipelineError::InspectorTimeout {
+                inspector: inspector_name.to_string(),
+                timeout_secs: self.config.inspector_timeout.as_secs(),
+            })?
+            .map_err(|e| PipelineError::InternalError {
+                details: format!("Inspector '{}' error: {}", inspector_name, e),
+            })?;
 
             match decision {
                 Decision::Approve => {
