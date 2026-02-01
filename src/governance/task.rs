@@ -829,6 +829,9 @@ pub struct TaskStore {
     config: TaskStoreConfig,
     /// Counter for pending (non-terminal) tasks
     pending_count: AtomicUsize,
+    /// Atomic counter of pending tasks per principal (keyed by rate_limit_key).
+    /// Prevents TOCTOU race between count check and insert in `create()`.
+    pending_by_principal: DashMap<String, AtomicUsize>,
 }
 
 impl TaskStore {
@@ -842,6 +845,7 @@ impl TaskStore {
             by_principal: DashMap::new(),
             config,
             pending_count: AtomicUsize::new(0),
+            pending_by_principal: DashMap::new(),
         }
     }
 
@@ -877,24 +881,6 @@ impl TaskStore {
         self.tasks.len()
     }
 
-    /// Counts pending tasks for a specific principal.
-    ///
-    /// Implements: REQ-GOV-001/F-009.1
-    fn count_pending_for_principal(&self, principal_key: &str) -> usize {
-        let task_ids = match self.by_principal.get(principal_key) {
-            Some(ids) => ids.clone(),
-            None => return 0,
-        };
-
-        task_ids
-            .iter()
-            .filter(|id| {
-                self.tasks
-                    .get(*id)
-                    .is_some_and(|entry| !entry.task.status.is_terminal())
-            })
-            .count()
-    }
 
     /// Creates and inserts a new task.
     ///
@@ -931,11 +917,18 @@ impl TaskStore {
             // CAS failed — another thread changed pending_count, retry
         }
 
-        // F-009.1, F-009.2: Check per-principal limit
-        // If this fails, rollback the global reservation
+        // F-009.1, F-009.2: Atomically check and reserve per-principal slot.
+        // Uses atomic increment + check to prevent TOCTOU race between
+        // count check and insert under concurrent access.
         let principal_key = principal.rate_limit_key();
-        let pending = self.count_pending_for_principal(&principal_key);
-        if pending >= self.config.max_pending_per_principal {
+        let principal_counter = self
+            .pending_by_principal
+            .entry(principal_key.clone())
+            .or_insert_with(|| AtomicUsize::new(0));
+        let prev = principal_counter.fetch_add(1, Ordering::AcqRel);
+        if prev >= self.config.max_pending_per_principal {
+            // Rollback both counters
+            principal_counter.fetch_sub(1, Ordering::Release);
             self.pending_count.fetch_sub(1, Ordering::Release);
             return Err(TaskError::RateLimited {
                 principal: principal_key,
@@ -1011,6 +1004,11 @@ impl TaskStore {
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
             self.pending_count.fetch_sub(1, Ordering::Release);
+            // Decrement per-principal counter
+            let principal_key = entry.task.principal.rate_limit_key();
+            if let Some(counter) = self.pending_by_principal.get(&principal_key) {
+                counter.fetch_sub(1, Ordering::Release);
+            }
             // Notify any waiters
             entry.notify.notify_waiters();
         }
@@ -1044,6 +1042,11 @@ impl TaskStore {
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
             self.pending_count.fetch_sub(1, Ordering::Release);
+            // Decrement per-principal counter
+            let principal_key = entry.task.principal.rate_limit_key();
+            if let Some(counter) = self.pending_by_principal.get(&principal_key) {
+                counter.fetch_sub(1, Ordering::Release);
+            }
             // Notify any waiters
             entry.notify.notify_waiters();
         }
