@@ -532,20 +532,49 @@ pub enum ParsedRequests {
 /// - EC-MCP-003: Missing jsonrpc field returns InvalidRequest
 /// - EC-MCP-006: Empty batch returns InvalidRequest
 pub fn parse_jsonrpc(bytes: &[u8]) -> Result<ParsedRequests, ThoughtGateError> {
-    // F-001.5: Parse JSON
-    let value: Value = serde_json::from_slice(bytes).map_err(|e| ThoughtGateError::ParseError {
-        details: format!("Invalid JSON: {}", e),
-    })?;
+    // Peek at the first non-whitespace byte to determine single vs batch
+    // without parsing the entire payload into an intermediate Value.
+    let first_byte = bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .ok_or_else(|| ThoughtGateError::ParseError {
+            details: "Invalid JSON: empty input".to_string(),
+        })?;
 
-    match value {
-        Value::Array(arr) => {
-            // F-001.2: Batch request
+    match first_byte {
+        b'{' => {
+            // F-001.1: Single request fast path — deserialize directly to
+            // RawJsonRpcRequest, skipping the intermediate Value allocation.
+            let raw: RawJsonRpcRequest = serde_json::from_slice(bytes).map_err(|e| {
+                // Distinguish syntax errors (bad JSON) from semantic errors
+                // (valid JSON but invalid field values like float IDs).
+                if e.is_syntax() || e.is_eof() {
+                    ThoughtGateError::ParseError {
+                        details: format!("Invalid JSON: {}", e),
+                    }
+                } else {
+                    ThoughtGateError::InvalidRequest {
+                        details: format!("Invalid JSON-RPC structure: {}", e),
+                    }
+                }
+            })?;
+            Ok(ParsedRequests::Single(parse_single_from_raw(raw)?))
+        }
+        b'[' => {
+            // F-001.2: Batch request — parse into Vec<Value> because
+            // EC-MCP-006 requires extracting IDs from malformed items.
+            let arr: Vec<Value> =
+                serde_json::from_slice(bytes).map_err(|e| ThoughtGateError::ParseError {
+                    details: format!("Invalid JSON: {}", e),
+                })?;
+
             if arr.is_empty() {
                 // EC-MCP-006: Empty batch
                 return Err(ThoughtGateError::InvalidRequest {
                     details: "Empty batch is not allowed".to_string(),
                 });
             }
+
             // EC-MCP-006: Collect mixed valid/invalid results
             let mut items = Vec::with_capacity(arr.len());
             for item in arr {
@@ -567,20 +596,26 @@ pub fn parse_jsonrpc(bytes: &[u8]) -> Result<ParsedRequests, ThoughtGateError> {
             }
             Ok(ParsedRequests::Batch(items))
         }
-        Value::Object(_) => {
-            // F-001.1: Single request
-            Ok(ParsedRequests::Single(parse_single_request(value)?))
-        }
         _ => {
-            // Invalid structure - neither object nor array
-            Err(ThoughtGateError::InvalidRequest {
-                details: "Request must be an object or array".to_string(),
-            })
+            // Attempt parse to get a proper serde error message
+            serde_json::from_slice::<Value>(bytes)
+                .map_err(|e| ThoughtGateError::ParseError {
+                    details: format!("Invalid JSON: {}", e),
+                })
+                .and_then(|_| {
+                    // Parsed successfully but isn't object or array
+                    Err(ThoughtGateError::InvalidRequest {
+                        details: "Request must be an object or array".to_string(),
+                    })
+                })
         }
     }
 }
 
 /// Parse a single JSON-RPC 2.0 request from a JSON value.
+///
+/// Used for batch items where each element is already a `Value`.
+/// Delegates to [`parse_single_from_raw`] after deserialization.
 ///
 /// Implements: REQ-CORE-003/F-001 (Parse JSON-RPC 2.0)
 ///
@@ -597,7 +632,16 @@ fn parse_single_request(value: Value) -> Result<McpRequest, ThoughtGateError> {
         serde_json::from_value(value).map_err(|e| ThoughtGateError::InvalidRequest {
             details: format!("Invalid JSON-RPC structure: {}", e),
         })?;
+    parse_single_from_raw(raw)
+}
 
+/// Validate and convert a raw JSON-RPC request into an [`McpRequest`].
+///
+/// This is the shared validation core used by both the single-request fast
+/// path (direct `from_slice`) and the batch path (via `parse_single_request`).
+///
+/// Implements: REQ-CORE-003/F-001.6, F-001.7, F-003
+fn parse_single_from_raw(raw: RawJsonRpcRequest) -> Result<McpRequest, ThoughtGateError> {
     // F-001.6: Validate JSON-RPC version
     match raw.jsonrpc.as_deref() {
         Some("2.0") => {}

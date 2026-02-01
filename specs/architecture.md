@@ -466,7 +466,11 @@ Environment variables can override specific settings but cannot define complex s
 | `THOUGHTGATE_CONFIG` | `/etc/thoughtgate/config.yaml` | Config file path |
 | `THOUGHTGATE_OUTBOUND_PORT` | `7467` | Outbound proxy port (MCP traffic) |
 | `THOUGHTGATE_ADMIN_PORT` | `7469` | Admin port (health, ready, metrics) |
-| `UPSTREAM_URL` | (required) | Upstream server URL (all traffic) |
+| `UPSTREAM_URL` | (required) | Upstream server URL (CLI reverse-proxy mode) |
+| `THOUGHTGATE_UPSTREAM` | (required) | Upstream server URL (MCP governance mode) |
+| `THOUGHTGATE_REQUEST_TIMEOUT_SECS` | `300` | Per-request timeout for proxy connections |
+| `THOUGHTGATE_MAX_BATCH_SIZE` | `100` | Maximum JSON-RPC batch array size |
+| `THOUGHTGATE_ENVIRONMENT` | `production` | Environment name (`development` for dev mode) |
 | `THOUGHTGATE_LOG_LEVEL` | `info` | Log level |
 | `THOUGHTGATE_LOG_FORMAT` | `json` | Log format (json/pretty) |
 
@@ -847,12 +851,11 @@ v0.2 uses SEP-1686 task mode for approval workflows.
 
 When a client sends a `tools/call` request and the governance rules require approval:
 
-1. HTTP connection is held open
-2. Approval request sent to Slack
-3. Wait for human response (with timeout from workflow config)
-4. On APPROVE: Execute tool, return normal result
-5. On REJECT: Return error -32007 (ApprovalRejected)
-6. On TIMEOUT: Execute on_timeout action (default: return -32008)
+1. Create SEP-1686 task, post approval request to Slack, return task ID immediately
+2. Background poller waits for human reaction (👍/👎) on Slack message
+3. On APPROVE: Mark task approved, execute tool call, store result on `tasks/result`
+4. On REJECT: Mark task failed with error -32007 (ApprovalRejected)
+5. On TIMEOUT: Execute `on_timeout` action (default: return -32008 ApprovalTimeout)
 
 **Why SEP-1686 for v0.2:**
 - Handles long-running approvals without HTTP timeout issues

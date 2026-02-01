@@ -311,6 +311,67 @@ impl Drop for AmberPathTimer {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MCP Request Metrics (Y-006)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Metrics collector for MCP request processing.
+///
+/// Tracks request counts, durations, and policy evaluation timing.
+///
+/// # Traceability
+/// - Implements: REQ-OBS-001 (Request-level metrics)
+#[derive(Clone)]
+pub struct McpMetrics {
+    /// Total MCP requests counter (tags: method, outcome)
+    pub mcp_requests_total: Counter<u64>,
+    /// MCP request duration histogram (tag: method)
+    pub mcp_request_duration_seconds: Histogram<f64>,
+    /// Policy evaluation duration histogram
+    pub mcp_policy_eval_duration_seconds: Histogram<f64>,
+}
+
+impl McpMetrics {
+    /// Create new MCP metrics collector.
+    pub fn new(meter: &Meter) -> Self {
+        Self {
+            mcp_requests_total: meter
+                .u64_counter("mcp_requests_total")
+                .with_description("Total number of MCP requests processed")
+                .build(),
+            mcp_request_duration_seconds: meter
+                .f64_histogram("mcp_request_duration_seconds")
+                .with_description("Duration of MCP request processing in seconds")
+                .build(),
+            mcp_policy_eval_duration_seconds: meter
+                .f64_histogram("mcp_policy_eval_duration_seconds")
+                .with_description("Duration of policy evaluation in seconds")
+                .build(),
+        }
+    }
+
+    /// Record a completed MCP request.
+    pub fn record_request(&self, method: &str, outcome: &str, duration_secs: f64) {
+        self.mcp_requests_total.add(
+            1,
+            &[
+                KeyValue::new("method", method.to_string()),
+                KeyValue::new("outcome", outcome.to_string()),
+            ],
+        );
+        self.mcp_request_duration_seconds.record(
+            duration_secs,
+            &[KeyValue::new("method", method.to_string())],
+        );
+    }
+
+    /// Record policy evaluation duration.
+    pub fn record_policy_eval(&self, duration_secs: f64) {
+        self.mcp_policy_eval_duration_seconds
+            .record(duration_secs, &[]);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Global Metrics
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -423,14 +484,19 @@ static AMBER_METRICS: std::sync::OnceLock<Arc<AmberPathMetrics>> = std::sync::On
 /// Global Governance metrics instance.
 static GOVERNANCE_METRICS: std::sync::OnceLock<Arc<GovernanceMetrics>> = std::sync::OnceLock::new();
 
+/// Global MCP request metrics instance.
+static MCP_METRICS: std::sync::OnceLock<Arc<McpMetrics>> = std::sync::OnceLock::new();
+
 /// Initialize global metrics.
 pub fn init_metrics(meter: &Meter) {
     let green_metrics = Arc::new(GreenPathMetrics::new(meter));
     let amber_metrics = Arc::new(AmberPathMetrics::new(meter));
     let governance_metrics = Arc::new(GovernanceMetrics::new(meter));
+    let mcp_metrics = Arc::new(McpMetrics::new(meter));
     let _ = GREEN_METRICS.set(green_metrics);
     let _ = AMBER_METRICS.set(amber_metrics);
     let _ = GOVERNANCE_METRICS.set(governance_metrics);
+    let _ = MCP_METRICS.set(mcp_metrics);
 }
 
 /// Get global Green Path metrics instance.
@@ -452,6 +518,14 @@ pub fn get_amber_metrics() -> Option<Arc<AmberPathMetrics>> {
 /// - Implements: REQ-GOV-002 NFR-001 (Governance Observability)
 pub fn get_governance_metrics() -> Option<Arc<GovernanceMetrics>> {
     GOVERNANCE_METRICS.get().cloned()
+}
+
+/// Get global MCP request metrics instance.
+///
+/// # Traceability
+/// - Implements: REQ-OBS-001 (Request-level metrics)
+pub fn get_mcp_metrics() -> Option<Arc<McpMetrics>> {
+    MCP_METRICS.get().cloned()
 }
 
 #[cfg(test)]
@@ -520,5 +594,19 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         timer.finish();
         // Duration recorded (can't easily assert the value)
+    }
+
+    #[test]
+    fn test_mcp_metrics_creation() {
+        let meter = global::meter("test");
+        let metrics = McpMetrics::new(&meter);
+
+        // Record request metrics
+        metrics.record_request("tools/call", "success", 0.05);
+        metrics.record_request("tools/call", "error", 0.1);
+        metrics.record_request("resources/read", "success", 0.02);
+
+        // Record policy eval duration
+        metrics.record_policy_eval(0.001);
     }
 }

@@ -1277,6 +1277,8 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
     let correlation_id = request.correlation_id.to_string();
     let id = request.id.clone();
     let is_notification = request.is_notification();
+    let method = request.method.clone();
+    let request_start = std::time::Instant::now();
 
     debug!(
         correlation_id = %correlation_id,
@@ -1288,6 +1290,12 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
 
     // Route the request through shared routing logic
     let result = route_request(state, request).await;
+
+    // Record MCP request metrics
+    let outcome = if result.is_ok() { "success" } else { "error" };
+    if let Some(mcp_metrics) = crate::metrics::get_mcp_metrics() {
+        mcp_metrics.record_request(&method, outcome, request_start.elapsed().as_secs_f64());
+    }
 
     // Handle notification - no response (empty body with 204)
     if is_notification {

@@ -572,6 +572,75 @@ impl LifecycleManager {
 }
 
 // ============================================================================
+// Environment Validation
+// ============================================================================
+
+/// Validate environment configuration for production safety.
+///
+/// Implements: REQ-CORE-005/F-001 (Startup Validation)
+///
+/// Checks that dangerous development-only configurations are not active in
+/// production environments. Defaults to production when `THOUGHTGATE_ENVIRONMENT`
+/// is unset (fail-safe behavior).
+///
+/// # Environment Variables
+///
+/// - `THOUGHTGATE_ENVIRONMENT` (default: "production"): Must be set to
+///   "development" or "test" to allow dev mode or mock adapter.
+/// - `THOUGHTGATE_DEV_MODE`: Rejected if set to "true" in production.
+/// - `THOUGHTGATE_APPROVAL_ADAPTER`: Rejected if set to "mock" in production.
+///
+/// # Errors
+///
+/// Returns a descriptive error string if unsafe configuration is detected.
+pub fn validate_environment() -> Result<(), String> {
+    let environment =
+        std::env::var("THOUGHTGATE_ENVIRONMENT").unwrap_or_else(|_| "production".to_string());
+
+    let is_production = matches!(environment.as_str(), "production" | "prod" | "");
+
+    let dev_mode = std::env::var("THOUGHTGATE_DEV_MODE").as_deref() == Ok("true");
+    let mock_adapter = std::env::var("THOUGHTGATE_APPROVAL_ADAPTER").as_deref() == Ok("mock");
+
+    if dev_mode {
+        if is_production {
+            return Err("THOUGHTGATE_DEV_MODE=true is not allowed in production. \
+                 Set THOUGHTGATE_ENVIRONMENT=development to use dev mode."
+                .to_string());
+        }
+        warn!(
+            environment = %environment,
+            "Dev mode is active — identity inference uses synthetic principal"
+        );
+    }
+
+    if mock_adapter {
+        if is_production {
+            return Err(
+                "THOUGHTGATE_APPROVAL_ADAPTER=mock is not allowed in production. \
+                 Set THOUGHTGATE_ENVIRONMENT=development to use the mock adapter."
+                    .to_string(),
+            );
+        }
+        warn!(
+            environment = %environment,
+            "Mock approval adapter is active — approvals will be auto-decided"
+        );
+    }
+
+    if is_production {
+        info!("Production environment validated — no dev bypasses active");
+    } else {
+        info!(
+            environment = %environment,
+            "Non-production environment — dev features may be enabled"
+        );
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Request Guard
 // ============================================================================
 
@@ -914,5 +983,96 @@ mod tests {
         assert_eq!(format!("{}", LifecycleState::Ready), "ready");
         assert_eq!(format!("{}", LifecycleState::ShuttingDown), "shutting_down");
         assert_eq!(format!("{}", LifecycleState::Stopped), "stopped");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Environment Validation Tests (B-003)
+    // ═══════════════════════════════════════════════════════════
+
+    use serial_test::serial;
+
+    /// Helper to clear all environment-validation env vars.
+    fn clear_env_validation_vars() {
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_ENVIRONMENT");
+            std::env::remove_var("THOUGHTGATE_DEV_MODE");
+            std::env::remove_var("THOUGHTGATE_APPROVAL_ADAPTER");
+        }
+    }
+
+    /// Production (default) rejects dev mode.
+    #[test]
+    #[serial]
+    fn test_validate_env_production_rejects_dev_mode() {
+        clear_env_validation_vars();
+        unsafe { std::env::set_var("THOUGHTGATE_DEV_MODE", "true") };
+        let result = validate_environment();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("DEV_MODE"));
+        clear_env_validation_vars();
+    }
+
+    /// Production (default) rejects mock adapter.
+    #[test]
+    #[serial]
+    fn test_validate_env_production_rejects_mock_adapter() {
+        clear_env_validation_vars();
+        unsafe { std::env::set_var("THOUGHTGATE_APPROVAL_ADAPTER", "mock") };
+        let result = validate_environment();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("mock"));
+        clear_env_validation_vars();
+    }
+
+    /// Explicit production also rejects dev mode.
+    #[test]
+    #[serial]
+    fn test_validate_env_explicit_production_rejects_dev_mode() {
+        clear_env_validation_vars();
+        unsafe {
+            std::env::set_var("THOUGHTGATE_ENVIRONMENT", "production");
+            std::env::set_var("THOUGHTGATE_DEV_MODE", "true");
+        }
+        let result = validate_environment();
+        assert!(result.is_err());
+        clear_env_validation_vars();
+    }
+
+    /// Development environment allows dev mode.
+    #[test]
+    #[serial]
+    fn test_validate_env_development_allows_dev_mode() {
+        clear_env_validation_vars();
+        unsafe {
+            std::env::set_var("THOUGHTGATE_ENVIRONMENT", "development");
+            std::env::set_var("THOUGHTGATE_DEV_MODE", "true");
+        }
+        let result = validate_environment();
+        assert!(result.is_ok());
+        clear_env_validation_vars();
+    }
+
+    /// Development environment allows mock adapter.
+    #[test]
+    #[serial]
+    fn test_validate_env_development_allows_mock_adapter() {
+        clear_env_validation_vars();
+        unsafe {
+            std::env::set_var("THOUGHTGATE_ENVIRONMENT", "development");
+            std::env::set_var("THOUGHTGATE_APPROVAL_ADAPTER", "mock");
+        }
+        let result = validate_environment();
+        assert!(result.is_ok());
+        clear_env_validation_vars();
+    }
+
+    /// Clean production environment passes validation.
+    #[test]
+    #[serial]
+    fn test_validate_env_clean_production_passes() {
+        clear_env_validation_vars();
+        let result = validate_environment();
+        assert!(result.is_ok());
+        clear_env_validation_vars();
     }
 }

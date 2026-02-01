@@ -218,6 +218,18 @@ cedar:
 | `namespace` | SA mount | `/var/run/secrets/kubernetes.io/serviceaccount/namespace` |
 | `service_account` | SA token | `/var/run/secrets/kubernetes.io/serviceaccount/token` (parse) |
 
+**JWT Parsing for K8s ServiceAccount Tokens:**
+
+The ServiceAccount token is a JWT. ThoughtGate uses `base64` decoding (without
+verification, since the token is already trusted by the kubelet mount) to extract
+the payload claims:
+- `kubernetes.io/serviceaccount/namespace` → `namespace`
+- `kubernetes.io/serviceaccount/service-account.name` → `service_account`
+- `sub` claim → used as fallback for `service_account`
+
+No cryptographic verification is performed; the token is trusted as a local
+identity source provided by the Kubernetes control plane.
+
 **Local Development Override:**
 | Variable | Purpose |
 |----------|---------|
