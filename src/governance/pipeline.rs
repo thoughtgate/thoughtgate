@@ -590,7 +590,11 @@ impl ApprovalPipeline {
         };
 
         // F-005.2: Compare output hash to stored hash
-        let new_hash = hash_request(&transformed);
+        let new_hash = hash_request(&transformed).map_err(|e| PipelineResult::Failure {
+            stage: FailureStage::TransformDrift,
+            reason: format!("Failed to hash transformed request: {e}"),
+            retriable: false,
+        })?;
         if new_hash != task.request_hash {
             // Transform drift detected
             match self.config.transform_drift_mode {
@@ -730,7 +734,10 @@ impl ExecutionPipeline for ApprovalPipeline {
         let transformed = self.run_inspector_chain(request).await?;
 
         // Compute hash of transformed request
-        let request_hash = hash_request(&transformed);
+        let request_hash =
+            hash_request(&transformed).map_err(|e| PipelineError::InternalError {
+                details: format!("Failed to hash request: {e}"),
+            })?;
 
         info!(
             tool = %request.name,
@@ -913,8 +920,8 @@ mod tests {
             mcp_request_id: super::super::JsonRpcId::Number(1),
         };
 
-        let hash1 = hash_request(&request);
-        let hash2 = hash_request(&request);
+        let hash1 = hash_request(&request).unwrap();
+        let hash2 = hash_request(&request).unwrap();
 
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 64); // SHA256 produces 64 hex chars
@@ -939,7 +946,10 @@ mod tests {
             mcp_request_id: super::super::JsonRpcId::Number(999),
         };
 
-        assert_eq!(hash_request(&request1), hash_request(&request2));
+        assert_eq!(
+            hash_request(&request1).unwrap(),
+            hash_request(&request2).unwrap()
+        );
     }
 
     /// Tests that different content produces different hashes.
@@ -959,7 +969,10 @@ mod tests {
             mcp_request_id: super::super::JsonRpcId::Number(1),
         };
 
-        assert_ne!(hash_request(&request1), hash_request(&request2));
+        assert_ne!(
+            hash_request(&request1).unwrap(),
+            hash_request(&request2).unwrap()
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────

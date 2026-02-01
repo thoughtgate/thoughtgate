@@ -481,14 +481,16 @@ impl Task {
     /// Creates a new task in Working state.
     ///
     /// Implements: REQ-GOV-001/F-002
-    #[must_use]
+    ///
+    /// Returns an error if the request arguments exceed the maximum JSON
+    /// nesting depth, which would prevent reliable integrity hashing.
     pub fn new(
         original_request: ToolCallRequest,
         pre_approval_transformed: ToolCallRequest,
         principal: Principal,
         ttl: Duration,
         on_timeout: TimeoutAction,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let id = TaskId::new();
         let now = Utc::now();
         // Clamp TTL to max 30 days if conversion fails (overflow for extremely large durations)
@@ -497,10 +499,10 @@ impl Task {
         let expires_at = now + chrono_ttl;
         // Hash the transformed request - this is what the human approves
         // The hash verifies integrity of the approved content, not the raw input
-        let request_hash = hash_request(&pre_approval_transformed);
+        let request_hash = hash_request(&pre_approval_transformed)?;
         let poll_interval = compute_poll_interval(ttl);
 
-        Self {
+        Ok(Self {
             id,
             original_request,
             pre_approval_transformed,
@@ -517,7 +519,7 @@ impl Task {
             result: None,
             failure: None,
             on_timeout,
-        }
+        })
     }
 
     /// Returns true if the task has expired.
@@ -625,13 +627,13 @@ impl Task {
 /// deterministic hashing regardless of key insertion order. This is necessary
 /// because `serde_json/preserve_order` is enabled transitively by
 /// `cedar-policy-core`, making `Value::to_string()` insertion-order dependent.
-#[must_use]
-pub fn hash_request(request: &ToolCallRequest) -> String {
+/// Returns an error if arguments exceed maximum nesting depth.
+pub fn hash_request(request: &ToolCallRequest) -> Result<String, String> {
     let mut hasher = Sha256::new();
     hasher.update(request.method.as_bytes());
     hasher.update(request.name.as_bytes());
-    hasher.update(canonical_json(&request.arguments).as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher.update(canonical_json(&request.arguments)?.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Maximum recursion depth for canonical JSON serialization.
@@ -645,38 +647,43 @@ const MAX_CANONICAL_JSON_DEPTH: usize = 64;
 /// is enabled via feature flags).
 ///
 /// Depth is capped at [`MAX_CANONICAL_JSON_DEPTH`] to prevent stack overflow
-/// from malicious deeply nested payloads.
-fn canonical_json(value: &serde_json::Value) -> String {
+/// from malicious deeply nested payloads. Returns an error if depth is exceeded
+/// rather than silently producing a sentinel that could cause hash collisions.
+fn canonical_json(value: &serde_json::Value) -> Result<String, String> {
     canonical_json_inner(value, 0)
 }
 
-fn canonical_json_inner(value: &serde_json::Value, depth: usize) -> String {
+fn canonical_json_inner(value: &serde_json::Value, depth: usize) -> Result<String, String> {
     if depth > MAX_CANONICAL_JSON_DEPTH {
-        return "\"<depth_exceeded>\"".to_string();
+        return Err(format!(
+            "JSON nesting depth exceeds maximum of {MAX_CANONICAL_JSON_DEPTH}"
+        ));
     }
 
     match value {
         serde_json::Value::Object(map) => {
             let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
             sorted.sort_by_key(|(k, _)| *k);
-            let entries: Vec<String> = sorted
-                .into_iter()
-                .map(|(k, v)| {
-                    let key_str = serde_json::to_string(k).unwrap_or_default();
-                    format!("{}:{}", key_str, canonical_json_inner(v, depth + 1))
-                })
-                .collect();
-            format!("{{{}}}", entries.join(","))
+            let mut entries = Vec::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                let key_str = serde_json::to_string(k).unwrap_or_default();
+                entries.push(format!(
+                    "{}:{}",
+                    key_str,
+                    canonical_json_inner(v, depth + 1)?
+                ));
+            }
+            Ok(format!("{{{}}}", entries.join(",")))
         }
         serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr
-                .iter()
-                .map(|v| canonical_json_inner(v, depth + 1))
-                .collect();
-            format!("[{}]", items.join(","))
+            let mut items = Vec::with_capacity(arr.len());
+            for v in arr {
+                items.push(canonical_json_inner(v, depth + 1)?);
+            }
+            Ok(format!("[{}]", items.join(",")))
         }
         // Leaf values (strings, numbers, bools, null) serialize deterministically
-        other => serde_json::to_string(other).unwrap_or_default(),
+        other => Ok(serde_json::to_string(other).unwrap_or_default()),
     }
 }
 
@@ -984,7 +991,8 @@ impl TaskStore {
             principal,
             ttl,
             on_timeout,
-        );
+        )
+        .map_err(|e| TaskError::Internal { details: e })?;
         let task_id = task.id.clone();
         let task_arc = Arc::new(task);
 
@@ -1638,7 +1646,8 @@ mod tests {
             test_principal(),
             Duration::from_secs(600),
             TimeoutAction::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(task.status, TaskStatus::Working);
         assert!(
@@ -1663,7 +1672,8 @@ mod tests {
             test_principal(),
             Duration::from_secs(600),
             TimeoutAction::default(),
-        );
+        )
+        .unwrap();
 
         task.transition(
             TaskStatus::InputRequired,
@@ -1692,7 +1702,8 @@ mod tests {
             test_principal(),
             Duration::from_secs(600),
             TimeoutAction::default(),
-        );
+        )
+        .unwrap();
 
         // Get to a terminal state
         task.transition(TaskStatus::InputRequired, None).unwrap();
@@ -1714,7 +1725,8 @@ mod tests {
             test_principal(),
             Duration::from_secs(600),
             TimeoutAction::default(),
-        );
+        )
+        .unwrap();
 
         // Correct expected status
         task.transition_if(TaskStatus::Working, TaskStatus::InputRequired, None)
@@ -2157,9 +2169,9 @@ mod tests {
             mcp_request_id: JsonRpcId::Number(1),
         };
 
-        let hash1 = hash_request(&req1);
-        let hash2 = hash_request(&req2);
-        let hash3 = hash_request(&req3);
+        let hash1 = hash_request(&req1).unwrap();
+        let hash2 = hash_request(&req2).unwrap();
+        let hash3 = hash_request(&req3).unwrap();
 
         // Same request produces same hash
         assert_eq!(hash1, hash2);
@@ -2199,7 +2211,10 @@ mod tests {
         };
 
         // Must produce identical hashes despite different key orders
-        assert_eq!(hash_request(&req_ab), hash_request(&req_ba));
+        assert_eq!(
+            hash_request(&req_ab).unwrap(),
+            hash_request(&req_ba).unwrap()
+        );
 
         // Nested objects should also be order-independent
         let nested_1 = serde_json::json!({"outer": {"z": 3, "a": 1}, "list": [1, 2]});
@@ -2218,7 +2233,10 @@ mod tests {
             mcp_request_id: JsonRpcId::Number(4),
         };
 
-        assert_eq!(hash_request(&req_nested_1), hash_request(&req_nested_2));
+        assert_eq!(
+            hash_request(&req_nested_1).unwrap(),
+            hash_request(&req_nested_2).unwrap()
+        );
     }
 
     /// Tests approval recording and state transition.
@@ -2511,12 +2529,12 @@ mod tests {
             deep = serde_json::json!({ "a": deep });
         }
 
-        // Should not stack overflow; contains depth sentinel
+        // Should not stack overflow; returns error on excessive depth
         let result = canonical_json(&deep);
+        assert!(result.is_err(), "Expected error for deeply nested JSON");
         assert!(
-            result.contains("<depth_exceeded>"),
-            "Expected depth sentinel in: {}",
-            &result[..result.len().min(200)]
+            result.unwrap_err().contains("nesting depth"),
+            "Error should mention nesting depth"
         );
     }
 
@@ -2528,7 +2546,7 @@ mod tests {
             "m": {"nested": "value"}
         });
 
-        let result = canonical_json(&json);
+        let result = canonical_json(&json).unwrap();
         // Keys must be sorted: a before m before z
         let a_pos = result.find("\"a\"").expect("missing key a");
         let m_pos = result.find("\"m\"").expect("missing key m");
