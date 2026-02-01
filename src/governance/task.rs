@@ -631,12 +631,27 @@ pub fn hash_request(request: &ToolCallRequest) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Maximum recursion depth for canonical JSON serialization.
+/// Matches `MAX_JSON_DEPTH` in `policy/engine.rs` for consistency.
+const MAX_CANONICAL_JSON_DEPTH: usize = 64;
+
 /// Produces a canonical JSON string with object keys sorted alphabetically.
 ///
 /// This ensures deterministic serialization regardless of the key insertion
 /// order used by `serde_json::Value` (which depends on whether `preserve_order`
 /// is enabled via feature flags).
+///
+/// Depth is capped at [`MAX_CANONICAL_JSON_DEPTH`] to prevent stack overflow
+/// from malicious deeply nested payloads.
 fn canonical_json(value: &serde_json::Value) -> String {
+    canonical_json_inner(value, 0)
+}
+
+fn canonical_json_inner(value: &serde_json::Value, depth: usize) -> String {
+    if depth > MAX_CANONICAL_JSON_DEPTH {
+        return "\"<depth_exceeded>\"".to_string();
+    }
+
     match value {
         serde_json::Value::Object(map) => {
             let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
@@ -645,13 +660,16 @@ fn canonical_json(value: &serde_json::Value) -> String {
                 .into_iter()
                 .map(|(k, v)| {
                     let key_str = serde_json::to_string(k).unwrap_or_default();
-                    format!("{}:{}", key_str, canonical_json(v))
+                    format!("{}:{}", key_str, canonical_json_inner(v, depth + 1))
                 })
                 .collect();
             format!("{{{}}}", entries.join(","))
         }
         serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(canonical_json).collect();
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| canonical_json_inner(v, depth + 1))
+                .collect();
             format!("[{}]", items.join(","))
         }
         // Leaf values (strings, numbers, bools, null) serialize deterministically
@@ -2476,5 +2494,43 @@ mod tests {
             !store.by_principal.contains_key(&key),
             "by_principal should not contain the principal after all tasks cleaned up"
         );
+    }
+
+    // ========================================================================
+    // canonical_json Tests
+    // ========================================================================
+
+    #[test]
+    fn test_canonical_json_depth_limit() {
+        // Build deeply nested JSON: {"a": {"a": {"a": ... }}}
+        let mut deep = serde_json::json!("leaf");
+        for _ in 0..100 {
+            deep = serde_json::json!({ "a": deep });
+        }
+
+        // Should not stack overflow; contains depth sentinel
+        let result = canonical_json(&deep);
+        assert!(
+            result.contains("<depth_exceeded>"),
+            "Expected depth sentinel in: {}",
+            &result[..result.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn test_canonical_json_sorted_keys() {
+        let json = serde_json::json!({
+            "z": "last",
+            "a": "first",
+            "m": {"nested": "value"}
+        });
+
+        let result = canonical_json(&json);
+        // Keys must be sorted: a before m before z
+        let a_pos = result.find("\"a\"").expect("missing key a");
+        let m_pos = result.find("\"m\"").expect("missing key m");
+        let z_pos = result.find("\"z\"").expect("missing key z");
+        assert!(a_pos < m_pos, "a should come before m");
+        assert!(m_pos < z_pos, "m should come before z");
     }
 }
