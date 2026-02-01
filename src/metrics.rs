@@ -349,19 +349,48 @@ impl McpMetrics {
         }
     }
 
+    /// Normalize MCP method name to a bounded set of known labels.
+    ///
+    /// Prevents cardinality explosion from untrusted JSON-RPC method names.
+    /// Unknown methods map to `"unknown"` instead of creating unbounded
+    /// time-series that could exhaust metrics backend memory.
+    ///
+    /// Implements: REQ-OBS-001 (defense against cardinality attacks)
+    fn normalize_method(method: &str) -> &'static str {
+        match method {
+            "initialize" => "initialize",
+            "ping" => "ping",
+            "tools/call" => "tools/call",
+            "tools/list" => "tools/list",
+            "resources/read" => "resources/read",
+            "resources/list" => "resources/list",
+            "resources/subscribe" => "resources/subscribe",
+            "resources/unsubscribe" => "resources/unsubscribe",
+            "prompts/get" => "prompts/get",
+            "prompts/list" => "prompts/list",
+            "completion/complete" => "completion/complete",
+            "tasks/get" => "tasks/get",
+            "tasks/cancel" => "tasks/cancel",
+            m if m.starts_with("notifications/") => "notifications/*",
+            _ => "unknown",
+        }
+    }
+
     /// Record a completed MCP request.
+    ///
+    /// Method names are normalized to prevent cardinality explosion from
+    /// untrusted JSON-RPC input.
     pub fn record_request(&self, method: &str, outcome: &str, duration_secs: f64) {
+        let normalized = Self::normalize_method(method);
         self.mcp_requests_total.add(
             1,
             &[
-                KeyValue::new("method", method.to_string()),
+                KeyValue::new("method", normalized),
                 KeyValue::new("outcome", outcome.to_string()),
             ],
         );
-        self.mcp_request_duration_seconds.record(
-            duration_secs,
-            &[KeyValue::new("method", method.to_string())],
-        );
+        self.mcp_request_duration_seconds
+            .record(duration_secs, &[KeyValue::new("method", normalized)]);
     }
 
     /// Record policy evaluation duration.
@@ -608,5 +637,40 @@ mod tests {
 
         // Record policy eval duration
         metrics.record_policy_eval(0.001);
+    }
+
+    #[test]
+    fn test_method_normalization() {
+        // Known methods pass through
+        assert_eq!(McpMetrics::normalize_method("initialize"), "initialize");
+        assert_eq!(McpMetrics::normalize_method("ping"), "ping");
+        assert_eq!(McpMetrics::normalize_method("tools/call"), "tools/call");
+        assert_eq!(McpMetrics::normalize_method("tools/list"), "tools/list");
+        assert_eq!(
+            McpMetrics::normalize_method("resources/read"),
+            "resources/read"
+        );
+        assert_eq!(McpMetrics::normalize_method("prompts/get"), "prompts/get");
+        assert_eq!(
+            McpMetrics::normalize_method("completion/complete"),
+            "completion/complete"
+        );
+        assert_eq!(McpMetrics::normalize_method("tasks/get"), "tasks/get");
+        assert_eq!(McpMetrics::normalize_method("tasks/cancel"), "tasks/cancel");
+
+        // Notifications are wildcarded
+        assert_eq!(
+            McpMetrics::normalize_method("notifications/tools/list_changed"),
+            "notifications/*"
+        );
+        assert_eq!(
+            McpMetrics::normalize_method("notifications/anything"),
+            "notifications/*"
+        );
+
+        // Unknown methods map to "unknown" — prevents cardinality explosion
+        assert_eq!(McpMetrics::normalize_method("evil/attack"), "unknown");
+        assert_eq!(McpMetrics::normalize_method("method_1"), "unknown");
+        assert_eq!(McpMetrics::normalize_method(""), "unknown");
     }
 }
