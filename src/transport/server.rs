@@ -1550,22 +1550,32 @@ async fn handle_task_method(
 /// Returns TaskNotFound (not "access denied") to prevent information leakage
 /// about tasks owned by other principals.
 ///
-/// If principal inference fails (no K8s identity and dev mode is off),
-/// verification is skipped. This is safe because task creation also requires
-/// principal inference — if identity cannot be established, no tasks will
-/// exist for the caller to access.
+/// Fails closed: if principal inference fails for any reason (I/O error,
+/// misconfiguration, spawn_blocking panic), access is denied rather than
+/// silently allowed.
 ///
 /// Implements: REQ-GOV-001/F-011 (Principal isolation)
 async fn verify_task_principal(
     state: &McpState,
     task_id: &crate::governance::task::TaskId,
 ) -> Result<(), ThoughtGateError> {
-    // If we can't infer principal, skip verification. This can happen in
-    // environments where identity is not configured. Task creation would
-    // also fail in such environments, providing defense-in-depth.
+    // Fail closed: if identity cannot be established, deny access.
+    // This prevents unauthorized access to tasks when identity inference
+    // fails due to I/O errors, misconfiguration, or spawn_blocking panics.
     let caller_principal = match tokio::task::spawn_blocking(infer_principal).await {
         Ok(Ok(p)) => Principal::new(&p.app_name),
-        _ => return Ok(()),
+        Ok(Err(e)) => {
+            warn!(error = %e, "Principal inference failed, denying task access");
+            return Err(ThoughtGateError::TaskNotFound {
+                task_id: task_id.to_string(),
+            });
+        }
+        Err(e) => {
+            warn!(error = %e, "Principal inference task panicked, denying task access");
+            return Err(ThoughtGateError::TaskNotFound {
+                task_id: task_id.to_string(),
+            });
+        }
     };
 
     let task = state
