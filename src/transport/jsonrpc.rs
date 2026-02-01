@@ -45,12 +45,15 @@ static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// with a monotonically increasing counter. This avoids the CSPRNG overhead
 /// of Uuid::new_v4() on every request while still producing unique 128-bit IDs.
 ///
-/// Note: The result is not a valid v4 UUID, but correlation IDs are internal-only
-/// and never validated by external systems.
+/// The result has correct v4 version and RFC 4122 variant bits set.
 pub fn fast_correlation_id() -> Uuid {
     let prefix = *CORRELATION_PREFIX;
     let counter = CORRELATION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let combined = ((prefix as u128) << 64) | (counter as u128);
+    let mut combined = ((prefix as u128) << 64) | (counter as u128);
+    // Set version 4 (bits 48-51 of the 128-bit value)
+    combined = (combined & !(0xF_u128 << 76)) | (0x4_u128 << 76);
+    // Set variant 1 - RFC 4122 (bits 64-65)
+    combined = (combined & !(0x3_u128 << 62)) | (0x2_u128 << 62);
     Uuid::from_u128(combined)
 }
 
