@@ -1171,7 +1171,7 @@ fn is_list_method(method: &str) -> bool {
 /// - For `action: forward` or `action: deny`: if client sent task metadata but
 ///   upstream doesn't support tasks, return TaskForbidden error
 fn validate_task_metadata(
-    request: &McpRequest,
+    request: &mut McpRequest,
     action: &crate::config::Action,
     tool_name: &str,
     upstream_supports_tasks: bool,
@@ -1189,12 +1189,15 @@ fn validate_task_metadata(
             }
         }
         crate::config::Action::Forward | crate::config::Action::Deny => {
-            // TaskForbidden: If client sent task metadata but upstream doesn't support tasks,
-            // we can't forward the task context. Return an error instead of silently dropping it.
+            // If client sent task metadata but upstream doesn't support tasks,
+            // strip the metadata and forward anyway. This avoids breaking forward
+            // compatibility as upstreams gradually add task support.
             if has_task_metadata && !upstream_supports_tasks {
-                return Err(ThoughtGateError::TaskForbidden {
-                    tool: tool_name.to_string(),
-                });
+                warn!(
+                    tool = %tool_name,
+                    "Stripping task metadata: upstream does not support tasks"
+                );
+                request.task_metadata = None;
             }
         }
     }
@@ -1578,7 +1581,7 @@ fn task_error_to_thoughtgate(error: crate::governance::TaskError) -> ThoughtGate
 /// ```
 async fn route_through_gates(
     state: &McpState,
-    request: McpRequest,
+    mut request: McpRequest,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
     let config = state
         .config
@@ -1680,7 +1683,7 @@ async fn route_through_gates(
     // Validate that client sent params.task for actions that require it
     // This is checked AFTER Gate 2 because we need to know the action first
     validate_task_metadata(
-        &request,
+        &mut request,
         &match_result.action,
         &resource_name,
         state.capability_cache.upstream_supports_tasks(),
