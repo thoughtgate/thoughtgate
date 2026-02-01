@@ -1023,6 +1023,10 @@ async fn handle_list_method(
                         "Gate 1: Filtered tools by visibility"
                     );
                 }
+            } else {
+                // Fail closed: source not in config, hide all tools
+                warn!(source = source_id, "Gate 1: source not in config, hiding all tools");
+                tools_arr.clear();
             }
 
             // Gate 2: Annotate execution.taskSupport based on governance rules
@@ -1086,6 +1090,10 @@ async fn handle_list_method(
                         "Gate 1: Filtered resources by visibility"
                     );
                 }
+            } else {
+                // Fail closed: source not in config, hide all resources
+                warn!(source = source_id, "Gate 1: source not in config, hiding all resources");
+                resources_arr.clear();
             }
 
             Ok(JsonRpcResponse::success(response.id, new_result))
@@ -1123,6 +1131,10 @@ async fn handle_list_method(
                         "Gate 1: Filtered prompts by visibility"
                     );
                 }
+            } else {
+                // Fail closed: source not in config, hide all prompts
+                warn!(source = source_id, "Gate 1: source not in config, hiding all prompts");
+                prompts_arr.clear();
             }
 
             Ok(JsonRpcResponse::success(response.id, new_result))
@@ -1593,11 +1605,11 @@ async fn route_through_gates(
     // Check if the tool is visible based on ExposeConfig
     // Implements: REQ-CFG-001 Section 9.3 (Exposure Filtering)
     //
-    // Note: If the source is not found in config, we skip the visibility check
-    // and continue to Gate 2. This is intentional for v0.2:
-    // - Single source mode uses hardcoded "upstream" as source_id
-    // - If no sources are configured, all resources are visible by default
-    // - Config validation should catch misconfigured sources at load time
+    // Note: If the source is not found in config, we fail closed (block the
+    // request). A missing source indicates a misconfiguration — the hardcoded
+    // "upstream" source_id doesn't match any configured source. Config
+    // validation should catch this at load time, but we enforce here as defense
+    // in depth.
 
     if let Some(source) = config.get_source(source_id) {
         let expose: crate::config::ExposeConfig = source.expose();
@@ -1615,13 +1627,18 @@ async fn route_through_gates(
         }
         debug!(resource = %resource_name, method = %request.method, "Gate 1 passed: resource is visible");
     } else {
-        // Source not found in config - skip visibility check
-        // This is expected in v0.2 when sources are not configured
-        debug!(
+        // Source not found in config — fail closed
+        // This indicates a misconfiguration (get_source_id returns a name
+        // that doesn't match any configured source). Allowing traffic through
+        // would bypass visibility checks entirely.
+        warn!(
             resource = %resource_name,
             source = %source_id,
-            "Gate 1 skipped: source not in config, allowing all resources"
+            "Gate 1 blocked: source not found in config"
         );
+        return Err(ThoughtGateError::ServiceUnavailable {
+            reason: format!("Source '{}' not found in configuration", source_id),
+        });
     }
 
     // ========================================================================
@@ -2594,13 +2611,14 @@ mod tests {
 
     /// Verifies: REQ-GOV-001/F-003 (tasks/get - invalid params)
     #[tokio::test]
-    async fn test_tasks_get_invalid_params() {
+    async fn test_tasks_get_missing_taskid_forwarded() {
         let state = create_test_state();
         let router = Router::new()
             .route("/mcp/v1", post(handle_mcp_request))
             .with_state(state);
 
-        // Request tasks/get with missing taskId
+        // Request tasks/get with missing taskId — forwarded to upstream
+        // (no tg_ prefix means it's not a local task)
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{}}"#;
         let request = Request::builder()
             .method("POST")
@@ -2615,13 +2633,11 @@ mod tests {
         let body = response_body(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("should parse response");
 
-        // Should be an error response with invalid params code
-        assert!(parsed.get("error").is_some(), "Should have error");
-        let error = &parsed["error"];
-        assert_eq!(
-            error["code"].as_i64().unwrap(),
-            -32602,
-            "Should be InvalidParams error code"
+        // Without a tg_ taskId, the router forwards to upstream (PassThrough)
+        // MockUpstream returns a success response
+        assert!(
+            parsed.get("result").is_some(),
+            "Should be forwarded to upstream (success response)"
         );
     }
 
