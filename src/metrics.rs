@@ -371,6 +371,8 @@ impl McpMetrics {
             "completion/complete" => "completion/complete",
             "tasks/get" => "tasks/get",
             "tasks/cancel" => "tasks/cancel",
+            "tasks/list" => "tasks/list",
+            "tasks/result" => "tasks/result",
             m if m.starts_with("notifications/") => "notifications/*",
             _ => "unknown",
         }
@@ -657,6 +659,8 @@ mod tests {
         );
         assert_eq!(McpMetrics::normalize_method("tasks/get"), "tasks/get");
         assert_eq!(McpMetrics::normalize_method("tasks/cancel"), "tasks/cancel");
+        assert_eq!(McpMetrics::normalize_method("tasks/list"), "tasks/list");
+        assert_eq!(McpMetrics::normalize_method("tasks/result"), "tasks/result");
 
         // Notifications are wildcarded
         assert_eq!(
