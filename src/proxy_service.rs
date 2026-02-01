@@ -358,29 +358,9 @@ impl ProxyService {
             .await
             .map_err(map_hyper_error)?;
 
-        // TODO(REQ-CORE-001 F-005): KNOWN LIMITATION - Timeout Wrapping
-        //
-        // Current State: TimeoutBody and ProxyBody wrappers exist but are not applied
-        // to the Green Path response bodies.
-        //
-        // Why: The current architecture returns `Response<Incoming>` directly from the
-        // client. Wrapping the body would change the return type to
-        // `Response<ProxyBody<TimeoutBody<Incoming>>>`, which would require:
-        // 1. Type erasure via BoxBody (adds allocation overhead)
-        // 2. Changes to Service trait implementation
-        // 3. Updates to all call sites in main.rs
-        //
-        // Impact: The proxy is vulnerable to slow-read attacks on the Green Path.
-        // Chunks can be delayed indefinitely without triggering timeouts.
-        //
-        // Remediation Path:
-        // 1. Change return type to use BoxBody for type erasure
-        // 2. Apply TimeoutBody wrapper with config from ProxyConfig
-        // 3. Apply ProxyBody wrapper for metrics and cancellation
-        // 4. Update Service trait and main.rs to handle boxed bodies
-        //
-        // Note: The Amber Path (BufferedForwarder) already has timeout protection
-        // via tokio::time::timeout wrapping the entire buffering operation.
+        // REQ-CORE-001 F-005: TimeoutBody is now applied to response bodies below,
+        // enforcing per-chunk (stream_read_timeout) and total (stream_total_timeout)
+        // timeouts to prevent slow-read attacks on the Green Path.
 
         // Log if upgrade was successful (REQ-CORE-001 F-004)
         if is_upgrade && is_upgrade_response(&upstream_res) {
@@ -419,9 +399,18 @@ impl ProxyService {
             // - Add integration test that verifies bidirectional data flow
         }
 
-        // Convert the Incoming body to UnifiedBody for type unification
+        // Convert the Incoming body to UnifiedBody for type unification.
+        // Wrap with TimeoutBody to enforce per-chunk and total stream timeouts,
+        // preventing slow-read attacks on the Green Path (REQ-CORE-001 F-005).
         let (parts, body) = upstream_res.into_parts();
-        let body_stream = BodyStream::new(body);
+
+        let timeout_config = crate::timeout::TimeoutConfig::new(
+            self.config.stream_read_timeout,
+            self.config.stream_total_timeout,
+        );
+        let timeout_body = crate::timeout::TimeoutBody::new(body, timeout_config);
+
+        let body_stream = BodyStream::new(timeout_body);
         let mapped_stream = body_stream.map(|result| {
             result.map_err(|e| ProxyError::Connection(format!("Body stream error: {}", e)))
         });
