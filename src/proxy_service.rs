@@ -121,14 +121,19 @@ impl ProxyService {
     /// - Native TLS root certificates cannot be loaded
     pub fn new_with_config(upstream_url: Option<String>, config: ProxyConfig) -> ProxyResult<Self> {
         // Install default crypto provider for rustls (required for TLS to work).
-        // Uses Once to ensure this is called exactly once, even if ProxyService
-        // is constructed multiple times (e.g., in tests).
-        static RUSTLS_INIT: std::sync::Once = std::sync::Once::new();
-        RUSTLS_INIT.call_once(|| {
+        // Uses OnceLock to ensure this is called exactly once and the result
+        // is captured for error reporting without panicking.
+        static RUSTLS_INIT: std::sync::OnceLock<Result<(), ()>> = std::sync::OnceLock::new();
+        let init_result = RUSTLS_INIT.get_or_init(|| {
             rustls::crypto::ring::default_provider()
                 .install_default()
-                .expect("BUG: failed to install rustls crypto provider");
+                .map_err(|_| ())
         });
+        if init_result.is_err() {
+            return Err(ProxyError::Connection(
+                "Failed to install rustls crypto provider".into(),
+            ));
+        }
 
         // Create HTTP connector with TCP_NODELAY enabled for upstream connections
         // Implements: REQ-CORE-001 F-001 (Latency - TCP_NODELAY on both legs)
