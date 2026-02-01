@@ -23,6 +23,7 @@
 //! 7. Return JSON-RPC response(s)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
     Router,
@@ -55,6 +56,20 @@ use crate::transport::jsonrpc::{
 use crate::transport::router::{McpRouter, RouteTarget, TaskMethod};
 use crate::transport::upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};
 use tokio_util::sync::CancellationToken;
+
+/// RAII guard that decrements the aggregate buffer counter on drop.
+///
+/// Ensures buffered_bytes is always decremented even if the handler panics.
+struct BufferGuard<'a> {
+    counter: &'a AtomicUsize,
+    size: usize,
+}
+
+impl<'a> Drop for BufferGuard<'a> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.size, Ordering::Release);
+    }
+}
 
 /// Configuration for the MCP server.
 ///
@@ -156,6 +171,10 @@ pub struct McpState {
     pub max_batch_size: usize,
     /// Capability cache for upstream detection (REQ-CORE-007)
     pub capability_cache: Arc<CapabilityCache>,
+    /// Current aggregate buffered bytes across all in-flight requests.
+    pub buffered_bytes: AtomicUsize,
+    /// Maximum aggregate buffered bytes before rejecting new requests.
+    pub max_aggregate_buffer: usize,
 }
 
 /// Configuration for the MCP handler.
@@ -169,6 +188,9 @@ pub struct McpHandlerConfig {
     pub max_concurrent_requests: usize,
     /// Maximum number of requests in a JSON-RPC batch
     pub max_batch_size: usize,
+    /// Maximum aggregate buffered bytes across all in-flight requests.
+    /// Prevents OOM when many concurrent requests buffer large bodies.
+    pub max_aggregate_buffer: usize,
 }
 
 impl Default for McpHandlerConfig {
@@ -177,6 +199,7 @@ impl Default for McpHandlerConfig {
             max_body_size: 1024 * 1024, // 1MB
             max_concurrent_requests: 10000,
             max_batch_size: 100,
+            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB
         }
     }
 }
@@ -188,6 +211,7 @@ impl McpHandlerConfig {
     ///
     /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
     /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
+    /// - `THOUGHTGATE_MAX_AGGREGATE_BUFFER` (default: 536870912 = 512MB): Max aggregate buffered bytes
     pub fn from_env() -> Self {
         let max_body_size: usize = std::env::var("THOUGHTGATE_MAX_REQUEST_BODY_BYTES")
             .ok()
@@ -204,10 +228,16 @@ impl McpHandlerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
 
+        let max_aggregate_buffer: usize = std::env::var("THOUGHTGATE_MAX_AGGREGATE_BUFFER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512 * 1024 * 1024); // 512MB default
+
         Self {
             max_body_size,
             max_concurrent_requests,
             max_batch_size,
+            max_aggregate_buffer,
         }
     }
 }
@@ -273,6 +303,8 @@ impl McpHandler {
             max_body_size: config.max_body_size,
             max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: config.max_aggregate_buffer,
         });
 
         Self { state }
@@ -300,6 +332,8 @@ impl McpHandler {
             max_body_size: config.max_body_size,
             max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: config.max_aggregate_buffer,
         });
 
         Self { state }
@@ -348,6 +382,8 @@ impl McpHandler {
             max_body_size: handler_config.max_body_size,
             max_batch_size: handler_config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: handler_config.max_aggregate_buffer,
         });
 
         Self { state }
@@ -540,6 +576,8 @@ impl McpServer {
             max_body_size: config.max_body_size,
             max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
         });
 
         Ok(Self {
@@ -579,6 +617,8 @@ impl McpServer {
             max_body_size: config.max_body_size,
             max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
         });
 
         Ok(Self {
@@ -630,6 +670,8 @@ impl McpServer {
             max_body_size: server_config.max_body_size,
             max_batch_size: server_config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
         });
 
         Ok(Self {
@@ -737,6 +779,31 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
         return error_bytes(None, &error, &correlation_id);
     }
 
+    // Track aggregate buffered bytes to prevent OOM.
+    // Increment before processing; decrement when this request completes.
+    let body_size = body.len();
+    let prev = state.buffered_bytes.fetch_add(body_size, Ordering::AcqRel);
+    if prev + body_size > state.max_aggregate_buffer {
+        state.buffered_bytes.fetch_sub(body_size, Ordering::Release);
+        let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
+        warn!(
+            correlation_id = %correlation_id,
+            buffered = prev + body_size,
+            limit = state.max_aggregate_buffer,
+            "Aggregate buffer limit exceeded"
+        );
+        let error = ThoughtGateError::RateLimited {
+            retry_after_secs: Some(1),
+        };
+        return error_bytes(None, &error, &correlation_id);
+    }
+
+    // Ensure we decrement buffered_bytes when this request completes.
+    let _buffer_guard = BufferGuard {
+        counter: &state.buffered_bytes,
+        size: body_size,
+    };
+
     // Parse JSON-RPC request(s) first to determine permit count
     // (generate unique correlation ID per REQ-CORE-004)
     let parsed = match parse_jsonrpc(&body) {
@@ -753,8 +820,7 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
         ParsedRequests::Single(_) => 1,
         ParsedRequests::Batch(requests) => {
             if requests.len() > state.max_batch_size {
-                let correlation_id =
-                    crate::transport::jsonrpc::fast_correlation_id().to_string();
+                let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
                 let error = ThoughtGateError::InvalidRequest {
                     details: format!(
                         "Batch size {} exceeds maximum of {}",
@@ -781,8 +847,8 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
             // Return HTTP 200 with JSON-RPC error per MCP spec.
             // MCP clients expect JSON-RPC error frames over HTTP 200, not HTTP 503.
             let error = ThoughtGateError::RateLimited {
-                    retry_after_secs: Some(1),
-                };
+                retry_after_secs: Some(1),
+            };
             let jsonrpc_error = error.to_jsonrpc_error(&correlation_id);
             let response = JsonRpcResponse::error(None, jsonrpc_error);
             let bytes = serde_json::to_vec(&response)
@@ -1037,7 +1103,10 @@ async fn handle_list_method(
                 }
             } else {
                 // Fail closed: source not in config, hide all tools
-                warn!(source = source_id, "Gate 1: source not in config, hiding all tools");
+                warn!(
+                    source = source_id,
+                    "Gate 1: source not in config, hiding all tools"
+                );
                 tools_arr.clear();
             }
 
@@ -1104,7 +1173,10 @@ async fn handle_list_method(
                 }
             } else {
                 // Fail closed: source not in config, hide all resources
-                warn!(source = source_id, "Gate 1: source not in config, hiding all resources");
+                warn!(
+                    source = source_id,
+                    "Gate 1: source not in config, hiding all resources"
+                );
                 resources_arr.clear();
             }
 
@@ -1145,7 +1217,10 @@ async fn handle_list_method(
                 }
             } else {
                 // Fail closed: source not in config, hide all prompts
-                warn!(source = source_id, "Gate 1: source not in config, hiding all prompts");
+                warn!(
+                    source = source_id,
+                    "Gate 1: source not in config, hiding all prompts"
+                );
                 prompts_arr.clear();
             }
 
@@ -2024,9 +2099,7 @@ async fn handle_batch_request_bytes(
 
                     let response = match result {
                         Ok(r) => r,
-                        Err(e) => {
-                            JsonRpcResponse::error(id, e.to_jsonrpc_error(&correlation_id))
-                        }
+                        Err(e) => JsonRpcResponse::error(id, e.to_jsonrpc_error(&correlation_id)),
                     };
                     Some(response)
                 }
@@ -2151,6 +2224,8 @@ mod tests {
             max_body_size: 1024 * 1024,
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         })
     }
 
@@ -2323,6 +2398,8 @@ mod tests {
             max_body_size: 1024 * 1024,
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         });
 
         let router = Router::new()
@@ -2342,7 +2419,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response_body(response).await;
-        assert!(body.contains("-32009"), "Expected RateLimited error code (-32009), got: {}", body);
+        assert!(
+            body.contains("-32009"),
+            "Expected RateLimited error code (-32009), got: {}",
+            body
+        );
     }
 
     /// Verifies: EC-MCP-004 (Body size limit returns JSON-RPC error)
@@ -2364,6 +2445,8 @@ mod tests {
             max_body_size: 10, // Very small limit
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         });
 
         // Router with DefaultBodyLimit disabled - we check size manually and return JSON-RPC error
@@ -2700,6 +2783,8 @@ mod tests {
             max_body_size: 1024 * 1024,
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         })
     }
 
@@ -2954,6 +3039,8 @@ mod tests {
             max_body_size: 1024 * 1024,
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         })
     }
 
