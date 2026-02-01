@@ -118,15 +118,22 @@ pub fn discriminate_traffic<B>(req: &Request<B>) -> TrafficType {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !content_type.contains("application/json") {
+    // Case-insensitive check per RFC 7231 Section 3.1.1.1
+    if !content_type
+        .to_ascii_lowercase()
+        .contains("application/json")
+    {
         return TrafficType::Http;
     }
 
     // Check 3: Path must be MCP endpoint
     // Standard: /mcp/v1
     // Also accept "/" for simple single-upstream deployments
+    // Normalize: collapse consecutive slashes, trim trailing slash
     let path = req.uri().path();
-    if path == "/mcp/v1" || path == "/" {
+    let normalized = normalize_path(path);
+    let normalized = normalized.as_str();
+    if normalized == "/mcp/v1" || normalized == "/" {
         return TrafficType::Mcp;
     }
 
@@ -156,6 +163,31 @@ pub fn discriminate_traffic<B>(req: &Request<B>) -> TrafficType {
 #[inline]
 pub fn is_mcp_request<B>(req: &Request<B>) -> bool {
     discriminate_traffic(req) == TrafficType::Mcp
+}
+
+/// Normalize a URL path by collapsing consecutive slashes and trimming trailing slash.
+///
+/// Prevents path confusion bypasses where `//mcp/v1` or `/mcp/v1/` would evade
+/// exact-match detection.
+fn normalize_path(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                result.push('/');
+            }
+            prev_slash = true;
+        } else {
+            result.push(ch);
+            prev_slash = false;
+        }
+    }
+    // Trim trailing slash (but keep "/" as-is)
+    if result.len() > 1 && result.ends_with('/') {
+        result.pop();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -318,6 +350,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(discriminate_traffic(&req), TrafficType::Http);
+    }
+
+    /// Test: Content-Type case insensitivity (RFC 7231)
+    #[test]
+    fn test_mcp_content_type_case_insensitive() {
+        for ct in [
+            "Application/JSON",
+            "APPLICATION/JSON",
+            "application/JSON",
+            "Application/Json; charset=utf-8",
+        ] {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/mcp/v1")
+                .header("content-type", ct)
+                .body(())
+                .unwrap();
+
+            assert_eq!(
+                discriminate_traffic(&req),
+                TrafficType::Mcp,
+                "Expected MCP for Content-Type: {}",
+                ct
+            );
+        }
+    }
+
+    /// Test: Path normalization (trailing slash, double slashes)
+    #[test]
+    fn test_mcp_path_normalization() {
+        for path in ["/mcp/v1/", "//mcp/v1", "/mcp//v1", "//mcp//v1//"] {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(())
+                .unwrap();
+
+            assert_eq!(
+                discriminate_traffic(&req),
+                TrafficType::Mcp,
+                "Expected MCP for path: {}",
+                path
+            );
+        }
+    }
+
+    /// Test: normalize_path helper
+    #[test]
+    fn test_normalize_path() {
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path("/mcp/v1"), "/mcp/v1");
+        assert_eq!(normalize_path("/mcp/v1/"), "/mcp/v1");
+        assert_eq!(normalize_path("//mcp/v1"), "/mcp/v1");
+        assert_eq!(normalize_path("/mcp//v1"), "/mcp/v1");
+        assert_eq!(normalize_path("//mcp//v1//"), "/mcp/v1");
     }
 
     /// Test: TrafficType Debug and Clone
