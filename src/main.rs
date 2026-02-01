@@ -78,8 +78,12 @@ struct Config {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 1: Initialize observability
+    // Use non-blocking writer to prevent logging from blocking the Tokio runtime.
+    // The _guard must be held for the lifetime of the program to ensure logs are flushed.
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .json()
+        .with_writer(non_blocking)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),

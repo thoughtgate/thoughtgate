@@ -41,6 +41,7 @@ tower-service = "0.3"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
 
 # CLI and config
 clap = { version = "4", features = ["derive", "env"] }
