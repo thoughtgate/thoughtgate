@@ -508,37 +508,50 @@ impl UpstreamClient {
             }
         }
 
-        // Read body with size limit (handles chunked responses without Content-Length)
-        let body = response.bytes().await.map_err(|e| {
+        // Stream body chunk-by-chunk with size enforcement.
+        // This prevents unbounded memory growth for chunked responses
+        // that lack a Content-Length header.
+        let mut buf = Vec::with_capacity(
+            response
+                .content_length()
+                .map(|cl| cl as usize)
+                .unwrap_or(8192)
+                .min(max_size),
+        );
+
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
             error!(
                 correlation_id = %correlation_id,
                 error = %e,
-                "Failed to read upstream response body"
+                "Failed to read upstream response body chunk"
             );
             ThoughtGateError::UpstreamError {
                 code: -32002,
                 message: format!("Failed to read upstream response: {}", e),
             }
-        })?;
-
-        if body.len() > max_size {
-            warn!(
-                correlation_id = %correlation_id,
-                body_size = body.len(),
-                max_response_size = max_size,
-                "Upstream response exceeds size limit (actual body)"
-            );
-            return Err(ThoughtGateError::UpstreamError {
-                code: -32002,
-                message: format!(
-                    "Upstream response too large: {} bytes exceeds {} byte limit",
-                    body.len(),
-                    max_size
-                ),
-            });
+        })? {
+            if buf.len() + chunk.len() > max_size {
+                warn!(
+                    correlation_id = %correlation_id,
+                    accumulated = buf.len(),
+                    chunk_size = chunk.len(),
+                    max_response_size = max_size,
+                    "Upstream response exceeds size limit during streaming"
+                );
+                return Err(ThoughtGateError::UpstreamError {
+                    code: -32002,
+                    message: format!(
+                        "Upstream response too large: >={} bytes exceeds {} byte limit",
+                        buf.len() + chunk.len(),
+                        max_size
+                    ),
+                });
+            }
+            buf.extend_from_slice(&chunk);
         }
 
-        Ok(body)
+        Ok(buf.into())
     }
 
     /// Classify a reqwest error into ThoughtGateError.

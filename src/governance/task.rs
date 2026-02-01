@@ -869,6 +869,19 @@ impl TaskStore {
         &self.config
     }
 
+    /// Decrements both global and per-principal pending counters.
+    ///
+    /// Must be called exactly once when a task transitions from non-terminal
+    /// to terminal. Caller is responsible for ensuring the task was previously
+    /// non-terminal (i.e., `was_terminal == false`).
+    fn decrement_pending_counters(&self, task: &Task) {
+        self.pending_count.fetch_sub(1, Ordering::Release);
+        let principal_key = task.principal.rate_limit_key();
+        if let Some(counter) = self.pending_by_principal.get(&principal_key) {
+            counter.fetch_sub(1, Ordering::Release);
+        }
+    }
+
     /// Returns the number of pending (non-terminal) tasks.
     ///
     /// Implements: REQ-GOV-001/F-009.3
@@ -1006,13 +1019,7 @@ impl TaskStore {
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Release);
-            // Decrement per-principal counter
-            let principal_key = entry.task.principal.rate_limit_key();
-            if let Some(counter) = self.pending_by_principal.get(&principal_key) {
-                counter.fetch_sub(1, Ordering::Release);
-            }
-            // Notify any waiters
+            self.decrement_pending_counters(&entry.task);
             entry.notify.notify_waiters();
         }
 
@@ -1042,13 +1049,7 @@ impl TaskStore {
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Release);
-            // Decrement per-principal counter
-            let principal_key = entry.task.principal.rate_limit_key();
-            if let Some(counter) = self.pending_by_principal.get(&principal_key) {
-                counter.fetch_sub(1, Ordering::Release);
-            }
-            // Notify any waiters
+            self.decrement_pending_counters(&entry.task);
             entry.notify.notify_waiters();
         }
 
@@ -1109,7 +1110,7 @@ impl TaskStore {
 
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Release);
+            self.decrement_pending_counters(&entry.task);
             entry.notify.notify_waiters();
         }
 
@@ -1149,7 +1150,7 @@ impl TaskStore {
             )?;
         }
         entry.terminal_at = Some(Utc::now());
-        self.pending_count.fetch_sub(1, Ordering::Release);
+        self.decrement_pending_counters(&entry.task);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -1212,7 +1213,7 @@ impl TaskStore {
         entry.terminal_at = Some(Utc::now());
 
         if !was_terminal {
-            self.pending_count.fetch_sub(1, Ordering::Release);
+            self.decrement_pending_counters(&entry.task);
         }
         entry.notify.notify_waiters();
 
@@ -1259,7 +1260,7 @@ impl TaskStore {
             Some("Cancelled by agent".to_string()),
         )?;
         entry.terminal_at = Some(Utc::now());
-        self.pending_count.fetch_sub(1, Ordering::Release);
+        self.decrement_pending_counters(&entry.task);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -1298,7 +1299,7 @@ impl TaskStore {
                         .is_ok()
                 {
                     entry.terminal_at = Some(now);
-                    self.pending_count.fetch_sub(1, Ordering::Release);
+                    self.decrement_pending_counters(&entry.task);
                     entry.notify.notify_waiters();
                     expired += 1;
                     tracing::warn!(
