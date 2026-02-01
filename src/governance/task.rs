@@ -1149,6 +1149,35 @@ impl TaskStore {
         Ok(Arc::new(entry.task.clone()))
     }
 
+    /// Records an execution result on an auto-approved expired task.
+    ///
+    /// Unlike `complete()`, this does not transition the task status (it stays
+    /// `Expired`). It records the result and approval for audit purposes so
+    /// that the task shows evidence of execution after auto-approval.
+    pub fn record_auto_approve_result(
+        &self,
+        task_id: &TaskId,
+        result: ToolCallResult,
+        approval: super::ApprovalRecord,
+    ) -> Result<(), TaskError> {
+        let mut entry = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| TaskError::NotFound {
+                task_id: task_id.clone(),
+            })?;
+
+        entry.task.result = Some(result);
+        entry.task.approval = Some(approval);
+        entry.task.transitions.push(TaskTransition {
+            from: TaskStatus::Expired,
+            to: TaskStatus::Expired, // Status doesn't change (terminal)
+            at: Utc::now(),
+            reason: Some("Auto-approved after expiration; executed successfully".to_string()),
+        });
+        Ok(())
+    }
+
     /// Marks a task as failed with failure info.
     ///
     /// Implements: REQ-GOV-001 (called by REQ-GOV-002)
