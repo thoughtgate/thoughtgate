@@ -906,7 +906,14 @@ impl TaskStore {
         self.pending_count.fetch_sub(1, Ordering::Release);
         let principal_key = task.principal.rate_limit_key();
         if let Some(counter) = self.pending_by_principal.get(&principal_key) {
-            counter.fetch_sub(1, Ordering::Release);
+            let prev = counter.fetch_sub(1, Ordering::Release);
+            drop(counter);
+            // Clean up entry when count reaches zero to prevent unbounded growth
+            // of the DashMap with stale zero-valued entries.
+            if prev == 1 {
+                self.pending_by_principal
+                    .remove_if(&principal_key, |_, v| v.load(Ordering::Acquire) == 0);
+            }
         }
     }
 
