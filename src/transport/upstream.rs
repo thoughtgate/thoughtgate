@@ -849,4 +849,79 @@ mod tests {
             assert!(details.contains("invalid"));
         }
     }
+
+    // ========================================================================
+    // read_body_limited Tests
+    // ========================================================================
+
+    /// Tests that responses within the size limit are read successfully.
+    #[tokio::test]
+    async fn test_read_body_limited_within_limit() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello"))
+            .mount(&mock_server)
+            .await;
+
+        let config = UpstreamConfig {
+            base_url: mock_server.uri(),
+            max_response_size: 1024,
+            ..UpstreamConfig::default()
+        };
+        let client = UpstreamClient::new(config).unwrap();
+
+        let response = client
+            .client
+            .post(format!("{}/", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let body = client.read_body_limited(response, "test-123").await;
+        assert!(body.is_ok());
+        assert_eq!(&body.unwrap()[..], b"hello");
+    }
+
+    /// Tests that responses exceeding the limit via Content-Length are rejected early.
+    #[tokio::test]
+    async fn test_read_body_limited_content_length_exceeds() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let large_body = vec![b'x'; 2048];
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(large_body))
+            .mount(&mock_server)
+            .await;
+
+        let config = UpstreamConfig {
+            base_url: mock_server.uri(),
+            max_response_size: 1024, // Smaller than body
+            ..UpstreamConfig::default()
+        };
+        let client = UpstreamClient::new(config).unwrap();
+
+        let response = client
+            .client
+            .post(format!("{}/", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client.read_body_limited(response, "test-456").await;
+        assert!(result.is_err());
+        match result {
+            Err(ThoughtGateError::UpstreamError { message, .. }) => {
+                assert!(
+                    message.contains("too large"),
+                    "Expected 'too large' in: {message}"
+                );
+            }
+            other => panic!("Expected UpstreamError, got: {other:?}"),
+        }
+    }
 }
