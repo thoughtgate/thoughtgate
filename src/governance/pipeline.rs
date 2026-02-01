@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::inspector::{Decision, InspectionContext, Inspector};
 use crate::policy::engine::CedarEngine;
@@ -789,10 +788,10 @@ fn to_mcp_request(request: &ToolCallRequest) -> McpRequest {
     McpRequest {
         id,
         method: request.method.clone(),
-        params,
+        params: params.map(std::sync::Arc::new),
         task_metadata: None,
         received_at: Instant::now(),
-        correlation_id: Uuid::new_v4(),
+        correlation_id: crate::transport::jsonrpc::fast_correlation_id(),
     }
 }
 

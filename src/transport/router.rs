@@ -365,7 +365,7 @@ mod tests {
         let req = McpRequest {
             id: Some(JsonRpcId::String("test-id".to_string())),
             method: "tools/call".to_string(),
-            params: Some(serde_json::json!({"name": "test"})),
+            params: Some(std::sync::Arc::new(serde_json::json!({"name": "test"}))),
             task_metadata: None,
             received_at: Instant::now(),
             correlation_id,

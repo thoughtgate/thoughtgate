@@ -50,8 +50,7 @@ use crate::protocol::{
     strip_sse_capability,
 };
 use crate::transport::jsonrpc::{
-    JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, PromptDefinition, ResourceDefinition,
-    TaskSupport, ToolDefinition, ToolExecution, parse_jsonrpc,
+    JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
 };
 use crate::transport::router::{McpRouter, RouteTarget, TaskMethod};
 use crate::transport::upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};
@@ -728,7 +727,7 @@ async fn handle_mcp_request(State(state): State<Arc<McpState>>, body: Bytes) -> 
 async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, Bytes) {
     // Check body size limit (generate unique correlation ID per REQ-CORE-004)
     if body.len() > state.max_body_size {
-        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
         let error = ThoughtGateError::InvalidRequest {
             details: format!(
                 "Request body exceeds maximum size of {} bytes",
@@ -743,7 +742,7 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
     let _permit = match state.semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
             warn!(
                 correlation_id = %correlation_id,
                 "Max concurrent requests reached, returning 503"
@@ -769,7 +768,7 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
     let parsed = match parse_jsonrpc(&body) {
         Ok(p) => p,
         Err(e) => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
             return error_bytes(None, &e, &correlation_id);
         }
     };
@@ -777,7 +776,7 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
     match parsed {
         ParsedRequests::Single(request) => handle_single_request_bytes(state, request).await,
         ParsedRequests::Batch(ref requests) if requests.len() > state.max_batch_size => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
             let error = ThoughtGateError::InvalidRequest {
                 details: format!(
                     "Batch size {} exceeds maximum of {}",
@@ -994,33 +993,33 @@ async fn handle_list_method(
     // Per REQ-CORE-003/F-003: Gate 1 applies to tools, resources, and prompts
     match request.method.as_str() {
         "tools/list" => {
-            let tools_value = match result.get("tools") {
-                Some(v) => v,
+            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
+            let mut new_result = result.clone();
+            let tools_arr = match new_result
+                .as_object_mut()
+                .and_then(|obj| obj.get_mut("tools"))
+                .and_then(|v| v.as_array_mut())
+            {
+                Some(arr) => arr,
                 None => return Ok(response),
-            };
-
-            // Parse tools into ToolDefinition structs
-            let mut tools: Vec<ToolDefinition> = match serde_json::from_value(tools_value.clone()) {
-                Ok(t) => t,
-                Err(e) => {
-                    // Fail closed: do not pass unfiltered tools to client (Gate 1 bypass)
-                    return Err(ThoughtGateError::ServiceUnavailable {
-                        reason: format!("Failed to parse upstream tools response: {e}"),
-                    });
-                }
             };
 
             // Gate 1: Filter by visibility (ExposeConfig)
             if let Some(source) = config.get_source(source_id) {
                 let expose = source.expose();
-                let original_count = tools.len();
-                tools.retain(|tool| expose.is_visible(&tool.name));
-                let filtered_count = original_count - tools.len();
+                let original_count = tools_arr.len();
+                tools_arr.retain(|tool| {
+                    tool.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|name| expose.is_visible(name))
+                        .unwrap_or(false) // Fail closed: hide unparseable tools
+                });
+                let filtered_count = original_count - tools_arr.len();
                 if filtered_count > 0 {
                     debug!(
                         source = source_id,
                         filtered = filtered_count,
-                        remaining = tools.len(),
+                        remaining = tools_arr.len(),
                         "Gate 1: Filtered tools by visibility"
                     );
                 }
@@ -1028,15 +1027,22 @@ async fn handle_list_method(
 
             // Gate 2: Annotate execution.taskSupport based on governance rules
             // Per MCP Tasks Specification (Protocol Revision 2025-11-25)
-            for tool in &mut tools {
-                let match_result = config.governance.evaluate(&tool.name, source_id);
+            for tool in tools_arr.iter_mut() {
+                let tool_name = match tool.get("name").and_then(|n| n.as_str()) {
+                    Some(name) => name,
+                    None => continue,
+                };
+                let match_result = config.governance.evaluate(tool_name, source_id);
                 match match_result.action {
                     crate::config::Action::Approve | crate::config::Action::Policy => {
                         // ThoughtGate requires async task mode for approval/policy actions
                         // Set execution.taskSupport = "required" per MCP spec
-                        tool.execution = Some(ToolExecution {
-                            task_support: Some(TaskSupport::Required),
-                        });
+                        if let Some(obj) = tool.as_object_mut() {
+                            obj.insert(
+                                "execution".to_string(),
+                                serde_json::json!({"taskSupport": "required"}),
+                            );
+                        }
                     }
                     crate::config::Action::Forward | crate::config::Action::Deny => {
                         // Preserve upstream's execution.taskSupport (don't modify)
@@ -1045,117 +1051,78 @@ async fn handle_list_method(
                 }
             }
 
-            // Rebuild response with filtered/annotated tools
-            let mut new_result = result.clone();
-            if let Some(obj) = new_result.as_object_mut() {
-                obj.insert(
-                    "tools".to_string(),
-                    serde_json::to_value(&tools).map_err(|e| {
-                        ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to serialize filtered tools: {e}"),
-                        }
-                    })?,
-                );
-            }
-
             Ok(JsonRpcResponse::success(response.id, new_result))
         }
         "resources/list" => {
-            let resources_value = match result.get("resources") {
-                Some(v) => v,
+            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
+            let mut new_result = result.clone();
+            let resources_arr = match new_result
+                .as_object_mut()
+                .and_then(|obj| obj.get_mut("resources"))
+                .and_then(|v| v.as_array_mut())
+            {
+                Some(arr) => arr,
                 None => return Ok(response),
             };
-
-            // Parse resources into ResourceDefinition structs
-            let mut resources: Vec<ResourceDefinition> =
-                match serde_json::from_value(resources_value.clone()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // Fail closed: do not pass unfiltered resources to client (Gate 1 bypass)
-                        return Err(ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to parse upstream resources response: {e}"),
-                        });
-                    }
-                };
 
             // Gate 1: Filter by visibility (ExposeConfig)
             // Resources are filtered by URI pattern
             if let Some(source) = config.get_source(source_id) {
                 let expose = source.expose();
-                let original_count = resources.len();
-                resources.retain(|resource| expose.is_visible(&resource.uri));
-                let filtered_count = original_count - resources.len();
+                let original_count = resources_arr.len();
+                resources_arr.retain(|resource| {
+                    resource
+                        .get("uri")
+                        .and_then(|u| u.as_str())
+                        .map(|uri| expose.is_visible(uri))
+                        .unwrap_or(false) // Fail closed: hide unparseable resources
+                });
+                let filtered_count = original_count - resources_arr.len();
                 if filtered_count > 0 {
                     debug!(
                         source = source_id,
                         filtered = filtered_count,
-                        remaining = resources.len(),
+                        remaining = resources_arr.len(),
                         "Gate 1: Filtered resources by visibility"
                     );
                 }
             }
 
-            // Rebuild response with filtered resources
-            let mut new_result = result.clone();
-            if let Some(obj) = new_result.as_object_mut() {
-                obj.insert(
-                    "resources".to_string(),
-                    serde_json::to_value(&resources).map_err(|e| {
-                        ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to serialize filtered resources: {e}"),
-                        }
-                    })?,
-                );
-            }
-
             Ok(JsonRpcResponse::success(response.id, new_result))
         }
         "prompts/list" => {
-            let prompts_value = match result.get("prompts") {
-                Some(v) => v,
+            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
+            let mut new_result = result.clone();
+            let prompts_arr = match new_result
+                .as_object_mut()
+                .and_then(|obj| obj.get_mut("prompts"))
+                .and_then(|v| v.as_array_mut())
+            {
+                Some(arr) => arr,
                 None => return Ok(response),
             };
-
-            // Parse prompts into PromptDefinition structs
-            let mut prompts: Vec<PromptDefinition> =
-                match serde_json::from_value(prompts_value.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // Fail closed: do not pass unfiltered prompts to client (Gate 1 bypass)
-                        return Err(ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to parse upstream prompts response: {e}"),
-                        });
-                    }
-                };
 
             // Gate 1: Filter by visibility (ExposeConfig)
             // Prompts are filtered by name pattern
             if let Some(source) = config.get_source(source_id) {
                 let expose = source.expose();
-                let original_count = prompts.len();
-                prompts.retain(|prompt| expose.is_visible(&prompt.name));
-                let filtered_count = original_count - prompts.len();
+                let original_count = prompts_arr.len();
+                prompts_arr.retain(|prompt| {
+                    prompt
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|name| expose.is_visible(name))
+                        .unwrap_or(false) // Fail closed: hide unparseable prompts
+                });
+                let filtered_count = original_count - prompts_arr.len();
                 if filtered_count > 0 {
                     debug!(
                         source = source_id,
                         filtered = filtered_count,
-                        remaining = prompts.len(),
+                        remaining = prompts_arr.len(),
                         "Gate 1: Filtered prompts by visibility"
                     );
                 }
-            }
-
-            // Rebuild response with filtered prompts
-            let mut new_result = result.clone();
-            if let Some(obj) = new_result.as_object_mut() {
-                obj.insert(
-                    "prompts".to_string(),
-                    serde_json::to_value(&prompts).map_err(|e| {
-                        ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to serialize filtered prompts: {e}"),
-                        }
-                    })?,
-                );
             }
 
             Ok(JsonRpcResponse::success(response.id, new_result))
@@ -1338,7 +1305,11 @@ async fn handle_task_method(
     request: &McpRequest,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
     // Extract params, defaulting to empty object
-    let params = request.params.clone().unwrap_or(serde_json::json!({}));
+    let params = request
+        .params
+        .as_deref()
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     match method {
         TaskMethod::Get => {
@@ -1985,7 +1956,7 @@ async fn handle_batch_request_bytes(
         match item {
             BatchItem::Invalid { id, error } => {
                 // EC-MCP-006: Include error response for invalid items
-                let correlation_id = uuid::Uuid::new_v4().to_string();
+                let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
                 responses.push(JsonRpcResponse::error(
                     id,
                     error.to_jsonrpc_error(&correlation_id),

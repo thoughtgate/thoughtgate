@@ -16,10 +16,43 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::error::ThoughtGateError;
+
+// ============================================================================
+// Fast Correlation ID Generator
+// ============================================================================
+
+/// Startup prefix derived from a single Uuid::new_v4() call.
+/// The upper 64 bits provide process-level uniqueness.
+static CORRELATION_PREFIX: LazyLock<u64> = LazyLock::new(|| {
+    let seed = Uuid::new_v4().as_u128();
+    (seed >> 64) as u64
+});
+
+/// Monotonically increasing counter for the lower 64 bits.
+static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a fast correlation ID using a counter-based approach.
+///
+/// Combines a process-unique prefix (from a single Uuid::new_v4() at startup)
+/// with a monotonically increasing counter. This avoids the CSPRNG overhead
+/// of Uuid::new_v4() on every request while still producing unique 128-bit IDs.
+///
+/// Note: The result is not a valid v4 UUID, but correlation IDs are internal-only
+/// and never validated by external systems.
+pub fn fast_correlation_id() -> Uuid {
+    let prefix = *CORRELATION_PREFIX;
+    let counter = CORRELATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let combined = ((prefix as u128) << 64) | (counter as u128);
+    Uuid::from_u128(combined)
+}
 
 // ============================================================================
 // MCP Tasks Protocol Types (Protocol Revision 2025-11-25)
@@ -288,15 +321,15 @@ const JSONRPC_VERSION: &str = "2.0";
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcRequest {
     /// Always "2.0"
-    pub jsonrpc: String,
+    pub jsonrpc: Cow<'static, str>,
     /// Request ID (None for notifications)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<JsonRpcId>,
     /// Method name
     pub method: String,
-    /// Method parameters
+    /// Method parameters (Arc-wrapped for O(1) clone)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
+    pub params: Option<Arc<Value>>,
 }
 
 impl JsonRpcRequest {
@@ -325,7 +358,7 @@ impl JsonRpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
     /// Always "2.0"
-    pub jsonrpc: String,
+    pub jsonrpc: Cow<'static, str>,
     /// Request ID - always serialized (None becomes null per JSON-RPC 2.0 spec)
     pub id: Option<JsonRpcId>,
     /// Result (mutually exclusive with error)
@@ -347,7 +380,7 @@ impl JsonRpcResponse {
     /// * `result` - The result value
     pub fn success(id: Option<JsonRpcId>, result: Value) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: Some(result),
             error: None,
@@ -366,7 +399,7 @@ impl JsonRpcResponse {
     /// * `error` - The JSON-RPC error object
     pub fn error(id: Option<JsonRpcId>, error: crate::error::jsonrpc::JsonRpcError) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: None,
             error: Some(error),
@@ -397,7 +430,7 @@ impl JsonRpcResponse {
         poll_interval: std::time::Duration,
     ) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
             result: Some(serde_json::json!({
                 "taskId": task_id,
@@ -433,8 +466,8 @@ pub struct McpRequest {
     pub id: Option<JsonRpcId>,
     /// Method name
     pub method: String,
-    /// Method parameters
-    pub params: Option<Value>,
+    /// Method parameters (Arc-wrapped for O(1) clone on the forward path)
+    pub params: Option<Arc<Value>>,
     /// SEP-1686 task metadata (if present)
     pub task_metadata: Option<TaskMetadata>,
     /// Timestamp when request was received
@@ -470,7 +503,7 @@ impl McpRequest {
     /// Implements: REQ-CORE-003/F-004 (Request Forwarding)
     pub fn to_jsonrpc_request(&self) -> JsonRpcRequest {
         JsonRpcRequest {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id: self.id.clone(),
             method: self.method.clone(),
             params: self.params.clone(),
@@ -532,20 +565,49 @@ pub enum ParsedRequests {
 /// - EC-MCP-003: Missing jsonrpc field returns InvalidRequest
 /// - EC-MCP-006: Empty batch returns InvalidRequest
 pub fn parse_jsonrpc(bytes: &[u8]) -> Result<ParsedRequests, ThoughtGateError> {
-    // F-001.5: Parse JSON
-    let value: Value = serde_json::from_slice(bytes).map_err(|e| ThoughtGateError::ParseError {
-        details: format!("Invalid JSON: {}", e),
-    })?;
+    // Peek at the first non-whitespace byte to determine single vs batch
+    // without parsing the entire payload into an intermediate Value.
+    let first_byte = bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .ok_or_else(|| ThoughtGateError::ParseError {
+            details: "Invalid JSON: empty input".to_string(),
+        })?;
 
-    match value {
-        Value::Array(arr) => {
-            // F-001.2: Batch request
+    match first_byte {
+        b'{' => {
+            // F-001.1: Single request fast path — deserialize directly to
+            // RawJsonRpcRequest, skipping the intermediate Value allocation.
+            let raw: RawJsonRpcRequest = serde_json::from_slice(bytes).map_err(|e| {
+                // Distinguish syntax errors (bad JSON) from semantic errors
+                // (valid JSON but invalid field values like float IDs).
+                if e.is_syntax() || e.is_eof() {
+                    ThoughtGateError::ParseError {
+                        details: format!("Invalid JSON: {}", e),
+                    }
+                } else {
+                    ThoughtGateError::InvalidRequest {
+                        details: format!("Invalid JSON-RPC structure: {}", e),
+                    }
+                }
+            })?;
+            Ok(ParsedRequests::Single(parse_single_from_raw(raw)?))
+        }
+        b'[' => {
+            // F-001.2: Batch request — parse into Vec<Value> because
+            // EC-MCP-006 requires extracting IDs from malformed items.
+            let arr: Vec<Value> =
+                serde_json::from_slice(bytes).map_err(|e| ThoughtGateError::ParseError {
+                    details: format!("Invalid JSON: {}", e),
+                })?;
+
             if arr.is_empty() {
                 // EC-MCP-006: Empty batch
                 return Err(ThoughtGateError::InvalidRequest {
                     details: "Empty batch is not allowed".to_string(),
                 });
             }
+
             // EC-MCP-006: Collect mixed valid/invalid results
             let mut items = Vec::with_capacity(arr.len());
             for item in arr {
@@ -567,20 +629,26 @@ pub fn parse_jsonrpc(bytes: &[u8]) -> Result<ParsedRequests, ThoughtGateError> {
             }
             Ok(ParsedRequests::Batch(items))
         }
-        Value::Object(_) => {
-            // F-001.1: Single request
-            Ok(ParsedRequests::Single(parse_single_request(value)?))
-        }
         _ => {
-            // Invalid structure - neither object nor array
-            Err(ThoughtGateError::InvalidRequest {
-                details: "Request must be an object or array".to_string(),
-            })
+            // Attempt parse to get a proper serde error message
+            serde_json::from_slice::<Value>(bytes)
+                .map_err(|e| ThoughtGateError::ParseError {
+                    details: format!("Invalid JSON: {}", e),
+                })
+                .and_then(|_| {
+                    // Parsed successfully but isn't object or array
+                    Err(ThoughtGateError::InvalidRequest {
+                        details: "Request must be an object or array".to_string(),
+                    })
+                })
         }
     }
 }
 
 /// Parse a single JSON-RPC 2.0 request from a JSON value.
+///
+/// Used for batch items where each element is already a `Value`.
+/// Delegates to [`parse_single_from_raw`] after deserialization.
 ///
 /// Implements: REQ-CORE-003/F-001 (Parse JSON-RPC 2.0)
 ///
@@ -597,7 +665,16 @@ fn parse_single_request(value: Value) -> Result<McpRequest, ThoughtGateError> {
         serde_json::from_value(value).map_err(|e| ThoughtGateError::InvalidRequest {
             details: format!("Invalid JSON-RPC structure: {}", e),
         })?;
+    parse_single_from_raw(raw)
+}
 
+/// Validate and convert a raw JSON-RPC request into an [`McpRequest`].
+///
+/// This is the shared validation core used by both the single-request fast
+/// path (direct `from_slice`) and the batch path (via `parse_single_request`).
+///
+/// Implements: REQ-CORE-003/F-001.6, F-001.7, F-003
+fn parse_single_from_raw(raw: RawJsonRpcRequest) -> Result<McpRequest, ThoughtGateError> {
     // F-001.6: Validate JSON-RPC version
     match raw.jsonrpc.as_deref() {
         Some("2.0") => {}
@@ -618,8 +695,8 @@ fn parse_single_request(value: Value) -> Result<McpRequest, ThoughtGateError> {
         details: "Missing required field: method".to_string(),
     })?;
 
-    // F-001.7: Generate correlation ID
-    let correlation_id = Uuid::new_v4();
+    // F-001.7: Generate correlation ID (counter-based, avoids CSPRNG per request)
+    let correlation_id = fast_correlation_id();
 
     // F-003: Extract SEP-1686 task metadata
     let task_metadata = extract_task_metadata(&raw.params);
@@ -627,7 +704,7 @@ fn parse_single_request(value: Value) -> Result<McpRequest, ThoughtGateError> {
     Ok(McpRequest {
         id: raw.id,
         method,
-        params: raw.params,
+        params: raw.params.map(Arc::new),
         task_metadata,
         received_at: Instant::now(),
         correlation_id,

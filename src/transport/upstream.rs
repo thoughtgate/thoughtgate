@@ -140,6 +140,8 @@ impl UpstreamConfig {
 pub struct UpstreamClient {
     client: Client,
     config: UpstreamConfig,
+    /// Pre-computed MCP endpoint URL (avoids `format!()` per request).
+    mcp_url: String,
 }
 
 impl UpstreamClient {
@@ -186,7 +188,13 @@ impl UpstreamClient {
                 correlation_id: format!("upstream-client-build-error: {}", e),
             })?;
 
-        Ok(Self { client, config })
+        let mcp_url = format!("{}/mcp/v1", config.base_url.trim_end_matches('/'));
+
+        Ok(Self {
+            client,
+            config,
+            mcp_url,
+        })
     }
 
     /// Perform a health check to verify upstream connectivity.
@@ -342,7 +350,7 @@ impl UpstreamClient {
         &self,
         request: &McpRequest,
     ) -> Result<JsonRpcResponse, ThoughtGateError> {
-        let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
+        let url = &self.mcp_url;
         let correlation_id = request.correlation_id.to_string();
 
         debug!(
@@ -357,7 +365,7 @@ impl UpstreamClient {
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .header("Content-Type", "application/json")
             .json(&jsonrpc_request)
             .send()
@@ -440,7 +448,7 @@ impl UpstreamClient {
             });
         }
 
-        let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
+        let url = &self.mcp_url;
 
         debug!(
             batch_size = requests.len(),
@@ -453,7 +461,7 @@ impl UpstreamClient {
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .header("Content-Type", "application/json")
             .json(&jsonrpc_requests)
             .send()

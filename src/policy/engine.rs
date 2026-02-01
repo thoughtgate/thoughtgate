@@ -31,9 +31,41 @@ use cedar_policy::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// Cached Cedar Entity Type Names
+// ============================================================================
+// These are parsed once at first access and reused for every evaluation,
+// avoiding repeated string parsing in the hot path.
+
+static ENTITY_TYPE_APP: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::App")
+        .expect("BUG: 'ThoughtGate::App' is a valid entity type name")
+});
+
+static ENTITY_TYPE_ACTION: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::Action")
+        .expect("BUG: 'ThoughtGate::Action' is a valid entity type name")
+});
+
+static ENTITY_TYPE_TOOL_CALL: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::ToolCall")
+        .expect("BUG: 'ThoughtGate::ToolCall' is a valid entity type name")
+});
+
+static ENTITY_TYPE_MCP_METHOD: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::McpMethod")
+        .expect("BUG: 'ThoughtGate::McpMethod' is a valid entity type name")
+});
+
+static ENTITY_TYPE_ROLE: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::Role")
+        .expect("BUG: 'ThoughtGate::Role' is a valid entity type name")
+});
 
 /// Cedar policy engine for ThoughtGate.
 ///
@@ -305,9 +337,7 @@ impl CedarEngine {
     ) -> Result<Request, PolicyError> {
         // Build principal UID
         let principal_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::App").map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid entity type: {}", e),
-            })?,
+            ENTITY_TYPE_APP.clone(),
             EntityId::from_str(&request.principal.app_name).map_err(|e| {
                 PolicyError::CedarError {
                     details: format!("Invalid principal ID: {}", e),
@@ -317,14 +347,12 @@ impl CedarEngine {
 
         // Build resource UID
         let (resource_type, resource_id) = match &request.resource {
-            CedarResource::ToolCall { name, .. } => ("ThoughtGate::ToolCall", name.clone()),
-            CedarResource::McpMethod { method, .. } => ("ThoughtGate::McpMethod", method.clone()),
+            CedarResource::ToolCall { name, .. } => (&*ENTITY_TYPE_TOOL_CALL, name.clone()),
+            CedarResource::McpMethod { method, .. } => (&*ENTITY_TYPE_MCP_METHOD, method.clone()),
         };
 
         let resource_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str(resource_type).map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid resource type: {}", e),
-            })?,
+            resource_type.clone(),
             EntityId::from_str(&resource_id).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid resource ID: {}", e),
             })?,
@@ -332,11 +360,7 @@ impl CedarEngine {
 
         // Build action UID
         let action_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::Action").map_err(|e| {
-                PolicyError::CedarError {
-                    details: format!("Invalid action type: {}", e),
-                }
-            })?,
+            ENTITY_TYPE_ACTION.clone(),
             EntityId::from_str(action_name).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid action ID: {}", e),
             })?,
@@ -360,7 +384,7 @@ impl CedarEngine {
         use cedar_policy::RestrictedExpression;
 
         // Build time context record
-        let mut time_fields = HashMap::new();
+        let mut time_fields = HashMap::with_capacity(3);
         time_fields.insert(
             "hour".to_string(),
             RestrictedExpression::new_long(ctx.time.hour as i64),
@@ -380,7 +404,7 @@ impl CedarEngine {
             })?;
 
         // Build main context record
-        let mut context_fields = HashMap::new();
+        let mut context_fields = HashMap::with_capacity(3);
         context_fields.insert(
             "policy_id".to_string(),
             RestrictedExpression::new_string(ctx.policy_id.clone()),
@@ -404,29 +428,42 @@ impl CedarEngine {
     fn build_entities_v2(&self, request: &CedarRequest) -> Result<Entities, PolicyError> {
         use cedar_policy::{Entity, RestrictedExpression};
 
-        let mut entities = vec![];
+        // Pre-allocate: 1 principal + 1 resource + N roles
+        let num_roles = request.principal.roles.len();
+        let mut entities = Vec::with_capacity(2 + num_roles);
 
-        // Build role UIDs first (needed for principal parent membership)
-        let mut role_uids = std::collections::HashSet::new();
+        // Single pass over roles: build both UIDs (for principal parents)
+        // and role Entity objects (for the entity set) in one loop.
+        let mut role_uids = std::collections::HashSet::with_capacity(num_roles);
         for role in &request.principal.roles {
             let role_uid = EntityUid::from_type_name_and_id(
-                EntityTypeName::from_str("ThoughtGate::Role").map_err(|e| {
-                    PolicyError::CedarError {
-                        details: format!("Invalid role type: {}", e),
-                    }
-                })?,
+                ENTITY_TYPE_ROLE.clone(),
                 EntityId::from_str(role).map_err(|e| PolicyError::CedarError {
                     details: format!("Invalid role ID: {}", e),
                 })?,
             );
+
+            let mut role_attrs = HashMap::with_capacity(1);
+            role_attrs.insert(
+                "name".to_string(),
+                RestrictedExpression::new_string(role.clone()),
+            );
+
+            let role_entity = Entity::new(
+                role_uid.clone(),
+                role_attrs,
+                std::collections::HashSet::new(),
+            )
+            .map_err(|e| PolicyError::CedarError {
+                details: format!("Failed to create role entity: {}", e),
+            })?;
+            entities.push(role_entity);
             role_uids.insert(role_uid);
         }
 
         // Build principal entity with attributes and role membership
         let principal_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::App").map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid entity type: {}", e),
-            })?,
+            ENTITY_TYPE_APP.clone(),
             EntityId::from_str(&request.principal.app_name).map_err(|e| {
                 PolicyError::CedarError {
                     details: format!("Invalid principal ID: {}", e),
@@ -434,7 +471,7 @@ impl CedarEngine {
             })?,
         );
 
-        let mut principal_attrs = HashMap::new();
+        let mut principal_attrs = HashMap::with_capacity(3);
         principal_attrs.insert(
             "name".to_string(),
             RestrictedExpression::new_string(request.principal.app_name.clone()),
@@ -449,12 +486,10 @@ impl CedarEngine {
         );
 
         // Include role UIDs as parents so `principal in Role::"admin"` checks work
-        let principal_entity =
-            Entity::new(principal_uid.clone(), principal_attrs, role_uids.clone()).map_err(
-                |e| PolicyError::CedarError {
-                    details: format!("Failed to create principal entity: {}", e),
-                },
-            )?;
+        let principal_entity = Entity::new(principal_uid.clone(), principal_attrs, role_uids)
+            .map_err(|e| PolicyError::CedarError {
+                details: format!("Failed to create principal entity: {}", e),
+            })?;
         entities.push(principal_entity);
 
         // Build resource entity with attributes (including arguments for ToolCall)
@@ -464,7 +499,7 @@ impl CedarEngine {
                 server,
                 arguments,
             } => {
-                let mut attrs = HashMap::new();
+                let mut attrs = HashMap::with_capacity(3);
                 attrs.insert(
                     "name".to_string(),
                     RestrictedExpression::new_string(name.clone()),
@@ -478,10 +513,10 @@ impl CedarEngine {
                 let arguments_expr = self.json_to_cedar_expr(arguments)?;
                 attrs.insert("arguments".to_string(), arguments_expr);
 
-                ("ThoughtGate::ToolCall", name.clone(), attrs)
+                (&*ENTITY_TYPE_TOOL_CALL, name.clone(), attrs)
             }
             CedarResource::McpMethod { method, server } => {
-                let mut attrs = HashMap::new();
+                let mut attrs = HashMap::with_capacity(2);
                 attrs.insert(
                     "method".to_string(),
                     RestrictedExpression::new_string(method.clone()),
@@ -490,14 +525,12 @@ impl CedarEngine {
                     "server".to_string(),
                     RestrictedExpression::new_string(server.clone()),
                 );
-                ("ThoughtGate::McpMethod", method.clone(), attrs)
+                (&*ENTITY_TYPE_MCP_METHOD, method.clone(), attrs)
             }
         };
 
         let resource_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str(resource_type).map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid resource type: {}", e),
-            })?,
+            resource_type.clone(),
             EntityId::from_str(&resource_id).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid resource ID: {}", e),
             })?,
@@ -512,32 +545,6 @@ impl CedarEngine {
             details: format!("Failed to create resource entity: {}", e),
         })?;
         entities.push(resource_entity);
-
-        // Add role entities (UIDs already built above)
-        for role in &request.principal.roles {
-            let role_uid = EntityUid::from_type_name_and_id(
-                EntityTypeName::from_str("ThoughtGate::Role").map_err(|e| {
-                    PolicyError::CedarError {
-                        details: format!("Invalid role type: {}", e),
-                    }
-                })?,
-                EntityId::from_str(role).map_err(|e| PolicyError::CedarError {
-                    details: format!("Invalid role ID: {}", e),
-                })?,
-            );
-
-            let mut role_attrs = HashMap::new();
-            role_attrs.insert(
-                "name".to_string(),
-                RestrictedExpression::new_string(role.clone()),
-            );
-
-            let role_entity = Entity::new(role_uid, role_attrs, std::collections::HashSet::new())
-                .map_err(|e| PolicyError::CedarError {
-                details: format!("Failed to create role entity: {}", e),
-            })?;
-            entities.push(role_entity);
-        }
 
         Entities::from_entities(entities, None).map_err(|e| PolicyError::CedarError {
             details: format!("Failed to create entities: {}", e),
@@ -763,9 +770,7 @@ impl CedarEngine {
     ) -> Result<Request, PolicyError> {
         // Build principal UID
         let principal_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::App").map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid entity type: {}", e),
-            })?,
+            ENTITY_TYPE_APP.clone(),
             EntityId::from_str(&request.principal.app_name).map_err(|e| {
                 PolicyError::CedarError {
                     details: format!("Invalid principal ID: {}", e),
@@ -775,14 +780,12 @@ impl CedarEngine {
 
         // Build resource UID
         let (resource_type, resource_id) = match &request.resource {
-            Resource::ToolCall { name, .. } => ("ThoughtGate::ToolCall", name.clone()),
-            Resource::McpMethod { method, .. } => ("ThoughtGate::McpMethod", method.clone()),
+            Resource::ToolCall { name, .. } => (&*ENTITY_TYPE_TOOL_CALL, name.clone()),
+            Resource::McpMethod { method, .. } => (&*ENTITY_TYPE_MCP_METHOD, method.clone()),
         };
 
         let resource_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str(resource_type).map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid resource type: {}", e),
-            })?,
+            resource_type.clone(),
             EntityId::from_str(&resource_id).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid resource ID: {}", e),
             })?,
@@ -790,11 +793,7 @@ impl CedarEngine {
 
         // Build action UID
         let action_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::Action").map_err(|e| {
-                PolicyError::CedarError {
-                    details: format!("Invalid action type: {}", e),
-                }
-            })?,
+            ENTITY_TYPE_ACTION.clone(),
             EntityId::from_str(action_name).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid action ID: {}", e),
             })?,
