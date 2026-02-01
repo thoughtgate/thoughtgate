@@ -210,63 +210,35 @@ impl UpstreamClient {
     ///
     /// # Returns
     ///
-    /// - `Ok(())` if the connection can be established
+    /// - `Ok(())` if the upstream is reachable (any HTTP response, including 4xx)
     /// - `Err(ThoughtGateError::UpstreamConnectionFailed)` if connection fails
     /// - `Err(ThoughtGateError::UpstreamTimeout)` if connection times out
     #[tracing::instrument(skip(self))]
     pub async fn health_check(&self) -> Result<(), ThoughtGateError> {
-        let url = match reqwest::Url::parse(&self.config.base_url) {
-            Ok(u) => u,
-            Err(e) => {
-                return Err(ThoughtGateError::InternalError {
-                    correlation_id: format!("health-check-url-parse-error: {}", e),
-                });
-            }
-        };
+        // Use the HTTP client (with its connection pool and TLS stack) rather
+        // than raw TCP, so the health check exercises the same path as real
+        // requests and properly tests TLS negotiation.
+        let result = self
+            .client
+            .head(&self.config.base_url)
+            .timeout(self.config.connect_timeout)
+            .send()
+            .await;
 
-        let host = match url.host_str() {
-            Some(h) => h,
-            None => {
-                // No host means malformed URL - fail clearly rather than probing localhost
-                return Err(ThoughtGateError::InternalError {
-                    correlation_id: format!(
-                        "health-check-no-host: URL '{}' has no host component",
-                        self.config.base_url
-                    ),
-                });
-            }
-        };
-        let port = match url.port_or_known_default() {
-            Some(p) => p,
-            None => {
-                warn!(
+        match result {
+            Ok(resp) => {
+                // Any HTTP response means the server is reachable.
+                // 4xx/405 is expected (HEAD on an MCP endpoint may not be supported).
+                // Only 5xx indicates an unhealthy server, but for a connectivity check
+                // even that means "reachable".
+                debug!(
                     url = %self.config.base_url,
-                    fallback = 80,
-                    "URL has no port and unknown scheme, falling back to port 80 for health check"
+                    status = %resp.status(),
+                    "Upstream health check: server reachable"
                 );
-                80
-            }
-        };
-        let addr = format!("{}:{}", host, port);
-
-        // TCP connect using configured connect_timeout for consistency
-        let timeout = self.config.connect_timeout;
-        let connect_result =
-            tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await;
-
-        match connect_result {
-            Ok(Ok(_stream)) => {
-                // Connection successful, drop stream immediately
                 Ok(())
             }
-            Ok(Err(e)) => Err(ThoughtGateError::UpstreamConnectionFailed {
-                url: self.config.base_url.clone(),
-                reason: e.to_string(),
-            }),
-            Err(_timeout) => Err(ThoughtGateError::UpstreamTimeout {
-                url: self.config.base_url.clone(),
-                timeout_secs: timeout.as_secs(),
-            }),
+            Err(e) => Err(self.classify_error(e, "health-check")),
         }
     }
 
