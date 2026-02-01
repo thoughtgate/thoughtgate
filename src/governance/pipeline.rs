@@ -485,28 +485,37 @@ impl ApprovalPipeline {
     /// Re-evaluate policy with approval context.
     ///
     /// Implements: REQ-GOV-002/F-004
+    ///
+    /// Cedar policy evaluation is CPU-bound and runs in `spawn_blocking`
+    /// to avoid blocking the async executor.
     #[allow(deprecated)] // Using v0.1 PolicyAction API
-    fn reevaluate_policy(
+    async fn reevaluate_policy(
         &self,
         task: &Task,
         approval: &ApprovalRecord,
     ) -> Result<(), PipelineResult> {
-        // Build approval grant for policy context
+        let policy_engine = self.policy_engine.clone();
+        let transformed = task.pre_approval_transformed.clone();
+        let principal = task.principal.clone();
         let approval_grant = ApprovalGrant {
             task_id: task.id.to_string(),
             approved_by: approval.decided_by.clone(),
             approved_at: approval.decided_at.timestamp(),
         };
+        let task_id = task.id.clone();
 
-        // Build policy request with approval context
-        let policy_request = build_policy_request(
-            &task.pre_approval_transformed,
-            &task.principal,
-            Some(approval_grant),
-        );
-
-        // Evaluate policy
-        let action = self.policy_engine.evaluate(&policy_request);
+        // Evaluate policy in blocking thread pool (Cedar is CPU-bound)
+        let action = tokio::task::spawn_blocking(move || {
+            let policy_request =
+                build_policy_request(&transformed, &principal, Some(approval_grant));
+            policy_engine.evaluate(&policy_request)
+        })
+        .await
+        .map_err(|e| PipelineResult::Failure {
+            stage: FailureStage::PolicyDrift,
+            reason: format!("Policy re-evaluation task failed: {e}"),
+            retriable: false,
+        })?;
 
         // F-004.2: Both Forward and Approve are valid post-approval outcomes.
         //
@@ -520,7 +529,7 @@ impl ApprovalPipeline {
         match action {
             PolicyAction::Forward | PolicyAction::Approve { .. } => {
                 debug!(
-                    task_id = %task.id,
+                    task_id = %task_id,
                     action = ?action,
                     "Policy permits execution"
                 );
@@ -529,7 +538,7 @@ impl ApprovalPipeline {
             PolicyAction::Reject { reason } => {
                 // F-004.3: Policy drift
                 warn!(
-                    task_id = %task.id,
+                    task_id = %task_id,
                     reason = %reason,
                     "Policy drift detected - no longer permitted"
                 );
@@ -754,7 +763,7 @@ impl ExecutionPipeline for ApprovalPipeline {
 
         // Phase 2: Policy re-evaluation
         // Implements: REQ-GOV-002/F-004
-        if let Err(failure) = self.reevaluate_policy(task, approval) {
+        if let Err(failure) = self.reevaluate_policy(task, approval).await {
             return failure;
         }
 
