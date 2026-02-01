@@ -463,7 +463,7 @@ pub struct TaskMetadata {
 /// metadata for tracing and correlation.
 ///
 /// Implements: REQ-CORE-003/§6.3 (Internal: Parsed Request Structure)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpRequest {
     /// Original JSON-RPC ID (None for notifications)
     pub id: Option<JsonRpcId>,
@@ -477,6 +477,20 @@ pub struct McpRequest {
     pub received_at: Instant,
     /// Unique correlation ID for tracing
     pub correlation_id: Uuid,
+}
+
+/// Custom Debug implementation that redacts params to prevent PII leakage
+/// (tool arguments, resource URIs, etc. may contain sensitive data).
+impl std::fmt::Debug for McpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpRequest")
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("params", &self.params.as_ref().map(|_| "<redacted>"))
+            .field("task_metadata", &self.task_metadata)
+            .field("correlation_id", &self.correlation_id)
+            .finish()
+    }
 }
 
 impl McpRequest {
