@@ -16,15 +16,15 @@ sidebar_position: 2
 ```bash
 git clone https://github.com/thoughtgate/thoughtgate
 cd thoughtgate
-cargo build --release
+cargo build --release -p thoughtgate-proxy
 ```
 
-The binary is at `target/release/thoughtgate`.
+The binary is at `target/release/thoughtgate-proxy`.
 
 ### Install Globally
 
 ```bash
-cargo install --path .
+cargo install --path thoughtgate-proxy
 ```
 
 ## Docker
@@ -63,7 +63,7 @@ See [Deploy to Kubernetes](/docs/how-to/deploy-kubernetes) for Helm charts and m
 
 ```bash
 # Check version
-thoughtgate --version
+thoughtgate-proxy --version
 
 # Check health (after starting)
 curl http://localhost:7469/health

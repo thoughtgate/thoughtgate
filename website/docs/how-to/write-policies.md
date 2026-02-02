@@ -225,7 +225,7 @@ cat thoughtgate.yaml | python -c "import sys, yaml; yaml.safe_load(sys.stdin)"
 
 # Start ThoughtGate and test
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
-./thoughtgate &
+./thoughtgate-proxy &
 
 # Test a forwarded request
 curl -X POST http://localhost:7467 \

@@ -291,7 +291,6 @@ jobs:
           done
 
           # Run k6 benchmark (uses default port 7467)
-          # TODO: Move k6 scripts to scripts/ or thoughtgate-proxy/tests/
           k6 run --out json=k6_raw.json thoughtgate-proxy/tests/benchmark-fast.js || true
 
           # Cleanup

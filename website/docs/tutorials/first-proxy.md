@@ -26,17 +26,17 @@ Clone the repository and build the release binary:
 ```bash
 git clone https://github.com/thoughtgate/thoughtgate
 cd thoughtgate
-cargo build --release
+cargo build --release -p thoughtgate-proxy
 ```
 
-The binary will be at `target/release/thoughtgate`.
+The binary will be at `target/release/thoughtgate-proxy`.
 
 ## Step 2: Start a Mock MCP Server
 
 For testing, ThoughtGate includes a mock MCP server:
 
 ```bash
-cargo build --release --bin mock_mcp --features mock
+cargo build --release -p thoughtgate-proxy --features mock --bin mock_mcp
 MOCK_MCP_PORT=3000 ./target/release/mock_mcp
 ```
 
@@ -95,7 +95,7 @@ Set environment variables and start the proxy:
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
 export SLACK_BOT_TOKEN=xoxb-your-token
 
-./target/release/thoughtgate
+./target/release/thoughtgate-proxy
 ```
 
 You should see:

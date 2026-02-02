@@ -74,9 +74,9 @@ ThoughtGate is built for minimal overhead using `hyper`, `mimalloc`, and `socket
 # From source
 git clone https://github.com/thoughtgate/thoughtgate
 cd thoughtgate
-cargo build --release
+cargo build --release -p thoughtgate-proxy
 
-# Binary at target/release/thoughtgate
+# Binary at target/release/thoughtgate-proxy
 ```
 
 Or use the Docker image:
@@ -133,7 +133,7 @@ Start ThoughtGate:
 
 ```bash
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
-./thoughtgate
+./thoughtgate-proxy
 ```
 
 Point your MCP client at `http://localhost:7467` (the default outbound port).
@@ -166,7 +166,7 @@ approval:
 ```bash
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
 export THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-token
-./thoughtgate
+./thoughtgate-proxy
 ```
 
 ## Architecture

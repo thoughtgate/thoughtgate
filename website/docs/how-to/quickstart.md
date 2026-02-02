@@ -17,7 +17,7 @@ Get ThoughtGate running in under 5 minutes.
 # Clone and build
 git clone https://github.com/thoughtgate/thoughtgate
 cd thoughtgate
-cargo build --release
+cargo build --release -p thoughtgate-proxy
 
 # Create config file
 cat > thoughtgate.yaml << 'EOF'
@@ -35,7 +35,7 @@ EOF
 
 # Run
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
-./target/release/thoughtgate
+./target/release/thoughtgate-proxy
 ```
 
 ## Option 2: Docker
@@ -94,7 +94,7 @@ Then set the Slack token and restart:
 ```bash
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
 export SLACK_BOT_TOKEN=xoxb-your-token
-./target/release/thoughtgate
+./target/release/thoughtgate-proxy
 ```
 
 ## Next Steps
