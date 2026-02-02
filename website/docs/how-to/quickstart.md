@@ -48,7 +48,7 @@ docker run -d \
   -p 7469:7469 \
   -v $(pwd)/thoughtgate.yaml:/etc/thoughtgate/config.yaml \
   -e THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml \
-  ghcr.io/thoughtgate/thoughtgate:v0.2.0
+  ghcr.io/thoughtgate/thoughtgate:v0.2.2
 ```
 
 ## Verify It Works

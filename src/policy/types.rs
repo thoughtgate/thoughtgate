@@ -158,23 +158,15 @@ impl TimeContext {
     }
 
     /// Create a TimeContext from a Unix timestamp.
-    ///
-    /// Uses Euclidean division to handle negative timestamps correctly
-    /// (timestamps before Unix epoch).
     #[must_use]
     pub fn from_timestamp(timestamp: i64) -> Self {
-        // Calculate hour and day_of_week from timestamp
-        // Unix epoch (Jan 1, 1970) was a Thursday (day 4)
-        let secs_per_day: i64 = 86400;
-        let secs_per_hour: i64 = 3600;
+        use chrono::{Datelike, TimeZone, Timelike, Utc};
 
-        // Use Euclidean division for correct handling of negative timestamps
-        let days_since_epoch = timestamp.div_euclid(secs_per_day);
-        let secs_today = timestamp.rem_euclid(secs_per_day);
-
-        // Thursday = 4, so add 4 and mod 7 (Euclidean for negative days)
-        let day_of_week = (days_since_epoch + 4).rem_euclid(7) as u8;
-        let hour = (secs_today / secs_per_hour) as u8;
+        let dt = Utc.timestamp_opt(timestamp, 0).single();
+        let (hour, day_of_week) = match dt {
+            Some(dt) => (dt.hour() as u8, dt.weekday().num_days_from_sunday() as u8),
+            None => (0, 0),
+        };
 
         Self {
             hour,

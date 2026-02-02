@@ -19,6 +19,12 @@ use tracing::{info, warn};
 ///
 /// # Returns
 /// Tuple of (policy_text, source)
+///
+/// # Note
+/// Uses blocking I/O (`std::fs`). Called only at startup (via `CedarEngine::new()`)
+/// and during rare hot-reload events (via `reload()`), so blocking is acceptable.
+/// Production callers that run on the Tokio runtime should wrap calls in
+/// `tokio::task::spawn_blocking` if needed.
 pub fn load_policies() -> (String, PolicySource) {
     // 1. Try ConfigMap
     let config_path = env::var("THOUGHTGATE_POLICY_FILE")
@@ -69,6 +75,9 @@ pub fn load_policies() -> (String, PolicySource) {
 /// Loads schema from:
 /// 1. File at `$THOUGHTGATE_SCHEMA_FILE` (default: `/etc/thoughtgate/schema.cedarschema`)
 /// 2. Embedded schema (compile-time)
+///
+/// # Note
+/// Uses blocking I/O (`std::fs`). See `load_policies` for rationale.
 pub fn load_schema() -> String {
     let schema_path = env::var("THOUGHTGATE_SCHEMA_FILE")
         .unwrap_or_else(|_| "/etc/thoughtgate/schema.cedarschema".to_string());

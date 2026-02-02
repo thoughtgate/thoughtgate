@@ -31,9 +31,62 @@ use cedar_policy::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// Prometheus Metrics
+// ============================================================================
+
+/// Histogram for Cedar policy evaluation duration (seconds).
+/// Enables p99 monitoring per REQ-OBS-001.
+static CEDAR_EVAL_DURATION: LazyLock<prometheus::Histogram> = LazyLock::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "cedar_eval_duration_seconds",
+        "Duration of Cedar policy evaluation in seconds",
+    )
+    .buckets(vec![
+        0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+    ]);
+    let h = prometheus::Histogram::with_opts(opts).expect("BUG: invalid histogram opts");
+    prometheus::default_registry()
+        .register(Box::new(h.clone()))
+        .expect("BUG: failed to register cedar_eval_duration_seconds");
+    h
+});
+
+// ============================================================================
+// Cached Cedar Entity Type Names
+// ============================================================================
+// These are parsed once at first access and reused for every evaluation,
+// avoiding repeated string parsing in the hot path.
+
+static ENTITY_TYPE_APP: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::App")
+        .expect("BUG: 'ThoughtGate::App' is a valid entity type name")
+});
+
+static ENTITY_TYPE_ACTION: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::Action")
+        .expect("BUG: 'ThoughtGate::Action' is a valid entity type name")
+});
+
+static ENTITY_TYPE_TOOL_CALL: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::ToolCall")
+        .expect("BUG: 'ThoughtGate::ToolCall' is a valid entity type name")
+});
+
+static ENTITY_TYPE_MCP_METHOD: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::McpMethod")
+        .expect("BUG: 'ThoughtGate::McpMethod' is a valid entity type name")
+});
+
+static ENTITY_TYPE_ROLE: LazyLock<EntityTypeName> = LazyLock::new(|| {
+    EntityTypeName::from_str("ThoughtGate::Role")
+        .expect("BUG: 'ThoughtGate::Role' is a valid entity type name")
+});
 
 /// Cedar policy engine for ThoughtGate.
 ///
@@ -229,6 +282,9 @@ impl CedarEngine {
             .total_eval_time_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
 
+        // Record to Prometheus histogram for p99 monitoring
+        CEDAR_EVAL_DURATION.observe(elapsed.as_secs_f64());
+
         // Convert response to CedarDecision
         match response.decision() {
             Decision::Allow => {
@@ -305,9 +361,7 @@ impl CedarEngine {
     ) -> Result<Request, PolicyError> {
         // Build principal UID
         let principal_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::App").map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid entity type: {}", e),
-            })?,
+            ENTITY_TYPE_APP.clone(),
             EntityId::from_str(&request.principal.app_name).map_err(|e| {
                 PolicyError::CedarError {
                     details: format!("Invalid principal ID: {}", e),
@@ -317,14 +371,12 @@ impl CedarEngine {
 
         // Build resource UID
         let (resource_type, resource_id) = match &request.resource {
-            CedarResource::ToolCall { name, .. } => ("ThoughtGate::ToolCall", name.clone()),
-            CedarResource::McpMethod { method, .. } => ("ThoughtGate::McpMethod", method.clone()),
+            CedarResource::ToolCall { name, .. } => (&*ENTITY_TYPE_TOOL_CALL, name.clone()),
+            CedarResource::McpMethod { method, .. } => (&*ENTITY_TYPE_MCP_METHOD, method.clone()),
         };
 
         let resource_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str(resource_type).map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid resource type: {}", e),
-            })?,
+            resource_type.clone(),
             EntityId::from_str(&resource_id).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid resource ID: {}", e),
             })?,
@@ -332,11 +384,7 @@ impl CedarEngine {
 
         // Build action UID
         let action_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::Action").map_err(|e| {
-                PolicyError::CedarError {
-                    details: format!("Invalid action type: {}", e),
-                }
-            })?,
+            ENTITY_TYPE_ACTION.clone(),
             EntityId::from_str(action_name).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid action ID: {}", e),
             })?,
@@ -360,7 +408,7 @@ impl CedarEngine {
         use cedar_policy::RestrictedExpression;
 
         // Build time context record
-        let mut time_fields = HashMap::new();
+        let mut time_fields = HashMap::with_capacity(3);
         time_fields.insert(
             "hour".to_string(),
             RestrictedExpression::new_long(ctx.time.hour as i64),
@@ -380,7 +428,7 @@ impl CedarEngine {
             })?;
 
         // Build main context record
-        let mut context_fields = HashMap::new();
+        let mut context_fields = HashMap::with_capacity(3);
         context_fields.insert(
             "policy_id".to_string(),
             RestrictedExpression::new_string(ctx.policy_id.clone()),
@@ -404,29 +452,42 @@ impl CedarEngine {
     fn build_entities_v2(&self, request: &CedarRequest) -> Result<Entities, PolicyError> {
         use cedar_policy::{Entity, RestrictedExpression};
 
-        let mut entities = vec![];
+        // Pre-allocate: 1 principal + 1 resource + N roles
+        let num_roles = request.principal.roles.len();
+        let mut entities = Vec::with_capacity(2 + num_roles);
 
-        // Build role UIDs first (needed for principal parent membership)
-        let mut role_uids = std::collections::HashSet::new();
+        // Single pass over roles: build both UIDs (for principal parents)
+        // and role Entity objects (for the entity set) in one loop.
+        let mut role_uids = std::collections::HashSet::with_capacity(num_roles);
         for role in &request.principal.roles {
             let role_uid = EntityUid::from_type_name_and_id(
-                EntityTypeName::from_str("ThoughtGate::Role").map_err(|e| {
-                    PolicyError::CedarError {
-                        details: format!("Invalid role type: {}", e),
-                    }
-                })?,
+                ENTITY_TYPE_ROLE.clone(),
                 EntityId::from_str(role).map_err(|e| PolicyError::CedarError {
                     details: format!("Invalid role ID: {}", e),
                 })?,
             );
+
+            let mut role_attrs = HashMap::with_capacity(1);
+            role_attrs.insert(
+                "name".to_string(),
+                RestrictedExpression::new_string(role.clone()),
+            );
+
+            let role_entity = Entity::new(
+                role_uid.clone(),
+                role_attrs,
+                std::collections::HashSet::new(),
+            )
+            .map_err(|e| PolicyError::CedarError {
+                details: format!("Failed to create role entity: {}", e),
+            })?;
+            entities.push(role_entity);
             role_uids.insert(role_uid);
         }
 
         // Build principal entity with attributes and role membership
         let principal_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::App").map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid entity type: {}", e),
-            })?,
+            ENTITY_TYPE_APP.clone(),
             EntityId::from_str(&request.principal.app_name).map_err(|e| {
                 PolicyError::CedarError {
                     details: format!("Invalid principal ID: {}", e),
@@ -434,7 +495,7 @@ impl CedarEngine {
             })?,
         );
 
-        let mut principal_attrs = HashMap::new();
+        let mut principal_attrs = HashMap::with_capacity(3);
         principal_attrs.insert(
             "name".to_string(),
             RestrictedExpression::new_string(request.principal.app_name.clone()),
@@ -449,12 +510,10 @@ impl CedarEngine {
         );
 
         // Include role UIDs as parents so `principal in Role::"admin"` checks work
-        let principal_entity =
-            Entity::new(principal_uid.clone(), principal_attrs, role_uids.clone()).map_err(
-                |e| PolicyError::CedarError {
-                    details: format!("Failed to create principal entity: {}", e),
-                },
-            )?;
+        let principal_entity = Entity::new(principal_uid.clone(), principal_attrs, role_uids)
+            .map_err(|e| PolicyError::CedarError {
+                details: format!("Failed to create principal entity: {}", e),
+            })?;
         entities.push(principal_entity);
 
         // Build resource entity with attributes (including arguments for ToolCall)
@@ -464,7 +523,7 @@ impl CedarEngine {
                 server,
                 arguments,
             } => {
-                let mut attrs = HashMap::new();
+                let mut attrs = HashMap::with_capacity(3);
                 attrs.insert(
                     "name".to_string(),
                     RestrictedExpression::new_string(name.clone()),
@@ -478,10 +537,10 @@ impl CedarEngine {
                 let arguments_expr = self.json_to_cedar_expr(arguments)?;
                 attrs.insert("arguments".to_string(), arguments_expr);
 
-                ("ThoughtGate::ToolCall", name.clone(), attrs)
+                (&*ENTITY_TYPE_TOOL_CALL, name.clone(), attrs)
             }
             CedarResource::McpMethod { method, server } => {
-                let mut attrs = HashMap::new();
+                let mut attrs = HashMap::with_capacity(2);
                 attrs.insert(
                     "method".to_string(),
                     RestrictedExpression::new_string(method.clone()),
@@ -490,14 +549,12 @@ impl CedarEngine {
                     "server".to_string(),
                     RestrictedExpression::new_string(server.clone()),
                 );
-                ("ThoughtGate::McpMethod", method.clone(), attrs)
+                (&*ENTITY_TYPE_MCP_METHOD, method.clone(), attrs)
             }
         };
 
         let resource_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str(resource_type).map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid resource type: {}", e),
-            })?,
+            resource_type.clone(),
             EntityId::from_str(&resource_id).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid resource ID: {}", e),
             })?,
@@ -513,36 +570,14 @@ impl CedarEngine {
         })?;
         entities.push(resource_entity);
 
-        // Add role entities (UIDs already built above)
-        for role in &request.principal.roles {
-            let role_uid = EntityUid::from_type_name_and_id(
-                EntityTypeName::from_str("ThoughtGate::Role").map_err(|e| {
-                    PolicyError::CedarError {
-                        details: format!("Invalid role type: {}", e),
-                    }
-                })?,
-                EntityId::from_str(role).map_err(|e| PolicyError::CedarError {
-                    details: format!("Invalid role ID: {}", e),
-                })?,
-            );
-
-            let mut role_attrs = HashMap::new();
-            role_attrs.insert(
-                "name".to_string(),
-                RestrictedExpression::new_string(role.clone()),
-            );
-
-            let role_entity = Entity::new(role_uid, role_attrs, std::collections::HashSet::new())
-                .map_err(|e| PolicyError::CedarError {
-                details: format!("Failed to create role entity: {}", e),
-            })?;
-            entities.push(role_entity);
-        }
-
         Entities::from_entities(entities, None).map_err(|e| PolicyError::CedarError {
             details: format!("Failed to create entities: {}", e),
         })
     }
+
+    /// Maximum recursion depth for JSON-to-Cedar conversion.
+    /// Prevents stack overflow from deeply nested JSON payloads.
+    const MAX_JSON_DEPTH: usize = 64;
 
     /// Convert JSON value to Cedar expression.
     ///
@@ -551,6 +586,27 @@ impl CedarEngine {
         &self,
         value: &serde_json::Value,
     ) -> Result<cedar_policy::RestrictedExpression, PolicyError> {
+        self.json_to_cedar_expr_depth(value, 0)
+    }
+
+    /// Convert JSON value to Cedar expression with depth tracking.
+    ///
+    /// Returns an error if recursion exceeds `MAX_JSON_DEPTH` to prevent
+    /// stack overflow from malicious deeply nested payloads.
+    fn json_to_cedar_expr_depth(
+        &self,
+        value: &serde_json::Value,
+        depth: usize,
+    ) -> Result<cedar_policy::RestrictedExpression, PolicyError> {
+        if depth > Self::MAX_JSON_DEPTH {
+            return Err(PolicyError::CedarError {
+                details: format!(
+                    "JSON nesting depth exceeds maximum of {}",
+                    Self::MAX_JSON_DEPTH
+                ),
+            });
+        }
+
         use cedar_policy::RestrictedExpression;
 
         match value {
@@ -566,15 +622,26 @@ impl CedarEngine {
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     Ok(RestrictedExpression::new_long(i))
+                } else if let Some(u) = n.as_u64() {
+                    // Value fits in u64 but exceeds i64::MAX — Cedar Long cannot represent it.
+                    // Convert to string for safe policy comparison.
+                    warn!(
+                        value = u,
+                        "u64 value exceeds i64::MAX, converting to string for Cedar"
+                    );
+                    Ok(RestrictedExpression::new_string(u.to_string()))
                 } else if let Some(f) = n.as_f64() {
-                    // Cedar doesn't have floats - round to nearest integer
+                    // Cedar doesn't have floats — reject fractional values to prevent
+                    // silent precision loss in policy evaluation.
                     let rounded = f.round() as i64;
                     if (f - rounded as f64).abs() > f64::EPSILON {
-                        warn!(
-                            original = f,
-                            rounded = rounded,
-                            "Float value rounded to integer for Cedar"
-                        );
+                        return Err(PolicyError::CedarError {
+                            details: format!(
+                                "Float value {} cannot be represented as Cedar Long; \
+                                 fractional values are not supported in policy evaluation",
+                                f
+                            ),
+                        });
                     }
                     Ok(RestrictedExpression::new_long(rounded))
                 } else {
@@ -585,14 +652,19 @@ impl CedarEngine {
             }
             serde_json::Value::String(s) => Ok(RestrictedExpression::new_string(s.clone())),
             serde_json::Value::Array(arr) => {
-                let exprs: Result<Vec<_>, _> =
-                    arr.iter().map(|v| self.json_to_cedar_expr(v)).collect();
+                let exprs: Result<Vec<_>, _> = arr
+                    .iter()
+                    .map(|v| self.json_to_cedar_expr_depth(v, depth + 1))
+                    .collect();
                 Ok(RestrictedExpression::new_set(exprs?))
             }
             serde_json::Value::Object(obj) => {
                 let fields: Result<HashMap<_, _>, _> = obj
                     .iter()
-                    .map(|(k, v)| self.json_to_cedar_expr(v).map(|e| (k.clone(), e)))
+                    .map(|(k, v)| {
+                        self.json_to_cedar_expr_depth(v, depth + 1)
+                            .map(|e| (k.clone(), e))
+                    })
                     .collect();
                 RestrictedExpression::new_record(fields?).map_err(|e| PolicyError::CedarError {
                     details: format!("Failed to create record: {}", e),
@@ -709,7 +781,15 @@ impl CedarEngine {
                     "Approve" => PolicyAction::Approve {
                         timeout: Duration::from_secs(300), // Default 5 minutes
                     },
-                    _ => unreachable!(),
+                    _ => {
+                        error!(
+                            action = action_name,
+                            "Unknown policy action, failing closed"
+                        );
+                        PolicyAction::Reject {
+                            reason: format!("Unknown action: {}", action_name),
+                        }
+                    }
                 };
             }
         }
@@ -763,9 +843,7 @@ impl CedarEngine {
     ) -> Result<Request, PolicyError> {
         // Build principal UID
         let principal_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::App").map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid entity type: {}", e),
-            })?,
+            ENTITY_TYPE_APP.clone(),
             EntityId::from_str(&request.principal.app_name).map_err(|e| {
                 PolicyError::CedarError {
                     details: format!("Invalid principal ID: {}", e),
@@ -775,14 +853,12 @@ impl CedarEngine {
 
         // Build resource UID
         let (resource_type, resource_id) = match &request.resource {
-            Resource::ToolCall { name, .. } => ("ThoughtGate::ToolCall", name.clone()),
-            Resource::McpMethod { method, .. } => ("ThoughtGate::McpMethod", method.clone()),
+            Resource::ToolCall { name, .. } => (&*ENTITY_TYPE_TOOL_CALL, name.clone()),
+            Resource::McpMethod { method, .. } => (&*ENTITY_TYPE_MCP_METHOD, method.clone()),
         };
 
         let resource_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str(resource_type).map_err(|e| PolicyError::CedarError {
-                details: format!("Invalid resource type: {}", e),
-            })?,
+            resource_type.clone(),
             EntityId::from_str(&resource_id).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid resource ID: {}", e),
             })?,
@@ -790,11 +866,7 @@ impl CedarEngine {
 
         // Build action UID
         let action_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("ThoughtGate::Action").map_err(|e| {
-                PolicyError::CedarError {
-                    details: format!("Invalid action type: {}", e),
-                }
-            })?,
+            ENTITY_TYPE_ACTION.clone(),
             EntityId::from_str(action_name).map_err(|e| PolicyError::CedarError {
                 details: format!("Invalid action ID: {}", e),
             })?,
@@ -880,9 +952,45 @@ impl CedarEngine {
     pub fn reload(&self) -> Result<(), PolicyError> {
         info!("Reloading policies");
 
+        // Retry once on parse failure in case the file was partially written
         let (policy_str, source) = loader::load_policies();
-        let new_policies = Self::parse_policies(&policy_str, &self.schema)?;
-        let new_annotations = Self::parse_annotations(&new_policies);
+        let (new_policies, new_annotations) = match Self::parse_policies(&policy_str, &self.schema)
+        {
+            Ok(policies) => {
+                let annotations = Self::parse_annotations(&policies);
+                (policies, annotations)
+            }
+            Err(first_err) => {
+                warn!(
+                    error = %first_err,
+                    "Policy parse failed, retrying immediately in case of partial file write"
+                );
+                let (retry_str, retry_source) = loader::load_policies();
+                let policies =
+                    Self::parse_policies(&retry_str, &self.schema).map_err(|retry_err| {
+                        warn!(
+                            first_error = %first_err,
+                            retry_error = %retry_err,
+                            "Policy reload failed after retry, keeping existing policies"
+                        );
+                        retry_err
+                    })?;
+                let annotations = Self::parse_annotations(&policies);
+                // Use the retried source on success
+                drop(source);
+                return {
+                    self.policies.store(Arc::new(policies));
+                    self.annotations.store(Arc::new(annotations));
+                    self.source.store(Arc::new(retry_source));
+                    self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .last_reload
+                        .store(Arc::new(Some(std::time::SystemTime::now())));
+                    info!("Policies reloaded successfully (after retry)");
+                    Ok(())
+                };
+            }
+        };
 
         // Atomic swap
         self.policies.store(Arc::new(new_policies));

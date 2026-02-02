@@ -82,7 +82,7 @@ cargo build --release
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.1
+docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.2
 ```
 
 ### Basic Usage
@@ -285,7 +285,7 @@ spec:
           value: "http://localhost:7467"  # Points to ThoughtGate
 
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:v0.2.1
+      image: ghcr.io/thoughtgate/thoughtgate:v0.2.2
       ports:
         - containerPort: 7467  # Outbound (proxy)
         - containerPort: 7469  # Admin (health)
@@ -323,7 +323,7 @@ docker run -d \
   -v $(pwd)/thoughtgate.yaml:/etc/thoughtgate/config.yaml \
   -e THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml \
   -e THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-... \
-  ghcr.io/thoughtgate/thoughtgate:v0.2.1
+  ghcr.io/thoughtgate/thoughtgate:v0.2.2
 ```
 
 ## Slack Setup

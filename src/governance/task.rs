@@ -481,14 +481,16 @@ impl Task {
     /// Creates a new task in Working state.
     ///
     /// Implements: REQ-GOV-001/F-002
-    #[must_use]
+    ///
+    /// Returns an error if the request arguments exceed the maximum JSON
+    /// nesting depth, which would prevent reliable integrity hashing.
     pub fn new(
         original_request: ToolCallRequest,
         pre_approval_transformed: ToolCallRequest,
         principal: Principal,
         ttl: Duration,
         on_timeout: TimeoutAction,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let id = TaskId::new();
         let now = Utc::now();
         // Clamp TTL to max 30 days if conversion fails (overflow for extremely large durations)
@@ -497,10 +499,10 @@ impl Task {
         let expires_at = now + chrono_ttl;
         // Hash the transformed request - this is what the human approves
         // The hash verifies integrity of the approved content, not the raw input
-        let request_hash = hash_request(&pre_approval_transformed);
+        let request_hash = hash_request(&pre_approval_transformed)?;
         let poll_interval = compute_poll_interval(ttl);
 
-        Self {
+        Ok(Self {
             id,
             original_request,
             pre_approval_transformed,
@@ -517,7 +519,7 @@ impl Task {
             result: None,
             failure: None,
             on_timeout,
-        }
+        })
     }
 
     /// Returns true if the task has expired.
@@ -612,50 +614,76 @@ impl Task {
 ///
 /// Implements: REQ-GOV-001/F-002.3
 ///
-/// The hash includes only the tool name and arguments, intentionally excluding
-/// the `mcp_request_id`. This is because:
+/// The hash includes the MCP method, tool name, and arguments, intentionally
+/// excluding the `mcp_request_id`. This is because:
 /// - The request ID is transport-layer metadata for JSON-RPC correlation
 /// - The hash verifies the *semantic content* of what was approved
-/// - Two requests with identical tool+arguments perform the same action
+/// - Two requests with identical method+tool+arguments perform the same action
 ///   regardless of their request IDs
+/// - Including `method` prevents collisions between different MCP operations
+///   (e.g., `tools/call` vs `resources/read`) with the same name/arguments
 ///
 /// Arguments are serialized using canonical JSON (sorted keys) to ensure
 /// deterministic hashing regardless of key insertion order. This is necessary
 /// because `serde_json/preserve_order` is enabled transitively by
 /// `cedar-policy-core`, making `Value::to_string()` insertion-order dependent.
-#[must_use]
-pub fn hash_request(request: &ToolCallRequest) -> String {
+/// Returns an error if arguments exceed maximum nesting depth.
+pub fn hash_request(request: &ToolCallRequest) -> Result<String, String> {
     let mut hasher = Sha256::new();
+    hasher.update(request.method.as_bytes());
     hasher.update(request.name.as_bytes());
-    hasher.update(canonical_json(&request.arguments).as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher.update(canonical_json(&request.arguments)?.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
 }
+
+/// Maximum recursion depth for canonical JSON serialization.
+/// Matches `MAX_JSON_DEPTH` in `policy/engine.rs` for consistency.
+const MAX_CANONICAL_JSON_DEPTH: usize = 64;
 
 /// Produces a canonical JSON string with object keys sorted alphabetically.
 ///
 /// This ensures deterministic serialization regardless of the key insertion
 /// order used by `serde_json::Value` (which depends on whether `preserve_order`
 /// is enabled via feature flags).
-fn canonical_json(value: &serde_json::Value) -> String {
+///
+/// Depth is capped at [`MAX_CANONICAL_JSON_DEPTH`] to prevent stack overflow
+/// from malicious deeply nested payloads. Returns an error if depth is exceeded
+/// rather than silently producing a sentinel that could cause hash collisions.
+fn canonical_json(value: &serde_json::Value) -> Result<String, String> {
+    canonical_json_inner(value, 0)
+}
+
+fn canonical_json_inner(value: &serde_json::Value, depth: usize) -> Result<String, String> {
+    if depth > MAX_CANONICAL_JSON_DEPTH {
+        return Err(format!(
+            "JSON nesting depth exceeds maximum of {MAX_CANONICAL_JSON_DEPTH}"
+        ));
+    }
+
     match value {
         serde_json::Value::Object(map) => {
             let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
             sorted.sort_by_key(|(k, _)| *k);
-            let entries: Vec<String> = sorted
-                .into_iter()
-                .map(|(k, v)| {
-                    let key_str = serde_json::to_string(k).unwrap_or_default();
-                    format!("{}:{}", key_str, canonical_json(v))
-                })
-                .collect();
-            format!("{{{}}}", entries.join(","))
+            let mut entries = Vec::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                let key_str = serde_json::to_string(k).unwrap_or_default();
+                entries.push(format!(
+                    "{}:{}",
+                    key_str,
+                    canonical_json_inner(v, depth + 1)?
+                ));
+            }
+            Ok(format!("{{{}}}", entries.join(",")))
         }
         serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(canonical_json).collect();
-            format!("[{}]", items.join(","))
+            let mut items = Vec::with_capacity(arr.len());
+            for v in arr {
+                items.push(canonical_json_inner(v, depth + 1)?);
+            }
+            Ok(format!("[{}]", items.join(",")))
         }
         // Leaf values (strings, numbers, bools, null) serialize deterministically
-        other => serde_json::to_string(other).unwrap_or_default(),
+        other => Ok(serde_json::to_string(other).unwrap_or_default()),
     }
 }
 
@@ -804,10 +832,14 @@ impl Default for TaskStoreConfig {
 // ============================================================================
 
 /// Internal task entry with metadata for cleanup.
+///
+/// Stores `Arc<Task>` to avoid deep clones on reads. Mutations use
+/// `Arc::make_mut` which clones only when other references exist
+/// (copy-on-write semantics).
 #[derive(Debug)]
 struct TaskEntry {
-    /// The task itself
-    task: Task,
+    /// The task itself (Arc for cheap reads, make_mut for writes)
+    task: Arc<Task>,
     /// When the task became terminal (for grace period cleanup)
     terminal_at: Option<DateTime<Utc>>,
     /// Notifier for waiters on this task
@@ -829,6 +861,9 @@ pub struct TaskStore {
     config: TaskStoreConfig,
     /// Counter for pending (non-terminal) tasks
     pending_count: AtomicUsize,
+    /// Atomic counter of pending tasks per principal (keyed by rate_limit_key).
+    /// Prevents TOCTOU race between count check and insert in `create()`.
+    pending_by_principal: DashMap<String, AtomicUsize>,
 }
 
 impl TaskStore {
@@ -842,6 +877,7 @@ impl TaskStore {
             by_principal: DashMap::new(),
             config,
             pending_count: AtomicUsize::new(0),
+            pending_by_principal: DashMap::new(),
         }
     }
 
@@ -861,6 +897,26 @@ impl TaskStore {
         &self.config
     }
 
+    /// Decrements both global and per-principal pending counters.
+    ///
+    /// Must be called exactly once when a task transitions from non-terminal
+    /// to terminal. Caller is responsible for ensuring the task was previously
+    /// non-terminal (i.e., `was_terminal == false`).
+    fn decrement_pending_counters(&self, task: &Task) {
+        self.pending_count.fetch_sub(1, Ordering::Release);
+        let principal_key = task.principal.rate_limit_key();
+        if let Some(counter) = self.pending_by_principal.get(&principal_key) {
+            let prev = counter.fetch_sub(1, Ordering::Release);
+            drop(counter);
+            // Clean up entry when count reaches zero to prevent unbounded growth
+            // of the DashMap with stale zero-valued entries.
+            if prev == 1 {
+                self.pending_by_principal
+                    .remove_if(&principal_key, |_, v| v.load(Ordering::Acquire) == 0);
+            }
+        }
+    }
+
     /// Returns the number of pending (non-terminal) tasks.
     ///
     /// Implements: REQ-GOV-001/F-009.3
@@ -875,25 +931,6 @@ impl TaskStore {
     #[must_use]
     pub fn total_count(&self) -> usize {
         self.tasks.len()
-    }
-
-    /// Counts pending tasks for a specific principal.
-    ///
-    /// Implements: REQ-GOV-001/F-009.1
-    fn count_pending_for_principal(&self, principal_key: &str) -> usize {
-        let task_ids = match self.by_principal.get(principal_key) {
-            Some(ids) => ids.clone(),
-            None => return 0,
-        };
-
-        task_ids
-            .iter()
-            .filter(|id| {
-                self.tasks
-                    .get(*id)
-                    .is_some_and(|entry| !entry.task.status.is_terminal())
-            })
-            .count()
     }
 
     /// Creates and inserts a new task.
@@ -914,7 +951,7 @@ impl TaskStore {
         principal: Principal,
         ttl: Option<Duration>,
         on_timeout: TimeoutAction,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         // F-009.3, F-009.4: Atomically reserve a global capacity slot
         loop {
             let current = self.pending_count.load(Ordering::Acquire);
@@ -931,11 +968,18 @@ impl TaskStore {
             // CAS failed — another thread changed pending_count, retry
         }
 
-        // F-009.1, F-009.2: Check per-principal limit
-        // If this fails, rollback the global reservation
+        // F-009.1, F-009.2: Atomically check and reserve per-principal slot.
+        // Uses atomic increment + check to prevent TOCTOU race between
+        // count check and insert under concurrent access.
         let principal_key = principal.rate_limit_key();
-        let pending = self.count_pending_for_principal(&principal_key);
-        if pending >= self.config.max_pending_per_principal {
+        let principal_counter = self
+            .pending_by_principal
+            .entry(principal_key.clone())
+            .or_insert_with(|| AtomicUsize::new(0));
+        let prev = principal_counter.fetch_add(1, Ordering::AcqRel);
+        if prev >= self.config.max_pending_per_principal {
+            // Rollback both counters
+            principal_counter.fetch_sub(1, Ordering::Release);
             self.pending_count.fetch_sub(1, Ordering::Release);
             return Err(TaskError::RateLimited {
                 principal: principal_key,
@@ -954,13 +998,14 @@ impl TaskStore {
             principal,
             ttl,
             on_timeout,
-        );
+        )
+        .map_err(|e| TaskError::Internal { details: e })?;
         let task_id = task.id.clone();
-        let task_clone = task.clone();
+        let task_arc = Arc::new(task);
 
         // Insert into store
         let entry = TaskEntry {
-            task,
+            task: task_arc.clone(),
             terminal_at: None,
             notify: Arc::new(Notify::new()),
         };
@@ -973,13 +1018,13 @@ impl TaskStore {
             .push(task_id);
 
         // Global slot was already reserved via compare_exchange above
-        Ok(task_clone)
+        Ok(task_arc)
     }
 
     /// Gets a task by ID.
     ///
     /// Implements: REQ-GOV-001/F-003
-    pub fn get(&self, task_id: &TaskId) -> Result<Task, TaskError> {
+    pub fn get(&self, task_id: &TaskId) -> Result<Arc<Task>, TaskError> {
         self.tasks
             .get(task_id)
             .map(|entry| entry.task.clone())
@@ -996,7 +1041,7 @@ impl TaskStore {
         task_id: &TaskId,
         new_status: TaskStatus,
         reason: Option<String>,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1005,13 +1050,12 @@ impl TaskStore {
             })?;
 
         let was_terminal = entry.task.status.is_terminal();
-        entry.task.transition(new_status, reason)?;
+        Arc::make_mut(&mut entry.task).transition(new_status, reason)?;
 
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Release);
-            // Notify any waiters
+            self.decrement_pending_counters(&entry.task);
             entry.notify.notify_waiters();
         }
 
@@ -1027,7 +1071,7 @@ impl TaskStore {
         expected_status: TaskStatus,
         new_status: TaskStatus,
         reason: Option<String>,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1036,15 +1080,12 @@ impl TaskStore {
             })?;
 
         let was_terminal = entry.task.status.is_terminal();
-        entry
-            .task
-            .transition_if(expected_status, new_status, reason)?;
+        Arc::make_mut(&mut entry.task).transition_if(expected_status, new_status, reason)?;
 
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Release);
-            // Notify any waiters
+            self.decrement_pending_counters(&entry.task);
             entry.notify.notify_waiters();
         }
 
@@ -1060,7 +1101,7 @@ impl TaskStore {
         decision: ApprovalDecision,
         decided_by: String,
         approval_valid_for: Duration,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1081,29 +1122,31 @@ impl TaskStore {
         let approval_valid_until = now
             + chrono::Duration::from_std(approval_valid_for).unwrap_or(chrono::Duration::zero());
 
-        entry.task.approval = Some(ApprovalRecord {
-            decision: decision.clone(),
-            decided_by,
-            decided_at: now,
-            approval_valid_until,
-            metadata: None,
-        });
-
         // Transition based on decision
-        let (new_status, reason) = match decision {
+        let (new_status, reason) = match &decision {
             ApprovalDecision::Approved => (TaskStatus::Executing, Some("Approved".to_string())),
             ApprovalDecision::Rejected { reason } => (
                 TaskStatus::Rejected,
-                reason.or_else(|| Some("Rejected".to_string())),
+                reason.clone().or_else(|| Some("Rejected".to_string())),
             ),
         };
 
         let was_terminal = entry.task.status.is_terminal();
-        entry.task.transition(new_status, reason)?;
+        {
+            let task = Arc::make_mut(&mut entry.task);
+            task.approval = Some(ApprovalRecord {
+                decision,
+                decided_by,
+                decided_at: now,
+                approval_valid_until,
+                metadata: None,
+            });
+            task.transition(new_status, reason)?;
+        }
 
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.pending_count.fetch_sub(1, Ordering::Release);
+            self.decrement_pending_counters(&entry.task);
             entry.notify.notify_waiters();
         }
 
@@ -1113,7 +1156,11 @@ impl TaskStore {
     /// Marks a task as completed with a result.
     ///
     /// Implements: REQ-GOV-001 (called by REQ-GOV-002)
-    pub fn complete(&self, task_id: &TaskId, result: ToolCallResult) -> Result<Task, TaskError> {
+    pub fn complete(
+        &self,
+        task_id: &TaskId,
+        result: ToolCallResult,
+    ) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1130,22 +1177,55 @@ impl TaskStore {
             });
         }
 
-        entry.task.result = Some(result);
-        entry.task.transition(
-            TaskStatus::Completed,
-            Some("Execution completed".to_string()),
-        )?;
+        {
+            let task = Arc::make_mut(&mut entry.task);
+            task.result = Some(result);
+            task.transition(
+                TaskStatus::Completed,
+                Some("Execution completed".to_string()),
+            )?;
+        }
         entry.terminal_at = Some(Utc::now());
-        self.pending_count.fetch_sub(1, Ordering::Release);
+        self.decrement_pending_counters(&entry.task);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
     }
 
+    /// Records an execution result on an auto-approved expired task.
+    ///
+    /// Unlike `complete()`, this does not transition the task status (it stays
+    /// `Expired`). It records the result and approval for audit purposes so
+    /// that the task shows evidence of execution after auto-approval.
+    pub fn record_auto_approve_result(
+        &self,
+        task_id: &TaskId,
+        result: ToolCallResult,
+        approval: super::ApprovalRecord,
+    ) -> Result<(), TaskError> {
+        let mut entry = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| TaskError::NotFound {
+                task_id: task_id.clone(),
+            })?;
+
+        let task = Arc::make_mut(&mut entry.task);
+        task.result = Some(result);
+        task.approval = Some(approval);
+        task.transitions.push(TaskTransition {
+            from: TaskStatus::Expired,
+            to: TaskStatus::Expired, // Status doesn't change (terminal)
+            at: Utc::now(),
+            reason: Some("Auto-approved after expiration; executed successfully".to_string()),
+        });
+        Ok(())
+    }
+
     /// Marks a task as failed with failure info.
     ///
     /// Implements: REQ-GOV-001 (called by REQ-GOV-002)
-    pub fn fail(&self, task_id: &TaskId, failure: FailureInfo) -> Result<Task, TaskError> {
+    pub fn fail(&self, task_id: &TaskId, failure: FailureInfo) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1161,14 +1241,15 @@ impl TaskStore {
             });
         }
 
-        entry.task.failure = Some(failure.clone());
-        entry
-            .task
-            .transition(TaskStatus::Failed, Some(failure.reason))?;
+        {
+            let task = Arc::make_mut(&mut entry.task);
+            task.failure = Some(failure.clone());
+            task.transition(TaskStatus::Failed, Some(failure.reason))?;
+        }
         entry.terminal_at = Some(Utc::now());
 
         if !was_terminal {
-            self.pending_count.fetch_sub(1, Ordering::Release);
+            self.decrement_pending_counters(&entry.task);
         }
         entry.notify.notify_waiters();
 
@@ -1181,7 +1262,7 @@ impl TaskStore {
     ///
     /// This operation is idempotent: cancelling an already-cancelled task
     /// returns success per SEP-1686 spec requirements.
-    pub fn cancel(&self, task_id: &TaskId) -> Result<Task, TaskError> {
+    pub fn cancel(&self, task_id: &TaskId) -> Result<Arc<Task>, TaskError> {
         let mut entry = self
             .tasks
             .get_mut(task_id)
@@ -1210,12 +1291,12 @@ impl TaskStore {
             });
         }
 
-        entry.task.transition(
+        Arc::make_mut(&mut entry.task).transition(
             TaskStatus::Cancelled,
             Some("Cancelled by agent".to_string()),
         )?;
         entry.terminal_at = Some(Utc::now());
-        self.pending_count.fetch_sub(1, Ordering::Release);
+        self.decrement_pending_counters(&entry.task);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -1246,24 +1327,24 @@ impl TaskStore {
 
         // Expire each task
         for task_id in to_expire {
-            if let Some(mut entry) = self.tasks.get_mut(&task_id)
-                && !entry.task.status.is_terminal()
-                && now > entry.task.expires_at
-                && entry
-                    .task
-                    .transition(TaskStatus::Expired, Some("TTL exceeded".to_string()))
-                    .is_ok()
-            {
-                entry.terminal_at = Some(now);
-                self.pending_count.fetch_sub(1, Ordering::Release);
-                entry.notify.notify_waiters();
-                expired += 1;
-                tracing::warn!(
-                    task_id = %task_id,
-                    tool = %entry.task.original_request.name,
-                    age_seconds = (now - entry.task.created_at).num_seconds(),
-                    "Task expired"
-                );
+            if let Some(mut entry) = self.tasks.get_mut(&task_id) {
+                if !entry.task.status.is_terminal()
+                    && now > entry.task.expires_at
+                    && Arc::make_mut(&mut entry.task)
+                        .transition(TaskStatus::Expired, Some("TTL exceeded".to_string()))
+                        .is_ok()
+                {
+                    entry.terminal_at = Some(now);
+                    self.decrement_pending_counters(&entry.task);
+                    entry.notify.notify_waiters();
+                    expired += 1;
+                    tracing::warn!(
+                        task_id = %task_id,
+                        tool = %entry.task.original_request.name,
+                        age_seconds = (now - entry.task.created_at).num_seconds(),
+                        "Task expired"
+                    );
+                }
             }
         }
 
@@ -1326,7 +1407,7 @@ impl TaskStore {
         principal: &Principal,
         offset: usize,
         limit: usize,
-    ) -> Vec<Task> {
+    ) -> Vec<Arc<Task>> {
         let principal_key = principal.rate_limit_key();
         let task_ids = match self.by_principal.get(&principal_key) {
             Some(ids) => ids.clone(),
@@ -1334,7 +1415,7 @@ impl TaskStore {
         };
 
         // Collect tasks, sorted by creation time (newest first)
-        let mut tasks: Vec<Task> = task_ids
+        let mut tasks: Vec<Arc<Task>> = task_ids
             .iter()
             .filter_map(|id| self.tasks.get(id).map(|e| e.task.clone()))
             .collect();
@@ -1359,7 +1440,7 @@ impl TaskStore {
         &self,
         task_id: &TaskId,
         timeout: Duration,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Arc<Task>, TaskError> {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
@@ -1572,7 +1653,8 @@ mod tests {
             test_principal(),
             Duration::from_secs(600),
             TimeoutAction::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(task.status, TaskStatus::Working);
         assert!(
@@ -1597,7 +1679,8 @@ mod tests {
             test_principal(),
             Duration::from_secs(600),
             TimeoutAction::default(),
-        );
+        )
+        .unwrap();
 
         task.transition(
             TaskStatus::InputRequired,
@@ -1626,7 +1709,8 @@ mod tests {
             test_principal(),
             Duration::from_secs(600),
             TimeoutAction::default(),
-        );
+        )
+        .unwrap();
 
         // Get to a terminal state
         task.transition(TaskStatus::InputRequired, None).unwrap();
@@ -1648,7 +1732,8 @@ mod tests {
             test_principal(),
             Duration::from_secs(600),
             TimeoutAction::default(),
-        );
+        )
+        .unwrap();
 
         // Correct expected status
         task.transition_if(TaskStatus::Working, TaskStatus::InputRequired, None)
@@ -2091,9 +2176,9 @@ mod tests {
             mcp_request_id: JsonRpcId::Number(1),
         };
 
-        let hash1 = hash_request(&req1);
-        let hash2 = hash_request(&req2);
-        let hash3 = hash_request(&req3);
+        let hash1 = hash_request(&req1).unwrap();
+        let hash2 = hash_request(&req2).unwrap();
+        let hash3 = hash_request(&req3).unwrap();
 
         // Same request produces same hash
         assert_eq!(hash1, hash2);
@@ -2133,7 +2218,10 @@ mod tests {
         };
 
         // Must produce identical hashes despite different key orders
-        assert_eq!(hash_request(&req_ab), hash_request(&req_ba));
+        assert_eq!(
+            hash_request(&req_ab).unwrap(),
+            hash_request(&req_ba).unwrap()
+        );
 
         // Nested objects should also be order-independent
         let nested_1 = serde_json::json!({"outer": {"z": 3, "a": 1}, "list": [1, 2]});
@@ -2152,7 +2240,10 @@ mod tests {
             mcp_request_id: JsonRpcId::Number(4),
         };
 
-        assert_eq!(hash_request(&req_nested_1), hash_request(&req_nested_2));
+        assert_eq!(
+            hash_request(&req_nested_1).unwrap(),
+            hash_request(&req_nested_2).unwrap()
+        );
     }
 
     /// Tests approval recording and state transition.
@@ -2189,7 +2280,7 @@ mod tests {
 
         assert_eq!(approved.status, TaskStatus::Executing);
         assert!(approved.approval.is_some());
-        let approval = approved.approval.unwrap();
+        let approval = approved.approval.as_ref().unwrap();
         assert_eq!(approval.decision, ApprovalDecision::Approved);
         assert_eq!(approval.decided_by, "approver@example.com");
     }
@@ -2431,5 +2522,43 @@ mod tests {
             !store.by_principal.contains_key(&key),
             "by_principal should not contain the principal after all tasks cleaned up"
         );
+    }
+
+    // ========================================================================
+    // canonical_json Tests
+    // ========================================================================
+
+    #[test]
+    fn test_canonical_json_depth_limit() {
+        // Build deeply nested JSON: {"a": {"a": {"a": ... }}}
+        let mut deep = serde_json::json!("leaf");
+        for _ in 0..100 {
+            deep = serde_json::json!({ "a": deep });
+        }
+
+        // Should not stack overflow; returns error on excessive depth
+        let result = canonical_json(&deep);
+        assert!(result.is_err(), "Expected error for deeply nested JSON");
+        assert!(
+            result.unwrap_err().contains("nesting depth"),
+            "Error should mention nesting depth"
+        );
+    }
+
+    #[test]
+    fn test_canonical_json_sorted_keys() {
+        let json = serde_json::json!({
+            "z": "last",
+            "a": "first",
+            "m": {"nested": "value"}
+        });
+
+        let result = canonical_json(&json).unwrap();
+        // Keys must be sorted: a before m before z
+        let a_pos = result.find("\"a\"").expect("missing key a");
+        let m_pos = result.find("\"m\"").expect("missing key m");
+        let z_pos = result.find("\"z\"").expect("missing key z");
+        assert!(a_pos < m_pos, "a should come before m");
+        assert!(m_pos < z_pos, "m should come before z");
     }
 }

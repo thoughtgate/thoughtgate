@@ -47,6 +47,9 @@ pub struct UpstreamConfig {
     pub pool_max_idle_per_host: usize,
     /// Idle connection timeout
     pub pool_idle_timeout: Duration,
+    /// Maximum response body size in bytes (default: 10MB).
+    /// Prevents unbounded memory allocation from oversized upstream responses.
+    pub max_response_size: usize,
 }
 
 impl Default for UpstreamConfig {
@@ -57,6 +60,7 @@ impl Default for UpstreamConfig {
             connect_timeout: Duration::from_secs(5),
             pool_max_idle_per_host: 32,
             pool_idle_timeout: Duration::from_secs(90),
+            max_response_size: 10 * 1024 * 1024, // 10 MB
         }
     }
 }
@@ -140,6 +144,8 @@ impl UpstreamConfig {
 pub struct UpstreamClient {
     client: Client,
     config: UpstreamConfig,
+    /// Pre-computed MCP endpoint URL (avoids `format!()` per request).
+    mcp_url: String,
 }
 
 impl UpstreamClient {
@@ -186,7 +192,13 @@ impl UpstreamClient {
                 correlation_id: format!("upstream-client-build-error: {}", e),
             })?;
 
-        Ok(Self { client, config })
+        let mcp_url = format!("{}/mcp/v1", config.base_url.trim_end_matches('/'));
+
+        Ok(Self {
+            client,
+            config,
+            mcp_url,
+        })
     }
 
     /// Perform a health check to verify upstream connectivity.
@@ -198,63 +210,35 @@ impl UpstreamClient {
     ///
     /// # Returns
     ///
-    /// - `Ok(())` if the connection can be established
+    /// - `Ok(())` if the upstream is reachable (any HTTP response, including 4xx)
     /// - `Err(ThoughtGateError::UpstreamConnectionFailed)` if connection fails
     /// - `Err(ThoughtGateError::UpstreamTimeout)` if connection times out
     #[tracing::instrument(skip(self))]
     pub async fn health_check(&self) -> Result<(), ThoughtGateError> {
-        let url = match reqwest::Url::parse(&self.config.base_url) {
-            Ok(u) => u,
-            Err(e) => {
-                return Err(ThoughtGateError::InternalError {
-                    correlation_id: format!("health-check-url-parse-error: {}", e),
-                });
-            }
-        };
+        // Use the HTTP client (with its connection pool and TLS stack) rather
+        // than raw TCP, so the health check exercises the same path as real
+        // requests and properly tests TLS negotiation.
+        let result = self
+            .client
+            .head(&self.config.base_url)
+            .timeout(self.config.connect_timeout)
+            .send()
+            .await;
 
-        let host = match url.host_str() {
-            Some(h) => h,
-            None => {
-                // No host means malformed URL - fail clearly rather than probing localhost
-                return Err(ThoughtGateError::InternalError {
-                    correlation_id: format!(
-                        "health-check-no-host: URL '{}' has no host component",
-                        self.config.base_url
-                    ),
-                });
-            }
-        };
-        let port = match url.port_or_known_default() {
-            Some(p) => p,
-            None => {
-                warn!(
+        match result {
+            Ok(resp) => {
+                // Any HTTP response means the server is reachable.
+                // 4xx/405 is expected (HEAD on an MCP endpoint may not be supported).
+                // Only 5xx indicates an unhealthy server, but for a connectivity check
+                // even that means "reachable".
+                debug!(
                     url = %self.config.base_url,
-                    fallback = 80,
-                    "URL has no port and unknown scheme, falling back to port 80 for health check"
+                    status = %resp.status(),
+                    "Upstream health check: server reachable"
                 );
-                80
-            }
-        };
-        let addr = format!("{}:{}", host, port);
-
-        // TCP connect using configured connect_timeout for consistency
-        let timeout = self.config.connect_timeout;
-        let connect_result =
-            tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await;
-
-        match connect_result {
-            Ok(Ok(_stream)) => {
-                // Connection successful, drop stream immediately
                 Ok(())
             }
-            Ok(Err(e)) => Err(ThoughtGateError::UpstreamConnectionFailed {
-                url: self.config.base_url.clone(),
-                reason: e.to_string(),
-            }),
-            Err(_timeout) => Err(ThoughtGateError::UpstreamTimeout {
-                url: self.config.base_url.clone(),
-                timeout_secs: timeout.as_secs(),
-            }),
+            Err(e) => Err(self.classify_error(e, "health-check")),
         }
     }
 
@@ -342,7 +326,7 @@ impl UpstreamClient {
         &self,
         request: &McpRequest,
     ) -> Result<JsonRpcResponse, ThoughtGateError> {
-        let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
+        let url = &self.mcp_url;
         let correlation_id = request.correlation_id.to_string();
 
         debug!(
@@ -357,7 +341,7 @@ impl UpstreamClient {
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .header("Content-Type", "application/json")
             .json(&jsonrpc_request)
             .send()
@@ -393,11 +377,13 @@ impl UpstreamClient {
             return Err(classify_upstream_http_error(status));
         }
 
-        // Parse response body
-        let body: JsonRpcResponse = response.json().await.map_err(|e| {
+        // Read response body with size limit, then parse
+        let body_bytes = self.read_body_limited(response, &correlation_id).await?;
+        let body: JsonRpcResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
             error!(
                 correlation_id = %correlation_id,
                 error = %e,
+                body_size = body_bytes.len(),
                 "Failed to parse upstream response"
             );
             ThoughtGateError::UpstreamError {
@@ -440,7 +426,7 @@ impl UpstreamClient {
             });
         }
 
-        let url = format!("{}/mcp/v1", self.config.base_url.trim_end_matches('/'));
+        let url = &self.mcp_url;
 
         debug!(
             batch_size = requests.len(),
@@ -453,7 +439,7 @@ impl UpstreamClient {
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .header("Content-Type", "application/json")
             .json(&jsonrpc_requests)
             .send()
@@ -476,14 +462,12 @@ impl UpstreamClient {
             return Err(classify_upstream_http_error(status));
         }
 
+        let body_bytes = self.read_body_limited(response, "batch").await?;
         let body: Vec<JsonRpcResponse> =
-            response
-                .json()
-                .await
-                .map_err(|e| ThoughtGateError::UpstreamError {
-                    code: -32002,
-                    message: format!("Failed to parse upstream batch response: {}", e),
-                })?;
+            serde_json::from_slice(&body_bytes).map_err(|e| ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: format!("Failed to parse upstream batch response: {}", e),
+            })?;
 
         debug!(
             response_count = body.len(),
@@ -491,6 +475,83 @@ impl UpstreamClient {
         );
 
         Ok(body)
+    }
+
+    /// Read the response body with a size limit.
+    ///
+    /// Checks the `Content-Length` header first (if present) for early rejection,
+    /// then reads the body up to `max_response_size`. Returns an error if the
+    /// response exceeds the limit.
+    async fn read_body_limited(
+        &self,
+        response: reqwest::Response,
+        correlation_id: &str,
+    ) -> Result<bytes::Bytes, ThoughtGateError> {
+        let max_size = self.config.max_response_size;
+
+        // Early reject if Content-Length exceeds limit
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > max_size {
+                warn!(
+                    correlation_id = %correlation_id,
+                    content_length = content_length,
+                    max_response_size = max_size,
+                    "Upstream response exceeds size limit (Content-Length)"
+                );
+                return Err(ThoughtGateError::UpstreamError {
+                    code: -32002,
+                    message: format!(
+                        "Upstream response too large: {} bytes exceeds {} byte limit",
+                        content_length, max_size
+                    ),
+                });
+            }
+        }
+
+        // Stream body chunk-by-chunk with size enforcement.
+        // This prevents unbounded memory growth for chunked responses
+        // that lack a Content-Length header.
+        let mut buf = Vec::with_capacity(
+            response
+                .content_length()
+                .map(|cl| cl as usize)
+                .unwrap_or(8192)
+                .min(max_size),
+        );
+
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            error!(
+                correlation_id = %correlation_id,
+                error = %e,
+                "Failed to read upstream response body chunk"
+            );
+            ThoughtGateError::UpstreamError {
+                code: -32002,
+                message: format!("Failed to read upstream response: {}", e),
+            }
+        })? {
+            if buf.len() + chunk.len() > max_size {
+                warn!(
+                    correlation_id = %correlation_id,
+                    accumulated = buf.len(),
+                    chunk_size = chunk.len(),
+                    max_response_size = max_size,
+                    "Upstream response exceeds size limit during streaming"
+                );
+                return Err(ThoughtGateError::UpstreamError {
+                    code: -32002,
+                    message: format!(
+                        "Upstream response too large: >={} bytes exceeds {} byte limit",
+                        buf.len() + chunk.len(),
+                        max_size
+                    ),
+                });
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        Ok(buf.into())
     }
 
     /// Classify a reqwest error into ThoughtGateError.
@@ -786,6 +847,81 @@ mod tests {
         if let Err(ThoughtGateError::InvalidParams { details }) = result {
             assert!(details.contains("THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS"));
             assert!(details.contains("invalid"));
+        }
+    }
+
+    // ========================================================================
+    // read_body_limited Tests
+    // ========================================================================
+
+    /// Tests that responses within the size limit are read successfully.
+    #[tokio::test]
+    async fn test_read_body_limited_within_limit() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello"))
+            .mount(&mock_server)
+            .await;
+
+        let config = UpstreamConfig {
+            base_url: mock_server.uri(),
+            max_response_size: 1024,
+            ..UpstreamConfig::default()
+        };
+        let client = UpstreamClient::new(config).unwrap();
+
+        let response = client
+            .client
+            .post(format!("{}/", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let body = client.read_body_limited(response, "test-123").await;
+        assert!(body.is_ok());
+        assert_eq!(&body.unwrap()[..], b"hello");
+    }
+
+    /// Tests that responses exceeding the limit via Content-Length are rejected early.
+    #[tokio::test]
+    async fn test_read_body_limited_content_length_exceeds() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let large_body = vec![b'x'; 2048];
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(large_body))
+            .mount(&mock_server)
+            .await;
+
+        let config = UpstreamConfig {
+            base_url: mock_server.uri(),
+            max_response_size: 1024, // Smaller than body
+            ..UpstreamConfig::default()
+        };
+        let client = UpstreamClient::new(config).unwrap();
+
+        let response = client
+            .client
+            .post(format!("{}/", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client.read_body_limited(response, "test-456").await;
+        assert!(result.is_err());
+        match result {
+            Err(ThoughtGateError::UpstreamError { message, .. }) => {
+                assert!(
+                    message.contains("too large"),
+                    "Expected 'too large' in: {message}"
+                );
+            }
+            other => panic!("Expected UpstreamError, got: {other:?}"),
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "thoughtgate"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.87"
 authors = ["Oleg Mukhin <oleg.v.mukhin@gmail.com>"]
@@ -41,6 +41,7 @@ tower-service = "0.3"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
 
 # CLI and config
 clap = { version = "4", features = ["derive", "env"] }
@@ -82,7 +83,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # serde-saphyr is a panic-free YAML parser built on Saphyr
 # Replaces deprecated serde_yaml and unsound serde_yml
-serde-saphyr = "0.0.15"
+serde-saphyr = "0.0.17"
 
 # Configuration (REQ-CFG-001)
 glob = "0.3"
@@ -147,6 +148,11 @@ harness = false
 # Policy evaluation benchmark (REQ-OBS-001 M-POL-001, M-POL-002)
 [[bench]]
 name = "policy_eval"
+harness = false
+
+# JSON-RPC parsing benchmark (tracks T-001 optimization)
+[[bench]]
+name = "jsonrpc_parse"
 harness = false
 
 [profile.release]

@@ -23,6 +23,7 @@
 //! 7. Return JSON-RPC response(s)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
     Router,
@@ -50,12 +51,25 @@ use crate::protocol::{
     strip_sse_capability,
 };
 use crate::transport::jsonrpc::{
-    JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, PromptDefinition, ResourceDefinition,
-    TaskSupport, ToolDefinition, ToolExecution, parse_jsonrpc,
+    JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
 };
 use crate::transport::router::{McpRouter, RouteTarget, TaskMethod};
 use crate::transport::upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};
 use tokio_util::sync::CancellationToken;
+
+/// RAII guard that decrements the aggregate buffer counter on drop.
+///
+/// Ensures buffered_bytes is always decremented even if the handler panics.
+struct BufferGuard<'a> {
+    counter: &'a AtomicUsize,
+    size: usize,
+}
+
+impl<'a> Drop for BufferGuard<'a> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.size, Ordering::Release);
+    }
+}
 
 /// Configuration for the MCP server.
 ///
@@ -157,6 +171,10 @@ pub struct McpState {
     pub max_batch_size: usize,
     /// Capability cache for upstream detection (REQ-CORE-007)
     pub capability_cache: Arc<CapabilityCache>,
+    /// Current aggregate buffered bytes across all in-flight requests.
+    pub buffered_bytes: AtomicUsize,
+    /// Maximum aggregate buffered bytes before rejecting new requests.
+    pub max_aggregate_buffer: usize,
 }
 
 /// Configuration for the MCP handler.
@@ -170,6 +188,9 @@ pub struct McpHandlerConfig {
     pub max_concurrent_requests: usize,
     /// Maximum number of requests in a JSON-RPC batch
     pub max_batch_size: usize,
+    /// Maximum aggregate buffered bytes across all in-flight requests.
+    /// Prevents OOM when many concurrent requests buffer large bodies.
+    pub max_aggregate_buffer: usize,
 }
 
 impl Default for McpHandlerConfig {
@@ -178,6 +199,7 @@ impl Default for McpHandlerConfig {
             max_body_size: 1024 * 1024, // 1MB
             max_concurrent_requests: 10000,
             max_batch_size: 100,
+            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB
         }
     }
 }
@@ -189,6 +211,7 @@ impl McpHandlerConfig {
     ///
     /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
     /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
+    /// - `THOUGHTGATE_MAX_AGGREGATE_BUFFER` (default: 536870912 = 512MB): Max aggregate buffered bytes
     pub fn from_env() -> Self {
         let max_body_size: usize = std::env::var("THOUGHTGATE_MAX_REQUEST_BODY_BYTES")
             .ok()
@@ -205,10 +228,16 @@ impl McpHandlerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
 
+        let max_aggregate_buffer: usize = std::env::var("THOUGHTGATE_MAX_AGGREGATE_BUFFER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512 * 1024 * 1024); // 512MB default
+
         Self {
             max_body_size,
             max_concurrent_requests,
             max_batch_size,
+            max_aggregate_buffer,
         }
     }
 }
@@ -274,6 +303,8 @@ impl McpHandler {
             max_body_size: config.max_body_size,
             max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: config.max_aggregate_buffer,
         });
 
         Self { state }
@@ -301,6 +332,8 @@ impl McpHandler {
             max_body_size: config.max_body_size,
             max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: config.max_aggregate_buffer,
         });
 
         Self { state }
@@ -349,6 +382,8 @@ impl McpHandler {
             max_body_size: handler_config.max_body_size,
             max_batch_size: handler_config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: handler_config.max_aggregate_buffer,
         });
 
         Self { state }
@@ -541,6 +576,8 @@ impl McpServer {
             max_body_size: config.max_body_size,
             max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
         });
 
         Ok(Self {
@@ -580,6 +617,8 @@ impl McpServer {
             max_body_size: config.max_body_size,
             max_batch_size: config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
         });
 
         Ok(Self {
@@ -631,6 +670,8 @@ impl McpServer {
             max_body_size: server_config.max_body_size,
             max_batch_size: server_config.max_batch_size,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
         });
 
         Ok(Self {
@@ -728,7 +769,7 @@ async fn handle_mcp_request(State(state): State<Arc<McpState>>, body: Bytes) -> 
 async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, Bytes) {
     // Check body size limit (generate unique correlation ID per REQ-CORE-004)
     if body.len() > state.max_body_size {
-        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
         let error = ThoughtGateError::InvalidRequest {
             details: format!(
                 "Request body exceeds maximum size of {} bytes",
@@ -738,19 +779,75 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
         return error_bytes(None, &error, &correlation_id);
     }
 
-    // Try to acquire semaphore permit (EC-MCP-011)
-    // Note: This returns HTTP 503 (not 200) to signal service overload at HTTP layer
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
+    // Track aggregate buffered bytes to prevent OOM.
+    // Increment before processing; decrement when this request completes.
+    let body_size = body.len();
+    let prev = state.buffered_bytes.fetch_add(body_size, Ordering::AcqRel);
+    if prev + body_size > state.max_aggregate_buffer {
+        state.buffered_bytes.fetch_sub(body_size, Ordering::Release);
+        let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
+        warn!(
+            correlation_id = %correlation_id,
+            buffered = prev + body_size,
+            limit = state.max_aggregate_buffer,
+            "Aggregate buffer limit exceeded"
+        );
+        let error = ThoughtGateError::RateLimited {
+            retry_after_secs: Some(1),
+        };
+        return error_bytes(None, &error, &correlation_id);
+    }
+
+    // Ensure we decrement buffered_bytes when this request completes.
+    let _buffer_guard = BufferGuard {
+        counter: &state.buffered_bytes,
+        size: body_size,
+    };
+
+    // Parse JSON-RPC request(s) first to determine permit count
+    // (generate unique correlation ID per REQ-CORE-004)
+    let parsed = match parse_jsonrpc(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
+            return error_bytes(None, &e, &correlation_id);
+        }
+    };
+
+    // Determine how many permits to acquire: 1 for single, batch_size for batch.
+    // This prevents a batch of N requests from consuming only 1 concurrency slot.
+    let permit_count = match &parsed {
+        ParsedRequests::Single(_) => 1,
+        ParsedRequests::Batch(requests) => {
+            if requests.len() > state.max_batch_size {
+                let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
+                let error = ThoughtGateError::InvalidRequest {
+                    details: format!(
+                        "Batch size {} exceeds maximum of {}",
+                        requests.len(),
+                        state.max_batch_size
+                    ),
+                };
+                return error_bytes(None, &error, &correlation_id);
+            }
+            requests.len().max(1) as u32
+        }
+    };
+
+    // Try to acquire semaphore permits weighted by request count (EC-MCP-011)
+    let _permit = match state.semaphore.clone().try_acquire_many_owned(permit_count) {
         Ok(permit) => permit,
         Err(_) => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
             warn!(
                 correlation_id = %correlation_id,
+                permits_requested = permit_count,
                 "Max concurrent requests reached, returning 503"
             );
-            // Build JSON-RPC error response with correlation ID, but return HTTP 503
-            let error = ThoughtGateError::ServiceUnavailable {
-                reason: "Max concurrent requests exceeded".to_string(),
+            // Return HTTP 200 with JSON-RPC error per MCP spec.
+            // MCP clients expect JSON-RPC error frames over HTTP 200, not HTTP 503.
+            let error = ThoughtGateError::RateLimited {
+                retry_after_secs: Some(1),
             };
             let jsonrpc_error = error.to_jsonrpc_error(&correlation_id);
             let response = JsonRpcResponse::error(None, jsonrpc_error);
@@ -758,35 +855,15 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
                 .map(Bytes::from)
                 .unwrap_or_else(|_| {
                     Bytes::from_static(
-                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32013,"message":"Service temporarily unavailable"}}"#,
+                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32009,"message":"Rate limited"}}"#,
                     )
                 });
-            return (StatusCode::SERVICE_UNAVAILABLE, bytes);
-        }
-    };
-
-    // Parse JSON-RPC request(s) (generate unique correlation ID per REQ-CORE-004)
-    let parsed = match parse_jsonrpc(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
-            return error_bytes(None, &e, &correlation_id);
+            return (StatusCode::OK, bytes);
         }
     };
 
     match parsed {
         ParsedRequests::Single(request) => handle_single_request_bytes(state, request).await,
-        ParsedRequests::Batch(ref requests) if requests.len() > state.max_batch_size => {
-            let correlation_id = uuid::Uuid::new_v4().to_string();
-            let error = ThoughtGateError::InvalidRequest {
-                details: format!(
-                    "Batch size {} exceeds maximum of {}",
-                    requests.len(),
-                    state.max_batch_size
-                ),
-            };
-            error_bytes(None, &error, &correlation_id)
-        }
         ParsedRequests::Batch(requests) => handle_batch_request_bytes(state, requests).await,
     }
 }
@@ -994,49 +1071,63 @@ async fn handle_list_method(
     // Per REQ-CORE-003/F-003: Gate 1 applies to tools, resources, and prompts
     match request.method.as_str() {
         "tools/list" => {
-            let tools_value = match result.get("tools") {
-                Some(v) => v,
+            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
+            let mut new_result = result.clone();
+            let tools_arr = match new_result
+                .as_object_mut()
+                .and_then(|obj| obj.get_mut("tools"))
+                .and_then(|v| v.as_array_mut())
+            {
+                Some(arr) => arr,
                 None => return Ok(response),
-            };
-
-            // Parse tools into ToolDefinition structs
-            let mut tools: Vec<ToolDefinition> = match serde_json::from_value(tools_value.clone()) {
-                Ok(t) => t,
-                Err(e) => {
-                    // Fail closed: do not pass unfiltered tools to client (Gate 1 bypass)
-                    return Err(ThoughtGateError::ServiceUnavailable {
-                        reason: format!("Failed to parse upstream tools response: {e}"),
-                    });
-                }
             };
 
             // Gate 1: Filter by visibility (ExposeConfig)
             if let Some(source) = config.get_source(source_id) {
                 let expose = source.expose();
-                let original_count = tools.len();
-                tools.retain(|tool| expose.is_visible(&tool.name));
-                let filtered_count = original_count - tools.len();
+                let original_count = tools_arr.len();
+                tools_arr.retain(|tool| {
+                    tool.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|name| expose.is_visible(name))
+                        .unwrap_or(false) // Fail closed: hide unparseable tools
+                });
+                let filtered_count = original_count - tools_arr.len();
                 if filtered_count > 0 {
                     debug!(
                         source = source_id,
                         filtered = filtered_count,
-                        remaining = tools.len(),
+                        remaining = tools_arr.len(),
                         "Gate 1: Filtered tools by visibility"
                     );
                 }
+            } else {
+                // Fail closed: source not in config, hide all tools
+                warn!(
+                    source = source_id,
+                    "Gate 1: source not in config, hiding all tools"
+                );
+                tools_arr.clear();
             }
 
             // Gate 2: Annotate execution.taskSupport based on governance rules
             // Per MCP Tasks Specification (Protocol Revision 2025-11-25)
-            for tool in &mut tools {
-                let match_result = config.governance.evaluate(&tool.name, source_id);
+            for tool in tools_arr.iter_mut() {
+                let tool_name = match tool.get("name").and_then(|n| n.as_str()) {
+                    Some(name) => name,
+                    None => continue,
+                };
+                let match_result = config.governance.evaluate(tool_name, source_id);
                 match match_result.action {
                     crate::config::Action::Approve | crate::config::Action::Policy => {
                         // ThoughtGate requires async task mode for approval/policy actions
                         // Set execution.taskSupport = "required" per MCP spec
-                        tool.execution = Some(ToolExecution {
-                            task_support: Some(TaskSupport::Required),
-                        });
+                        if let Some(obj) = tool.as_object_mut() {
+                            obj.insert(
+                                "execution".to_string(),
+                                serde_json::json!({"taskSupport": "required"}),
+                            );
+                        }
                     }
                     crate::config::Action::Forward | crate::config::Action::Deny => {
                         // Preserve upstream's execution.taskSupport (don't modify)
@@ -1045,117 +1136,92 @@ async fn handle_list_method(
                 }
             }
 
-            // Rebuild response with filtered/annotated tools
-            let mut new_result = result.clone();
-            if let Some(obj) = new_result.as_object_mut() {
-                obj.insert(
-                    "tools".to_string(),
-                    serde_json::to_value(&tools).map_err(|e| {
-                        ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to serialize filtered tools: {e}"),
-                        }
-                    })?,
-                );
-            }
-
             Ok(JsonRpcResponse::success(response.id, new_result))
         }
         "resources/list" => {
-            let resources_value = match result.get("resources") {
-                Some(v) => v,
+            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
+            let mut new_result = result.clone();
+            let resources_arr = match new_result
+                .as_object_mut()
+                .and_then(|obj| obj.get_mut("resources"))
+                .and_then(|v| v.as_array_mut())
+            {
+                Some(arr) => arr,
                 None => return Ok(response),
             };
-
-            // Parse resources into ResourceDefinition structs
-            let mut resources: Vec<ResourceDefinition> =
-                match serde_json::from_value(resources_value.clone()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // Fail closed: do not pass unfiltered resources to client (Gate 1 bypass)
-                        return Err(ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to parse upstream resources response: {e}"),
-                        });
-                    }
-                };
 
             // Gate 1: Filter by visibility (ExposeConfig)
             // Resources are filtered by URI pattern
             if let Some(source) = config.get_source(source_id) {
                 let expose = source.expose();
-                let original_count = resources.len();
-                resources.retain(|resource| expose.is_visible(&resource.uri));
-                let filtered_count = original_count - resources.len();
+                let original_count = resources_arr.len();
+                resources_arr.retain(|resource| {
+                    resource
+                        .get("uri")
+                        .and_then(|u| u.as_str())
+                        .map(|uri| expose.is_visible(uri))
+                        .unwrap_or(false) // Fail closed: hide unparseable resources
+                });
+                let filtered_count = original_count - resources_arr.len();
                 if filtered_count > 0 {
                     debug!(
                         source = source_id,
                         filtered = filtered_count,
-                        remaining = resources.len(),
+                        remaining = resources_arr.len(),
                         "Gate 1: Filtered resources by visibility"
                     );
                 }
-            }
-
-            // Rebuild response with filtered resources
-            let mut new_result = result.clone();
-            if let Some(obj) = new_result.as_object_mut() {
-                obj.insert(
-                    "resources".to_string(),
-                    serde_json::to_value(&resources).map_err(|e| {
-                        ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to serialize filtered resources: {e}"),
-                        }
-                    })?,
+            } else {
+                // Fail closed: source not in config, hide all resources
+                warn!(
+                    source = source_id,
+                    "Gate 1: source not in config, hiding all resources"
                 );
+                resources_arr.clear();
             }
 
             Ok(JsonRpcResponse::success(response.id, new_result))
         }
         "prompts/list" => {
-            let prompts_value = match result.get("prompts") {
-                Some(v) => v,
+            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
+            let mut new_result = result.clone();
+            let prompts_arr = match new_result
+                .as_object_mut()
+                .and_then(|obj| obj.get_mut("prompts"))
+                .and_then(|v| v.as_array_mut())
+            {
+                Some(arr) => arr,
                 None => return Ok(response),
             };
-
-            // Parse prompts into PromptDefinition structs
-            let mut prompts: Vec<PromptDefinition> =
-                match serde_json::from_value(prompts_value.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // Fail closed: do not pass unfiltered prompts to client (Gate 1 bypass)
-                        return Err(ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to parse upstream prompts response: {e}"),
-                        });
-                    }
-                };
 
             // Gate 1: Filter by visibility (ExposeConfig)
             // Prompts are filtered by name pattern
             if let Some(source) = config.get_source(source_id) {
                 let expose = source.expose();
-                let original_count = prompts.len();
-                prompts.retain(|prompt| expose.is_visible(&prompt.name));
-                let filtered_count = original_count - prompts.len();
+                let original_count = prompts_arr.len();
+                prompts_arr.retain(|prompt| {
+                    prompt
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|name| expose.is_visible(name))
+                        .unwrap_or(false) // Fail closed: hide unparseable prompts
+                });
+                let filtered_count = original_count - prompts_arr.len();
                 if filtered_count > 0 {
                     debug!(
                         source = source_id,
                         filtered = filtered_count,
-                        remaining = prompts.len(),
+                        remaining = prompts_arr.len(),
                         "Gate 1: Filtered prompts by visibility"
                     );
                 }
-            }
-
-            // Rebuild response with filtered prompts
-            let mut new_result = result.clone();
-            if let Some(obj) = new_result.as_object_mut() {
-                obj.insert(
-                    "prompts".to_string(),
-                    serde_json::to_value(&prompts).map_err(|e| {
-                        ThoughtGateError::ServiceUnavailable {
-                            reason: format!("Failed to serialize filtered prompts: {e}"),
-                        }
-                    })?,
+            } else {
+                // Fail closed: source not in config, hide all prompts
+                warn!(
+                    source = source_id,
+                    "Gate 1: source not in config, hiding all prompts"
                 );
+                prompts_arr.clear();
             }
 
             Ok(JsonRpcResponse::success(response.id, new_result))
@@ -1180,7 +1246,7 @@ fn is_list_method(method: &str) -> bool {
 /// - For `action: forward` or `action: deny`: if client sent task metadata but
 ///   upstream doesn't support tasks, return TaskForbidden error
 fn validate_task_metadata(
-    request: &McpRequest,
+    request: &mut McpRequest,
     action: &crate::config::Action,
     tool_name: &str,
     upstream_supports_tasks: bool,
@@ -1198,12 +1264,15 @@ fn validate_task_metadata(
             }
         }
         crate::config::Action::Forward | crate::config::Action::Deny => {
-            // TaskForbidden: If client sent task metadata but upstream doesn't support tasks,
-            // we can't forward the task context. Return an error instead of silently dropping it.
+            // If client sent task metadata but upstream doesn't support tasks,
+            // strip the metadata and forward anyway. This avoids breaking forward
+            // compatibility as upstreams gradually add task support.
             if has_task_metadata && !upstream_supports_tasks {
-                return Err(ThoughtGateError::TaskForbidden {
-                    tool: tool_name.to_string(),
-                });
+                warn!(
+                    tool = %tool_name,
+                    "Stripping task metadata: upstream does not support tasks"
+                );
+                request.task_metadata = None;
             }
         }
     }
@@ -1338,7 +1407,11 @@ async fn handle_task_method(
     request: &McpRequest,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
     // Extract params, defaulting to empty object
-    let params = request.params.clone().unwrap_or(serde_json::json!({}));
+    let params = request
+        .params
+        .as_deref()
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     match method {
         TaskMethod::Get => {
@@ -1349,7 +1422,7 @@ async fn handle_task_method(
                 })?;
 
             // Verify caller owns this task (returns TaskNotFound on mismatch)
-            verify_task_principal(state, &req.task_id)?;
+            verify_task_principal(state, &req.task_id).await?;
 
             let result = state
                 .task_handler
@@ -1373,7 +1446,7 @@ async fn handle_task_method(
                 })?;
 
             // Verify caller owns this task (returns TaskNotFound on mismatch)
-            verify_task_principal(state, &req.task_id)?;
+            verify_task_principal(state, &req.task_id).await?;
 
             // If we have an approval engine, use it to execute approved tasks
             if let Some(approval_engine) = &state.approval_engine {
@@ -1415,9 +1488,17 @@ async fn handle_task_method(
                     details: format!("Invalid tasks/list params: {}", e),
                 })?;
 
-            // Infer principal from environment (same as other task operations)
-            let policy_principal =
-                infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
+            // Infer principal from environment (sidecar mode).
+            // TODO(gateway): In gateway/multi-tenant mode, extract principal from
+            // request headers (e.g. X-Forwarded-User, mTLS client cert CN) instead
+            // of the sidecar's own K8s identity. Without this, all tasks/list calls
+            // in gateway mode would return the same principal's tasks.
+            let policy_principal = tokio::task::spawn_blocking(infer_principal)
+                .await
+                .map_err(|e| ThoughtGateError::ServiceUnavailable {
+                    reason: format!("Principal inference task failed: {}", e),
+                })?
+                .map_err(|e| ThoughtGateError::PolicyDenied {
                     tool: String::new(),
                     policy_id: None,
                     reason: Some(format!("Identity unavailable: {}", e)),
@@ -1447,7 +1528,7 @@ async fn handle_task_method(
                 })?;
 
             // Verify caller owns this task (returns TaskNotFound on mismatch)
-            verify_task_principal(state, &req.task_id)?;
+            verify_task_principal(state, &req.task_id).await?;
 
             let result = state
                 .task_handler
@@ -1469,22 +1550,32 @@ async fn handle_task_method(
 /// Returns TaskNotFound (not "access denied") to prevent information leakage
 /// about tasks owned by other principals.
 ///
-/// If principal inference fails (no K8s identity and dev mode is off),
-/// verification is skipped. This is safe because task creation also requires
-/// principal inference — if identity cannot be established, no tasks will
-/// exist for the caller to access.
+/// Fails closed: if principal inference fails for any reason (I/O error,
+/// misconfiguration, spawn_blocking panic), access is denied rather than
+/// silently allowed.
 ///
 /// Implements: REQ-GOV-001/F-011 (Principal isolation)
-fn verify_task_principal(
+async fn verify_task_principal(
     state: &McpState,
     task_id: &crate::governance::task::TaskId,
 ) -> Result<(), ThoughtGateError> {
-    // If we can't infer principal, skip verification. This can happen in
-    // environments where identity is not configured. Task creation would
-    // also fail in such environments, providing defense-in-depth.
-    let caller_principal = match infer_principal() {
-        Ok(p) => Principal::new(&p.app_name),
-        Err(_) => return Ok(()),
+    // Fail closed: if identity cannot be established, deny access.
+    // This prevents unauthorized access to tasks when identity inference
+    // fails due to I/O errors, misconfiguration, or spawn_blocking panics.
+    let caller_principal = match tokio::task::spawn_blocking(infer_principal).await {
+        Ok(Ok(p)) => Principal::new(&p.app_name),
+        Ok(Err(e)) => {
+            warn!(error = %e, "Principal inference failed, denying task access");
+            return Err(ThoughtGateError::TaskNotFound {
+                task_id: task_id.to_string(),
+            });
+        }
+        Err(e) => {
+            warn!(error = %e, "Principal inference task panicked, denying task access");
+            return Err(ThoughtGateError::TaskNotFound {
+                task_id: task_id.to_string(),
+            });
+        }
     };
 
     let task = state
@@ -1579,7 +1670,7 @@ fn task_error_to_thoughtgate(error: crate::governance::TaskError) -> ThoughtGate
 /// ```
 async fn route_through_gates(
     state: &McpState,
-    request: McpRequest,
+    mut request: McpRequest,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
     let config = state
         .config
@@ -1622,11 +1713,11 @@ async fn route_through_gates(
     // Check if the tool is visible based on ExposeConfig
     // Implements: REQ-CFG-001 Section 9.3 (Exposure Filtering)
     //
-    // Note: If the source is not found in config, we skip the visibility check
-    // and continue to Gate 2. This is intentional for v0.2:
-    // - Single source mode uses hardcoded "upstream" as source_id
-    // - If no sources are configured, all resources are visible by default
-    // - Config validation should catch misconfigured sources at load time
+    // Note: If the source is not found in config, we fail closed (block the
+    // request). A missing source indicates a misconfiguration — the hardcoded
+    // "upstream" source_id doesn't match any configured source. Config
+    // validation should catch this at load time, but we enforce here as defense
+    // in depth.
 
     if let Some(source) = config.get_source(source_id) {
         let expose: crate::config::ExposeConfig = source.expose();
@@ -1644,13 +1735,18 @@ async fn route_through_gates(
         }
         debug!(resource = %resource_name, method = %request.method, "Gate 1 passed: resource is visible");
     } else {
-        // Source not found in config - skip visibility check
-        // This is expected in v0.2 when sources are not configured
-        debug!(
+        // Source not found in config — fail closed
+        // This indicates a misconfiguration (get_source_id returns a name
+        // that doesn't match any configured source). Allowing traffic through
+        // would bypass visibility checks entirely.
+        warn!(
             resource = %resource_name,
             source = %source_id,
-            "Gate 1 skipped: source not in config, allowing all resources"
+            "Gate 1 blocked: source not found in config"
         );
+        return Err(ThoughtGateError::ServiceUnavailable {
+            reason: format!("Source '{}' not found in configuration", source_id),
+        });
     }
 
     // ========================================================================
@@ -1676,7 +1772,7 @@ async fn route_through_gates(
     // Validate that client sent params.task for actions that require it
     // This is checked AFTER Gate 2 because we need to know the action first
     validate_task_metadata(
-        &request,
+        &mut request,
         &match_result.action,
         &resource_name,
         state.capability_cache.upstream_supports_tasks(),
@@ -1736,12 +1832,17 @@ async fn start_approval_flow(
                 reason: "Approval engine not configured".to_string(),
             })?;
 
-    // Infer principal from environment
-    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
-        tool: String::new(),
-        policy_id: None,
-        reason: Some(format!("Identity unavailable: {}", e)),
-    })?;
+    // Infer principal from environment (uses spawn_blocking for file I/O)
+    let policy_principal = tokio::task::spawn_blocking(infer_principal)
+        .await
+        .map_err(|e| ThoughtGateError::ServiceUnavailable {
+            reason: format!("Principal inference task failed: {}", e),
+        })?
+        .map_err(|e| ThoughtGateError::PolicyDenied {
+            tool: String::new(),
+            policy_id: None,
+            reason: Some(format!("Identity unavailable: {}", e)),
+        })?;
 
     // Create ToolCallRequest for the approval engine
     // Transport and governance now share the same JsonRpcId type
@@ -1854,12 +1955,17 @@ async fn evaluate_with_cedar(
         }
     };
 
-    // Infer principal from environment
-    let policy_principal = infer_principal().map_err(|e| ThoughtGateError::PolicyDenied {
-        tool: String::new(),
-        policy_id: None,
-        reason: Some(format!("Identity unavailable: {}", e)),
-    })?;
+    // Infer principal from environment (uses spawn_blocking for file I/O)
+    let policy_principal = tokio::task::spawn_blocking(infer_principal)
+        .await
+        .map_err(|e| ThoughtGateError::ServiceUnavailable {
+            reason: format!("Principal inference task failed: {}", e),
+        })?
+        .map_err(|e| ThoughtGateError::PolicyDenied {
+            tool: String::new(),
+            policy_id: None,
+            reason: Some(format!("Identity unavailable: {}", e)),
+        })?;
 
     // Get policy_id and source_id from Gate 2 result, or use defaults
     let policy_id = match_result
@@ -1976,54 +2082,66 @@ async fn handle_batch_request_bytes(
     items: Vec<crate::transport::jsonrpc::BatchItem>,
 ) -> (StatusCode, Bytes) {
     use crate::transport::jsonrpc::BatchItem;
+    use futures_util::stream::{self, StreamExt};
 
-    let mut responses: Vec<JsonRpcResponse> = Vec::new();
-
-    // Process each item sequentially - see Design Note above
+    // Process batch items concurrently using buffer_unordered.
+    // JSON-RPC batch spec allows responses in any order (matched by id).
     // EC-MCP-006: Handle mixed valid/invalid items
-    for item in items {
-        match item {
-            BatchItem::Invalid { id, error } => {
-                // EC-MCP-006: Include error response for invalid items
-                let correlation_id = uuid::Uuid::new_v4().to_string();
-                responses.push(JsonRpcResponse::error(
-                    id,
-                    error.to_jsonrpc_error(&correlation_id),
-                ));
-            }
-            BatchItem::Valid(request) => {
-                let is_notification = request.is_notification();
-                let id = request.id.clone();
-                let correlation_id = request.correlation_id.to_string();
+    let batch_concurrency = items.len().min(16); // Cap concurrent items
 
-                // Route through shared routing logic
-                let result = route_request(state, request).await;
-
-                // F-007.4: Notifications don't produce response entries
-                if is_notification {
-                    if let Err(e) = result {
-                        error!(
-                            correlation_id = %correlation_id,
-                            error = %e,
-                            "Notification in batch failed"
-                        );
-                    }
-                    continue;
+    let responses: Vec<Option<JsonRpcResponse>> = stream::iter(items)
+        .map(|item| async move {
+            match item {
+                BatchItem::Invalid { id, error } => {
+                    // EC-MCP-006: Include error response for invalid items
+                    let correlation_id =
+                        crate::transport::jsonrpc::fast_correlation_id().to_string();
+                    Some(JsonRpcResponse::error(
+                        id,
+                        error.to_jsonrpc_error(&correlation_id),
+                    ))
                 }
+                BatchItem::Valid(request) => {
+                    let is_notification = request.is_notification();
+                    let id = request.id.clone();
+                    let correlation_id = request.correlation_id.to_string();
 
-                let response = match result {
-                    Ok(r) => r,
-                    Err(e) => JsonRpcResponse::error(id, e.to_jsonrpc_error(&correlation_id)),
-                };
-                responses.push(response);
+                    // Route through shared routing logic
+                    let result = route_request(state, request).await;
+
+                    // F-007.4: Notifications don't produce response entries
+                    if is_notification {
+                        if let Err(e) = result {
+                            error!(
+                                correlation_id = %correlation_id,
+                                error = %e,
+                                "Notification in batch failed"
+                            );
+                        }
+                        return None;
+                    }
+
+                    let response = match result {
+                        Ok(r) => r,
+                        Err(e) => JsonRpcResponse::error(id, e.to_jsonrpc_error(&correlation_id)),
+                    };
+                    Some(response)
+                }
             }
-        }
-    }
+        })
+        .buffer_unordered(batch_concurrency)
+        .collect()
+        .await;
+
+    // Filter out None entries (notifications)
+    let responses: Vec<JsonRpcResponse> = responses.into_iter().flatten().collect();
 
     // Return batch response
     if responses.is_empty() {
-        // All were notifications — return empty JSON array per JSON-RPC 2.0 §6
-        return (StatusCode::OK, Bytes::from_static(b"[]"));
+        // All were notifications — per JSON-RPC 2.0 §6: "The client MUST NOT
+        // expect the server to return any Response for a Batch that only
+        // contains Notification objects." Return 204 No Content.
+        return (StatusCode::NO_CONTENT, Bytes::new());
     }
 
     // Serialize batch response
@@ -2132,6 +2250,8 @@ mod tests {
             max_body_size: 1024 * 1024,
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         })
     }
 
@@ -2304,6 +2424,8 @@ mod tests {
             max_body_size: 1024 * 1024,
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         });
 
         let router = Router::new()
@@ -2319,10 +2441,15 @@ mod tests {
             .expect("should build request");
 
         let response = router.oneshot(request).await.expect("should get response");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // MCP clients expect JSON-RPC errors over HTTP 200 (not HTTP 503)
+        assert_eq!(response.status(), StatusCode::OK);
 
         let body = response_body(response).await;
-        assert!(body.contains("-32013")); // Service unavailable
+        assert!(
+            body.contains("-32009"),
+            "Expected RateLimited error code (-32009), got: {}",
+            body
+        );
     }
 
     /// Verifies: EC-MCP-004 (Body size limit returns JSON-RPC error)
@@ -2344,6 +2471,8 @@ mod tests {
             max_body_size: 10, // Very small limit
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         });
 
         // Router with DefaultBodyLimit disabled - we check size manually and return JSON-RPC error
@@ -2461,10 +2590,12 @@ mod tests {
             .expect("should build request");
 
         let response = router.oneshot(request).await.expect("should get response");
-        // All notifications in batch = empty JSON array per JSON-RPC 2.0 §6
-        assert_eq!(response.status(), StatusCode::OK);
+        // All notifications in batch = 204 No Content per JSON-RPC 2.0 §6:
+        // "The client MUST NOT expect the server to return any Response for
+        // a Batch that only contains Notification objects."
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let body_str = response_body(response).await;
-        assert_eq!(body_str, "[]");
+        assert!(body_str.is_empty());
     }
 
     #[test]
@@ -2623,13 +2754,14 @@ mod tests {
 
     /// Verifies: REQ-GOV-001/F-003 (tasks/get - invalid params)
     #[tokio::test]
-    async fn test_tasks_get_invalid_params() {
+    async fn test_tasks_get_missing_taskid_forwarded() {
         let state = create_test_state();
         let router = Router::new()
             .route("/mcp/v1", post(handle_mcp_request))
             .with_state(state);
 
-        // Request tasks/get with missing taskId
+        // Request tasks/get with missing taskId — forwarded to upstream
+        // (no tg_ prefix means it's not a local task)
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{}}"#;
         let request = Request::builder()
             .method("POST")
@@ -2644,13 +2776,11 @@ mod tests {
         let body = response_body(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("should parse response");
 
-        // Should be an error response with invalid params code
-        assert!(parsed.get("error").is_some(), "Should have error");
-        let error = &parsed["error"];
-        assert_eq!(
-            error["code"].as_i64().unwrap(),
-            -32602,
-            "Should be InvalidParams error code"
+        // Without a tg_ taskId, the router forwards to upstream (PassThrough)
+        // MockUpstream returns a success response
+        assert!(
+            parsed.get("result").is_some(),
+            "Should be forwarded to upstream (success response)"
         );
     }
 
@@ -2681,6 +2811,8 @@ mod tests {
             max_body_size: 1024 * 1024,
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         })
     }
 
@@ -2935,6 +3067,8 @@ mod tests {
             max_body_size: 1024 * 1024,
             max_batch_size: 100,
             capability_cache: Arc::new(CapabilityCache::new()),
+            buffered_bytes: AtomicUsize::new(0),
+            max_aggregate_buffer: 512 * 1024 * 1024,
         })
     }
 

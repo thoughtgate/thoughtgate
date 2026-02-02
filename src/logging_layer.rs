@@ -8,7 +8,7 @@
 
 use http::HeaderMap;
 use std::fmt;
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 /// Headers that are redacted from logs for security.
@@ -45,7 +45,7 @@ const SENSITIVE_HEADERS: &[&str] = &[
 /// - Implements: REQ-CORE-001 (Zero-Copy Peeking Strategy - observability)
 pub fn logging_layer() -> TraceLayer<
     tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
-    DefaultMakeSpan,
+    CorrelationMakeSpan,
     OnRequestLogger,
     OnResponseLogger,
     tower_http::trace::DefaultOnBodyChunk,
@@ -53,10 +53,40 @@ pub fn logging_layer() -> TraceLayer<
     OnFailureLogger,
 > {
     TraceLayer::new_for_http()
-        .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+        .make_span_with(CorrelationMakeSpan)
         .on_request(OnRequestLogger)
         .on_response(OnResponseLogger)
         .on_failure(OnFailureLogger)
+}
+
+/// Custom span creator that attaches a correlation ID to every request span.
+///
+/// Extracts `x-request-id` from the request headers if present, otherwise
+/// generates one using `fast_correlation_id()`. This ensures every log line
+/// within a request's lifecycle carries a `request_id` field for correlation.
+///
+/// # Traceability
+/// - Implements: REQ-CORE-001 (Observability - request correlation)
+#[derive(Clone, Debug)]
+pub struct CorrelationMakeSpan;
+
+impl<B> tower_http::trace::MakeSpan<B> for CorrelationMakeSpan {
+    fn make_span(&mut self, request: &hyper::Request<B>) -> tracing::Span {
+        let request_id = request
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| crate::transport::jsonrpc::fast_correlation_id().to_string());
+
+        tracing::info_span!(
+            "request",
+            method = %request.method(),
+            uri = %request.uri(),
+            version = ?request.version(),
+            request_id = %request_id,
+        )
+    }
 }
 
 /// Custom on-request callback that logs method, URI, and optionally headers.

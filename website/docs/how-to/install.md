@@ -32,7 +32,7 @@ cargo install --path .
 ### Pull the Image
 
 ```bash
-docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.0
+docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.2
 ```
 
 ### Available Tags
@@ -40,7 +40,7 @@ docker pull ghcr.io/thoughtgate/thoughtgate:v0.2.0
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `v0.2.0` | Specific version |
+| `v0.2.2` | Specific version |
 | `main-abc1234` | Main branch build |
 
 ### Run
@@ -52,7 +52,7 @@ docker run -d \
   -p 7469:7469 \
   -v $(pwd)/thoughtgate.yaml:/etc/thoughtgate/config.yaml \
   -e THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml \
-  ghcr.io/thoughtgate/thoughtgate:v0.2.0
+  ghcr.io/thoughtgate/thoughtgate:v0.2.2
 ```
 
 ## Kubernetes

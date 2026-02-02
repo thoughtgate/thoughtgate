@@ -18,6 +18,7 @@
 //! - Deferred: REQ-CORE-002 Section 3.2 (Memory Management)
 
 use std::time::Duration;
+use tracing::warn;
 
 /// Runtime configuration for the ThoughtGate proxy.
 ///
@@ -90,6 +91,10 @@ pub struct ProxyConfig {
     /// # Traceability
     /// - Implements: REQ-CORE-002 Section 3.2 (THOUGHTGATE_BUFFER_TIMEOUT_SECS)
     pub buffer_timeout: Duration,
+
+    /// Maximum number of idle connections per host in the connection pool.
+    /// Higher values reduce latency under load by keeping connections warm.
+    pub pool_max_idle_per_host: usize,
 }
 
 impl Default for ProxyConfig {
@@ -109,6 +114,7 @@ impl Default for ProxyConfig {
             req_buffer_max: 2 * 1024 * 1024,   // 2 MB
             resp_buffer_max: 10 * 1024 * 1024, // 10 MB
             buffer_timeout: Duration::from_secs(30),
+            pool_max_idle_per_host: 128,
         }
     }
 }
@@ -136,6 +142,10 @@ impl ProxyConfig {
     /// - `THOUGHTGATE_RESP_BUFFER_MAX` (default: 10485760 = 10MB)
     /// - `THOUGHTGATE_BUFFER_TIMEOUT_SECS` (default: 30)
     ///
+    /// # Environment Variables (Connection Pool)
+    ///
+    /// - `THOUGHTGATE_POOL_MAX_IDLE` (default: 128)
+    ///
     /// # Traceability
     /// - Implements: REQ-CORE-001 Section 3.2 (Config Loading)
     /// - Implements: REQ-CORE-002 Section 3.2 (Config Loading)
@@ -144,66 +154,81 @@ impl ProxyConfig {
 
         Self {
             // Green Path configuration
-            tcp_nodelay: std::env::var("THOUGHTGATE_TCP_NODELAY")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default.tcp_nodelay),
+            tcp_nodelay: parse_env_warn("THOUGHTGATE_TCP_NODELAY", default.tcp_nodelay),
 
-            tcp_keepalive_secs: std::env::var("THOUGHTGATE_TCP_KEEPALIVE_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default.tcp_keepalive_secs),
+            tcp_keepalive_secs: parse_env_warn(
+                "THOUGHTGATE_TCP_KEEPALIVE_SECS",
+                default.tcp_keepalive_secs,
+            ),
 
-            stream_read_timeout: std::env::var("THOUGHTGATE_STREAM_READ_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.stream_read_timeout),
+            stream_read_timeout: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_STREAM_READ_TIMEOUT_SECS",
+                default.stream_read_timeout.as_secs(),
+            )),
 
-            stream_write_timeout: std::env::var("THOUGHTGATE_STREAM_WRITE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.stream_write_timeout),
+            stream_write_timeout: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_STREAM_WRITE_TIMEOUT_SECS",
+                default.stream_write_timeout.as_secs(),
+            )),
 
-            stream_total_timeout: std::env::var("THOUGHTGATE_STREAM_TOTAL_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.stream_total_timeout),
+            stream_total_timeout: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_STREAM_TOTAL_TIMEOUT_SECS",
+                default.stream_total_timeout.as_secs(),
+            )),
 
-            max_concurrent_streams: std::env::var("THOUGHTGATE_MAX_CONCURRENT_STREAMS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default.max_concurrent_streams),
+            max_concurrent_streams: parse_env_warn(
+                "THOUGHTGATE_MAX_CONCURRENT_STREAMS",
+                default.max_concurrent_streams,
+            ),
 
-            socket_buffer_size: std::env::var("THOUGHTGATE_SOCKET_BUFFER_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default.socket_buffer_size),
+            socket_buffer_size: parse_env_warn(
+                "THOUGHTGATE_SOCKET_BUFFER_SIZE",
+                default.socket_buffer_size,
+            ),
 
             // Amber Path configuration
-            max_concurrent_buffers: std::env::var("THOUGHTGATE_MAX_CONCURRENT_BUFFERS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default.max_concurrent_buffers),
+            max_concurrent_buffers: parse_env_warn(
+                "THOUGHTGATE_MAX_CONCURRENT_BUFFERS",
+                default.max_concurrent_buffers,
+            ),
 
-            req_buffer_max: std::env::var("THOUGHTGATE_REQ_BUFFER_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default.req_buffer_max),
+            req_buffer_max: parse_env_warn("THOUGHTGATE_REQ_BUFFER_MAX", default.req_buffer_max),
 
-            resp_buffer_max: std::env::var("THOUGHTGATE_RESP_BUFFER_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default.resp_buffer_max),
+            resp_buffer_max: parse_env_warn("THOUGHTGATE_RESP_BUFFER_MAX", default.resp_buffer_max),
 
-            buffer_timeout: std::env::var("THOUGHTGATE_BUFFER_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(default.buffer_timeout),
+            buffer_timeout: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_BUFFER_TIMEOUT_SECS",
+                default.buffer_timeout.as_secs(),
+            )),
+
+            // Connection pool configuration
+            pool_max_idle_per_host: parse_env_warn(
+                "THOUGHTGATE_POOL_MAX_IDLE",
+                default.pool_max_idle_per_host,
+            ),
         }
+    }
+}
+
+/// Parse an environment variable with a warning on invalid values.
+///
+/// If the env var is set but cannot be parsed, logs a warning and returns the default.
+/// If the env var is not set, returns the default silently.
+fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(val) => match val.parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                warn!(
+                    env_var = name,
+                    value = %val,
+                    default = %default,
+                    "Invalid value for environment variable, using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
     }
 }
 
@@ -226,6 +251,9 @@ mod tests {
         assert_eq!(config.req_buffer_max, 2 * 1024 * 1024); // 2 MB
         assert_eq!(config.resp_buffer_max, 10 * 1024 * 1024); // 10 MB
         assert_eq!(config.buffer_timeout, Duration::from_secs(30));
+
+        // Connection pool defaults
+        assert_eq!(config.pool_max_idle_per_host, 128);
     }
 
     #[test]

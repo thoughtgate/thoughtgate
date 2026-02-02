@@ -57,6 +57,11 @@ fn dev_mode_principal() -> Principal {
 /// - `$HOSTNAME` → app_name
 /// - `/var/run/secrets/kubernetes.io/serviceaccount/namespace` → namespace
 /// - `/var/run/secrets/kubernetes.io/serviceaccount/token` → service_account (parsed)
+///
+/// # Note
+/// Uses blocking I/O (`std::fs`) to read K8s ServiceAccount mount files.
+/// Production callers on the Tokio runtime wrap this in
+/// `tokio::task::spawn_blocking(infer_principal)` to avoid blocking.
 fn kubernetes_principal() -> Result<Principal, PolicyError> {
     // Read hostname (pod name)
     let app_name = env::var("HOSTNAME").map_err(|_| PolicyError::IdentityError {

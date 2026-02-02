@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::inspector::{Decision, InspectionContext, Inspector};
 use crate::policy::engine::CedarEngine;
@@ -35,6 +34,25 @@ use super::{
     ApprovalRecord, FailureStage, Principal, Task, TaskStatus, ToolCallRequest, ToolCallResult,
     hash_request,
 };
+
+/// Parse an environment variable with a warning on invalid values.
+fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(val) => match val.parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                warn!(
+                    env_var = name,
+                    value = %val,
+                    default = %default,
+                    "Invalid value for environment variable, using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 // ============================================================================
 // Pre-Approval Result
@@ -118,6 +136,15 @@ pub enum PipelineError {
         details: String,
     },
 
+    /// Inspector timed out
+    #[error("Inspector '{inspector}' timed out after {timeout_secs}s")]
+    InspectorTimeout {
+        /// Name of the timed-out inspector
+        inspector: String,
+        /// Timeout duration in seconds
+        timeout_secs: u64,
+    },
+
     /// Request serialization/deserialization error
     #[error("Serialization error: {details}")]
     SerializationError {
@@ -139,6 +166,8 @@ pub struct PipelineConfig {
     pub approval_validity: Duration,
     /// Timeout for upstream execution
     pub execution_timeout: Duration,
+    /// Timeout for individual inspector execution
+    pub inspector_timeout: Duration,
     /// Transform drift handling mode
     pub transform_drift_mode: TransformDriftMode,
 }
@@ -148,6 +177,7 @@ impl Default for PipelineConfig {
         Self {
             approval_validity: Duration::from_secs(300),
             execution_timeout: Duration::from_secs(30),
+            inspector_timeout: Duration::from_secs(30),
             transform_drift_mode: TransformDriftMode::Strict,
         }
     }
@@ -162,20 +192,18 @@ impl PipelineConfig {
     ///
     /// - `THOUGHTGATE_APPROVAL_VALIDITY_SECS` (default: 300)
     /// - `THOUGHTGATE_EXECUTION_TIMEOUT_SECS` (default: 30)
+    /// - `THOUGHTGATE_INSPECTOR_TIMEOUT_SECS` (default: 30)
     /// - `THOUGHTGATE_TRANSFORM_DRIFT_MODE` (default: strict)
     #[must_use]
     pub fn from_env() -> Self {
-        let approval_validity = std::env::var("THOUGHTGATE_APPROVAL_VALIDITY_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(300));
+        let approval_validity =
+            Duration::from_secs(parse_env_warn("THOUGHTGATE_APPROVAL_VALIDITY_SECS", 300u64));
 
-        let execution_timeout = std::env::var("THOUGHTGATE_EXECUTION_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(30));
+        let execution_timeout =
+            Duration::from_secs(parse_env_warn("THOUGHTGATE_EXECUTION_TIMEOUT_SECS", 30u64));
+
+        let inspector_timeout =
+            Duration::from_secs(parse_env_warn("THOUGHTGATE_INSPECTOR_TIMEOUT_SECS", 30u64));
 
         let transform_drift_mode = std::env::var("THOUGHTGATE_TRANSFORM_DRIFT_MODE")
             .ok()
@@ -185,11 +213,33 @@ impl PipelineConfig {
             })
             .unwrap_or(TransformDriftMode::Strict);
 
-        Self {
+        let config = Self {
             approval_validity,
             execution_timeout,
+            inspector_timeout,
             transform_drift_mode,
+        };
+        if let Err(msg) = config.validate() {
+            warn!(reason = %msg, "Invalid PipelineConfig from env, using defaults");
+            return Self::default();
         }
+        config
+    }
+
+    /// Validate cross-field invariants.
+    ///
+    /// Returns an error message if the configuration is invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.inspector_timeout > self.execution_timeout {
+            return Err(format!(
+                "inspector_timeout ({:?}) must be <= execution_timeout ({:?})",
+                self.inspector_timeout, self.execution_timeout
+            ));
+        }
+        if self.approval_validity.is_zero() {
+            return Err("approval_validity must be > 0".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -357,14 +407,20 @@ impl ApprovalPipeline {
             let (parts, _) = fake_req.into_parts();
             let ctx = InspectionContext::Request(&parts);
 
-            // Run inspector
-            let decision =
-                inspector
-                    .inspect(&bytes, ctx)
-                    .await
-                    .map_err(|e| PipelineError::InternalError {
-                        details: format!("Inspector '{}' error: {}", inspector_name, e),
-                    })?;
+            // Run inspector with timeout to prevent hung inspectors from
+            // blocking the pipeline indefinitely.
+            let decision = tokio::time::timeout(
+                self.config.inspector_timeout,
+                inspector.inspect(&bytes, ctx),
+            )
+            .await
+            .map_err(|_| PipelineError::InspectorTimeout {
+                inspector: inspector_name.to_string(),
+                timeout_secs: self.config.inspector_timeout.as_secs(),
+            })?
+            .map_err(|e| PipelineError::InternalError {
+                details: format!("Inspector '{}' error: {}", inspector_name, e),
+            })?;
 
             match decision {
                 Decision::Approve => {
@@ -450,28 +506,37 @@ impl ApprovalPipeline {
     /// Re-evaluate policy with approval context.
     ///
     /// Implements: REQ-GOV-002/F-004
+    ///
+    /// Cedar policy evaluation is CPU-bound and runs in `spawn_blocking`
+    /// to avoid blocking the async executor.
     #[allow(deprecated)] // Using v0.1 PolicyAction API
-    fn reevaluate_policy(
+    async fn reevaluate_policy(
         &self,
         task: &Task,
         approval: &ApprovalRecord,
     ) -> Result<(), PipelineResult> {
-        // Build approval grant for policy context
+        let policy_engine = self.policy_engine.clone();
+        let transformed = task.pre_approval_transformed.clone();
+        let principal = task.principal.clone();
         let approval_grant = ApprovalGrant {
             task_id: task.id.to_string(),
             approved_by: approval.decided_by.clone(),
             approved_at: approval.decided_at.timestamp(),
         };
+        let task_id = task.id.clone();
 
-        // Build policy request with approval context
-        let policy_request = build_policy_request(
-            &task.pre_approval_transformed,
-            &task.principal,
-            Some(approval_grant),
-        );
-
-        // Evaluate policy
-        let action = self.policy_engine.evaluate(&policy_request);
+        // Evaluate policy in blocking thread pool (Cedar is CPU-bound)
+        let action = tokio::task::spawn_blocking(move || {
+            let policy_request =
+                build_policy_request(&transformed, &principal, Some(approval_grant));
+            policy_engine.evaluate(&policy_request)
+        })
+        .await
+        .map_err(|e| PipelineResult::Failure {
+            stage: FailureStage::PolicyDrift,
+            reason: format!("Policy re-evaluation task failed: {e}"),
+            retriable: false,
+        })?;
 
         // F-004.2: Both Forward and Approve are valid post-approval outcomes.
         //
@@ -485,7 +550,7 @@ impl ApprovalPipeline {
         match action {
             PolicyAction::Forward | PolicyAction::Approve { .. } => {
                 debug!(
-                    task_id = %task.id,
+                    task_id = %task_id,
                     action = ?action,
                     "Policy permits execution"
                 );
@@ -494,7 +559,7 @@ impl ApprovalPipeline {
             PolicyAction::Reject { reason } => {
                 // F-004.3: Policy drift
                 warn!(
-                    task_id = %task.id,
+                    task_id = %task_id,
                     reason = %reason,
                     "Policy drift detected - no longer permitted"
                 );
@@ -546,7 +611,11 @@ impl ApprovalPipeline {
         };
 
         // F-005.2: Compare output hash to stored hash
-        let new_hash = hash_request(&transformed);
+        let new_hash = hash_request(&transformed).map_err(|e| PipelineResult::Failure {
+            stage: FailureStage::TransformDrift,
+            reason: format!("Failed to hash transformed request: {e}"),
+            retriable: false,
+        })?;
         if new_hash != task.request_hash {
             // Transform drift detected
             match self.config.transform_drift_mode {
@@ -686,7 +755,10 @@ impl ExecutionPipeline for ApprovalPipeline {
         let transformed = self.run_inspector_chain(request).await?;
 
         // Compute hash of transformed request
-        let request_hash = hash_request(&transformed);
+        let request_hash =
+            hash_request(&transformed).map_err(|e| PipelineError::InternalError {
+                details: format!("Failed to hash request: {e}"),
+            })?;
 
         info!(
             tool = %request.name,
@@ -719,7 +791,7 @@ impl ExecutionPipeline for ApprovalPipeline {
 
         // Phase 2: Policy re-evaluation
         // Implements: REQ-GOV-002/F-004
-        if let Err(failure) = self.reevaluate_policy(task, approval) {
+        if let Err(failure) = self.reevaluate_policy(task, approval).await {
             return failure;
         }
 
@@ -789,10 +861,10 @@ fn to_mcp_request(request: &ToolCallRequest) -> McpRequest {
     McpRequest {
         id,
         method: request.method.clone(),
-        params,
+        params: params.map(std::sync::Arc::new),
         task_metadata: None,
         received_at: Instant::now(),
-        correlation_id: Uuid::new_v4(),
+        correlation_id: crate::transport::jsonrpc::fast_correlation_id(),
     }
 }
 
@@ -869,8 +941,8 @@ mod tests {
             mcp_request_id: super::super::JsonRpcId::Number(1),
         };
 
-        let hash1 = hash_request(&request);
-        let hash2 = hash_request(&request);
+        let hash1 = hash_request(&request).unwrap();
+        let hash2 = hash_request(&request).unwrap();
 
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 64); // SHA256 produces 64 hex chars
@@ -895,7 +967,10 @@ mod tests {
             mcp_request_id: super::super::JsonRpcId::Number(999),
         };
 
-        assert_eq!(hash_request(&request1), hash_request(&request2));
+        assert_eq!(
+            hash_request(&request1).unwrap(),
+            hash_request(&request2).unwrap()
+        );
     }
 
     /// Tests that different content produces different hashes.
@@ -915,7 +990,10 @@ mod tests {
             mcp_request_id: super::super::JsonRpcId::Number(1),
         };
 
-        assert_ne!(hash_request(&request1), hash_request(&request2));
+        assert_ne!(
+            hash_request(&request1).unwrap(),
+            hash_request(&request2).unwrap()
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────

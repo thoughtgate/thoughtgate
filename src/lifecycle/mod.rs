@@ -537,21 +537,24 @@ impl LifecycleManager {
                             .await;
 
                         match result {
-                            Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
-                                lifecycle.update_upstream_health(true, None);
-                                tracing::debug!(
-                                    upstream = %upstream_url,
-                                    status = %resp.status(),
-                                    "Upstream health check passed"
-                                );
-                            }
-                            Ok(resp) => {
+                            Ok(resp) if resp.status().is_server_error() => {
+                                // Only 5xx indicates an unhealthy upstream.
                                 let error_msg = format!("HTTP {}", resp.status());
                                 lifecycle.update_upstream_health(false, Some(error_msg.clone()));
                                 tracing::warn!(
                                     upstream = %upstream_url,
                                     status = %resp.status(),
-                                    "Upstream health check failed: non-success status"
+                                    "Upstream health check failed: server error"
+                                );
+                            }
+                            Ok(resp) => {
+                                // Any non-5xx HTTP response means the upstream is reachable.
+                                // 4xx (404, 405) is expected — MCP servers may not handle HEAD.
+                                lifecycle.update_upstream_health(true, None);
+                                tracing::debug!(
+                                    upstream = %upstream_url,
+                                    status = %resp.status(),
+                                    "Upstream health check passed (server reachable)"
                                 );
                             }
                             Err(e) => {

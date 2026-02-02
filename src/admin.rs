@@ -29,7 +29,7 @@ use crate::ports::admin_port;
 pub struct AdminServerConfig {
     /// Port to listen on (default: 7469)
     pub port: u16,
-    /// Bind address (default: 0.0.0.0)
+    /// Bind address (default: 127.0.0.1)
     pub bind_addr: String,
 }
 
@@ -37,7 +37,7 @@ impl Default for AdminServerConfig {
     fn default() -> Self {
         Self {
             port: admin_port(),
-            bind_addr: "0.0.0.0".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
         }
     }
 }
@@ -312,14 +312,14 @@ mod tests {
     fn test_admin_config_default() {
         let config = AdminServerConfig::default();
         assert_eq!(config.port, 7469);
-        assert_eq!(config.bind_addr, "0.0.0.0");
-        assert_eq!(config.bind_string(), "0.0.0.0:7469");
+        assert_eq!(config.bind_addr, "127.0.0.1");
+        assert_eq!(config.bind_string(), "127.0.0.1:7469");
     }
 
     #[test]
     fn test_admin_config_with_port() {
         let config = AdminServerConfig::with_port(9000);
         assert_eq!(config.port, 9000);
-        assert_eq!(config.bind_string(), "0.0.0.0:9000");
+        assert_eq!(config.bind_string(), "127.0.0.1:9000");
     }
 }

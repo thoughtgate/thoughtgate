@@ -28,7 +28,7 @@ use thoughtgate::config::{self, Version, find_config_file, load_and_validate};
 use thoughtgate::error::ProxyError;
 use thoughtgate::lifecycle::{DrainResult, LifecycleConfig, LifecycleManager};
 use thoughtgate::logging_layer::logging_layer;
-use thoughtgate::ports::{admin_port, inbound_port, outbound_port};
+use thoughtgate::ports::{admin_port, outbound_port};
 use thoughtgate::proxy_config::ProxyConfig;
 use thoughtgate::proxy_service::ProxyService;
 use thoughtgate::transport::{
@@ -78,8 +78,12 @@ struct Config {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 1: Initialize observability
+    // Use non-blocking writer to prevent logging from blocking the Tokio runtime.
+    // The _guard must be held for the lifetime of the program to ensure logs are flushed.
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .json()
+        .with_writer(non_blocking)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -88,6 +92,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli_config = Config::parse();
     let proxy_config = ProxyConfig::from_env();
+
+    // Validate centralized defaults (REQ-CFG-001/5.6)
+    let defaults = thoughtgate::config::ThoughtGateDefaults::from_env();
+    if let Err(msg) = defaults.validate() {
+        error!(reason = %msg, "Invalid configuration defaults — refusing to start");
+        std::process::exit(1);
+    }
 
     // Phase 1b: Validate environment safety
     // Implements: REQ-CORE-005/F-001 (Startup Safety)
@@ -132,12 +143,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_port_val = admin_port();
     let admin_shutdown = shutdown.clone();
     let admin_lifecycle = lifecycle.clone();
+    let admin_bind = cli_config.bind.clone();
     tokio::spawn(async move {
         let admin_server = AdminServer::with_config(
             admin_lifecycle,
             thoughtgate::admin::AdminServerConfig {
                 port: admin_port_val,
-                bind_addr: "0.0.0.0".to_string(),
+                bind_addr: admin_bind,
             },
         );
         if let Err(e) = admin_server.run(admin_shutdown).await {
@@ -149,18 +161,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Admin server started (/health, /ready, /metrics)"
     );
 
-    // Reserve inbound port (7468) - dummy socket, not wired to anything
-    // This reserves the port for future callback/webhook functionality.
-    // IMPORTANT: This listener must be kept alive (not dropped) to hold the port.
-    // The #[allow(unused)] silences the warning while keeping the socket open.
-    let inbound_port_val = inbound_port();
-    #[allow(unused)]
-    let inbound_listener = TcpListener::bind(format!("0.0.0.0:{}", inbound_port_val)).await?;
-    info!(
-        inbound_port = inbound_port_val,
-        "Inbound port reserved (not wired)"
-    );
-
     // Phase 5: Bind main listener (outbound port)
     let outbound_port_val = outbound_port();
     let addr = format!("{}:{}", cli_config.bind, outbound_port_val);
@@ -169,7 +169,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(
         bind = %cli_config.bind,
         outbound_port = outbound_port_val,
-        inbound_port = inbound_port_val,
         admin_port = admin_port_val,
         drain_timeout_secs = lifecycle.config().drain_timeout.as_secs(),
         addr = %addr,
@@ -177,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcp_keepalive_secs = proxy_config.tcp_keepalive_secs,
         max_concurrent_streams = proxy_config.max_concurrent_streams,
         socket_buffer_size = proxy_config.socket_buffer_size,
-        "ThoughtGate Proxy starting (Envoy-style 3-port model)"
+        "ThoughtGate Proxy starting"
     );
 
     // Phase 6: Load YAML config and create governance components
@@ -341,12 +340,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Per-request timeout for proxy connections
     // Prevents indefinitely hanging connections from leaking resources
-    let request_timeout = Duration::from_secs(
-        std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(300),
-    );
+    let request_timeout =
+        Duration::from_secs(match std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS") {
+            Ok(val) => match val.parse::<u64>() {
+                Ok(secs) => secs,
+                Err(_) => {
+                    warn!(
+                        env_var = "THOUGHTGATE_REQUEST_TIMEOUT_SECS",
+                        value = %val,
+                        default = 300u64,
+                        "Invalid value for environment variable, using default"
+                    );
+                    300
+                }
+            },
+            Err(_) => 300,
+        });
     info!(
         timeout_secs = request_timeout.as_secs(),
         "Per-request timeout configured"

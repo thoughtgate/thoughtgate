@@ -105,25 +105,25 @@ impl TaskHandler {
         }
 
         // Return result if completed successfully
-        if let Some(result) = task.result {
+        if let Some(ref result) = task.result {
             return Ok(Sep1686TaskResult {
-                content: result.content,
+                content: result.content.clone(),
                 is_error: result.is_error,
             });
         }
 
         // For failed/rejected/cancelled/expired tasks, construct error result
-        let error_content = if let Some(failure) = task.failure {
+        let error_content = if let Some(ref failure) = task.failure {
             serde_json::json!({
                 "error": failure.reason,
                 "stage": format!("{:?}", failure.stage),
                 "retriable": failure.retriable,
             })
-        } else if let Some(approval) = task.approval {
-            match approval.decision {
+        } else if let Some(ref approval) = task.approval {
+            match &approval.decision {
                 super::ApprovalDecision::Rejected { reason } => {
                     serde_json::json!({
-                        "error": reason.unwrap_or_else(|| "Request rejected".to_string()),
+                        "error": reason.as_deref().unwrap_or("Request rejected"),
                         "decided_by": approval.decided_by,
                     })
                 }
@@ -378,7 +378,7 @@ mod tests {
             )
             .unwrap();
 
-        let req = TasksResultRequest::new(task.id);
+        let req = TasksResultRequest::new(task.id.clone());
         let result = handler.handle_tasks_result(req).unwrap();
 
         assert!(!result.is_error);
@@ -541,7 +541,7 @@ mod tests {
             .unwrap();
 
         // Task is in Working state, not cancellable
-        let req = TasksCancelRequest::new(task.id);
+        let req = TasksCancelRequest::new(task.id.clone());
         let result = handler.handle_tasks_cancel(req);
 
         assert!(matches!(result, Err(TaskError::InvalidTransition { .. })));
