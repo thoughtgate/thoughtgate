@@ -7,6 +7,10 @@ authors.workspace = true
 license.workspace = true
 description = "ThoughtGate CLI wrapper for local MCP governance"
 
+[lib]
+name = "thoughtgate"
+path = "src/lib.rs"
+
 [[bin]]
 name = "thoughtgate"
 path = "src/main.rs"
@@ -14,8 +18,14 @@ path = "src/main.rs"
 [dependencies]
 thoughtgate-core = { path = "../thoughtgate-core" }
 clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dirs = "6"
 fs2 = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal", "process"] }

@@ -1,0 +1,1048 @@
+//! Bidirectional stdio proxy with governance evaluation.
+//!
+//! Implements: REQ-CORE-008 §7.4 (F-011 through F-017), §7.5 (F-018)
+//!
+//! This module contains the main shim proxy function [`run_shim`] which spawns
+//! an MCP server child process, proxies stdin/stdout bidirectionally with
+//! governance evaluation on the agent→server path, sends periodic heartbeats,
+//! and handles graceful shutdown.
+
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::watch;
+
+use thoughtgate_core::StreamDirection;
+use thoughtgate_core::governance::api::{
+    GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse, MessageType,
+};
+use thoughtgate_core::governance::service::HeartbeatRequest;
+use thoughtgate_core::jsonrpc::JsonRpcMessageKind;
+use thoughtgate_core::metrics::StdioMetrics;
+use thoughtgate_core::profile::Profile;
+
+use crate::error::{FramingError, StdioError};
+use crate::shim::ndjson::{detect_smuggling, parse_stdio_message};
+use crate::wrap::config_adapter::ShimOptions;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Initial backoff delay for governance /healthz polling (F-016a).
+const HEALTHZ_INITIAL_BACKOFF_MS: u64 = 50;
+
+/// Maximum backoff delay for governance /healthz polling.
+const HEALTHZ_MAX_BACKOFF_MS: u64 = 2000;
+
+/// Maximum number of /healthz poll attempts before giving up.
+const HEALTHZ_MAX_ATTEMPTS: u32 = 20;
+
+/// Heartbeat interval — shims send a heartbeat every 5 seconds when idle.
+const HEARTBEAT_INTERVAL_SECS: u64 = 5;
+
+/// Connect timeout for all governance HTTP requests (F-016b).
+const CONNECT_TIMEOUT_MS: u64 = 500;
+
+/// Request timeout for POST /governance/evaluate (F-016b).
+const EVALUATE_TIMEOUT_MS: u64 = 2000;
+
+/// Request timeout for POST /governance/heartbeat.
+const HEARTBEAT_TIMEOUT_MS: u64 = 5000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure Helper Functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check if a JSON-RPC method should bypass governance evaluation (F-017).
+///
+/// These messages are forwarded without calling POST /governance/evaluate:
+/// - Protocol handshake: `initialize`, `initialized`
+/// - Cancel/progress notifications
+/// - Resource/tool/prompt list change notifications
+/// - Ping/pong keepalive
+///
+/// Implements: REQ-CORE-008/F-017
+fn is_passthrough(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "initialized"
+            | "notifications/cancelled"
+            | "notifications/progress"
+            | "notifications/resources/updated"
+            | "notifications/resources/list_changed"
+            | "notifications/tools/list_changed"
+            | "notifications/prompts/list_changed"
+            | "ping"
+            | "pong"
+    )
+}
+
+/// Format a JSON-RPC error response for a denied message.
+///
+/// Returns a complete NDJSON line (with trailing newline) containing a
+/// JSON-RPC 2.0 error response with code -32001 and ThoughtGate denial
+/// details in the `data` field.
+///
+/// Implements: REQ-CORE-008/F-012
+fn format_deny_response(
+    id: &thoughtgate_core::jsonrpc::JsonRpcId,
+    server_id: &str,
+    policy_id: Option<&str>,
+) -> String {
+    let id_json = serde_json::to_value(id).unwrap_or(serde_json::Value::Null);
+    let mut data = serde_json::json!({
+        "server_id": server_id,
+    });
+    if let Some(pid) = policy_id {
+        data["policy_id"] = serde_json::Value::String(pid.to_string());
+    }
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id_json,
+        "error": {
+            "code": -32001,
+            "message": "Denied by ThoughtGate policy",
+            "data": data,
+        }
+    });
+    let mut line = serde_json::to_string(&response).unwrap_or_default();
+    line.push('\n');
+    line
+}
+
+/// Convert a [`FramingError`] variant to a metric label string.
+///
+/// Used as the `error_type` attribute for `framing_errors_total` counter.
+fn framing_error_type(e: &FramingError) -> &'static str {
+    match e {
+        FramingError::MessageTooLarge { .. } => "message_too_large",
+        FramingError::MalformedJson { .. } => "malformed_json",
+        FramingError::MissingVersion => "missing_version",
+        FramingError::UnsupportedVersion { .. } => "unsupported_version",
+        FramingError::BrokenPipe => "broken_pipe",
+        FramingError::UnsupportedBatch => "unsupported_batch",
+        FramingError::Io(_) => "io_error",
+    }
+}
+
+/// Extract the method name from a parsed [`JsonRpcMessageKind`].
+///
+/// Returns the method for requests and notifications, or `"response"` for
+/// responses (which have no method field).
+fn method_from_kind(kind: &JsonRpcMessageKind) -> &str {
+    match kind {
+        JsonRpcMessageKind::Request { method, .. } => method.as_str(),
+        JsonRpcMessageKind::Notification { method } => method.as_str(),
+        JsonRpcMessageKind::Response { .. } => "response",
+    }
+}
+
+/// Derive the [`MessageType`] from a parsed [`JsonRpcMessageKind`].
+fn message_type_from_kind(kind: &JsonRpcMessageKind) -> MessageType {
+    match kind {
+        JsonRpcMessageKind::Request { .. } => MessageType::Request,
+        JsonRpcMessageKind::Response { .. } => MessageType::Response,
+        JsonRpcMessageKind::Notification { .. } => MessageType::Notification,
+    }
+}
+
+/// Extract the JSON-RPC ID from a message kind, if present.
+fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<thoughtgate_core::jsonrpc::JsonRpcId> {
+    match kind {
+        JsonRpcMessageKind::Request { id, .. } | JsonRpcMessageKind::Response { id } => {
+            Some(id.clone())
+        }
+        JsonRpcMessageKind::Notification { .. } => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Governance Healthz Polling (F-016a)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Poll the governance service `/healthz` endpoint with exponential backoff.
+///
+/// The shim MUST wait for the governance service to become reachable before
+/// entering the proxy loop. This prevents fail-closed denials during normal
+/// startup races between shim instances and the governance service.
+///
+/// # Errors
+///
+/// Returns [`StdioError::GovernanceUnavailable`] if the governance service is
+/// not reachable within the backoff window.
+///
+/// Implements: REQ-CORE-008/F-016a
+async fn poll_governance_healthz(
+    client: &reqwest::Client,
+    endpoint: &str,
+) -> Result<(), StdioError> {
+    let url = format!("{endpoint}/healthz");
+    let mut delay_ms = HEALTHZ_INITIAL_BACKOFF_MS;
+
+    for attempt in 1..=HEALTHZ_MAX_ATTEMPTS {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(attempt, "governance service is healthy");
+                return Ok(());
+            }
+            Ok(resp) => {
+                tracing::debug!(attempt, status = %resp.status(), "governance healthz non-200");
+            }
+            Err(e) => {
+                tracing::debug!(attempt, error = %e, "governance healthz unreachable");
+            }
+        }
+
+        if attempt < HEALTHZ_MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            delay_ms = (delay_ms * 2).min(HEALTHZ_MAX_BACKOFF_MS);
+        }
+    }
+
+    tracing::error!(
+        attempts = HEALTHZ_MAX_ATTEMPTS,
+        "governance service unavailable after readiness polling"
+    );
+    Err(StdioError::GovernanceUnavailable)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main Proxy Function
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the shim proxy for a single MCP server.
+///
+/// Spawns the server child process, establishes bidirectional stdio proxying
+/// with governance evaluation on the agent→server path, sends periodic
+/// heartbeats, and handles graceful shutdown.
+///
+/// # Arguments
+///
+/// * `opts` - Shim configuration (server_id, governance endpoint, profile).
+/// * `metrics` - Stdio metrics collector (use `StdioMetrics::noop()` for tests).
+/// * `server_command` - The MCP server command to spawn.
+/// * `server_args` - Arguments for the server command.
+///
+/// # Returns
+///
+/// The server's exit code (0 for clean shutdown).
+///
+/// # Errors
+///
+/// Returns [`StdioError`] on spawn failure, governance unavailability, or
+/// unrecoverable IO errors.
+///
+/// Implements: REQ-CORE-008/F-011, F-012, F-016, F-018
+pub async fn run_shim(
+    opts: ShimOptions,
+    metrics: StdioMetrics,
+    server_command: String,
+    server_args: Vec<String>,
+) -> Result<i32, StdioError> {
+    let server_id = opts.server_id.clone();
+    let governance_endpoint = opts.governance_endpoint.clone();
+    let profile = opts.profile;
+
+    // ── F-011: Spawn server child process ────────────────────────────────
+    let mut cmd = Command::new(&server_command);
+    cmd.args(&server_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd.spawn().map_err(|e| StdioError::ServerSpawnError {
+        server_id: server_id.clone(),
+        reason: e.to_string(),
+    })?;
+
+    metrics.increment_active_servers();
+    metrics.record_server_state(&server_id, "running");
+    tracing::info!(server_id, server_command, "server process spawned");
+
+    // ── Build reqwest client ─────────────────────────────────────────────
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
+        .build()
+        .map_err(|e| StdioError::ServerSpawnError {
+            server_id: server_id.clone(),
+            reason: format!("failed to build HTTP client: {e}"),
+        })?;
+
+    // ── F-016a: Poll governance /healthz ─────────────────────────────────
+    poll_governance_healthz(&client, &governance_endpoint).await?;
+
+    // ── Set up channels and IO handles ───────────────────────────────────
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| StdioError::ServerSpawnError {
+            server_id: server_id.clone(),
+            reason: "failed to capture server stdin".to_string(),
+        })?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| StdioError::ServerSpawnError {
+            server_id: server_id.clone(),
+            reason: "failed to capture server stdout".to_string(),
+        })?;
+
+    // ── Spawn concurrent tasks ───────────────────────────────────────────
+
+    // Task 1: Agent → Server
+    let a2s_handle = {
+        let server_id = server_id.clone();
+        let governance_endpoint = governance_endpoint.clone();
+        let client = client.clone();
+        let metrics = metrics.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        let shutdown_tx = shutdown_tx.clone();
+
+        tokio::spawn(async move {
+            agent_to_server(
+                server_id,
+                governance_endpoint,
+                profile,
+                client,
+                metrics,
+                child_stdin,
+                &mut shutdown_rx,
+                shutdown_tx,
+            )
+            .await
+        })
+    };
+
+    // Task 2: Server → Agent
+    let s2a_handle = {
+        let server_id = server_id.clone();
+        let metrics = metrics.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+
+        tokio::spawn(async move {
+            server_to_agent(server_id, metrics, child_stdout, &mut shutdown_rx).await
+        })
+    };
+
+    // Task 3: Heartbeat
+    let hb_handle = {
+        let server_id = server_id.clone();
+        let governance_endpoint = governance_endpoint.clone();
+        let client = client.clone();
+        let shutdown_tx = shutdown_tx.clone();
+
+        tokio::spawn(async move {
+            heartbeat_loop(server_id, governance_endpoint, client, shutdown_tx).await;
+        })
+    };
+
+    // ── Select on task completion ────────────────────────────────────────
+    let mut shutdown_rx_main = shutdown_rx.clone();
+
+    tokio::select! {
+        result = a2s_handle => {
+            match result {
+                Ok(Ok(())) => tracing::info!(server_id, "agent→server stream closed (stdin EOF)"),
+                Ok(Err(ref e)) => tracing::error!(server_id, error = %e, "agent→server task failed"),
+                Err(ref e) => tracing::error!(server_id, error = %e, "agent→server task panicked"),
+            }
+        }
+        result = s2a_handle => {
+            match result {
+                Ok(Ok(())) => tracing::info!(server_id, "server→agent stream closed (server stdout EOF)"),
+                Ok(Err(ref e)) => tracing::error!(server_id, error = %e, "server→agent task failed"),
+                Err(ref e) => tracing::error!(server_id, error = %e, "server→agent task panicked"),
+            }
+        }
+        status = child.wait() => {
+            match status {
+                Ok(ref s) => tracing::info!(server_id, ?s, "server process exited"),
+                Err(ref e) => tracing::error!(server_id, error = %e, "failed to wait on server process"),
+            }
+        }
+        _ = shutdown_rx_main.changed() => {
+            tracing::info!(server_id, "governance-initiated shutdown");
+        }
+    }
+
+    // ── F-018: Graceful shutdown sequence ────────────────────────────────
+    let shutdown_req = crate::shim::lifecycle::ShutdownRequest::default();
+    let exit_code = shutdown_server(&server_id, &mut child, &metrics, &shutdown_req).await;
+
+    // Abort remaining tasks (best-effort).
+    // The heartbeat task handle is not in scope from select! so we abort it here.
+    hb_handle.abort();
+
+    exit_code
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent → Server Task (F-012 outbound)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read from agent stdin, evaluate via governance, forward to server stdin.
+///
+/// Implements: REQ-CORE-008/F-012 (agent→server), F-013, F-014, F-016, F-017
+#[allow(clippy::too_many_arguments)]
+async fn agent_to_server(
+    server_id: String,
+    governance_endpoint: String,
+    profile: Profile,
+    client: reqwest::Client,
+    metrics: StdioMetrics,
+    mut child_stdin: tokio::process::ChildStdin,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    shutdown_tx: watch::Sender<bool>,
+) -> Result<(), StdioError> {
+    let agent_stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(agent_stdin);
+    let mut agent_stdout = tokio::io::stdout();
+    let mut buf = String::new();
+    let evaluate_url = format!("{governance_endpoint}/governance/evaluate");
+
+    loop {
+        buf.clear();
+
+        let bytes_read = tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                tracing::debug!(server_id, "agent→server: shutdown signal received");
+                break;
+            }
+            result = reader.read_line(&mut buf) => {
+                result.map_err(|e| StdioError::Framing {
+                    server_id: server_id.clone(),
+                    direction: StreamDirection::AgentToServer,
+                    source: FramingError::Io(e),
+                })?
+            }
+        };
+
+        // EOF — agent closed stdin.
+        if bytes_read == 0 {
+            tracing::debug!(server_id, "agent stdin EOF");
+            break;
+        }
+
+        // Skip empty lines (lenient parsing per §10.2).
+        if buf.trim().is_empty() {
+            continue;
+        }
+
+        // F-014: Smuggling detection (before parsing).
+        let smuggled = detect_smuggling(buf.as_bytes());
+
+        // F-013: Parse the NDJSON line.
+        let msg = match parse_stdio_message(&buf) {
+            Ok(msg) => msg,
+            Err(e) => {
+                metrics.record_framing_error(&server_id, framing_error_type(&e));
+                tracing::warn!(server_id, error = %e, "agent→server framing error, skipping");
+                continue;
+            }
+        };
+
+        // Handle smuggling per profile (F-014).
+        if smuggled {
+            metrics.record_framing_error(&server_id, "smuggling");
+            if profile == Profile::Production {
+                tracing::warn!(server_id, "smuggling detected, rejecting message");
+                continue;
+            }
+            tracing::warn!(
+                server_id,
+                "smuggling detected, WOULD_REJECT (development mode)"
+            );
+        }
+
+        let method = method_from_kind(&msg.kind).to_string();
+
+        // NFR-002: Record every parsed message.
+        metrics.record_message(&server_id, "agent_to_server", &method);
+
+        // F-017: Passthrough messages bypass governance.
+        if is_passthrough(&method) {
+            child_stdin
+                .write_all(buf.as_bytes())
+                .await
+                .map_err(|e| StdioError::Framing {
+                    server_id: server_id.clone(),
+                    direction: StreamDirection::AgentToServer,
+                    source: FramingError::Io(e),
+                })?;
+            child_stdin.flush().await.map_err(|e| StdioError::Framing {
+                server_id: server_id.clone(),
+                direction: StreamDirection::AgentToServer,
+                source: FramingError::Io(e),
+            })?;
+            continue;
+        }
+
+        // F-016: Governance evaluation via HTTP.
+        let eval_req = GovernanceEvaluateRequest {
+            server_id: server_id.clone(),
+            direction: StreamDirection::AgentToServer,
+            method: method.clone(),
+            id: id_from_kind(&msg.kind),
+            params: msg.params.clone(),
+            message_type: message_type_from_kind(&msg.kind),
+            profile,
+        };
+
+        let eval_result = client
+            .post(&evaluate_url)
+            .timeout(Duration::from_millis(EVALUATE_TIMEOUT_MS))
+            .json(&eval_req)
+            .send()
+            .await;
+
+        let eval_resp: GovernanceEvaluateResponse = match eval_result {
+            Ok(resp) => match resp.json().await {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::error!(server_id, error = %e, "failed to parse governance response");
+                    // Fail-closed in production, forward in development.
+                    if profile == Profile::Production {
+                        continue;
+                    }
+                    tracing::warn!(
+                        server_id,
+                        "WOULD_DENY: governance parse error, forwarding in dev"
+                    );
+                    GovernanceEvaluateResponse {
+                        decision: GovernanceDecision::Forward,
+                        task_id: None,
+                        policy_id: None,
+                        reason: None,
+                        shutdown: false,
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::error!(server_id, error = %e, "governance evaluate request failed");
+                // Fail-closed in production, forward in development.
+                if profile == Profile::Production {
+                    metrics.record_governance_decision(&server_id, "deny", &format!("{profile:?}"));
+                    continue;
+                }
+                tracing::warn!(
+                    server_id,
+                    "WOULD_DENY: governance timeout, forwarding in dev"
+                );
+                GovernanceEvaluateResponse {
+                    decision: GovernanceDecision::Forward,
+                    task_id: None,
+                    policy_id: None,
+                    reason: None,
+                    shutdown: false,
+                }
+            }
+        };
+
+        // NFR-002: Record governance decision.
+        let decision_str = match eval_resp.decision {
+            GovernanceDecision::Forward => "forward",
+            GovernanceDecision::Deny => "deny",
+            GovernanceDecision::PendingApproval => "pending_approval",
+        };
+        metrics.record_governance_decision(&server_id, decision_str, &format!("{profile:?}"));
+
+        // Check for shutdown signal piggy-backed on evaluate response.
+        if eval_resp.shutdown {
+            tracing::info!(server_id, "shutdown signal in evaluate response");
+            let _ = shutdown_tx.send(true);
+        }
+
+        match eval_resp.decision {
+            GovernanceDecision::Forward => {
+                child_stdin
+                    .write_all(buf.as_bytes())
+                    .await
+                    .map_err(|e| StdioError::Framing {
+                        server_id: server_id.clone(),
+                        direction: StreamDirection::AgentToServer,
+                        source: FramingError::Io(e),
+                    })?;
+                child_stdin.flush().await.map_err(|e| StdioError::Framing {
+                    server_id: server_id.clone(),
+                    direction: StreamDirection::AgentToServer,
+                    source: FramingError::Io(e),
+                })?;
+            }
+            GovernanceDecision::Deny => {
+                if let Some(id) = id_from_kind(&msg.kind) {
+                    let deny_line =
+                        format_deny_response(&id, &server_id, eval_resp.policy_id.as_deref());
+                    agent_stdout
+                        .write_all(deny_line.as_bytes())
+                        .await
+                        .map_err(StdioError::StdioIo)?;
+                    agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
+                }
+                // Notifications have no id — silently drop denials for them.
+            }
+            GovernanceDecision::PendingApproval => {
+                // TODO: Implement approval polling (tasks/get endpoint).
+                // For now, stub as Forward.
+                tracing::debug!(server_id, method, "PendingApproval stubbed as Forward");
+                child_stdin
+                    .write_all(buf.as_bytes())
+                    .await
+                    .map_err(|e| StdioError::Framing {
+                        server_id: server_id.clone(),
+                        direction: StreamDirection::AgentToServer,
+                        source: FramingError::Io(e),
+                    })?;
+                child_stdin.flush().await.map_err(|e| StdioError::Framing {
+                    server_id: server_id.clone(),
+                    direction: StreamDirection::AgentToServer,
+                    source: FramingError::Io(e),
+                })?;
+            }
+        }
+    }
+
+    // Dropping child_stdin closes the server's stdin pipe.
+    drop(child_stdin);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Server → Agent Task (F-012 inbound)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read from server stdout, forward to agent stdout.
+///
+/// In v0.3, server→agent messages are forwarded unconditionally after local
+/// audit logging. No governance HTTP call is made for inbound messages.
+///
+/// Implements: REQ-CORE-008/F-012 (server→agent)
+async fn server_to_agent(
+    server_id: String,
+    metrics: StdioMetrics,
+    child_stdout: tokio::process::ChildStdout,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<(), StdioError> {
+    let mut reader = BufReader::new(child_stdout);
+    let mut agent_stdout = tokio::io::stdout();
+    let mut buf = String::new();
+
+    loop {
+        buf.clear();
+
+        let bytes_read = tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                tracing::debug!(server_id, "server→agent: shutdown signal received");
+                break;
+            }
+            result = reader.read_line(&mut buf) => {
+                result.map_err(|e| StdioError::Framing {
+                    server_id: server_id.clone(),
+                    direction: StreamDirection::ServerToAgent,
+                    source: FramingError::Io(e),
+                })?
+            }
+        };
+
+        // EOF — server closed stdout (server exited).
+        if bytes_read == 0 {
+            tracing::debug!(server_id, "server stdout EOF");
+            break;
+        }
+
+        // Skip empty lines.
+        if buf.trim().is_empty() {
+            continue;
+        }
+
+        // F-014: Smuggling detection (log only for server→agent in v0.3).
+        if detect_smuggling(buf.as_bytes()) {
+            metrics.record_framing_error(&server_id, "smuggling");
+            tracing::warn!(
+                server_id,
+                "smuggling detected in server→agent message (logged only)"
+            );
+        }
+
+        // Parse for metrics/audit — but always forward the raw line.
+        match parse_stdio_message(&buf) {
+            Ok(msg) => {
+                let method = method_from_kind(&msg.kind);
+                // NFR-002: Record every parsed message.
+                metrics.record_message(&server_id, "server_to_agent", method);
+            }
+            Err(e) => {
+                // NFR-002: Record framing error.
+                metrics.record_framing_error(&server_id, framing_error_type(&e));
+                tracing::warn!(
+                    server_id,
+                    error = %e,
+                    "server→agent framing error (forwarding raw line)"
+                );
+            }
+        }
+
+        // Always forward raw line to agent stdout.
+        agent_stdout
+            .write_all(buf.as_bytes())
+            .await
+            .map_err(StdioError::StdioIo)?;
+        agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Heartbeat Task (F-016)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Send periodic heartbeats to the governance service.
+///
+/// If the governance service responds with `shutdown: true`, or if any
+/// connection error occurs, the shutdown signal is sent immediately.
+///
+/// **EC-STDIO-042:** Connection errors are treated as fatal — no retry,
+/// no backoff. The governance service is gone; initiate shutdown.
+///
+/// Implements: REQ-CORE-008/F-016
+async fn heartbeat_loop(
+    server_id: String,
+    governance_endpoint: String,
+    client: reqwest::Client,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    let url = format!("{governance_endpoint}/governance/heartbeat");
+    let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+
+    // Skip the first immediate tick (the proxy just started).
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+
+        let req = HeartbeatRequest {
+            server_id: server_id.clone(),
+        };
+
+        match client
+            .post(&url)
+            .timeout(Duration::from_millis(HEARTBEAT_TIMEOUT_MS))
+            .json(&req)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                match resp
+                    .json::<thoughtgate_core::governance::service::HeartbeatResponse>()
+                    .await
+                {
+                    Ok(hb) => {
+                        if hb.shutdown {
+                            tracing::info!(server_id, "heartbeat: shutdown signal received");
+                            let _ = shutdown_tx.send(true);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(server_id, error = %e, "heartbeat: failed to parse response");
+                    }
+                }
+            }
+            Err(e) => {
+                // EC-STDIO-042: Any connection error is fatal. No retry.
+                tracing::error!(
+                    server_id,
+                    error = %e,
+                    "heartbeat: connection error — governance service gone, initiating shutdown"
+                );
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shutdown Sequence (F-018)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Execute the graceful shutdown sequence for a server child process.
+///
+/// 1. Close stdin (already dropped by aborting agent→server task)
+/// 2. Wait stdin_close_grace for server to exit
+/// 3. Send SIGTERM to process group (Unix)
+/// 4. Wait sigterm_grace
+/// 5. Send SIGKILL
+/// 6. Collect exit code via wait() (F-021: zombie prevention)
+///
+/// Implements: REQ-CORE-008/F-018, F-021
+async fn shutdown_server(
+    server_id: &str,
+    child: &mut tokio::process::Child,
+    metrics: &StdioMetrics,
+    shutdown_req: &crate::shim::lifecycle::ShutdownRequest,
+) -> Result<i32, StdioError> {
+    metrics.record_server_state(server_id, "shutting_down");
+    tracing::info!(server_id, "initiating graceful shutdown");
+
+    // Step 2: Wait for server to exit after stdin is closed.
+    match tokio::time::timeout(shutdown_req.stdin_close_grace, child.wait()).await {
+        Ok(Ok(status)) => {
+            let code = status.code().unwrap_or(-1);
+            tracing::info!(server_id, code, "server exited after stdin close");
+            metrics.decrement_active_servers();
+            metrics.record_server_state(server_id, "stopped");
+            return Ok(code);
+        }
+        Ok(Err(e)) => {
+            tracing::error!(server_id, error = %e, "wait failed after stdin close");
+        }
+        Err(_) => {
+            tracing::info!(server_id, "server did not exit within stdin_close_grace");
+        }
+    }
+
+    // Step 3: Send SIGTERM to process group (Unix only).
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        if let Some(pid) = child.id() {
+            tracing::info!(server_id, pid, "sending SIGTERM to process group");
+            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        }
+    }
+
+    // Step 4: Wait for server to exit after SIGTERM.
+    match tokio::time::timeout(shutdown_req.sigterm_grace, child.wait()).await {
+        Ok(Ok(status)) => {
+            let code = status.code().unwrap_or(-1);
+            tracing::info!(server_id, code, "server exited after SIGTERM");
+            metrics.decrement_active_servers();
+            metrics.record_server_state(server_id, "stopped");
+            return Ok(code);
+        }
+        Ok(Err(e)) => {
+            tracing::error!(server_id, error = %e, "wait failed after SIGTERM");
+        }
+        Err(_) => {
+            tracing::warn!(server_id, "server did not exit within sigterm_grace");
+        }
+    }
+
+    // Step 5: SIGKILL as last resort.
+    tracing::warn!(server_id, "sending SIGKILL");
+    if let Err(e) = child.kill().await {
+        tracing::error!(server_id, error = %e, "SIGKILL failed");
+    }
+
+    // Step 6: Collect exit code (F-021: zombie prevention).
+    let status = child.wait().await.map_err(StdioError::StdioIo)?;
+    let code = status.code().unwrap_or(-1);
+    tracing::info!(server_id, code, "server exited after SIGKILL");
+
+    metrics.decrement_active_servers();
+    metrics.record_server_state(server_id, "stopped");
+    Ok(code)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thoughtgate_core::jsonrpc::JsonRpcId;
+
+    // ── F-017 Passthrough Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_is_passthrough_initialize() {
+        assert!(is_passthrough("initialize"));
+        assert!(is_passthrough("initialized"));
+    }
+
+    #[test]
+    fn test_is_passthrough_tools_call_not_passthrough() {
+        assert!(!is_passthrough("tools/call"));
+        assert!(!is_passthrough("tools/list"));
+        assert!(!is_passthrough("resources/read"));
+        assert!(!is_passthrough("prompts/get"));
+    }
+
+    #[test]
+    fn test_is_passthrough_notifications() {
+        assert!(is_passthrough("notifications/cancelled"));
+        assert!(is_passthrough("notifications/progress"));
+        assert!(is_passthrough("notifications/resources/updated"));
+        assert!(is_passthrough("notifications/resources/list_changed"));
+        assert!(is_passthrough("notifications/tools/list_changed"));
+        assert!(is_passthrough("notifications/prompts/list_changed"));
+    }
+
+    #[test]
+    fn test_is_passthrough_ping_pong() {
+        assert!(is_passthrough("ping"));
+        assert!(is_passthrough("pong"));
+    }
+
+    #[test]
+    fn test_is_passthrough_unknown_method() {
+        assert!(!is_passthrough("custom/method"));
+        assert!(!is_passthrough(""));
+        assert!(!is_passthrough("sampling/createMessage"));
+    }
+
+    // ── Deny Response Formatting Tests ───────────────────────────────────
+
+    #[test]
+    fn test_format_deny_response_number_id() {
+        let line = format_deny_response(&JsonRpcId::Number(42), "filesystem", Some("pol-001"));
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(parsed["error"]["code"], -32001);
+        assert_eq!(parsed["error"]["message"], "Denied by ThoughtGate policy");
+        assert_eq!(parsed["error"]["data"]["server_id"], "filesystem");
+        assert_eq!(parsed["error"]["data"]["policy_id"], "pol-001");
+    }
+
+    #[test]
+    fn test_format_deny_response_string_id() {
+        let line = format_deny_response(&JsonRpcId::String("req-abc".to_string()), "github", None);
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["id"], "req-abc");
+        assert_eq!(parsed["error"]["data"]["server_id"], "github");
+        assert!(parsed["error"]["data"]["policy_id"].is_null());
+    }
+
+    #[test]
+    fn test_format_deny_response_null_id() {
+        let line = format_deny_response(&JsonRpcId::Null, "sqlite", Some("pol-002"));
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(parsed["id"].is_null());
+        assert_eq!(parsed["error"]["code"], -32001);
+    }
+
+    #[test]
+    fn test_format_deny_response_ends_with_newline() {
+        let line = format_deny_response(&JsonRpcId::Number(1), "test", None);
+        assert!(line.ends_with('\n'));
+        // Should be a single line (NDJSON).
+        assert_eq!(line.matches('\n').count(), 1);
+    }
+
+    // ── framing_error_type Tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_framing_error_type_labels() {
+        assert_eq!(
+            framing_error_type(&FramingError::MessageTooLarge { max_bytes: 100 }),
+            "message_too_large"
+        );
+        assert_eq!(
+            framing_error_type(&FramingError::MalformedJson {
+                reason: "bad".to_string()
+            }),
+            "malformed_json"
+        );
+        assert_eq!(
+            framing_error_type(&FramingError::MissingVersion),
+            "missing_version"
+        );
+        assert_eq!(
+            framing_error_type(&FramingError::UnsupportedVersion {
+                version: "1.0".to_string()
+            }),
+            "unsupported_version"
+        );
+        assert_eq!(framing_error_type(&FramingError::BrokenPipe), "broken_pipe");
+        assert_eq!(
+            framing_error_type(&FramingError::UnsupportedBatch),
+            "unsupported_batch"
+        );
+    }
+
+    // ── Helper Function Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_method_from_kind() {
+        assert_eq!(
+            method_from_kind(&JsonRpcMessageKind::Request {
+                id: JsonRpcId::Number(1),
+                method: "tools/call".to_string(),
+            }),
+            "tools/call"
+        );
+        assert_eq!(
+            method_from_kind(&JsonRpcMessageKind::Notification {
+                method: "initialized".to_string(),
+            }),
+            "initialized"
+        );
+        assert_eq!(
+            method_from_kind(&JsonRpcMessageKind::Response {
+                id: JsonRpcId::Number(1),
+            }),
+            "response"
+        );
+    }
+
+    #[test]
+    fn test_message_type_from_kind() {
+        assert!(matches!(
+            message_type_from_kind(&JsonRpcMessageKind::Request {
+                id: JsonRpcId::Number(1),
+                method: "x".to_string(),
+            }),
+            MessageType::Request
+        ));
+        assert!(matches!(
+            message_type_from_kind(&JsonRpcMessageKind::Response {
+                id: JsonRpcId::Number(1),
+            }),
+            MessageType::Response
+        ));
+        assert!(matches!(
+            message_type_from_kind(&JsonRpcMessageKind::Notification {
+                method: "x".to_string(),
+            }),
+            MessageType::Notification
+        ));
+    }
+
+    #[test]
+    fn test_id_from_kind() {
+        assert_eq!(
+            id_from_kind(&JsonRpcMessageKind::Request {
+                id: JsonRpcId::Number(42),
+                method: "x".to_string(),
+            }),
+            Some(JsonRpcId::Number(42))
+        );
+        assert_eq!(
+            id_from_kind(&JsonRpcMessageKind::Response {
+                id: JsonRpcId::String("abc".to_string()),
+            }),
+            Some(JsonRpcId::String("abc".to_string()))
+        );
+        assert_eq!(
+            id_from_kind(&JsonRpcMessageKind::Notification {
+                method: "x".to_string(),
+            }),
+            None
+        );
+    }
+}

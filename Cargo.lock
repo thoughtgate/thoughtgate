@@ -2181,6 +2181,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "no-std-compat"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3701,10 +3713,14 @@ dependencies = [
  "clap",
  "dirs",
  "fs2",
+ "nix",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "thoughtgate-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
