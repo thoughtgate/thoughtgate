@@ -23,7 +23,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY_PATH="${PROJECT_ROOT}/target/release/thoughtgate"
+BINARY_PATH="${PROJECT_ROOT}/target/release/thoughtgate-proxy"
 OUTPUT_FILE="${PROJECT_ROOT}/bench_metrics.json"
 
 # ThoughtGate v0.2 uses a 3-port Envoy-style model:

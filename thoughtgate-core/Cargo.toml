@@ -1,0 +1,96 @@
+[package]
+name = "thoughtgate-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ThoughtGate core governance library - transport-agnostic"
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Cancellation and utilities
+tokio-util.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Observability
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Data
+bytes.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# Async trait support (Inspector interface)
+async-trait.workspace = true
+
+# Atomic swap (Cedar policy hot-reload)
+arc-swap.workspace = true
+
+# HTTP types (for Inspector trait context - types only, not a server)
+http = "1"
+
+# Policy engine (REQ-POL-001)
+cedar-policy = "4.8.0"
+base64 = "0.22"
+
+# Task lifecycle (REQ-GOV-001)
+governor = "0.8"
+dashmap = "6"
+sha2 = "0.10"
+hex = "0.4"
+
+# Configuration (REQ-CFG-001)
+# serde-saphyr is a panic-free YAML parser built on Saphyr
+# Replaces deprecated serde_yaml and unsound serde_yml
+serde-saphyr = "0.0.17"
+glob = "0.3"
+humantime = "2"
+iso8601-duration = "0.2"
+url = "2"
+regex = "1"
+
+# HTTP client for upstream MCP server (REQ-CORE-003)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# HTTP server for governance service handler (localhost API)
+axum = "0.8"
+
+# OpenTelemetry + Prometheus (REQ-OBS-001)
+opentelemetry = { version = "0.31", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-prometheus = "0.31"
+prometheus = "0.14"
+
+[features]
+default = ["metrics"]
+metrics = []
+fuzzing = []
+
+[dev-dependencies]
+proptest = "1.0"
+insta = { version = "1.46.1", features = ["json"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+wiremock = "0.6"
+serial_test = "3.0"
+tower = "0.5"
+http-body-util = "0.1"
+http = "1"
+serde.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "policy_eval"
+harness = false
+
+[[bench]]
+name = "jsonrpc_parse"
+harness = false

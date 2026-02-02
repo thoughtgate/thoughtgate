@@ -76,7 +76,7 @@ spec:
               EXIT_CODE=$?
               echo "K6 finished with exit code: $EXIT_CODE"
               echo "Signaling ThoughtGate proxy to terminate..."
-              PROXY_PID=$(ps aux | grep '/thoughtgate' | grep -v grep | awk '{print $2}' | head -1)
+              PROXY_PID=$(ps aux | grep '/thoughtgate-proxy' | grep -v grep | awk '{print $2}' | head -1)
               if [ -n "$PROXY_PID" ]; then
                 echo "Sending SIGTERM to ThoughtGate (PID: $PROXY_PID)"
                 kill $PROXY_PID 2>/dev/null || true
@@ -100,7 +100,11 @@ spec:
         - name: thoughtgate
           image: thoughtgate:test
           imagePullPolicy: Never
-          args: ["--port", "4141", "--bind", "0.0.0.0", "--upstream-url", "http://mock-mcp"]
+          env:
+            - name: THOUGHTGATE_UPSTREAM_URL
+              value: "http://mock-mcp"
+            - name: THOUGHTGATE_OUTBOUND_PORT
+              value: "4141"
           # Set high file descriptor limit for connection handling
           securityContext:
             capabilities:

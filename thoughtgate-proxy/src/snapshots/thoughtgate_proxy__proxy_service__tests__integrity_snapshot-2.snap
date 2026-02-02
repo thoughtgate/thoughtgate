@@ -1,0 +1,13 @@
+---
+source: thoughtgate-proxy/src/proxy_service.rs
+expression: snapshot_data_forward
+---
+{
+  "test_case": "forward_proxy_absolute_uri",
+  "method": "GET",
+  "version": "HTTP/1.1",
+  "target_uri": "https://api.openai.com/v1/models",
+  "forwarded_headers": {
+    "authorization": "Bearer token"
+  }
+}

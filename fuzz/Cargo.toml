@@ -22,8 +22,12 @@ serde_json = "1"
 chrono = "0.4"
 serde-saphyr = "0.0"
 
-[dependencies.thoughtgate]
-path = ".."
+[dependencies.thoughtgate-core]
+path = "../thoughtgate-core"
+features = ["fuzzing"]
+
+[dependencies.thoughtgate-proxy]
+path = "../thoughtgate-proxy"
 features = ["fuzzing", "amber_path"]
 
 # URI parsing and Host header injection

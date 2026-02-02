@@ -1,0 +1,130 @@
+[package]
+name = "thoughtgate-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ThoughtGate HTTP+SSE proxy sidecar for K8s"
+
+[[bin]]
+name = "thoughtgate-proxy"
+path = "src/main.rs"
+
+[[bin]]
+name = "mock_mcp"
+path = "src/bin/mock_mcp.rs"
+required-features = ["mock"]
+
+[dependencies]
+thoughtgate-core = { path = "../thoughtgate-core" }
+
+# Async runtime
+tokio.workspace = true
+
+# Cancellation and utilities
+tokio-util.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Observability
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Data
+bytes.workspace = true
+async-trait.workspace = true
+
+# HTTP stack (Hyper v1)
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body = "1"
+http-body-util = "0.1"
+http = "1"
+httparse = "1"
+
+# HTTPS/TLS support for upstream connections
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "log", "logging", "native-tokio", "ring", "rustls-native-certs", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+
+# Stream utilities for zero-copy streaming
+futures-util = "0.3"
+
+# Socket configuration (REQ-CORE-001 Section 3.2)
+socket2 = { version = "0.6.2", features = ["all"] }
+
+# Middleware stack
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tower-service = "0.3"
+
+# HTTP server (REQ-CORE-003)
+axum = "0.8"
+
+# HTTP client for upstream MCP server
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# CLI and config
+clap = { version = "4", features = ["derive", "env"] }
+
+# Observability
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
+
+# Memory allocator (reduces fragmentation under load)
+mimalloc = "0.1"
+
+# OpenTelemetry + Prometheus (REQ-OBS-001)
+opentelemetry = { version = "0.31", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-prometheus = "0.31"
+prometheus = "0.14"
+
+[features]
+default = ["metrics"]
+mock = []
+fuzzing = []
+metrics = []
+# Amber Path: Buffered inspection for PII detection, schema validation, etc.
+# Deferred to v0.3+ - enable when response inspection is needed
+amber_path = []
+
+[dev-dependencies]
+# Kubernetes orchestration
+kube = { version = "2.0", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.26", features = ["v1_30"] }
+
+# TLS support for kube client (must match main dependency)
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+
+# Async utilities
+futures = "0.3"
+anyhow = "1.0"
+
+# Timestamps (for governance/approval tests)
+chrono.workspace = true
+
+# YAML configuration parsing (for config tests)
+serde-saphyr = "0.0.17"
+
+# Testing utilities
+rand = "0.9"
+serial_test = "3.0"
+uuid = { version = "1.20", features = ["v4", "serde"] }
+insta = { version = "1.46.1", features = ["json"] }
+wiremock = "0.6"
+
+# Property-based testing (SDD Phase 4 - L2 Verification)
+proptest = "1.0"
+
+# Benchmarking (REQ-CORE-001 Section 5 - TTFB verification)
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+# Benchmarks
+[[bench]]
+name = "ttfb"
+harness = false

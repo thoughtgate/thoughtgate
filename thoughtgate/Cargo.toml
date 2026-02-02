@@ -1,0 +1,16 @@
+[package]
+name = "thoughtgate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ThoughtGate CLI wrapper for local MCP governance"
+
+[[bin]]
+name = "thoughtgate"
+path = "src/main.rs"
+
+[dependencies]
+thoughtgate-core = { path = "../thoughtgate-core" }
+clap = { version = "4", features = ["derive"] }

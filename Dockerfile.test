@@ -1,7 +1,7 @@
 # Test Dockerfile - includes mock_mcp for K8s integration tests
 #
 # This image is used by CI for Kubernetes integration tests.
-# It includes both thoughtgate and mock_mcp binaries.
+# It includes both thoughtgate-proxy and mock_mcp binaries.
 #
 # Production deployments should use the main Dockerfile instead.
 
@@ -11,31 +11,31 @@ WORKDIR /app
 
 # Copy only dependency manifests first (for caching)
 COPY Cargo.toml Cargo.lock ./
+COPY thoughtgate-core/Cargo.toml thoughtgate-core/Cargo.toml
+COPY thoughtgate-proxy/Cargo.toml thoughtgate-proxy/Cargo.toml
+COPY thoughtgate/Cargo.toml thoughtgate/Cargo.toml
 
-# Create dummy source files to build dependencies
-# Note: Must match real project module structure to avoid E0761 conflicts
-RUN mkdir -p src/bin src/error && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "fn main() {}" > src/bin/mock_mcp.rs && \
-    echo "pub mod error; pub mod logging_layer; pub mod proxy_service;" > src/lib.rs && \
-    echo "pub struct ProxyService;" > src/proxy_service.rs && \
-    echo "pub enum ProxyError {}" > src/error/mod.rs && \
-    echo "pub struct LoggingLayer;" > src/logging_layer.rs
+# Create workspace-aware dummy sources for dependency caching
+RUN mkdir -p thoughtgate-core/src thoughtgate-proxy/src/bin thoughtgate/src && \
+    echo "fn main() {}" > thoughtgate-proxy/src/main.rs && \
+    echo "" > thoughtgate-core/src/lib.rs && \
+    echo "fn main() {}" > thoughtgate/src/main.rs && \
+    echo "fn main() {}" > thoughtgate-proxy/src/bin/mock_mcp.rs
 
 # Build dependencies (this layer will be cached unless Cargo.toml/Cargo.lock change)
-RUN cargo build --release --locked --bin thoughtgate || true && \
-    cargo build --release --locked --bin mock_mcp --features mock || true
+RUN cargo build --release --locked -p thoughtgate-proxy || true && \
+    cargo build --release --locked -p thoughtgate-proxy --features mock --bin mock_mcp || true
 
 # Now copy actual source code
 COPY . .
 
 # Remove dummy binaries to force rebuild with real source
-RUN rm -rf target/release/thoughtgate target/release/mock_mcp \
+RUN rm -rf target/release/thoughtgate-proxy target/release/mock_mcp \
            target/release/deps/thoughtgate* target/release/deps/mock_mcp*
 
-# Build both thoughtgate and mock_mcp with real source
-RUN cargo build --release --locked --bin thoughtgate && \
-    cargo build --release --locked --bin mock_mcp --features mock
+# Build both thoughtgate-proxy and mock_mcp with real source
+RUN cargo build --release --locked -p thoughtgate-proxy && \
+    cargo build --release --locked -p thoughtgate-proxy --features mock --bin mock_mcp
 
 # Test stage - minimal Debian image with both binaries
 FROM debian:bookworm-slim
@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     rm -rf /var/lib/apt/lists/*
 
 # Copy both binaries
-COPY --from=builder /app/target/release/thoughtgate /thoughtgate
+COPY --from=builder /app/target/release/thoughtgate-proxy /thoughtgate-proxy
 COPY --from=builder /app/target/release/mock_mcp /mock_mcp
 
 # Run as non-root user (nobody already exists as UID 65534 in Debian)
@@ -54,4 +54,4 @@ USER nobody
 # Expose default ports
 EXPOSE 7467 7468 7469 8080
 
-ENTRYPOINT ["/thoughtgate"]
+ENTRYPOINT ["/thoughtgate-proxy"]

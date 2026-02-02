@@ -8,7 +8,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
-use thoughtgate::proxy_service::ProxyService;
+use thoughtgate_proxy::proxy_service::ProxyService;
 use hyper::{Request, Method};
 
 #[derive(Arbitrary, Debug)]

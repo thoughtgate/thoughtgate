@@ -33,13 +33,12 @@ jobs:
         with:
           filters: |
             code:
-              - 'src/**'
-              - 'tests/**'
-              - 'benches/**'
+              - 'thoughtgate-core/**'
+              - 'thoughtgate-proxy/**'
+              - 'thoughtgate/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Dockerfile'
-              - 'build.rs'
               - '.cargo/**'
 
   # Stage 1a: Quick Checks (fast-fail)
@@ -76,7 +75,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Security audit
         run: cargo audit --deny warnings
@@ -102,15 +101,15 @@ jobs:
 
       - name: Build release binaries
         run: |
-          cargo build --release --bin thoughtgate
-          cargo build --release --bin mock_mcp --features mock
+          cargo build --release -p thoughtgate-proxy
+          cargo build --release -p thoughtgate-proxy --features mock --bin mock_mcp
 
       - name: Upload binaries as artifact
         uses: actions/upload-artifact@v6
         with:
           name: binaries
           path: |
-            target/release/thoughtgate
+            target/release/thoughtgate-proxy
             target/release/mock_mcp
           retention-days: 7
 
@@ -125,13 +124,13 @@ jobs:
       matrix:
         include:
           - test-name: "unit"
-            test-cmd: "cargo test --lib -- --nocapture"
+            test-cmd: "cargo test --workspace --lib -- --nocapture"
           - test-name: "streaming"
-            test-cmd: "cargo test --test integration_streaming -- --nocapture"
+            test-cmd: "cargo test -p thoughtgate-proxy --test integration_streaming -- --nocapture"
           - test-name: "peeking"
-            test-cmd: "cargo test --test unit_peeking -- --nocapture"
+            test-cmd: "cargo test -p thoughtgate-proxy --test unit_peeking -- --nocapture"
           - test-name: "memory"
-            test-cmd: "cargo test --test memory_profile -- --nocapture"
+            test-cmd: "cargo test -p thoughtgate-proxy --test memory_profile -- --nocapture"
     
     steps:
       - name: Checkout code
@@ -183,13 +182,13 @@ jobs:
           cache-on-failure: true
 
       - name: Build release binaries
-        run: cargo build --release --bin thoughtgate --bin mock_mcp --features mock
+        run: cargo build --release -p thoughtgate-proxy --features mock
 
       - name: Run Criterion benchmarks
         run: |
           echo "Running Criterion benchmarks..."
-          cargo bench --bench ttfb -- --noplot
-          cargo bench --bench policy_eval -- --noplot || echo "policy_eval benchmark not yet available"
+          cargo bench -p thoughtgate-proxy --bench ttfb -- --noplot
+          cargo bench -p thoughtgate-core --bench policy_eval -- --noplot || echo "policy_eval benchmark not yet available"
           
           echo ""
           echo "Benchmark complete. Checking output..."
@@ -213,7 +212,7 @@ jobs:
           THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:19999" \
           THOUGHTGATE_OUTBOUND_PORT=18080 \
           THOUGHTGATE_ADMIN_PORT=18082 \
-          ./target/release/thoughtgate &
+          ./target/release/thoughtgate-proxy &
           PID=$!
 
           # Wait for /health endpoint on admin port
@@ -282,7 +281,7 @@ jobs:
 
           # Start ThoughtGate proxy (uses default ports: 7467 outbound, 7469 admin)
           THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:8888" \
-          ./target/release/thoughtgate &
+          ./target/release/thoughtgate-proxy &
           PROXY_PID=$!
 
           # Wait for proxy health on admin port (default: 7469)
@@ -292,7 +291,8 @@ jobs:
           done
 
           # Run k6 benchmark (uses default port 7467)
-          k6 run --out json=k6_raw.json tests/benchmark-fast.js || true
+          # TODO: Move k6 scripts to scripts/ or thoughtgate-proxy/tests/
+          k6 run --out json=k6_raw.json thoughtgate-proxy/tests/benchmark-fast.js || true
 
           # Cleanup
           kill $PROXY_PID $MOCK_PID 2>/dev/null || true
@@ -589,7 +589,7 @@ jobs:
           (echo "Failed to load image into Kind" && exit 1)
 
       - name: Run Kubernetes integration tests
-        run: cargo test --test integration_k8s -- --nocapture
+        run: cargo test -p thoughtgate-proxy --test integration_k8s -- --nocapture
 
       - name: Install Bencher CLI
         if: always()

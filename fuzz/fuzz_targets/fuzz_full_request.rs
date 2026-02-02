@@ -28,7 +28,7 @@ fuzz_target!(|input: FuzzRequest| {
 
 async fn fuzz_request_handling(input: FuzzRequest) {
     use hyper::Request;
-    use thoughtgate::proxy_service::ProxyService;
+    use thoughtgate_proxy::proxy_service::ProxyService;
 
     // Parse method
     let method = if let Ok(method_str) = std::str::from_utf8(&input.method_bytes) {
@@ -83,7 +83,7 @@ async fn fuzz_request_handling(input: FuzzRequest) {
     }
 
     // Test 3: Header filtering logic
-    use thoughtgate::proxy_service::is_hop_by_hop_header;
+    use thoughtgate_proxy::proxy_service::is_hop_by_hop_header;
     for (name, _value) in req.headers().iter() {
         let _ = is_hop_by_hop_header(name.as_str());
     }

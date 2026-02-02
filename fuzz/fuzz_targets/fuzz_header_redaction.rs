@@ -9,7 +9,7 @@
 use arbitrary::Arbitrary;
 use http::HeaderMap;
 use libfuzzer_sys::fuzz_target;
-use thoughtgate::logging_layer;
+use thoughtgate_proxy::logging_layer;
 
 #[derive(Arbitrary, Debug)]
 struct FuzzHeaders {
