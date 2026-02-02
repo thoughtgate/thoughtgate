@@ -13,6 +13,7 @@
 //! - `pipeline` - Approval execution pipeline (REQ-GOV-002)
 //! - `engine` - Approval engine coordinator (REQ-GOV-002)
 //! - `approval` - External approval system integration (REQ-GOV-003)
+//! - `api` - Governance API wire types for shim↔service communication (REQ-CORE-008)
 //!
 //! ## v0.2 Features
 //!
@@ -22,6 +23,7 @@
 //! - **Polling model** - Sidecars poll for decisions (no callbacks)
 //! - **Approval Engine** - Coordinates approval workflow (create, poll, execute)
 
+pub mod api;
 pub mod approval;
 pub mod engine;
 pub mod handlers;
@@ -52,4 +54,9 @@ pub use pipeline::{
 // Re-export engine types
 pub use engine::{
     ApprovalEngine, ApprovalEngineConfig, ApprovalEngineError, ApprovalStartResult, TimeoutAction,
+};
+
+// Re-export governance API wire types (REQ-CORE-008)
+pub use api::{
+    GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse, MessageType,
 };
