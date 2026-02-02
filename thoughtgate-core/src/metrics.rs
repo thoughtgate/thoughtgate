@@ -8,9 +8,10 @@
 //! # Traceability
 //! - Implements: REQ-CORE-001 NFR-001 (Observability)
 //! - Implements: REQ-CORE-002 NFR-001 (Observability)
+//! - Implements: REQ-CORE-008 NFR-002 (stdio Observability)
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
@@ -506,6 +507,150 @@ impl GovernanceMetrics {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// stdio Transport Metrics (REQ-CORE-008 NFR-002)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Metrics collector for the stdio transport (CLI wrapper).
+///
+/// # Metrics
+///
+/// - `thoughtgate_stdio_messages_total`: Counter by server_id, direction, method
+/// - `thoughtgate_stdio_governance_decisions_total`: Counter by server_id, decision, profile
+/// - `thoughtgate_stdio_framing_errors_total`: Counter by server_id, error_type
+/// - `thoughtgate_stdio_server_state`: Gauge by server_id, state
+/// - `thoughtgate_stdio_approval_latency_seconds`: Histogram by server_id
+/// - `thoughtgate_stdio_active_servers`: UpDownCounter (total active shim connections)
+///
+/// # Traceability
+/// - Implements: REQ-CORE-008 NFR-002 (Observability)
+#[derive(Clone)]
+pub struct StdioMetrics {
+    /// Total messages processed (tags: server_id, direction, method).
+    pub messages_total: Counter<u64>,
+    /// Total governance decisions (tags: server_id, decision, profile).
+    pub governance_decisions_total: Counter<u64>,
+    /// Total framing errors (tags: server_id, error_type).
+    pub framing_errors_total: Counter<u64>,
+    /// Current server process state (tags: server_id, state).
+    pub server_state: Gauge<u64>,
+    /// Approval latency from request to decision (tags: server_id).
+    pub approval_latency: Histogram<f64>,
+    /// Currently active shim-managed servers.
+    pub active_servers: UpDownCounter<i64>,
+}
+
+impl StdioMetrics {
+    /// Create new stdio metrics collector.
+    ///
+    /// # Traceability
+    /// - Implements: REQ-CORE-008 NFR-002 (Observability)
+    pub fn new(meter: &Meter) -> Self {
+        Self {
+            messages_total: meter
+                .u64_counter("thoughtgate_stdio_messages_total")
+                .with_description("Total stdio messages processed")
+                .build(),
+            governance_decisions_total: meter
+                .u64_counter("thoughtgate_stdio_governance_decisions_total")
+                .with_description("Total governance decisions for stdio messages")
+                .build(),
+            framing_errors_total: meter
+                .u64_counter("thoughtgate_stdio_framing_errors_total")
+                .with_description("Total NDJSON framing errors detected")
+                .build(),
+            server_state: meter
+                .u64_gauge("thoughtgate_stdio_server_state")
+                .with_description("Current state of managed MCP server processes")
+                .build(),
+            approval_latency: meter
+                .f64_histogram("thoughtgate_stdio_approval_latency_seconds")
+                .with_description("Time from approval request to decision in seconds")
+                .build(),
+            active_servers: meter
+                .i64_up_down_counter("thoughtgate_stdio_active_servers")
+                .with_description("Number of currently active shim-managed servers")
+                .build(),
+        }
+    }
+
+    /// Create a no-op metrics instance (for tests and when OTLP is not configured).
+    ///
+    /// Uses a global no-op meter provider so all instruments silently discard data.
+    pub fn noop() -> Self {
+        let meter = opentelemetry::global::meter("noop");
+        Self::new(&meter)
+    }
+
+    /// Record a processed message.
+    pub fn record_message(&self, server_id: &str, direction: &str, method: &str) {
+        self.messages_total.add(
+            1,
+            &[
+                KeyValue::new("server_id", server_id.to_string()),
+                KeyValue::new("direction", direction.to_string()),
+                KeyValue::new("method", method.to_string()),
+            ],
+        );
+    }
+
+    /// Record a governance decision.
+    pub fn record_governance_decision(&self, server_id: &str, decision: &str, profile: &str) {
+        self.governance_decisions_total.add(
+            1,
+            &[
+                KeyValue::new("server_id", server_id.to_string()),
+                KeyValue::new("decision", decision.to_string()),
+                KeyValue::new("profile", profile.to_string()),
+            ],
+        );
+    }
+
+    /// Record a framing error.
+    pub fn record_framing_error(&self, server_id: &str, error_type: &str) {
+        self.framing_errors_total.add(
+            1,
+            &[
+                KeyValue::new("server_id", server_id.to_string()),
+                KeyValue::new("error_type", error_type.to_string()),
+            ],
+        );
+    }
+
+    /// Record server state change.
+    pub fn record_server_state(&self, server_id: &str, state: &str) {
+        self.server_state.record(
+            1,
+            &[
+                KeyValue::new("server_id", server_id.to_string()),
+                KeyValue::new("state", state.to_string()),
+            ],
+        );
+    }
+
+    /// Record approval latency.
+    pub fn record_approval_latency(&self, server_id: &str, duration: std::time::Duration) {
+        self.approval_latency.record(
+            duration.as_secs_f64(),
+            &[KeyValue::new("server_id", server_id.to_string())],
+        );
+    }
+
+    /// Increment active servers count.
+    pub fn increment_active_servers(&self) {
+        self.active_servers.add(1, &[]);
+    }
+
+    /// Decrement active servers count.
+    pub fn decrement_active_servers(&self) {
+        self.active_servers.add(-1, &[]);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Global Metrics
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Global metrics instance (Green Path only for backwards compatibility).
 static GREEN_METRICS: std::sync::OnceLock<Arc<GreenPathMetrics>> = std::sync::OnceLock::new();
 
@@ -518,16 +663,21 @@ static GOVERNANCE_METRICS: std::sync::OnceLock<Arc<GovernanceMetrics>> = std::sy
 /// Global MCP request metrics instance.
 static MCP_METRICS: std::sync::OnceLock<Arc<McpMetrics>> = std::sync::OnceLock::new();
 
+/// Global stdio transport metrics instance.
+static STDIO_METRICS: std::sync::OnceLock<Arc<StdioMetrics>> = std::sync::OnceLock::new();
+
 /// Initialize global metrics.
 pub fn init_metrics(meter: &Meter) {
     let green_metrics = Arc::new(GreenPathMetrics::new(meter));
     let amber_metrics = Arc::new(AmberPathMetrics::new(meter));
     let governance_metrics = Arc::new(GovernanceMetrics::new(meter));
     let mcp_metrics = Arc::new(McpMetrics::new(meter));
+    let stdio_metrics = Arc::new(StdioMetrics::new(meter));
     let _ = GREEN_METRICS.set(green_metrics);
     let _ = AMBER_METRICS.set(amber_metrics);
     let _ = GOVERNANCE_METRICS.set(governance_metrics);
     let _ = MCP_METRICS.set(mcp_metrics);
+    let _ = STDIO_METRICS.set(stdio_metrics);
 }
 
 /// Get global Green Path metrics instance.
@@ -557,6 +707,14 @@ pub fn get_governance_metrics() -> Option<Arc<GovernanceMetrics>> {
 /// - Implements: REQ-OBS-001 (Request-level metrics)
 pub fn get_mcp_metrics() -> Option<Arc<McpMetrics>> {
     MCP_METRICS.get().cloned()
+}
+
+/// Get global stdio transport metrics instance.
+///
+/// # Traceability
+/// - Implements: REQ-CORE-008 NFR-002 (stdio Observability)
+pub fn get_stdio_metrics() -> Option<Arc<StdioMetrics>> {
+    STDIO_METRICS.get().cloned()
 }
 
 #[cfg(test)]
@@ -676,5 +834,36 @@ mod tests {
         assert_eq!(McpMetrics::normalize_method("evil/attack"), "unknown");
         assert_eq!(McpMetrics::normalize_method("method_1"), "unknown");
         assert_eq!(McpMetrics::normalize_method(""), "unknown");
+    }
+
+    #[test]
+    fn test_stdio_metrics_noop() {
+        let metrics = StdioMetrics::noop();
+
+        // Verify all instruments can be called without panicking
+        metrics.record_message("test-server", "agent_to_server", "tools/call");
+        metrics.record_governance_decision("test-server", "forward", "production");
+        metrics.record_framing_error("test-server", "malformed_json");
+        metrics.record_server_state("test-server", "running");
+        metrics.record_approval_latency("test-server", std::time::Duration::from_millis(150));
+        metrics.increment_active_servers();
+        metrics.decrement_active_servers();
+    }
+
+    #[test]
+    fn test_stdio_metrics_creation() {
+        let meter = global::meter("test");
+        let metrics = StdioMetrics::new(&meter);
+
+        // Exercise each instrument
+        metrics.record_message("fs", "agent_to_server", "tools/call");
+        metrics.record_message("fs", "server_to_agent", "tools/call");
+        metrics.record_governance_decision("fs", "deny", "production");
+        metrics.record_framing_error("fs", "message_too_large");
+        metrics.record_server_state("fs", "starting");
+        metrics.record_approval_latency("fs", std::time::Duration::from_secs(5));
+        metrics.increment_active_servers();
+        metrics.increment_active_servers();
+        metrics.decrement_active_servers();
     }
 }
