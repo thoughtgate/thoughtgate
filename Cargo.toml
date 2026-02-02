@@ -52,7 +52,7 @@ uuid = { version = "1.20", features = ["v4", "serde"] }
 
 # Policy engine (REQ-POL-001)
 cedar-policy = "4.8.0"
-arc-swap = "1.8.0"
+arc-swap = "1.8.1"
 
 # Base64 decoding for K8s JWT tokens (REQ-POL-001/F-006.1)
 base64 = "0.22"
@@ -132,7 +132,7 @@ serde_json = "1.0"
 rand = "0.9"
 serial_test = "3.0"
 uuid = { version = "1.20", features = ["v4", "serde"] }
-insta = { version = "1.46.1", features = ["json"] }
+insta = { version = "1.46.3", features = ["json"] }
 wiremock = "0.6"
 
 # Property-based testing (SDD Phase 4 - L2 Verification)
