@@ -527,7 +527,7 @@ jobs:
           outputs: type=docker,dest=/tmp/thoughtgate-image.tar
 
       - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           input: /tmp/thoughtgate-image.tar
           severity: 'CRITICAL,HIGH'
