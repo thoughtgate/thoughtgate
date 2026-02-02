@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "remote-api": {
+      "type": "sse",
+      "url": "http://localhost:3001/sse"
+    }
+  }
+}
