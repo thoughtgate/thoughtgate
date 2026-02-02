@@ -63,11 +63,13 @@ ThoughtGate runs as a **sidecar** inside a Kubernetes pod. This creates a fundam
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**CLI wrapper mode (v0.3, REQ-CORE-008):** In CLI wrapper mode, shims communicate with a localhost governance service started by `thoughtgate wrap`. The same polling model applies — each shim polls `127.0.0.1:19090` for governance decisions. Shims are not individually addressable from external systems, just like sidecars.
+
 ### 1.3 Design Philosophy
 
 - ThoughtGate posts approval requests to Slack (outbound only)
 - ThoughtGate polls Slack API for decisions (no inbound callbacks)
-- Each sidecar is self-sufficient (no central coordinator needed)
+- Each sidecar/shim is self-sufficient (no central coordinator needed)
 - Adapters encapsulate polling logic for different systems
 - **Workflow configuration loaded from YAML config** (REQ-CFG-001)
 
