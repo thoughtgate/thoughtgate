@@ -90,22 +90,20 @@ This requirement spans two subcommands within the single `thoughtgate` CLI binar
 
 The shim logic is embedded in the `thoughtgate` binary as a library module, not a separate binary. Config rewrites `command` to `thoughtgate shim --server-id x -- original-command args`.
 
-> **Note:** The HTTP sidecar for K8s deployments is a separate binary (`thoughtgate-proxy`) in a separate crate. See §1.6.
-
 ### 1.6 Workspace Architecture
 
-ThoughtGate uses a three-crate Cargo workspace with **one library and two binaries**. This split ensures transport-agnostic logic (governance, Cedar, JSON-RPC classification, telemetry, profiles) is reusable across both the HTTP sidecar and the stdio CLI, while keeping the two deployment targets in separate binaries with non-overlapping dependency trees.
+ThoughtGate uses a three-crate Cargo workspace. This split ensures transport-agnostic logic (governance, Cedar, JSON-RPC classification, profiles, telemetry) is reusable across both the HTTP sidecar and the stdio CLI binaries.
 
 | Crate | Type | Owns | Depends On |
 |-------|------|------|-----------|
-| `thoughtgate-core` | library | GovernanceEngine trait + impl, Cedar evaluation, task lifecycle, JSON-RPC classification, config parsing, telemetry/spans/metrics, audit events, approval pipeline, profiles, governance API types, StreamDirection | `cedar-policy`, `serde`, `serde_json`, `tokio`, `tracing`, `thiserror`, `opentelemetry`, `reqwest` |
-| `thoughtgate-proxy` | binary | HTTP+SSE listener, K8s health/readiness probes, Axum request handlers, SSE streaming, upstream connection pooling, TLS | `thoughtgate-core`, `axum`, `hyper`, `hyper-util`, `hyper-rustls`, `rustls`, `tower`, `tower-http`, `tracing-subscriber` |
-| `thoughtgate` | binary | `wrap` + `shim` subcommands, ConfigAdapter trait + impls, StdioMessage (with `raw` field), NDJSON parser, ShimOptions, McpServerEntry, process lifecycle types, FramingError, StdioError, ConfigGuard | `thoughtgate-core`, `clap`, `nix`, `tokio`, `reqwest`, `dirs`, `tracing-subscriber` |
+| `thoughtgate-core` | library | Profile, ProfileBehaviour, JsonRpcMessageKind, GovernanceEngine trait, governance HTTP service handler, Cedar evaluation, governance API types (request/response), StreamDirection, OTel metric instruments, span builders, redaction pipeline | `cedar-policy`, `serde`, `serde_json`, `tokio`, `tracing`, `thiserror`, `opentelemetry`, `aho-corasick`, `regex` |
+| `thoughtgate-proxy` | binary | HTTP sidecar proxy (v0.2 transport), Kubernetes sidecar injection | `thoughtgate-core`, `axum`, `hyper`, `tower` |
+| `thoughtgate` | binary | `wrap` + `shim` subcommands, ConfigAdapter trait + impls, StdioMessage (with `raw` field), NDJSON parser, ShimOptions, McpServerEntry, process lifecycle types, FramingError, StdioError, ConfigGuard | `thoughtgate-core`, `clap`, `nix`, `tokio`, `reqwest`, `dirs` |
 
 ```
 thoughtgate/
 ├── Cargo.toml                       # [workspace]
-├── thoughtgate-core/                # Transport-agnostic governance + telemetry
+├── thoughtgate-core/                # Transport-agnostic library
 │   └── src/
 │       ├── lib.rs
 │       ├── profile.rs               # Profile, ProfileBehaviour (§6.7)
@@ -116,23 +114,21 @@ thoughtgate/
 │       │   ├── cedar.rs             # Cedar evaluation (REQ-POL-001)
 │       │   └── service.rs           # Governance HTTP service handler
 │       ├── telemetry/
+│       │   ├── mod.rs
 │       │   ├── attributes.rs        # OTel semantic attribute constants
 │       │   ├── spans.rs             # Span builders (McpToolCallSpan, etc.)
 │       │   ├── context.rs           # W3C trace context propagation
 │       │   ├── redact.rs            # Redaction pipeline
 │       │   ├── audit.rs             # OCSF audit event types
-│       │   ├── metrics.rs           # Metric instrument definitions
+│       │   ├── metrics.rs           # Metric instrument definitions (NFR-002)
 │       │   └── init.rs              # OTel SDK initialisation
 │       └── error.rs                 # Shared governance errors
 │
-├── thoughtgate-proxy/               # Binary: HTTP+SSE sidecar for K8s
+├── thoughtgate-proxy/               # Binary: HTTP sidecar (not modified by this spec)
 │   └── src/
-│       ├── main.rs                  # Startup, listener, shutdown orchestration
-│       ├── handlers.rs              # Axum request handlers (MCP, passthrough)
-│       ├── sse.rs                   # SSE response streaming
-│       └── health.rs                # K8s health/readiness probes
+│       └── main.rs
 │
-└── thoughtgate/                     # Binary: CLI wrapper for local dev
+└── thoughtgate/                     # Binary: wrap + shim subcommands
     └── src/
         ├── main.rs                  # clap dispatch
         ├── wrap/
@@ -148,17 +144,19 @@ thoughtgate/
         └── error.rs                 # StdioError, FramingError (§6.5, §6.8)
 ```
 
-**Rationale for three crates (two binaries, not one):**
+**Rationale for three crates:**
 
-1. **`thoughtgate-core` must exist as a library** because both the HTTP sidecar and the stdio CLI need governance logic, Cedar evaluation, telemetry, and profile types. Without it, one binary depends on the other or governance types are duplicated.
+1. **`thoughtgate-core` must exist as a library** because both binaries (`thoughtgate-proxy` for HTTP sidecar and `thoughtgate` for stdio CLI) need governance logic, Cedar evaluation, profile types, and telemetry. Without it, either one binary depends on the other or types are duplicated.
 
-2. **Telemetry stays in `thoughtgate-core`**, not a separate crate. Splitting telemetry was considered but rejected as premature — the observability code does not yet impose enough compile-time or dependency weight to justify a third library crate. It can be promoted to its own crate later if OTel dependencies become a burden.
+2. **Two separate binaries** (`thoughtgate-proxy` and `thoughtgate`) rather than one binary with subcommands because:
+   - The HTTP sidecar runs as a long-lived Kubernetes pod; the CLI wraps short-lived agent sessions
+   - Different operational contexts: sidecar is injected by mutation webhook; CLI is invoked by users
+   - Separate binaries allow independent versioning and deployment
+   - Container image size: stdio CLI doesn't need HTTP server dependencies
 
-3. **Two separate binaries are required for security.** The K8s sidecar Docker image (`thoughtgate-proxy`) must NOT contain `nix`, `dirs`, config-rewriting logic, or child process spawning code. In regulated industries, security auditors review container contents — desktop development tooling in a production sidecar is an audit finding. Dead code elimination does not help: the code paths are reachable through `clap` dispatch even if never invoked at runtime. This follows service mesh precedent (Envoy/istioctl, linkerd-proxy/linkerd CLI are separate binaries for the same reason).
+3. **Feature flags were rejected** in favour of explicit crate boundaries because conditional compilation complicates AI-assisted development (Claude Code cannot reason about `#[cfg(feature)]` gating across files) and adds build matrix complexity.
 
-4. **Feature flags are reserved for optional heavyweight capabilities within core** (e.g., `prompt-guard = ["dep:ort"]`), not for transport boundaries. Conditional compilation complicates AI-assisted development and adds build matrix complexity.
-
-> **Note:** The governance service handler — the axum HTTP service that shims connect to at `127.0.0.1:19090` — is defined as library code in `thoughtgate-core/src/governance/service.rs`. The startup/binding/lifecycle orchestration lives in `thoughtgate/src/wrap/`. This mirrors how `axum::Router` is defined as a library construct but instantiated by the binary.
+> **Note:** The governance service handler — the axum HTTP service that shims connect to on `127.0.0.1` (dynamic port by default) — is defined as library code in `thoughtgate-core/src/governance/service.rs`. The startup/binding/lifecycle orchestration lives in `thoughtgate/src/wrap/`. This mirrors how `axum::Router` is defined as a library construct but instantiated by the binary.
 
 ## 2. Dependencies
 
@@ -211,6 +209,7 @@ The system must:
 - **GUI / system tray integration** — CLI only for v0.3.
 - **Server restart on crash** — if an MCP server process dies, the shim reports the error and exits. No automatic restart with backoff (defer to v0.4+).
 - **Remote stdio** — SSH-tunnelled or network-bridged stdio transport. Local processes only.
+- **Agent-initiated config changes during session** — If the user installs or removes an MCP server via the agent's UI while ThoughtGate is running, the agent overwrites the rewritten config. On exit, ThoughtGate restores its backup — losing the newly added server. This is a fundamental limitation of the config-rewrite injection model shared by all tools in this category. **Workaround:** exit the wrapped session and re-run `thoughtgate wrap`. Future versions may watch the config file for external modifications and merge changes.
 
 ## 5. Constraints
 
@@ -220,8 +219,8 @@ The system must:
 |------------|-------|-----------|
 | **Async runtime** | Tokio (full features) | Required for async process I/O, signal handling |
 | **Target platforms** | macOS (aarch64, x86_64), Linux (x86_64, aarch64) | Primary developer platforms. Windows deferred. |
-| **Rust edition** | 2021 | Consistent with workspace (see §1.6) |
-| **Binary location** | Single `thoughtgate` binary (CLI wrapper) | `wrap` and `shim` are subcommands, not separate binaries. The HTTP sidecar is `thoughtgate-proxy` (separate crate). |
+| **Rust edition** | 2024 | Latest stable edition; aligns with new workspace |
+| **Binary location** | Single `thoughtgate` binary | `wrap` and `shim` are subcommands, not separate binaries |
 
 ### 5.2 Protocol Constraints
 
@@ -240,7 +239,7 @@ The system must:
 | **Config backup** | `.thoughtgate-backup` suffix | Must survive unexpected termination |
 | **Backup written before rewrite** | Always | Crash between backup and rewrite = safe (original preserved) |
 | **Restore on exit** | Best-effort | Register cleanup via signal handlers AND `Drop` trait |
-| **No concurrent wrapping** | One `thoughtgate wrap` per agent config file | Use file lock (flock) to prevent races |
+| **No concurrent wrapping** | One `thoughtgate wrap` per agent config file | Use file lock (flock) on `<config_path>.thoughtgate-lock` — a separate lock file that survives atomic saves by editors |
 
 ### 5.4 Governance Constraints
 
@@ -265,13 +264,19 @@ OPTIONS:
     --profile <PROFILE>       Configuration profile [default: production]
                               [production, development]
     --thoughtgate-config <PATH>  ThoughtGate config file [default: thoughtgate.yaml]
+    --governance-port <PORT>  Port for governance service [default: 0 (OS-assigned)]
+                              Use a fixed port for debugging or firewall rules.
     --no-restore              Don't restore original config on exit
+    --dry-run                 Print the rewritten config diff without writing.
+                              Useful for verifying config changes before committing.
     --verbose                 Enable debug logging
+    --version                 Print version and exit
 
 EXAMPLES:
     thoughtgate wrap -- claude-code
     thoughtgate wrap --agent-type cursor -- cursor .
     thoughtgate wrap --profile development -- claude-code
+    thoughtgate wrap --dry-run -- claude-code
     thoughtgate wrap --config-path ~/.config/custom/mcp.json --agent-type custom -- my-agent
 ```
 
@@ -281,7 +286,7 @@ thoughtgate shim [OPTIONS] -- <SERVER_COMMAND> [SERVER_ARGS...]
 OPTIONS:
     --server-id <ID>          Server identifier (from config rewrite)
     --governance-endpoint <URL>  ThoughtGate governance service URL
-                                [default: http://127.0.0.1:19090]
+                                (injected by `wrap` during config rewrite, includes dynamic port)
     --profile <PROFILE>       Configuration profile [production, development]
 
 NOTE: This subcommand is not intended for direct user invocation.
@@ -473,6 +478,9 @@ pub enum FramingError {
     #[error("Pipe closed unexpectedly")]
     BrokenPipe,
 
+    #[error("JSON-RPC batch requests (arrays) are not supported")]
+    UnsupportedBatch,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -651,7 +659,6 @@ pub enum StdioError {
     - Claude Desktop / Claude Code / Cursor / Windsurf: `mcpServers` key with `{command, args, env}` objects
     - VS Code: `servers` key (not `mcpServers`), with `{command, args, env}` under `type: "stdio"`
     - Zed: `context_servers` key with different nesting
-    - Continue.dev: YAML format with `transport` object (if supported)
 
     Reject configs with zero stdio servers (exit with helpful message).
 
@@ -663,10 +670,11 @@ pub enum StdioError {
 ### 7.2 Config Rewriting
 
 - **F-005 (Atomic Backup):** Before modifying any config file:
-    1. Acquire an advisory file lock (`flock`) on the config file to prevent concurrent `thoughtgate wrap` invocations
-    2. Copy original to `<config_path>.thoughtgate-backup`
-    3. Verify backup was written successfully (read back and compare)
-    4. Only then proceed to rewrite
+    1. Acquire an advisory file lock (`flock`) on a separate lock file at `<config_path>.thoughtgate-lock` (not on the config file itself — editors like VS Code perform atomic saves by writing a temp file and renaming over the target, which changes the inode and silently breaks locks held on the original file)
+    2. **Double-wrap detection:** Check if any server entry's `command` already resolves to the `thoughtgate` binary (by comparing against `current_exe()` canonical path or checking for a `"__thoughtgate_managed": true` marker in the config). If detected, exit with a clear error: "Config already managed by ThoughtGate. Run the agent directly or restore the original config with `thoughtgate unwrap`."
+    3. Copy original to `<config_path>.thoughtgate-backup`
+    4. Verify backup was written successfully (read back and compare)
+    5. Only then proceed to rewrite
 
 - **F-006 (Command Replacement):** For each `McpServerEntry`, rewrite the config:
 
@@ -706,11 +714,15 @@ pub enum StdioError {
 
     The `command` field points to the `thoughtgate` binary's absolute path (resolved via `std::env::current_exe()`). The original command and args follow `--` as positional arguments.
 
-- **F-007 (Shim Binary Resolution):** Resolve the absolute path of the `thoughtgate` binary for config injection. Use `std::env::current_exe()` as primary, with `which::which("thoughtgate")` as fallback. Fail if neither resolves (the binary must be findable after the agent launches in a potentially different working directory).
+- **F-007 (Shim Binary Resolution):** Resolve the absolute path of the `thoughtgate` binary for config injection. Use `std::env::current_exe()` as primary, with `which::which("thoughtgate")` as fallback. **Canonicalize the result** with `std::fs::canonicalize()` to resolve symlinks — on macOS, `current_exe()` may return a symlink path that becomes invalid if the symlink target changes (e.g., after `brew upgrade`). Fail if neither resolves (the binary must be findable after the agent launches in a potentially different working directory).
+
+- **F-007a (Dry Run):** When `--dry-run` is specified, `thoughtgate wrap` performs config discovery, parsing, and rewrite generation, then prints a unified diff of the original vs. rewritten config to stdout and exits with code 0. No backup is created, no config is modified, no processes are spawned. This enables users to verify config changes before committing.
+
+- **F-007b (JSON-RPC Batch Rejection):** JSON-RPC 2.0 permits batch requests (a JSON array of request objects). MCP does not use batch requests and ThoughtGate does not support them. If a parsed NDJSON line is a JSON array, the shim MUST reject it with a `FramingError::UnsupportedBatch` error, log at `WARN` level, and skip the message. This is explicitly specified to prevent silent misclassification.
 
 ### 7.3 Agent Launch & Lifecycle
 
-- **F-008 (Governance Service Startup):** Before launching the agent, start a lightweight HTTP service on `127.0.0.1:19090` (configurable) that shim instances connect to for governance decisions. This service:
+- **F-008 (Governance Service Startup):** Before launching the agent, start a lightweight HTTP service on `127.0.0.1` that shim instances connect to for governance decisions. By default, bind to port 0 (OS-assigned ephemeral port) to eliminate port collision errors. The actual bound port is passed to shim instances via the config rewrite. Users may override with `--governance-port <PORT>` for debugging or firewall rules. This service:
     - Loads ThoughtGate configuration (`thoughtgate.yaml`)
     - Initialises the Cedar policy engine
     - Initialises approval adapters (Slack)
@@ -725,11 +737,11 @@ pub enum StdioError {
 
 - **F-010 (Wait for Exit):** `thoughtgate wrap` blocks until the agent process exits, then:
     1. Collect exit code
-    2. Send shutdown signal to governance service
+    2. Send shutdown signal to governance service (set internal shutdown flag)
     3. Wait for all shim instances to drain (up to `stdin_close_grace`)
     4. Terminate remaining server processes
     5. Restore config from backup (unless `--no-restore`)
-    6. Release file lock
+    6. Release file lock and remove `<config_path>.thoughtgate-lock`
     7. Exit with the agent's exit code
 
 ### 7.4 Shim: stdio Proxy
@@ -748,6 +760,8 @@ pub enum StdioError {
     `kill_on_drop(true)` ensures the server is terminated if the shim panics or is dropped.
     `.process_group(0)` prevents Ctrl+C from propagating directly to the server — the shim controls shutdown.
 
+    > **Security note:** `stderr(Stdio::inherit())` means a compromised MCP server can write arbitrary content to the user's terminal. This content will appear interleaved with ThoughtGate's own log output with no visual distinction. This is a known limitation of the stdio wrapping model — prefixing stderr lines would break servers that use stderr for structured logging. Users should be aware that terminal output from wrapped sessions may include untrusted content from MCP servers.
+
 - **F-012 (Bidirectional Proxy):** The shim runs two concurrent Tokio tasks:
 
     **Agent→Server (outbound):**
@@ -761,9 +775,11 @@ pub enum StdioError {
     **Server→Agent (inbound):**
     1. Read NDJSON lines from server's stdout
     2. Parse each line as `StdioMessage`
-    3. Log for audit trail
-    4. Optionally inspect (if Inspector Framework is enabled — v0.5+)
+    3. Log for audit trail (locally in the shim — does NOT call the governance evaluate endpoint in v0.3)
+    4. Apply governance evaluation for server→agent messages (v0.5+ — when Inspector Framework is enabled)
     5. Write original line to own stdout (agent reads it)
+
+    > **Note:** In v0.3, server→agent messages are forwarded unconditionally after local audit logging. The `direction` field in `GovernanceEvaluateRequest` exists to support future server→agent governance (v0.5+) without API changes. The shim does not call `POST /governance/evaluate` for inbound messages in this version.
 
     Use `tokio::select!` to handle both directions plus child process exit concurrently.
 
@@ -778,10 +794,12 @@ pub enum StdioError {
     - On validation failure: log the error with raw bytes (hex-encoded if not UTF-8), return `FramingError`, and skip the message (do not crash)
 
 - **F-014 (Message Framing Validation):** As a security defence against message smuggling:
-    - Reject any line that, when parsed as JSON, contains a `result` or `params` field with a string value containing a literal newline character that appears to be a valid JSON-RPC message (nested message detection)
-    - Log all framing violations at `WARN` level with server_id context
-    - In `production` profile: reject the message
+    - After reading each NDJSON line, split the raw byte buffer on literal `0x0A` (newline) bytes. If the split produces more than one non-empty segment, check whether any segment after the first parses as valid JSON containing a `"jsonrpc"` key. If so, flag as a smuggling attempt.
+    - This detects the attack where a malicious server embeds a complete JSON-RPC message inside a string value with a literal (unescaped) newline, causing a naive line-based parser to treat the embedded content as a separate message.
+    - Log all framing violations at `WARN` level with server_id context and hex-encoded raw bytes
+    - In `production` profile: reject the entire line
     - In `development` profile: log as `WOULD_REJECT` and forward
+    - **False positive mitigation:** Only flag when the secondary segment contains a `"jsonrpc"` key — legitimate multi-line content (base64 blobs, markdown) will not trigger this heuristic
 
 - **F-015 (Request ID Tracking):** Maintain a bidirectional request ID map per server:
     - Track outstanding request IDs sent by the agent (outbound requests awaiting responses)
@@ -799,6 +817,8 @@ pub enum StdioError {
         pub server_id: String,
         pub direction: StreamDirection,
         pub method: String,
+        /// JSON-RPC request/response ID, if present. Used for audit trail correlation.
+        pub id: Option<JsonRpcId>,
         pub params: Option<serde_json::Value>,
         pub message_type: MessageType,
         pub profile: Profile,
@@ -819,6 +839,9 @@ pub enum StdioError {
         pub task_id: Option<String>,
         pub policy_id: Option<String>,
         pub reason: Option<String>,
+        /// When true, the shim must initiate graceful shutdown (F-018).
+        /// Set by the governance service when `wrap` triggers shutdown (F-019).
+        pub shutdown: bool,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -834,21 +857,36 @@ pub enum StdioError {
     - `POST /governance/evaluate` — submit a message for 4-gate evaluation (body: `GovernanceEvaluateRequest`)
     - Response: `GovernanceEvaluateResponse`
     - For `PendingApproval`: poll `GET /governance/task/{task_id}` until resolved
+    - `POST /governance/heartbeat` — periodic shim liveness signal (body: `{ "server_id": "..." }`)
+    - Response: `{ "shutdown": false }` (or `true` when wrap has triggered shutdown)
+    - Shims MUST send a heartbeat every 5 seconds when idle (no messages flowing). If the response contains `"shutdown": true`, the shim initiates graceful shutdown (F-018). If the heartbeat request fails with connection refused or timeout, the shim treats this as an unclean governance service exit and initiates shutdown immediately.
     - Backpressure: while awaiting approval, stop reading from agent stdin (bounded channel fills, read task blocks)
     - Timeout: configurable per-profile (production: 5min, development: 10s auto-approve)
+    - **Shutdown coordination:** When any `GovernanceEvaluateResponse` or heartbeat response contains `shutdown: true`, the shim stops accepting new messages from the agent and initiates F-018. This is the mechanism by which F-019 step 2 ("governance service signals all connected shims to drain") is implemented — the governance service sets an internal shutdown flag that is piggy-backed onto the next evaluate or heartbeat response for each connected shim.
+
+- **F-016a (Shim Readiness Check):** Before entering the proxy loop, the shim MUST poll the governance service's `/healthz` endpoint with exponential backoff (initial: 50ms, max: 2s, max attempts: 20). If the governance service is not reachable within the backoff window, exit with `StdioError::GovernanceUnavailable`. This prevents fail-closed denials during normal startup races between shim instances and the governance service.
+
+- **F-016b (Governance Request Timeout):** All HTTP calls from shim to governance service MUST have explicit `reqwest` timeouts:
+    - `POST /governance/evaluate`: 500ms connect + 2s total request timeout
+    - `GET /governance/task/{task_id}` (approval polling): 500ms connect + 5s total per poll
+    - On timeout: fail-closed deny (production) or log `WOULD_DENY` and forward (development)
 
 - **F-017 (Protocol Passthrough):** The following messages MUST be forwarded without governance evaluation:
     - `initialize` request and response (capability negotiation)
     - `initialized` notification
     - `notifications/cancelled` (cancel propagation)
     - `notifications/progress` (progress updates)
+    - `notifications/resources/updated` (resource change signal)
+    - `notifications/resources/list_changed` (resource list change signal)
+    - `notifications/tools/list_changed` (tool list change signal)
+    - `notifications/prompts/list_changed` (prompt list change signal)
     - `ping` / `pong`
 
     The shim MUST NOT modify `initialize` request/response content — protocol version negotiation is transparent.
 
 ### 7.5 Process Lifecycle Management
 
-- **F-018 (Graceful Shutdown — Shim):** When the shim receives shutdown signal (stdin EOF from agent, or signal from governance service):
+- **F-018 (Graceful Shutdown — Shim):** When the shim receives a shutdown signal (stdin EOF from agent, `shutdown: true` in a governance response or heartbeat, or SIGTERM from OS):
     1. Close stdin to the server process (signals EOF)
     2. Wait up to `stdin_close_grace` (default: 5s) for server to exit cleanly
     3. If still running: send SIGTERM to the server's process group
@@ -858,9 +896,9 @@ pub enum StdioError {
     7. Exit with 0 (clean shutdown) or server's exit code
 
 - **F-019 (Graceful Shutdown — Wrap):** When `thoughtgate wrap` receives SIGTERM or SIGINT:
-    1. Signal the governance service to begin shutdown
-    2. Governance service signals all connected shims to drain
-    3. Wait for all shims to report exit (up to 10s)
+    1. Signal the governance service to set its internal shutdown flag
+    2. Connected shims discover the shutdown flag via their next `POST /governance/evaluate` response or `POST /governance/heartbeat` response (idle shims discover within one heartbeat interval, ≤5s). Each shim initiates F-018 independently and in parallel.
+    3. Wait for all shims to report exit (up to 10s wall-clock time, covering all shims concurrently)
     4. Terminate any remaining server processes
     5. Restore config from backup
     6. Exit
@@ -980,10 +1018,10 @@ thoughtgate_stdio_active_servers
 | Message exceeds 10MB limit | Reject with `FramingError::MessageTooLarge`, skip message | EC-STDIO-014 |
 | Malformed JSON on stdio stream | Log error, skip message, continue reading | EC-STDIO-015 |
 | Missing `jsonrpc` field | Log error, skip message, continue reading | EC-STDIO-016 |
-| Valid JSON but not JSON-RPC (missing method and id) | Log warning, forward as-is (lenient) | EC-STDIO-017 |
+| Valid JSON but not JSON-RPC (missing method and id) | Drop message (production) or log `WOULD_DROP` and forward (development). Fail-closed per §5.4. | EC-STDIO-017 |
 | Embedded newline smuggling attempt | Detect and reject (production) or warn (development) | EC-STDIO-018 |
 | Server sends request to agent (`sampling/createMessage`) | Route server→agent, track response ID | EC-STDIO-019 |
-| Server sends `notifications/listChanged` | Forward to agent without governance (notification) | EC-STDIO-020 |
+| Server sends `notifications/tools/list_changed` | Forward to agent without governance (on F-017 passthrough whitelist) | EC-STDIO-020 |
 | Approval required but Slack is unreachable | Timeout → deny (production), auto-approve (development) | EC-STDIO-021 |
 | Approval pending when Ctrl+C received | Cancel pending approvals, proceed with shutdown | EC-STDIO-022 |
 | VS Code config with `servers` key (not `mcpServers`) | Parse correctly via VS Code adapter | EC-STDIO-023 |
@@ -997,6 +1035,17 @@ thoughtgate_stdio_active_servers
 | `notifications/cancelled` while approval pending | Abort approval workflow, forward cancellation | EC-STDIO-031 |
 | Large base64 tool response (~5MB) | Forward (under 10MB limit), no special handling | EC-STDIO-032 |
 | Development profile with Cedar deny | Log `WOULD_BLOCK`, forward message, record in audit | EC-STDIO-033 |
+| Config already rewritten by ThoughtGate (double-wrap) | Exit with clear error, do not nest shim inside shim | EC-STDIO-034 |
+| JSON-RPC batch request (JSON array) on stdio | Reject with `FramingError::UnsupportedBatch`, log, skip | EC-STDIO-035 |
+| Governance service not ready when shim starts | Poll `/healthz` with backoff; exit if unreachable after retries | EC-STDIO-036 |
+| Governance `POST /evaluate` times out (service hung) | Fail-closed deny (production) or log and forward (development) | EC-STDIO-037 |
+| `--dry-run` flag specified | Print config diff to stdout, exit 0, no file changes | EC-STDIO-038 |
+| Agent UI adds new MCP server during wrapped session | New server not governed; original config restored on exit (known limitation) | EC-STDIO-039 |
+| Governance port 19090 already in use (explicit `--governance-port` override) | Exit with clear error identifying the port conflict | EC-STDIO-040 |
+| Shim idle when wrap receives SIGTERM | Heartbeat discovers `shutdown: true` within 5s, initiates F-018 | EC-STDIO-041 |
+| Governance service crashes (connection refused on heartbeat) | Shim treats as unclean shutdown, initiates F-018 immediately | EC-STDIO-042 |
+| Editor performs atomic save on config file during session | Lock on `.thoughtgate-lock` is unaffected by inode change | EC-STDIO-043 |
+| Stale `.thoughtgate-lock` file from previous crash | `flock` on the file succeeds (advisory lock was released on process exit); proceed normally | EC-STDIO-044 |
 
 ### 9.2 Assertions
 
@@ -1042,6 +1091,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 thiserror = "2"
+opentelemetry = { version = "0.27", features = ["trace", "metrics"] }
 ```
 
 **`thoughtgate-core/Cargo.toml`:**
@@ -1049,35 +1099,25 @@ thiserror = "2"
 [package]
 name = "thoughtgate-core"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-# Workspace-shared
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-
-# Governance & policy
-cedar-policy = "4"
-arc-swap = "1"              # Atomic policy swap for hot-reload
-axum = "0.8"                # Governance service handler (localhost API)
-uuid = { version = "1", features = ["v4"] }
-glob = "0.3"
-chrono = { version = "0.4", features = ["serde"] }
-
-# Telemetry (kept in core — not yet split)
-opentelemetry = { version = "0.27", features = ["trace", "metrics"] }
+opentelemetry.workspace = true
 opentelemetry-otlp = "0.27"
 opentelemetry_sdk = "0.27"
 tracing-opentelemetry = "0.28"
-aho-corasick = "1"           # Redaction pipeline
-regex = "1"                  # Redaction pipeline
-secrecy = "0.10"             # Secret wrapping
-
-# Approval adapters
-reqwest = { version = "0.12", features = ["json"] }  # Slack API
+cedar-policy = "4"
+arc-swap = "1"              # Atomic policy swap for hot-reload
+axum = "0.8"                # Governance service handler
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+aho-corasick = "1"          # Redaction pipeline
+regex = "1"                 # Redaction patterns
 ```
 
 **`thoughtgate-proxy/Cargo.toml`:**
@@ -1085,29 +1125,16 @@ reqwest = { version = "0.12", features = ["json"] }  # Slack API
 [package]
 name = "thoughtgate-proxy"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 
-[[bin]]
-name = "thoughtgate-proxy"
-path = "src/main.rs"
-
+# HTTP sidecar binary — not modified by REQ-CORE-008
 [dependencies]
 thoughtgate-core = { path = "../thoughtgate-core" }
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber = "0.3"
-thiserror.workspace = true
-
-# HTTP transport
 axum = "0.8"
-hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
-hyper-util = { version = "0.1", features = ["full"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "rustls-native-certs", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+hyper = "1"
+tower = "0.4"
 ```
 
 **`thoughtgate/Cargo.toml`:**
@@ -1115,11 +1142,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 [package]
 name = "thoughtgate"
 version = "0.3.0"
-edition = "2021"
-
-[[bin]]
-name = "thoughtgate"
-path = "src/main.rs"
+edition = "2024"
 
 [dependencies]
 thoughtgate-core = { path = "../thoughtgate-core" }
@@ -1131,6 +1154,7 @@ tracing-subscriber = "0.3"
 thiserror.workspace = true
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
+glob = "0.3"                # Config file discovery patterns
 reqwest = { version = "0.12", features = ["json"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -1181,6 +1205,7 @@ tokio::select! {
 struct ConfigGuard {
     config_path: PathBuf,
     backup_path: PathBuf,
+    lock_path: PathBuf,    // <config_path>.thoughtgate-lock
     restored: AtomicBool,
 }
 
@@ -1197,6 +1222,8 @@ impl ConfigGuard {
             let _ = std::fs::remove_file(&self.backup_path);
             tracing::info!("Config restored from backup");
         }
+        // Clean up lock file (best-effort)
+        let _ = std::fs::remove_file(&self.lock_path);
     }
 }
 
@@ -1218,48 +1245,60 @@ impl Drop for ConfigGuard {
 | Relative path for shim binary in config | Agent may launch with different CWD | Always use absolute path via `current_exe()` |
 | Blocking on governance in the parser task | Stalls the entire proxy pipeline | Use bounded channels: separate parse/governance/forward |
 | Restoring config in signal handler only | Drop/panic paths skip signal handler | Use RAII `ConfigGuard` + signal handler + `ctrlc` handler |
-| Defining `JsonRpcId` in a transport crate | Both transports need the same type — causes duplication | Use `thoughtgate-core::jsonrpc::JsonRpcId` |
-| Putting `Profile` in a transport crate | Development mode semantics apply to both transports | Use `thoughtgate-core::profile::Profile` |
+| Defining `JsonRpcId` in thoughtgate | HTTP transport needs the same type — causes duplication | Use `thoughtgate-core::jsonrpc::JsonRpcId` |
+| Putting `Profile` in thoughtgate | Development mode semantics apply to HTTP mode too | Use `thoughtgate-core::profile::Profile` |
+| Forwarding unclassifiable messages (no id or method) | Bypasses governance entirely, violates fail-closed | Drop in production, `WOULD_DROP` in development |
+| No timeout on governance HTTP calls | Hung governance service stalls the entire proxy pipeline | Set explicit connect + request timeouts on `reqwest` client |
+| No readiness check before proxy loop | Startup race → first messages fail-closed denied | Poll `/healthz` with exponential backoff before accepting traffic |
+| Treating JSON arrays as single messages | JSON-RPC batch requests bypass per-message governance | Check `value.is_array()` and reject with `UnsupportedBatch` |
+| Wrapping an already-wrapped config | Nests shim inside shim, doubling latency and confusing shutdown | Detect ThoughtGate binary in `command` field before rewriting |
+| Relying on evaluate response alone for shutdown | Idle shims never call evaluate, never discover shutdown | Use periodic heartbeat (5s) as independent shutdown discovery channel |
+| Locking the config file directly with `flock` | Atomic-save editors (VS Code, vim) change inode, silently breaking the lock | Lock a separate `.thoughtgate-lock` file |
+| Hardcoding governance port 19090 | Port collisions on first run violate "5 minutes to value" | Default to port 0 (OS-assigned); pass actual port via config rewrite |
 
 ### 10.4 Crate Dependency Diagram
 
 ```
-    ┌───────────────────────┐       ┌─────────────────────────────┐
-    │   thoughtgate          │       │   thoughtgate-proxy          │
-    │   (CLI binary)         │       │   (HTTP sidecar binary)      │
-    │                        │       │                               │
-    │   src/main.rs          │       │   src/main.rs                 │
-    │   src/wrap/            │       │   src/handlers.rs             │
-    │   src/shim/            │       │   src/sse.rs                  │
-    │   src/error.rs         │       │   src/health.rs               │
-    └─────────┬──────────────┘       └──────────┬────────────────────┘
-              │                                  │
-              │  NO cross-dependency (╳)         │
-              │                                  │
-              └──────────────┬───────────────────┘
-                             │
-                             ▼
-              ┌──────────────────────────┐
-              │  thoughtgate-core         │
-              │  (library crate)          │
-              │                           │
-              │  profile.rs               │
-              │  jsonrpc.rs               │
-              │  governance/              │
-              │    api.rs, engine.rs      │
-              │    cedar.rs, service.rs   │
-              │  telemetry/               │
-              │    spans.rs, metrics.rs   │
-              │    redact.rs, audit.rs    │
-              │  error.rs                 │
-              └──────────────────────────┘
+    ┌──────────────────────┐      ┌──────────────────────┐
+    │   thoughtgate-proxy   │      │      thoughtgate      │
+    │   (binary crate)      │      │   (binary crate)      │
+    │                       │      │                       │
+    │   HTTP sidecar        │      │   src/main.rs         │
+    │   (v0.2 transport)    │      │   src/wrap/           │
+    │                       │      │   src/shim/           │
+    │                       │      │   src/error.rs        │
+    └───────────┬───────────┘      └───────────┬───────────┘
+                │                              │
+                │                              │
+                └──────────────┬───────────────┘
+                               │
+                               ▼
+                ┌──────────────────────────────┐
+                │      thoughtgate-core        │
+                │      (library crate)         │
+                │                              │
+                │  profile.rs                  │
+                │  jsonrpc.rs                  │
+                │  governance/                 │
+                │    api.rs                    │
+                │    engine.rs                 │
+                │    cedar.rs                  │
+                │    service.rs                │
+                │  telemetry/                  │
+                │    mod.rs                    │
+                │    attributes.rs             │
+                │    spans.rs                  │
+                │    redact.rs                 │
+                │    audit.rs                  │
+                │    metrics.rs                │
+                │    init.rs                   │
+                └──────────────────────────────┘
 
     Legend:
     ─▶  depends on (Cargo dependency)
-    ╳   no dependency between CLI and proxy
 ```
 
-**Key constraint:** `thoughtgate` (CLI) and `thoughtgate-proxy` (HTTP sidecar) have NO cross-dependency. The K8s sidecar Docker image (`cargo build -p thoughtgate-proxy`) never ships stdio transport code, `nix`, `dirs`, child process spawning, or config-rewriting logic. Desktop installs (`cargo install thoughtgate`) never ship `hyper`, `rustls`, or K8s lifecycle code. `thoughtgate-core` is the shared foundation that both depend on.
+**Key constraint:** Both binaries (`thoughtgate-proxy` and `thoughtgate`) depend on `thoughtgate-core` but NOT on each other. This allows independent deployment and versioning. The HTTP sidecar doesn't need CLI wiring; the CLI doesn't need sidecar-specific HTTP handling.
 
 ## 11. Definition of Done
 
@@ -1278,9 +1317,16 @@ impl Drop for ConfigGuard {
 - [ ] No zombie processes after any exit path
 - [ ] `--profile development` logs `WOULD_BLOCK` for denied messages and forwards them
 - [ ] `--profile development` auto-approves approval workflows
-- [ ] All 33 edge cases (EC-STDIO-001 through EC-STDIO-033) have corresponding tests
+- [ ] All 44 edge cases (EC-STDIO-001 through EC-STDIO-044) have corresponding tests
 - [ ] All metrics from NFR-002 are instrumented
 - [ ] Integration test: mock agent + mock server + governance, full round-trip
+- [ ] Double-wrap detection prevents nesting shim inside shim
+- [ ] `--dry-run` prints config diff without modifying files
+- [ ] Shim waits for governance `/healthz` before entering proxy loop
+- [ ] JSON-RPC batch arrays are rejected with `FramingError::UnsupportedBatch`
+- [ ] Shim heartbeat discovers `shutdown: true` and initiates graceful shutdown within one heartbeat interval
+- [ ] Shim detects governance service crash (connection refused) and shuts down cleanly (not as error)
+- [ ] File lock on `.thoughtgate-lock` survives atomic-save editors (VS Code)
 - [ ] `cargo clippy -- -D warnings` passes
 - [ ] `cargo test` passes (unit + integration)
 
