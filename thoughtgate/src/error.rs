@@ -1,10 +1,16 @@
-//! Framing errors for stdio NDJSON transport.
+//! Error types for the stdio transport and CLI wrapper.
 //!
-//! Implements: REQ-CORE-008 §6.5.3 (FramingError)
+//! Implements: REQ-CORE-008 §6.5.3 (FramingError), §6.8 (StdioError)
 //!
-//! These errors cover all failure modes during NDJSON line parsing: size limits,
-//! malformed JSON, JSON-RPC version validation, batch rejection, broken pipes,
-//! and underlying IO errors.
+//! `FramingError` covers NDJSON line parsing failures: size limits, malformed
+//! JSON, JSON-RPC version validation, batch rejection, broken pipes, and IO.
+//!
+//! `StdioError` covers higher-level shim and wrapper failures: config discovery,
+//! server spawn, governance unavailability, and process lifecycle errors.
+
+use std::path::PathBuf;
+
+use thoughtgate_core::StreamDirection;
 
 /// Errors that can occur when parsing an NDJSON-framed JSON-RPC message.
 ///
@@ -56,4 +62,110 @@ pub enum FramingError {
     /// An underlying IO error occurred while reading from stdin/stdout.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stdio Transport Errors
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Errors specific to the stdio transport and CLI wrapper.
+///
+/// Covers the full range of failures in the shim proxy and `wrap` command:
+/// config discovery/rewrite, server process lifecycle, governance connectivity,
+/// and framing errors encountered during proxying.
+///
+/// Implements: REQ-CORE-008 §6.8
+#[derive(Debug, thiserror::Error)]
+pub enum StdioError {
+    /// Agent type could not be detected from the command name/path.
+    #[error("Agent type could not be detected from command: {command}")]
+    UnknownAgentType {
+        /// The command that was not recognized.
+        command: String,
+    },
+
+    /// Config file not found at the expected location.
+    #[error("Config file not found at {}", path.display())]
+    ConfigNotFound {
+        /// The path that was checked.
+        path: PathBuf,
+    },
+
+    /// Config file is locked by another ThoughtGate instance.
+    #[error("Config file is locked by another ThoughtGate instance: {}", path.display())]
+    ConfigLocked {
+        /// The path to the locked config file.
+        path: PathBuf,
+    },
+
+    /// Failed to parse the agent's config file.
+    #[error("Failed to parse config: {reason}")]
+    ConfigParseError {
+        /// The path to the config file.
+        path: PathBuf,
+        /// Human-readable description of the parse failure.
+        reason: String,
+    },
+
+    /// Failed to write the rewritten config file.
+    #[error("Failed to write config: {reason}")]
+    ConfigWriteError {
+        /// The path to the config file.
+        path: PathBuf,
+        /// Human-readable description of the write failure.
+        reason: String,
+    },
+
+    /// Failed to restore config from backup.
+    #[error("Failed to restore config from backup: {reason}")]
+    RestoreError {
+        /// The path to the backup file.
+        backup_path: PathBuf,
+        /// Human-readable description of the restore failure.
+        reason: String,
+    },
+
+    /// Server process failed to start.
+    #[error("Server process failed to start: {reason}")]
+    ServerSpawnError {
+        /// The MCP server identifier.
+        server_id: String,
+        /// Human-readable description of the spawn failure.
+        reason: String,
+    },
+
+    /// Server process exited unexpectedly.
+    #[error("Server process exited unexpectedly with code {code}")]
+    ServerCrashed {
+        /// The MCP server identifier.
+        server_id: String,
+        /// The exit code from the server process.
+        code: i32,
+    },
+
+    /// Framing error encountered during proxying.
+    #[error("Framing error on {direction:?} stream: {source}")]
+    Framing {
+        /// The MCP server identifier.
+        server_id: String,
+        /// Which direction the error occurred on.
+        direction: StreamDirection,
+        /// The underlying framing error.
+        source: FramingError,
+    },
+
+    /// Governance service unavailable after readiness polling.
+    #[error("Governance service unavailable after readiness polling")]
+    GovernanceUnavailable,
+
+    /// Agent process exited with the given code.
+    #[error("Agent process exited with code {code}")]
+    AgentExited {
+        /// The exit code from the agent process.
+        code: i32,
+    },
+
+    /// An underlying IO error occurred.
+    #[error("IO error: {0}")]
+    StdioIo(std::io::Error),
 }
