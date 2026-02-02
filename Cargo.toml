@@ -131,7 +131,7 @@ serde_json = "1.0"
 rand = "0.9"
 serial_test = "3.0"
 uuid = { version = "1.20", features = ["v4", "serde"] }
-insta = { version = "1.46.1", features = ["json"] }
+insta = { version = "1.46.2", features = ["json"] }
 wiremock = "0.6"
 
 # Property-based testing (SDD Phase 4 - L2 Verification)
