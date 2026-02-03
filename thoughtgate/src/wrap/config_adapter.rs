@@ -181,6 +181,7 @@ pub fn detect_agent_type(command: &str) -> Option<AgentType> {
 
     match basename {
         "claude-code" | "claude" => Some(AgentType::ClaudeCode),
+        "claude-desktop" => Some(AgentType::ClaudeDesktop),
         "cursor" => Some(AgentType::Cursor),
         "code" | "code-insiders" => Some(AgentType::VsCode),
         "windsurf" => Some(AgentType::Windsurf),
