@@ -56,6 +56,10 @@ const HEARTBEAT_TIMEOUT_MS: u64 = 5000;
 /// Default poll interval for approval status checks (ms).
 const DEFAULT_APPROVAL_POLL_MS: u64 = 5000;
 
+/// Minimum poll interval to prevent CPU spin from a misconfigured or
+/// compromised governance service returning very low values.
+const MIN_APPROVAL_POLL_MS: u64 = 100;
+
 /// Request timeout for GET /governance/task/{id} (ms).
 const TASK_STATUS_TIMEOUT_MS: u64 = 5000;
 
@@ -930,7 +934,8 @@ async fn agent_to_server(
                 let poll_interval = Duration::from_millis(
                     eval_resp
                         .poll_interval_ms
-                        .unwrap_or(DEFAULT_APPROVAL_POLL_MS),
+                        .unwrap_or(DEFAULT_APPROVAL_POLL_MS)
+                        .max(MIN_APPROVAL_POLL_MS),
                 );
                 let task_url = format!("{governance_endpoint}/governance/task/{task_id}");
 
