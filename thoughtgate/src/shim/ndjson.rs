@@ -298,6 +298,7 @@ mod tests {
         );
     }
 
+    /// EC-STDIO-032: Large base64 tool response (~5MB) under limit is accepted.
     #[test]
     fn test_parse_large_valid_message() {
         // ~5 MB base64-like payload in the result field — should be accepted.
@@ -412,6 +413,24 @@ mod tests {
             matches!(err, FramingError::MalformedJson { ref reason } if reason.contains("neither id nor method")),
             "expected MalformedJson for unclassifiable message, got: {err:?}"
         );
+    }
+
+    /// EC-STDIO-016: Missing jsonrpc field.
+    /// (Also covered by test_parse_missing_jsonrpc above — explicit tag here.)
+
+    /// EC-STDIO-027: Partial line (no trailing newline) parses correctly.
+    #[test]
+    fn test_parse_no_trailing_newline_ec027() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#;
+        assert!(parse_stdio_message(line).is_ok());
+    }
+
+    /// EC-STDIO-030: Protocol version mismatch passes through transparently.
+    #[test]
+    fn test_version_mismatch_passthrough_ec030() {
+        let line =
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"99.0"}}"#;
+        assert!(parse_stdio_message(line).is_ok());
     }
 
     #[test]

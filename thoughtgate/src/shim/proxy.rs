@@ -7,7 +7,8 @@
 //! governance evaluation on the agent→server path, sends periodic heartbeats,
 //! and handles graceful shutdown.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -191,6 +192,26 @@ enum ApprovalPollResult {
     Error,
     /// Shutdown signal received during polling.
     Shutdown,
+}
+
+/// Metadata for an outstanding (in-flight) JSON-RPC request.
+///
+/// Implements: REQ-CORE-008/F-015
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    method: String,
+    sent_at: Instant,
+}
+
+/// Bidirectional request ID tracking for audit and orphan detection.
+///
+/// Implements: REQ-CORE-008/F-015
+#[derive(Debug, Default)]
+struct PendingRequests {
+    /// Agent→server requests awaiting server responses.
+    outbound: std::collections::HashMap<String, PendingRequest>,
+    /// Server→agent requests awaiting agent responses.
+    inbound: std::collections::HashMap<String, PendingRequest>,
 }
 
 /// Poll `GET /governance/task/{task_id}` until a terminal decision is reached.
@@ -388,6 +409,9 @@ pub async fn run_shim(
     // ── F-016a: Poll governance /healthz ─────────────────────────────────
     poll_governance_healthz(&client, &governance_endpoint).await?;
 
+    // ── F-015: Bidirectional request ID tracking ─────────────────────────
+    let pending = Arc::new(tokio::sync::Mutex::new(PendingRequests::default()));
+
     // ── Set up channels and IO handles ───────────────────────────────────
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -416,6 +440,7 @@ pub async fn run_shim(
         let metrics = metrics.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         let shutdown_tx = shutdown_tx.clone();
+        let pending = pending.clone();
 
         tokio::spawn(async move {
             agent_to_server(
@@ -427,6 +452,7 @@ pub async fn run_shim(
                 child_stdin,
                 &mut shutdown_rx,
                 shutdown_tx,
+                pending,
             )
             .await
         })
@@ -437,9 +463,10 @@ pub async fn run_shim(
         let server_id = server_id.clone();
         let metrics = metrics.clone();
         let mut shutdown_rx = shutdown_rx.clone();
+        let pending = pending.clone();
 
         tokio::spawn(async move {
-            server_to_agent(server_id, metrics, child_stdout, &mut shutdown_rx).await
+            server_to_agent(server_id, metrics, child_stdout, &mut shutdown_rx, pending).await
         })
     };
 
@@ -492,6 +519,25 @@ pub async fn run_shim(
     // The heartbeat task handle is not in scope from select! so we abort it here.
     hb_handle.abort();
 
+    // F-015: Log orphaned requests at shutdown.
+    {
+        let map = pending.lock().await;
+        if !map.outbound.is_empty() {
+            tracing::warn!(
+                server_id,
+                count = map.outbound.len(),
+                "orphaned outbound requests at shutdown"
+            );
+        }
+        if !map.inbound.is_empty() {
+            tracing::warn!(
+                server_id,
+                count = map.inbound.len(),
+                "orphaned inbound requests at shutdown"
+            );
+        }
+    }
+
     exit_code
 }
 
@@ -501,7 +547,7 @@ pub async fn run_shim(
 
 /// Read from agent stdin, evaluate via governance, forward to server stdin.
 ///
-/// Implements: REQ-CORE-008/F-012 (agent→server), F-013, F-014, F-016, F-017
+/// Implements: REQ-CORE-008/F-012 (agent→server), F-013, F-014, F-015, F-016, F-017
 #[allow(clippy::too_many_arguments)]
 async fn agent_to_server(
     server_id: String,
@@ -512,6 +558,7 @@ async fn agent_to_server(
     mut child_stdin: tokio::process::ChildStdin,
     shutdown_rx: &mut watch::Receiver<bool>,
     shutdown_tx: watch::Sender<bool>,
+    pending: Arc<tokio::sync::Mutex<PendingRequests>>,
 ) -> Result<(), StdioError> {
     let agent_stdin = tokio::io::stdin();
     let mut reader = BufReader::new(agent_stdin);
@@ -668,6 +715,30 @@ async fn agent_to_server(
         };
         metrics.record_governance_decision(&server_id, decision_str, &format!("{profile:?}"));
 
+        // NFR-002: Structured audit log entry.
+        {
+            let tool_name = msg
+                .params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("-");
+            let message_id = id_from_kind(&msg.kind)
+                .map(|id| serde_json::to_string(&id).unwrap_or_default())
+                .unwrap_or_else(|| "-".to_string());
+            tracing::info!(
+                component = "shim",
+                server_id = %server_id,
+                direction = "agent_to_server",
+                method = %method,
+                tool = %tool_name,
+                message_id = %message_id,
+                governance_decision = %decision_str,
+                profile = ?profile,
+                "governance audit"
+            );
+        }
+
         // Check for shutdown signal piggy-backed on evaluate response.
         if eval_resp.shutdown {
             tracing::info!(server_id, "shutdown signal in evaluate response");
@@ -689,6 +760,18 @@ async fn agent_to_server(
                     direction: StreamDirection::AgentToServer,
                     source: FramingError::Io(e),
                 })?;
+
+                // F-015: Track outbound request IDs.
+                if let Some(id) = id_from_kind(&msg.kind) {
+                    let key = serde_json::to_string(&id).unwrap_or_default();
+                    pending.lock().await.outbound.insert(
+                        key,
+                        PendingRequest {
+                            method: method.clone(),
+                            sent_at: Instant::now(),
+                        },
+                    );
+                }
             }
             GovernanceDecision::Deny => {
                 if let Some(id) = id_from_kind(&msg.kind) {
@@ -736,9 +819,12 @@ async fn agent_to_server(
                     "PendingApproval — starting poll loop"
                 );
 
+                // NFR-002: Track approval latency.
+                let approval_start = Instant::now();
                 let outcome =
                     poll_approval_status(&client, &task_url, poll_interval, shutdown_rx, profile)
                         .await;
+                metrics.record_approval_latency(&server_id, approval_start.elapsed());
 
                 match outcome {
                     ApprovalPollResult::Approved => {
@@ -755,6 +841,18 @@ async fn agent_to_server(
                             direction: StreamDirection::AgentToServer,
                             source: FramingError::Io(e),
                         })?;
+
+                        // F-015: Track outbound request IDs (after approval).
+                        if let Some(id) = id_from_kind(&msg.kind) {
+                            let key = serde_json::to_string(&id).unwrap_or_default();
+                            pending.lock().await.outbound.insert(
+                                key,
+                                PendingRequest {
+                                    method: method.clone(),
+                                    sent_at: Instant::now(),
+                                },
+                            );
+                        }
                     }
                     ApprovalPollResult::Rejected(reason) => {
                         tracing::info!(
@@ -843,12 +941,13 @@ async fn agent_to_server(
 /// In v0.3, server→agent messages are forwarded unconditionally after local
 /// audit logging. No governance HTTP call is made for inbound messages.
 ///
-/// Implements: REQ-CORE-008/F-012 (server→agent)
+/// Implements: REQ-CORE-008/F-012 (server→agent), F-015
 async fn server_to_agent(
     server_id: String,
     metrics: StdioMetrics,
     child_stdout: tokio::process::ChildStdout,
     shutdown_rx: &mut watch::Receiver<bool>,
+    pending: Arc<tokio::sync::Mutex<PendingRequests>>,
 ) -> Result<(), StdioError> {
     let mut reader = BufReader::new(child_stdout);
     let mut agent_stdout = tokio::io::stdout();
@@ -898,6 +997,43 @@ async fn server_to_agent(
                 let method = method_from_kind(&msg.kind);
                 // NFR-002: Record every parsed message.
                 metrics.record_message(&server_id, "server_to_agent", method);
+
+                // NFR-002: Structured audit log for server→agent.
+                tracing::info!(
+                    component = "shim",
+                    server_id = %server_id,
+                    direction = "server_to_agent",
+                    method = %method,
+                    governance_decision = "passthrough",
+                    "audit: server response forwarded"
+                );
+
+                // F-015: Correlate responses to outbound requests; track inbound requests.
+                match &msg.kind {
+                    JsonRpcMessageKind::Response { id } => {
+                        let key = serde_json::to_string(id).unwrap_or_default();
+                        let matched = pending.lock().await.outbound.remove(&key);
+                        if let Some(req) = matched {
+                            tracing::debug!(
+                                server_id,
+                                method = %req.method,
+                                latency_us = req.sent_at.elapsed().as_micros() as u64,
+                                "response matched outbound request"
+                            );
+                        }
+                    }
+                    JsonRpcMessageKind::Request { id, method: m } => {
+                        let key = serde_json::to_string(id).unwrap_or_default();
+                        pending.lock().await.inbound.insert(
+                            key,
+                            PendingRequest {
+                                method: m.clone(),
+                                sent_at: Instant::now(),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
             }
             Err(e) => {
                 // NFR-002: Record framing error.
@@ -1100,6 +1236,7 @@ mod tests {
         assert!(!is_passthrough("prompts/get"));
     }
 
+    /// EC-STDIO-020: Passthrough whitelist includes server→agent notifications.
     #[test]
     fn test_is_passthrough_notifications() {
         assert!(is_passthrough("notifications/cancelled"));
@@ -1262,5 +1399,49 @@ mod tests {
             }),
             None
         );
+    }
+
+    // ── F-015 PendingRequests Tests ─────────────────────────────────────
+
+    #[test]
+    fn test_pending_requests_insert_remove() {
+        let mut pending = PendingRequests::default();
+        pending.outbound.insert(
+            "42".to_string(),
+            PendingRequest {
+                method: "tools/call".to_string(),
+                sent_at: Instant::now(),
+            },
+        );
+        assert_eq!(pending.outbound.len(), 1);
+        assert!(pending.outbound.remove("42").is_some());
+        assert!(pending.outbound.is_empty());
+    }
+
+    #[test]
+    fn test_pending_requests_independent_maps() {
+        let mut pending = PendingRequests::default();
+        pending.outbound.insert(
+            "1".to_string(),
+            PendingRequest {
+                method: "tools/call".to_string(),
+                sent_at: Instant::now(),
+            },
+        );
+        pending.inbound.insert(
+            "1".to_string(),
+            PendingRequest {
+                method: "sampling/createMessage".to_string(),
+                sent_at: Instant::now(),
+            },
+        );
+        assert_eq!(pending.outbound.len(), 1);
+        assert_eq!(pending.inbound.len(), 1);
+    }
+
+    /// EC-STDIO-019: Server-initiated requests (sampling/createMessage) are not passthrough.
+    #[test]
+    fn test_sampling_not_passthrough_ec019() {
+        assert!(!is_passthrough("sampling/createMessage"));
     }
 }

@@ -330,3 +330,127 @@ fn test_concurrent_lock_rejected() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EC-STDIO Edge Case Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// EC-STDIO-001: Config file not found at expected path.
+#[test]
+fn test_config_not_found_ec001() {
+    let adapter = ClaudeDesktopAdapter;
+    let result = adapter.parse_servers(Path::new("/nonexistent/path/config.json"));
+    assert!(
+        matches!(result, Err(ConfigError::NotFound { .. })),
+        "expected NotFound error, got: {result:?}"
+    );
+}
+
+/// EC-STDIO-002: Config file is empty (0 bytes).
+#[test]
+fn test_config_empty_file_ec002() {
+    let dir = temp_dir_unique("empty");
+    let path = dir.join("config.json");
+    std::fs::write(&path, "").unwrap();
+    let adapter = ClaudeDesktopAdapter;
+    let result = adapter.parse_servers(&path);
+    assert!(result.is_err(), "empty file should fail to parse");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// EC-STDIO-003: Config has zero MCP servers → returns empty vec.
+#[test]
+fn test_config_zero_servers_ec003() {
+    let dir = temp_dir_unique("zero-servers");
+    let path = dir.join("config.json");
+    std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+    let adapter = ClaudeDesktopAdapter;
+    let servers = adapter.parse_servers(&path).unwrap();
+    assert!(
+        servers.is_empty(),
+        "empty mcpServers should return empty vec"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// EC-STDIO-006: Backup already exists (stale from previous crash) — overwritten.
+#[test]
+fn test_stale_backup_overwritten_ec006() {
+    let dir = temp_dir_unique("stale-backup");
+    let config_path = dir.join("config.json");
+    let original = r#"{"mcpServers":{"fs":{"command":"npx","args":["server"]}}}"#;
+    std::fs::write(&config_path, original).unwrap();
+    // Create a stale backup with different content.
+    let stale_backup = config_path.with_extension("json.thoughtgate-backup");
+    std::fs::write(&stale_backup, "stale content").unwrap();
+
+    let adapter = ClaudeDesktopAdapter;
+    let servers = adapter.parse_servers(&config_path).unwrap();
+    let shim = PathBuf::from("/usr/bin/thoughtgate");
+    let opts = ShimOptions {
+        server_id: String::new(),
+        governance_endpoint: "http://127.0.0.1:19090".to_string(),
+        profile: Profile::Production,
+        config_path: PathBuf::from("thoughtgate.yaml"),
+    };
+    let backup = adapter
+        .rewrite_config(&config_path, &servers, &shim, &opts)
+        .unwrap();
+    // Backup should now contain the ORIGINAL config, not "stale content".
+    let backup_content = std::fs::read_to_string(&backup).unwrap();
+    assert_eq!(backup_content, original);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// EC-STDIO-040: Governance port already in use.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_governance_port_conflict_ec040() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let state = Arc::new(GovernanceServiceState::new());
+    let result = start_governance_service(port, state).await;
+    assert!(result.is_err(), "should fail when port is already bound");
+    drop(listener);
+}
+
+/// EC-STDIO-044: Stale lock file from previous crash — flock succeeds.
+#[test]
+fn test_stale_lock_file_ec044() {
+    let dir = temp_dir_unique("stale-lock");
+    let config_path = dir.join("config.json");
+    let backup_path = dir.join("config.json.thoughtgate-backup");
+    std::fs::write(&config_path, "{}").unwrap();
+    std::fs::write(&backup_path, "{}").unwrap();
+    // Manually create stale lock file (as if previous process crashed).
+    let mut lock_os = config_path.as_os_str().to_os_string();
+    lock_os.push(".thoughtgate-lock");
+    std::fs::write(PathBuf::from(&lock_os), "").unwrap();
+    // Lock should succeed (advisory lock was released on previous process exit).
+    let guard = ConfigGuard::new(&config_path, &backup_path);
+    assert!(guard.is_ok(), "should acquire lock despite stale lock file");
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EC-STDIO edge cases deferred — require infrastructure not yet available
+// ─────────────────────────────────────────────────────────────────────────────
+// EC-STDIO-004: All servers disabled — needs "disabled" field support
+// EC-STDIO-007: Permission denied on config rewrite — needs filesystem mock
+// EC-STDIO-008: Agent process fails to start — needs process-level integration
+// EC-STDIO-011: Agent crashes mid-session — needs wrap-level process orchestration test
+// EC-STDIO-012: SIGTERM → graceful shutdown — needs signal delivery to child process
+// EC-STDIO-013: SIGINT → graceful shutdown — same as EC-STDIO-012
+// EC-STDIO-021: Approval + Slack unreachable — needs Slack mock infrastructure
+// EC-STDIO-022: Approval pending + Ctrl+C — needs signal + approval coordination
+// EC-STDIO-023: VS Code adapter — tested in config_adapter unit tests (implicit)
+// EC-STDIO-024: Zed adapter — tested in config_adapter unit tests (implicit)
+// EC-STDIO-025: Claude Code merge — tested in config_adapter unit tests (implicit)
+// EC-STDIO-026: Env var expansion — tested in config_adapter unit tests (implicit)
+// EC-STDIO-028: stderr passthrough — inherent in tokio::process (no interception)
+// EC-STDIO-029: Binary not on PATH — tested indirectly via resolve_shim_binary
+// EC-STDIO-033: Dev profile Cedar deny — tested in evaluator.rs unit tests
+// EC-STDIO-037: Governance evaluate timeout — tested in proxy.rs fail-closed path
+// EC-STDIO-038: --dry-run flag — not yet implemented
+// EC-STDIO-039: New server during session — known limitation, no test needed
+// EC-STDIO-043: Atomic save — lock is on separate .thoughtgate-lock file

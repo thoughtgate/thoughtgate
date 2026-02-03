@@ -33,6 +33,7 @@ fn test_opts(server_id: &str, port: u16) -> ShimOptions {
     }
 }
 
+/// EC-STDIO-010: Server process crashes mid-session.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_server_crash_handled_gracefully() {
     // `false` exits immediately with code 1. The shim should detect this
@@ -55,6 +56,7 @@ async fn test_server_crash_handled_gracefully() {
     }
 }
 
+/// EC-STDIO-036: Governance service not ready when shim starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_governance_unavailable_returns_error() {
     // Point at a port where nothing is listening.
@@ -78,6 +80,7 @@ async fn test_governance_unavailable_returns_error() {
     }
 }
 
+/// EC-STDIO-009: Server process fails to start (command not found).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_server_spawn_failure() {
     let (port, _state) = start_test_governance().await;
@@ -103,6 +106,7 @@ async fn test_server_spawn_failure() {
     }
 }
 
+/// EC-STDIO-041, EC-STDIO-042: Shutdown via governance heartbeat.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shutdown_via_governance() {
     // Start governance, trigger shutdown immediately, then start a shim.

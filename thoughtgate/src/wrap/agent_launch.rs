@@ -84,9 +84,32 @@ fn adapter_for_agent_type(agent_type: AgentType) -> Box<dyn ConfigAdapter> {
 /// Resolve the path to the current binary (used as the shim binary in config
 /// rewrites).
 ///
+/// Primary: `current_exe()` → `canonicalize()` to resolve symlinks.
+/// Fallback: `which::which("thoughtgate")` for PATH-based discovery.
+///
 /// Implements: REQ-CORE-008/F-007
 fn resolve_shim_binary() -> Result<PathBuf, StdioError> {
-    std::env::current_exe().map_err(StdioError::StdioIo)
+    // Primary: current_exe() → canonicalize() to resolve symlinks.
+    if let Ok(exe) = std::env::current_exe() {
+        match std::fs::canonicalize(&exe) {
+            Ok(canonical) => return Ok(canonical),
+            Err(e) => {
+                tracing::debug!(
+                    exe = %exe.display(),
+                    error = %e,
+                    "canonicalize failed, trying which fallback"
+                );
+            }
+        }
+    }
+
+    // Fallback: which::which("thoughtgate").
+    which::which("thoughtgate").map_err(|e| {
+        StdioError::StdioIo(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("could not resolve thoughtgate binary: {e}"),
+        ))
+    })
 }
 
 /// Convert a `ConfigError` to a `StdioError`, attaching the config path for
@@ -656,6 +679,15 @@ mod tests {
         assert!(path.is_ok(), "should resolve current exe path");
         let path = path.unwrap();
         assert!(!path.to_string_lossy().is_empty());
+    }
+
+    /// F-007: Resolved path is absolute (canonicalize guarantees this).
+    #[test]
+    fn test_resolve_shim_binary_returns_canonical_path() {
+        let path = resolve_shim_binary();
+        assert!(path.is_ok());
+        let path = path.unwrap();
+        assert!(path.is_absolute());
     }
 
     #[test]

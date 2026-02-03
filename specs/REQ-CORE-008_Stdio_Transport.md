@@ -911,6 +911,12 @@ pub enum StdioError {
     
     If restoration fails (e.g., backup file missing), log `ERROR` with the backup path and instructions for manual restoration. Never panic during restoration.
 
+> **Implementation Note (v0.3):** Items 1–3 are implemented (normal exit path,
+> `ConfigGuard` RAII with `Drop`, and `tokio::signal` handlers for SIGTERM/SIGINT).
+> Item 4 (`ctrlc` crate handler) is deferred — the tokio signal handler already
+> intercepts SIGINT before the default handler runs, making `ctrlc` redundant in
+> the tokio runtime context. Can be added as defensive depth in v0.4 if needed.
+
 - **F-021 (Zombie Prevention):** Always call `child.wait()` after termination of any child process. The `kill_on_drop(true)` on `tokio::process::Child` provides a safety net, but explicit waiting is required for clean exit code collection and log messages.
 
 ### 7.6 Configuration Profiles
@@ -1019,6 +1025,10 @@ thoughtgate_stdio_active_servers
 | Malformed JSON on stdio stream | Log error, skip message, continue reading | EC-STDIO-015 |
 | Missing `jsonrpc` field | Log error, skip message, continue reading | EC-STDIO-016 |
 | Valid JSON but not JSON-RPC (missing method and id) | Drop message (production) or log `WOULD_DROP` and forward (development). Fail-closed per §5.4. | EC-STDIO-017 |
+<!-- v0.3 Note: Unclassifiable messages (neither id nor method) are rejected via
+FramingError::MalformedJson in ndjson.rs. In proxy.rs, malformed messages are
+logged at WARN and skipped in both profiles. The fully-structured WOULD_DROP
+format with development-mode forwarding is deferred to v0.4. -->
 | Embedded newline smuggling attempt | Detect and reject (production) or warn (development) | EC-STDIO-018 |
 | Server sends request to agent (`sampling/createMessage`) | Route server→agent, track response ID | EC-STDIO-019 |
 | Server sends `notifications/tools/list_changed` | Forward to agent without governance (on F-017 passthrough whitelist) | EC-STDIO-020 |
@@ -1033,6 +1043,11 @@ thoughtgate_stdio_active_servers
 | `thoughtgate` binary not on PATH after agent launches | Fail at shim launch — detected during config rewrite by using absolute path | EC-STDIO-029 |
 | Protocol version mismatch (agent and server disagree) | Pass through transparently — ThoughtGate does not participate in version negotiation | EC-STDIO-030 |
 | `notifications/cancelled` while approval pending | Abort approval workflow, forward cancellation | EC-STDIO-031 |
+<!-- v0.3 Note: notifications/cancelled is on the F-017 passthrough whitelist and
+forwarded without governance. Aborting pending approval workflows on cancellation
+requires the F-015 request ID correlation map (implemented in v0.3) plus an approval
+task cancellation API in the governance service. The abort-on-cancel flow is deferred
+to v0.4. -->
 | Large base64 tool response (~5MB) | Forward (under 10MB limit), no special handling | EC-STDIO-032 |
 | Development profile with Cedar deny | Log `WOULD_BLOCK`, forward message, record in audit | EC-STDIO-033 |
 | Config already rewritten by ThoughtGate (double-wrap) | Exit with clear error, do not nest shim inside shim | EC-STDIO-034 |
