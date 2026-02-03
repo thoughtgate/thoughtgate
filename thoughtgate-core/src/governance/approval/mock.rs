@@ -156,6 +156,7 @@ impl ApprovalAdapter for MockAdapter {
             posted_at: Utc::now(),
             next_poll_at: Instant::now() + self.delay,
             poll_count: 0,
+            dispatch_trace_context: None, // Mock adapter doesn't track trace context
         })
     }
 
@@ -243,6 +244,7 @@ mod tests {
             expires_at: Utc::now() + chrono::Duration::minutes(5),
             created_at: Utc::now(),
             correlation_id: "test-123".to_string(),
+            request_span_context: None,
         }
     }
 

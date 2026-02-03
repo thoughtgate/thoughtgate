@@ -403,6 +403,7 @@ impl GovernanceEvaluator {
                 expires_at: task.expires_at,
                 created_at: Utc::now(),
                 correlation_id: task_id.to_string(),
+                request_span_context: None, // TODO: Wire span context from request handler
             };
 
             if let Err(e) = scheduler.submit(approval_req).await {

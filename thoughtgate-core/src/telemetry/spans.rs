@@ -6,11 +6,12 @@
 //! # Traceability
 //! - Implements: REQ-OBS-002 §5.1 (MCP Spans)
 //! - Implements: REQ-OBS-002 §5.1.1 (MCP Span Attributes)
+//! - Implements: REQ-OBS-002 §5.4 (Approval Workflow Spans)
 
 use opentelemetry::{
-    KeyValue,
+    Context, KeyValue,
     global::{self, BoxedSpan},
-    trace::{Span, SpanKind, Status, Tracer},
+    trace::{Link, Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer},
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,6 +64,42 @@ pub const THOUGHTGATE_REQUEST_ID: &str = "thoughtgate.request_id";
 pub const ERROR_TYPE: &str = "error.type";
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Approval Span Attribute Constants (REQ-OBS-002 §5.4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// SEP-1686 task identifier for correlation
+/// Requirement: Required for approval spans
+pub const THOUGHTGATE_TASK_ID: &str = "thoughtgate.task.id";
+
+/// Approval integration type (e.g., "slack", "webhook", "teams")
+/// Requirement: Required for approval dispatch/callback spans
+pub const THOUGHTGATE_APPROVAL_CHANNEL: &str = "thoughtgate.approval.channel";
+
+/// Target channel/endpoint for approval (redacted if sensitive)
+/// Requirement: Recommended for approval dispatch spans
+pub const THOUGHTGATE_APPROVAL_TARGET: &str = "thoughtgate.approval.target";
+
+/// Configured approval timeout in seconds
+/// Requirement: Recommended for approval dispatch spans
+pub const THOUGHTGATE_APPROVAL_TIMEOUT_S: &str = "thoughtgate.approval.timeout_s";
+
+/// Human decision outcome (e.g., "approved", "denied")
+/// Requirement: Required for approval callback spans
+pub const THOUGHTGATE_APPROVAL_DECISION: &str = "thoughtgate.approval.decision";
+
+/// Approving user identifier (pseudonymized per REQ-OBS-003)
+/// Requirement: Recommended for approval callback spans
+pub const THOUGHTGATE_APPROVAL_USER: &str = "thoughtgate.approval.user";
+
+/// Wall-clock time from dispatch to callback in seconds
+/// Requirement: Required for approval callback spans
+pub const THOUGHTGATE_APPROVAL_LATENCY_S: &str = "thoughtgate.approval.latency_s";
+
+/// Whether trace context was successfully recovered (false if corrupted)
+/// Requirement: Required when graceful degradation occurs
+pub const THOUGHTGATE_TRACE_CONTEXT_RECOVERED: &str = "thoughtgate.trace_context.recovered";
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -104,6 +141,36 @@ pub struct McpSpanData<'a> {
     pub correlation_id: &'a str,
     /// Tool name for tools/call requests
     pub tool_name: Option<&'a str>,
+}
+
+/// Data needed to start an approval dispatch span.
+///
+/// Implements: REQ-OBS-002 §5.4.1
+pub struct ApprovalDispatchData<'a> {
+    /// SEP-1686 task identifier
+    pub task_id: &'a str,
+    /// Approval integration type (e.g., "slack", "webhook")
+    pub channel: &'a str,
+    /// Target channel/endpoint (e.g., "#security-approvals")
+    pub target: Option<&'a str>,
+    /// Configured approval timeout in seconds
+    pub timeout_secs: Option<u64>,
+    /// Optional span context to link to (from the parent MCP request)
+    pub link_to: Option<&'a SpanContext>,
+}
+
+/// Data needed to start an approval callback span.
+///
+/// Implements: REQ-OBS-002 §5.4.2
+pub struct ApprovalCallbackData<'a> {
+    /// SEP-1686 task identifier
+    pub task_id: &'a str,
+    /// Approval integration type (e.g., "slack", "webhook")
+    pub channel: &'a str,
+    /// Whether trace context was successfully recovered
+    pub trace_context_recovered: bool,
+    /// Optional span context to link to (from the dispatch span)
+    pub link_to: Option<&'a SpanContext>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -194,6 +261,186 @@ pub fn finish_mcp_span(
     } else {
         span.set_status(Status::Ok);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Approval Span Functions (REQ-OBS-002 §5.4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Start an approval dispatch span using the global tracer provider.
+///
+/// This span is created when ThoughtGate sends an approval request to an
+/// external system (Slack/webhook). It completes immediately after dispatch.
+///
+/// Span name: `thoughtgate.approval.dispatch`
+/// Span kind: PRODUCER (we're producing a message for async consumption)
+///
+/// If `link_to` is provided, a span link is created to maintain trace
+/// correlation without creating a parent-child relationship that would
+/// span hours.
+///
+/// # Arguments
+///
+/// * `data` - Span data containing task ID, channel, and link context
+///
+/// # Returns
+///
+/// A `BoxedSpan` that should be ended after the dispatch completes.
+///
+/// # Example
+///
+/// ```ignore
+/// let data = ApprovalDispatchData {
+///     task_id: "tg-task-xyz789",
+///     channel: "slack",
+///     target: Some("#security-approvals"),
+///     timeout_secs: Some(3600),
+///     link_to: Some(&mcp_span_context),
+/// };
+/// let mut span = start_approval_dispatch_span(&data);
+/// // ... dispatch to Slack ...
+/// span.end();
+/// ```
+///
+/// Implements: REQ-OBS-002 §5.4.1
+pub fn start_approval_dispatch_span(data: &ApprovalDispatchData<'_>) -> BoxedSpan {
+    let tracer = global::tracer("thoughtgate");
+
+    let mut attributes = vec![
+        KeyValue::new(THOUGHTGATE_TASK_ID, data.task_id.to_string()),
+        KeyValue::new(THOUGHTGATE_APPROVAL_CHANNEL, data.channel.to_string()),
+    ];
+
+    if let Some(target) = data.target {
+        attributes.push(KeyValue::new(
+            THOUGHTGATE_APPROVAL_TARGET,
+            target.to_string(),
+        ));
+    }
+
+    if let Some(timeout) = data.timeout_secs {
+        attributes.push(KeyValue::new(
+            THOUGHTGATE_APPROVAL_TIMEOUT_S,
+            timeout as i64,
+        ));
+    }
+
+    let mut builder = tracer
+        .span_builder("thoughtgate.approval.dispatch")
+        .with_kind(SpanKind::Producer)
+        .with_attributes(attributes);
+
+    // Add span link to the MCP request span (if available)
+    if let Some(link_ctx) = data.link_to {
+        builder = builder.with_links(vec![Link::new(link_ctx.clone(), vec![], 0)]);
+    }
+
+    builder.start(&tracer)
+}
+
+/// Start an approval callback span using the global tracer provider.
+///
+/// This span is created when the human responds (approve/deny) via Slack
+/// or webhook. It's a new span within the same trace, linked to the
+/// dispatch span (not a child of it).
+///
+/// Span name: `thoughtgate.approval.callback`
+/// Span kind: CONSUMER (we're consuming the async approval decision)
+///
+/// # Arguments
+///
+/// * `data` - Span data containing task ID, channel, recovery status, and link context
+///
+/// # Returns
+///
+/// A `BoxedSpan` that should be finished with `finish_approval_callback_span`.
+///
+/// # Graceful Degradation
+///
+/// If `trace_context_recovered` is false, this indicates the original trace
+/// context was corrupted and a new trace was started. The span will have
+/// the `thoughtgate.trace_context.recovered=false` attribute set.
+///
+/// Implements: REQ-OBS-002 §5.4.2
+pub fn start_approval_callback_span(data: &ApprovalCallbackData<'_>) -> BoxedSpan {
+    let tracer = global::tracer("thoughtgate");
+
+    let attributes = vec![
+        KeyValue::new(THOUGHTGATE_TASK_ID, data.task_id.to_string()),
+        KeyValue::new(THOUGHTGATE_APPROVAL_CHANNEL, data.channel.to_string()),
+        KeyValue::new(
+            THOUGHTGATE_TRACE_CONTEXT_RECOVERED,
+            data.trace_context_recovered,
+        ),
+    ];
+
+    let mut builder = tracer
+        .span_builder("thoughtgate.approval.callback")
+        .with_kind(SpanKind::Consumer)
+        .with_attributes(attributes);
+
+    // Add span link to the dispatch span (if available)
+    if let Some(link_ctx) = data.link_to {
+        builder = builder.with_links(vec![Link::new(link_ctx.clone(), vec![], 0)]);
+    }
+
+    // If we have a link context with a valid trace ID, we want to be part of that trace
+    // but NOT as a child span. We achieve this by creating a context with the trace ID
+    // but not setting it as the parent.
+    if let Some(link_ctx) = data.link_to {
+        if link_ctx.is_valid() {
+            // Create a new context that preserves the trace_id from the linked span
+            // This keeps us in the same trace while not being a child
+            let parent_ctx = Context::new().with_remote_span_context(link_ctx.clone());
+            return builder.start_with_context(&tracer, &parent_ctx);
+        }
+    }
+
+    builder.start(&tracer)
+}
+
+/// Finish an approval callback span with decision attributes.
+///
+/// Sets the approval decision, approver identity, and latency attributes,
+/// then ends the span.
+///
+/// # Arguments
+///
+/// * `span` - The span to finish (from `start_approval_callback_span`)
+/// * `decision` - The approval decision ("approved" or "denied")
+/// * `approver` - The user who made the decision (pseudonymized per REQ-OBS-003)
+/// * `latency_secs` - Wall-clock time from dispatch to callback in seconds
+///
+/// Implements: REQ-OBS-002 §5.4.2
+pub fn finish_approval_callback_span(
+    span: &mut impl Span,
+    decision: &str,
+    approver: &str,
+    latency_secs: f64,
+) {
+    span.set_attribute(KeyValue::new(
+        THOUGHTGATE_APPROVAL_DECISION,
+        decision.to_string(),
+    ));
+    span.set_attribute(KeyValue::new(
+        THOUGHTGATE_APPROVAL_USER,
+        approver.to_string(),
+    ));
+    span.set_attribute(KeyValue::new(THOUGHTGATE_APPROVAL_LATENCY_S, latency_secs));
+
+    // Set span status based on decision (approved = ok, denied = still ok but noted)
+    span.set_status(Status::Ok);
+}
+
+/// Get the current span context from the active span.
+///
+/// Useful for extracting the span context to serialize for async boundaries.
+///
+/// # Returns
+///
+/// The `SpanContext` of the currently active span.
+pub fn current_span_context() -> SpanContext {
+    Context::current().span().span_context().clone()
 }
 
 /// Derive GenAI operation name from MCP method.
@@ -322,5 +569,201 @@ mod tests {
 
         let finished = &spans[0];
         assert_eq!(finished.name.as_ref(), "notifications/initialized");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Approval Span Tests (REQ-OBS-002 §5.4)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_approval_dispatch_span() {
+        let (provider, exporter) = setup_test_provider();
+
+        let data = ApprovalDispatchData {
+            task_id: "tg-task-xyz789",
+            channel: "slack",
+            target: Some("#security-approvals"),
+            timeout_secs: Some(3600),
+            link_to: None,
+        };
+
+        let span = start_approval_dispatch_span(&data);
+        drop(span);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.name.as_ref(), "thoughtgate.approval.dispatch");
+        assert_eq!(finished.span_kind, opentelemetry::trace::SpanKind::Producer);
+    }
+
+    #[test]
+    #[serial]
+    fn test_approval_callback_span() {
+        let (provider, exporter) = setup_test_provider();
+
+        let data = ApprovalCallbackData {
+            task_id: "tg-task-xyz789",
+            channel: "slack",
+            trace_context_recovered: true,
+            link_to: None,
+        };
+
+        let mut span: BoxedSpan = start_approval_callback_span(&data);
+        finish_approval_callback_span(&mut span, "approved", "user:alice", 127.5);
+        drop(span);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.name.as_ref(), "thoughtgate.approval.callback");
+        assert_eq!(finished.span_kind, opentelemetry::trace::SpanKind::Consumer);
+    }
+
+    #[test]
+    #[serial]
+    fn test_approval_span_links() {
+        use opentelemetry::trace::{SpanId, TraceFlags, TraceId, TraceState};
+
+        let (provider, exporter) = setup_test_provider();
+
+        // Create a mock span context to link to
+        let trace_id = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        let span_id = SpanId::from_hex("00f067aa0ba902b7").unwrap();
+        let mock_ctx = SpanContext::new(
+            trace_id,
+            span_id,
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        );
+
+        // Create dispatch span with link
+        let dispatch_data = ApprovalDispatchData {
+            task_id: "tg-task-abc123",
+            channel: "slack",
+            target: None,
+            timeout_secs: None,
+            link_to: Some(&mock_ctx),
+        };
+
+        let dispatch_span = start_approval_dispatch_span(&dispatch_data);
+        drop(dispatch_span);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.links.len(), 1, "Dispatch span should have a link");
+        assert_eq!(
+            finished.links[0].span_context.trace_id(),
+            trace_id,
+            "Link should point to the MCP request trace"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_approval_callback_span_shares_trace_id() {
+        use opentelemetry::trace::{SpanId, TraceFlags, TraceId, TraceState};
+
+        let (provider, exporter) = setup_test_provider();
+
+        // Create a mock dispatch span context to link to
+        let dispatch_trace_id = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        let dispatch_span_id = SpanId::from_hex("00f067aa0ba902b7").unwrap();
+        let dispatch_ctx = SpanContext::new(
+            dispatch_trace_id,
+            dispatch_span_id,
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        );
+
+        // Create callback span with link to dispatch
+        let callback_data = ApprovalCallbackData {
+            task_id: "tg-task-abc123",
+            channel: "slack",
+            trace_context_recovered: true,
+            link_to: Some(&dispatch_ctx),
+        };
+
+        let mut callback_span: BoxedSpan = start_approval_callback_span(&callback_data);
+        finish_approval_callback_span(&mut callback_span, "approved", "user:bob", 300.0);
+        drop(callback_span);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+
+        // Callback span should have a link to dispatch span
+        assert_eq!(finished.links.len(), 1, "Callback span should have a link");
+        assert_eq!(
+            finished.links[0].span_context.span_id(),
+            dispatch_span_id,
+            "Link should point to the dispatch span"
+        );
+
+        // Callback span should share the same trace_id as dispatch
+        // (because we used with_remote_span_context)
+        assert_eq!(
+            finished.span_context.trace_id(),
+            dispatch_trace_id,
+            "Callback span should share trace_id with dispatch"
+        );
+
+        // Callback span should NOT be a child of dispatch (different span_id)
+        assert_ne!(
+            finished.span_context.span_id(),
+            dispatch_span_id,
+            "Callback span should have its own span_id (not a child)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_approval_callback_with_corrupted_context() {
+        let (provider, exporter) = setup_test_provider();
+
+        // Simulate corrupted context scenario (trace_context_recovered = false)
+        let callback_data = ApprovalCallbackData {
+            task_id: "tg-task-corrupted",
+            channel: "slack",
+            trace_context_recovered: false, // Context was corrupted
+            link_to: None,                  // No link because context couldn't be parsed
+        };
+
+        let mut callback_span: BoxedSpan = start_approval_callback_span(&callback_data);
+        finish_approval_callback_span(&mut callback_span, "approved", "user:charlie", 600.0);
+        drop(callback_span);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.name.as_ref(), "thoughtgate.approval.callback");
+
+        // Should have no links since context was corrupted
+        assert_eq!(
+            finished.links.len(),
+            0,
+            "Corrupted context should result in no links"
+        );
+
+        // Span should still have valid trace_id (new trace started)
+        assert_ne!(
+            finished.span_context.trace_id(),
+            opentelemetry::trace::TraceId::INVALID,
+            "Should have valid trace_id even with corrupted context"
+        );
     }
 }

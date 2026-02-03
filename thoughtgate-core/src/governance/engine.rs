@@ -434,6 +434,7 @@ impl ApprovalEngine {
             expires_at: task.expires_at,
             created_at: task.created_at,
             correlation_id: correlation_id.clone(),
+            request_span_context: None, // TODO: Wire span context from request handler
         };
 
         // F-002.2: Submit to scheduler (posts to Slack and starts polling)
@@ -885,6 +886,7 @@ mod tests {
                 posted_at: chrono::Utc::now(),
                 next_poll_at: std::time::Instant::now() + Duration::from_millis(10),
                 poll_count: 0,
+                dispatch_trace_context: None,
             })
         }
 

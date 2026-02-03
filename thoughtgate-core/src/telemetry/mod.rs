@@ -20,9 +20,13 @@
 pub mod cardinality;
 pub mod prom_metrics;
 pub mod spans;
+pub mod trace_context;
 
 pub use spans::{
-    // Constants
+    // Approval Span Types and Functions (REQ-OBS-002 §5.4)
+    ApprovalCallbackData,
+    ApprovalDispatchData,
+    // MCP Span Constants
     ERROR_TYPE,
     GENAI_OPERATION_NAME,
     GENAI_TOOL_CALL_ID,
@@ -33,11 +37,30 @@ pub use spans::{
     MCP_METHOD_NAME,
     MCP_RESULT_IS_ERROR,
     MCP_SESSION_ID,
+    // MCP Span Types and Functions
     McpMessageType,
     McpSpanData,
+    // Approval Span Constants (REQ-OBS-002 §5.4)
+    THOUGHTGATE_APPROVAL_CHANNEL,
+    THOUGHTGATE_APPROVAL_DECISION,
+    THOUGHTGATE_APPROVAL_LATENCY_S,
+    THOUGHTGATE_APPROVAL_TARGET,
+    THOUGHTGATE_APPROVAL_TIMEOUT_S,
+    THOUGHTGATE_APPROVAL_USER,
     THOUGHTGATE_REQUEST_ID,
+    THOUGHTGATE_TASK_ID,
+    THOUGHTGATE_TRACE_CONTEXT_RECOVERED,
+    current_span_context,
+    finish_approval_callback_span,
     finish_mcp_span,
+    start_approval_callback_span,
+    start_approval_dispatch_span,
     start_mcp_span,
+};
+
+// Re-export trace context types (REQ-OBS-002 §7.4)
+pub use trace_context::{
+    DeserializedContext, SerializedTraceContext, deserialize_span_context, serialize_span_context,
 };
 
 // Re-export prometheus-client metrics

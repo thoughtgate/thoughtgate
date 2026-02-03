@@ -38,11 +38,13 @@ pub use slack::{SlackAdapter, SlackConfig};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use opentelemetry::trace::SpanContext;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::governance::{Principal, TaskId};
+use crate::telemetry::SerializedTraceContext;
 
 // ============================================================================
 // Approval Request
@@ -51,6 +53,7 @@ use crate::governance::{Principal, TaskId};
 /// Request to post an approval message to an external system.
 ///
 /// Implements: REQ-GOV-003/§6.4
+/// Implements: REQ-OBS-002 §5.4 (Approval span context for trace correlation)
 ///
 /// Contains all information needed to construct an approval request
 /// message for human review.
@@ -71,6 +74,10 @@ pub struct ApprovalRequest {
     pub created_at: DateTime<Utc>,
     /// Correlation ID for tracing
     pub correlation_id: String,
+    /// Span context from the parent MCP request for trace linking.
+    /// Used to create span links in the approval dispatch span.
+    /// Implements: REQ-OBS-002 §5.4.1 (link to parent MCP request)
+    pub request_span_context: Option<SpanContext>,
 }
 
 impl std::fmt::Debug for ApprovalRequest {
@@ -83,6 +90,13 @@ impl std::fmt::Debug for ApprovalRequest {
             .field("expires_at", &self.expires_at)
             .field("created_at", &self.created_at)
             .field("correlation_id", &self.correlation_id)
+            .field(
+                "request_span_context",
+                &self
+                    .request_span_context
+                    .as_ref()
+                    .map(|ctx| format!("trace_id={}, span_id={}", ctx.trace_id(), ctx.span_id())),
+            )
             .finish()
     }
 }
@@ -94,6 +108,7 @@ impl std::fmt::Debug for ApprovalRequest {
 /// Reference to a posted approval message for polling.
 ///
 /// Implements: REQ-GOV-003/§6.4
+/// Implements: REQ-OBS-002 §7.4.1 (Context Storage at Dispatch)
 ///
 /// Stored after successfully posting an approval request, this contains
 /// the information needed to poll for and cancel the approval.
@@ -111,6 +126,10 @@ pub struct ApprovalReference {
     pub next_poll_at: Instant,
     /// Number of polls performed
     pub poll_count: u32,
+    /// Serialized trace context from the dispatch span.
+    /// Stored for use when creating the callback span on approval decision.
+    /// Implements: REQ-OBS-002 §7.4.1 (Context Storage at Dispatch)
+    pub dispatch_trace_context: Option<SerializedTraceContext>,
 }
 
 // ============================================================================

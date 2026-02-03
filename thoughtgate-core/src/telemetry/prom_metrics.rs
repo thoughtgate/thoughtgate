@@ -590,6 +590,45 @@ impl ThoughtGateMetrics {
             })
             .observe(size_bytes);
     }
+
+    /// Record an approval request.
+    ///
+    /// Increments the approval request counter for the given channel and outcome.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel` - Approval channel (e.g., "slack", "webhook")
+    /// * `outcome` - Approval outcome (e.g., "approved", "rejected", "timeout", "pending")
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-005
+    pub fn record_approval_request(&self, channel: &str, outcome: &str) {
+        self.approval_requests_total
+            .get_or_create(&ApprovalLabels {
+                channel: channel.to_string(),
+                outcome: outcome.to_string(),
+            })
+            .inc();
+    }
+
+    /// Record approval wait duration.
+    ///
+    /// Records how long an approval took from dispatch to callback.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel` - Approval channel (e.g., "slack", "webhook")
+    /// * `outcome` - Approval outcome (e.g., "approved", "rejected", "timeout")
+    /// * `duration_secs` - Wall-clock time from dispatch to callback in seconds
+    ///
+    /// Implements: REQ-OBS-002 §6.2/MH-004
+    pub fn record_approval_wait_duration(&self, channel: &str, outcome: &str, duration_secs: f64) {
+        self.approval_wait_duration_s
+            .get_or_create(&ApprovalLabels {
+                channel: channel.to_string(),
+                outcome: outcome.to_string(),
+            })
+            .observe(duration_secs);
+    }
 }
 
 #[cfg(test)]

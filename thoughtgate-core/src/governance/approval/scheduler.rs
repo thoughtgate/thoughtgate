@@ -548,6 +548,7 @@ mod tests {
                 posted_at: chrono::Utc::now(),
                 next_poll_at: Instant::now() + Duration::from_millis(10),
                 poll_count: 0,
+                dispatch_trace_context: None,
             })
         }
 
@@ -580,6 +581,7 @@ mod tests {
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             created_at: chrono::Utc::now(),
             correlation_id: "test-correlation".to_string(),
+            request_span_context: None,
         }
     }
 
@@ -722,6 +724,7 @@ mod tests {
                     posted_at: chrono::Utc::now(),
                     next_poll_at: self.fixed_poll_at, // Same time for all!
                     poll_count: 0,
+                    dispatch_trace_context: None,
                 })
             }
 

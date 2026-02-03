@@ -16,9 +16,15 @@ use super::{
     AdapterError, ApprovalAdapter, ApprovalReference, ApprovalRequest, DecisionMethod,
     PollDecision, PollResult,
 };
+use crate::telemetry::{
+    ApprovalCallbackData, ApprovalDispatchData, deserialize_span_context,
+    finish_approval_callback_span, serialize_span_context, start_approval_callback_span,
+    start_approval_dispatch_span,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
+use opentelemetry::trace::{Span, SpanContext};
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
@@ -392,6 +398,54 @@ impl SlackAdapter {
             },
         }
     }
+
+    /// Restore trace context from the approval reference.
+    ///
+    /// Attempts to deserialize the stored trace context from the dispatch span.
+    /// If the context is corrupted or missing, returns None with recovered=false,
+    /// allowing graceful degradation to a new trace.
+    ///
+    /// Implements: REQ-OBS-002 §7.4.2 (Context Restoration at Callback)
+    fn restore_trace_context(&self, reference: &ApprovalReference) -> (Option<SpanContext>, bool) {
+        match &reference.dispatch_trace_context {
+            Some(serialized) => {
+                let deserialized = deserialize_span_context(serialized);
+                if deserialized.recovered {
+                    // Successfully restored context
+                    let span_context = SpanContext::new(
+                        deserialized.trace_id,
+                        deserialized.span_id,
+                        deserialized.trace_flags,
+                        true, // is_remote = true since we're restoring from serialized
+                        deserialized.trace_state,
+                    );
+                    (Some(span_context), true)
+                } else {
+                    // Context was corrupted, new trace started
+                    warn!(
+                        task_id = %reference.task_id,
+                        "Trace context corrupted, starting new trace"
+                    );
+                    // Return the new context from graceful degradation
+                    let span_context = SpanContext::new(
+                        deserialized.trace_id,
+                        deserialized.span_id,
+                        deserialized.trace_flags,
+                        true,
+                        deserialized.trace_state,
+                    );
+                    (Some(span_context), false)
+                }
+            }
+            None => {
+                warn!(
+                    task_id = %reference.task_id,
+                    "No trace context stored, starting new trace"
+                );
+                (None, false)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -399,11 +453,34 @@ impl ApprovalAdapter for SlackAdapter {
     /// Post approval request to Slack.
     ///
     /// Implements: REQ-GOV-003/F-001
+    /// Implements: REQ-OBS-002 §5.4.1 (Approval Dispatch Span)
     /// Handles: EC-APR-001, EC-APR-002, EC-APR-003
     async fn post_approval_request(
         &self,
         request: &ApprovalRequest,
     ) -> Result<ApprovalReference, AdapterError> {
+        // Start approval dispatch span with link to MCP request span
+        // Implements: REQ-OBS-002 §5.4.1
+        let dispatch_data = ApprovalDispatchData {
+            task_id: &request.task_id.to_string(),
+            channel: "slack",
+            target: Some(&self.config.channel),
+            timeout_secs: Some(
+                request
+                    .expires_at
+                    .signed_duration_since(Utc::now())
+                    .num_seconds()
+                    .max(0) as u64,
+            ),
+            link_to: request.request_span_context.as_ref(),
+        };
+        let mut dispatch_span = start_approval_dispatch_span(&dispatch_data);
+
+        // Serialize dispatch span context for storage in Slack metadata
+        // Implements: REQ-OBS-002 §7.4.1 (Context Storage at Dispatch)
+        let dispatch_span_context = dispatch_span.span_context().clone();
+        let serialized_trace_context = serialize_span_context(&dispatch_span_context);
+
         let blocks = self.build_approval_blocks(request);
 
         let response = self
@@ -416,7 +493,8 @@ impl ApprovalAdapter for SlackAdapter {
                 "metadata": {
                     "event_type": "thoughtgate_approval",
                     "event_payload": {
-                        "task_id": request.task_id.to_string()
+                        "task_id": request.task_id.to_string(),
+                        "trace_context": serialized_trace_context
                     }
                 }
             }))
@@ -424,6 +502,7 @@ impl ApprovalAdapter for SlackAdapter {
             .await
             .map_err(|e| {
                 error!(task_id = %request.task_id, error = %e, "Failed to post approval message");
+                dispatch_span.end();
                 AdapterError::PostFailed {
                     reason: e.to_string(),
                     retriable: e.is_connect() || e.is_timeout(),
@@ -432,39 +511,50 @@ impl ApprovalAdapter for SlackAdapter {
 
         // Check for rate limiting
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            dispatch_span.end();
             return Err(Self::handle_rate_limit(&response));
         }
 
-        let body: SlackPostMessageResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AdapterError::PostFailed {
-                    reason: format!("Failed to parse Slack response: {e}"),
-                    retriable: false,
-                })?;
+        let body: SlackPostMessageResponse = response.json().await.map_err(|e| {
+            dispatch_span.end();
+            AdapterError::PostFailed {
+                reason: format!("Failed to parse Slack response: {e}"),
+                retriable: false,
+            }
+        })?;
 
         if !body.ok {
             let error = body.error.as_deref().unwrap_or("unknown");
+            dispatch_span.end();
             return Err(Self::map_slack_error(error, &self.config.channel, None));
         }
 
-        let ts = body.ts.ok_or_else(|| AdapterError::PostFailed {
-            reason: "No timestamp in response".to_string(),
-            retriable: false,
+        let ts = body.ts.ok_or_else(|| {
+            dispatch_span.end();
+            AdapterError::PostFailed {
+                reason: "No timestamp in response".to_string(),
+                retriable: false,
+            }
         })?;
 
-        let channel = body.channel.ok_or_else(|| AdapterError::PostFailed {
-            reason: "No channel in response".to_string(),
-            retriable: false,
+        let channel = body.channel.ok_or_else(|| {
+            dispatch_span.end();
+            AdapterError::PostFailed {
+                reason: "No channel in response".to_string(),
+                retriable: false,
+            }
         })?;
 
         info!(
             task_id = %request.task_id,
             channel = %channel,
             ts = %ts,
+            trace_id = %dispatch_span_context.trace_id(),
             "Posted approval message to Slack"
         );
+
+        // End dispatch span after successful post
+        dispatch_span.end();
 
         Ok(ApprovalReference {
             task_id: request.task_id.clone(),
@@ -473,12 +563,14 @@ impl ApprovalAdapter for SlackAdapter {
             posted_at: Utc::now(),
             next_poll_at: Instant::now() + self.config.initial_poll_interval,
             poll_count: 0,
+            dispatch_trace_context: Some(serialized_trace_context),
         })
     }
 
     /// Poll for decision via reactions.get.
     ///
     /// Implements: REQ-GOV-003/F-003
+    /// Implements: REQ-OBS-002 §5.4.2 (Approval Callback Span)
     /// Handles: EC-APR-004, EC-APR-005, EC-APR-006, EC-APR-007
     async fn poll_for_decision(
         &self,
@@ -539,11 +631,46 @@ impl ApprovalAdapter for SlackAdapter {
                 }
             };
 
+            // Calculate approval latency (time from dispatch to callback)
+            let latency_secs = Utc::now()
+                .signed_duration_since(reference.posted_at)
+                .num_milliseconds() as f64
+                / 1000.0;
+
+            // Restore trace context and create callback span
+            // Implements: REQ-OBS-002 §7.4.2 (Context Restoration at Callback)
+            let (dispatch_span_context, trace_context_recovered) =
+                self.restore_trace_context(reference);
+
+            let callback_data = ApprovalCallbackData {
+                task_id: &reference.task_id.to_string(),
+                channel: "slack",
+                trace_context_recovered,
+                link_to: dispatch_span_context.as_ref(),
+            };
+
+            let mut callback_span = start_approval_callback_span(&callback_data);
+
+            // Set decision attributes and end span
+            let decision_str = match decision {
+                PollDecision::Approved => "approved",
+                PollDecision::Rejected => "denied",
+            };
+            finish_approval_callback_span(
+                &mut callback_span,
+                decision_str,
+                &display_name,
+                latency_secs,
+            );
+            callback_span.end();
+
             info!(
                 task_id = %reference.task_id,
                 decision = ?decision,
                 decided_by = %display_name,
                 emoji = %emoji,
+                latency_secs = latency_secs,
+                trace_context_recovered = trace_context_recovered,
                 "Detected approval decision"
             );
 
@@ -687,6 +814,7 @@ mod tests {
             expires_at: Utc::now() + chrono::Duration::hours(1),
             created_at: Utc::now(),
             correlation_id: "test-correlation".to_string(),
+            request_span_context: None, // No span context for basic tests
         }
     }
 
@@ -937,6 +1065,7 @@ mod tests {
                 posted_at: Utc::now(),
                 next_poll_at: std::time::Instant::now() + self.inner.config.initial_poll_interval,
                 poll_count: 0,
+                dispatch_trace_context: None, // No tracing in wiremock tests
             })
         }
 
@@ -1170,6 +1299,7 @@ mod tests {
             posted_at: Utc::now(),
             next_poll_at: std::time::Instant::now(),
             poll_count: 0,
+            dispatch_trace_context: None,
         };
 
         let result = adapter.poll_for_decision(&reference).await;
@@ -1221,6 +1351,7 @@ mod tests {
             posted_at: Utc::now(),
             next_poll_at: std::time::Instant::now(),
             poll_count: 0,
+            dispatch_trace_context: None,
         };
 
         let result = adapter.poll_for_decision(&reference).await;
@@ -1261,6 +1392,7 @@ mod tests {
             posted_at: Utc::now(),
             next_poll_at: std::time::Instant::now(),
             poll_count: 0,
+            dispatch_trace_context: None,
         };
 
         let result = adapter.poll_for_decision(&reference).await;
@@ -1302,6 +1434,7 @@ mod tests {
             posted_at: Utc::now(),
             next_poll_at: std::time::Instant::now(),
             poll_count: 0,
+            dispatch_trace_context: None,
         };
 
         let result = adapter.poll_for_decision(&reference).await;
