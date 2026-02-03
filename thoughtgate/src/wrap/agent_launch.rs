@@ -542,6 +542,7 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .env("THOUGHTGATE_ACTIVE", "1")
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| StdioError::ServerSpawnError {
             server_id: "agent".to_string(),
