@@ -13,7 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
+use thoughtgate_core::governance::approval::{
+    ApprovalAdapter, MockAdapter, PollingConfig, PollingScheduler, SlackAdapter, SlackConfig,
+};
+use thoughtgate_core::governance::evaluator::GovernanceEvaluator;
 use thoughtgate_core::governance::service::{GovernanceServiceState, start_governance_service};
+use thoughtgate_core::governance::task::{Principal, TaskStore};
+use thoughtgate_core::policy::engine::CedarEngine;
 use thoughtgate_core::profile::Profile;
 
 use crate::cli::WrapArgs;
@@ -290,8 +298,149 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         return run_dry_run(&*adapter, &config_path, &servers, &shim_binary, profile);
     }
 
+    // ── Load ThoughtGate config (if provided) ──────────────────────────────
+    let tg_config = if args.thoughtgate_config.as_os_str().is_empty() {
+        None
+    } else if args.thoughtgate_config.exists() {
+        match thoughtgate_core::config::load_and_validate(
+            &args.thoughtgate_config,
+            thoughtgate_core::config::Version::V0_2,
+        ) {
+            Ok((config, warnings)) => {
+                if !warnings.is_clean() {
+                    tracing::warn!(
+                        warnings = ?warnings,
+                        "config validation warnings"
+                    );
+                }
+                tracing::info!(
+                    config_path = %args.thoughtgate_config.display(),
+                    "loaded ThoughtGate config"
+                );
+                Some(Arc::new(config))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    config_path = %args.thoughtgate_config.display(),
+                    "failed to load ThoughtGate config — governance will use stub mode"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::debug!(
+            config_path = %args.thoughtgate_config.display(),
+            "ThoughtGate config not found — governance will use stub mode"
+        );
+        None
+    };
+
+    // ── Create governance evaluator (if config loaded) ───────────────────
+    let (gov_state, scheduler_state) = if let Some(config) = tg_config {
+        // Infer principal with graceful fallback for non-K8s environments.
+        let policy_principal =
+            tokio::task::spawn_blocking(thoughtgate_core::policy::principal::infer_principal)
+                .await
+                .ok()
+                .and_then(|r| r.ok());
+
+        let principal = match policy_principal {
+            Some(p) => Principal::from_policy(
+                &p.app_name,
+                &p.namespace,
+                &p.service_account,
+                p.roles.clone(),
+            ),
+            None => {
+                let user = std::env::var("USER").unwrap_or_else(|_| "anonymous".to_string());
+                tracing::info!(
+                    user = %user,
+                    "principal inference failed — using local fallback"
+                );
+                Principal::from_policy(&user, "local", "local", vec![])
+            }
+        };
+
+        // Create Cedar engine (optional — falls back to profile-dependent behavior).
+        let cedar_engine = match CedarEngine::new() {
+            Ok(engine) => {
+                tracing::info!("Cedar policy engine initialized");
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                tracing::info!(
+                    error = %e,
+                    "Cedar engine not available — Cedar policy rules will use fallback"
+                );
+                None
+            }
+        };
+
+        // Create task store.
+        let task_store = Arc::new(TaskStore::with_defaults());
+
+        // Create evaluator.
+        let evaluator = Arc::new(GovernanceEvaluator::new(
+            config.clone(),
+            cedar_engine,
+            task_store.clone(),
+            principal,
+            profile,
+        ));
+
+        // Conditionally create polling scheduler (if config uses approval workflows).
+        let scheduler_state = if config.requires_approval_engine() {
+            let cancel_token = CancellationToken::new();
+
+            let adapter: Arc<dyn ApprovalAdapter> =
+                match SlackConfig::from_env().and_then(SlackAdapter::new) {
+                    Ok(adapter) => {
+                        tracing::info!("Slack adapter initialized for approval polling");
+                        Arc::new(adapter)
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            error = %e,
+                            "Slack adapter unavailable — using mock adapter (auto-approve)"
+                        );
+                        Arc::new(MockAdapter::new(Duration::from_secs(1), true))
+                    }
+                };
+
+            let scheduler = Arc::new(PollingScheduler::new(
+                adapter,
+                task_store.clone(),
+                PollingConfig::default(),
+                cancel_token.clone(),
+            ));
+
+            evaluator.set_scheduler(scheduler.clone());
+
+            let scheduler_handle = tokio::spawn({
+                let scheduler = scheduler.clone();
+                async move {
+                    scheduler.run().await;
+                }
+            });
+
+            tracing::info!("approval polling scheduler started");
+            Some((cancel_token, scheduler_handle))
+        } else {
+            tracing::debug!("no approval workflows configured — scheduler not started");
+            None
+        };
+
+        let state = Arc::new(GovernanceServiceState::with_evaluator(
+            evaluator, task_store,
+        ));
+        (state, scheduler_state)
+    } else {
+        // No config — use stub mode.
+        (Arc::new(GovernanceServiceState::new()), None)
+    };
+
     // ── F-008: Start governance service ────────────────────────────────────
-    let gov_state = Arc::new(GovernanceServiceState::new());
     let (gov_port, gov_handle) = start_governance_service(args.governance_port, gov_state.clone())
         .await
         .map_err(StdioError::StdioIo)?;
@@ -412,6 +561,13 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
     }
 
     // ── F-010: Cleanup ─────────────────────────────────────────────────────
+
+    // Stop the approval polling scheduler (if running).
+    if let Some((cancel_token, scheduler_handle)) = scheduler_state {
+        cancel_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), scheduler_handle).await;
+        tracing::debug!("approval scheduler stopped");
+    }
 
     // Signal governance to shut down (so shims drain).
     gov_state.trigger_shutdown();

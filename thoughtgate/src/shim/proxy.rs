@@ -15,7 +15,8 @@ use tokio::sync::watch;
 
 use thoughtgate_core::StreamDirection;
 use thoughtgate_core::governance::api::{
-    GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse, MessageType,
+    ApprovalOutcome, GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse,
+    MessageType, TaskStatusResponse,
 };
 use thoughtgate_core::governance::service::HeartbeatRequest;
 use thoughtgate_core::jsonrpc::JsonRpcMessageKind;
@@ -50,6 +51,16 @@ const EVALUATE_TIMEOUT_MS: u64 = 2000;
 
 /// Request timeout for POST /governance/heartbeat.
 const HEARTBEAT_TIMEOUT_MS: u64 = 5000;
+
+/// Default poll interval for approval status checks (ms).
+const DEFAULT_APPROVAL_POLL_MS: u64 = 5000;
+
+/// Request timeout for GET /governance/task/{id} (ms).
+const TASK_STATUS_TIMEOUT_MS: u64 = 5000;
+
+/// Maximum number of poll cycles before giving up (safety net).
+/// Real timeout is server-side TTL. 720 polls × 5s = 1 hour.
+const MAX_POLL_CYCLES: u32 = 720;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure Helper Functions
@@ -157,6 +168,105 @@ fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<thoughtgate_core::jsonrpc::
         }
         JsonRpcMessageKind::Notification { .. } => None,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Approval Polling (PendingApproval)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Result of polling the task status endpoint for an approval decision.
+#[derive(Debug)]
+enum ApprovalPollResult {
+    /// Approval granted — shim should forward the original message.
+    Approved,
+    /// Approval explicitly rejected by a human reviewer.
+    Rejected(Option<String>),
+    /// Task expired before a decision was made.
+    Expired,
+    /// Task was cancelled.
+    Cancelled,
+    /// Poll cycle limit reached without a decision.
+    Timeout,
+    /// Unrecoverable HTTP error during polling.
+    Error,
+    /// Shutdown signal received during polling.
+    Shutdown,
+}
+
+/// Poll `GET /governance/task/{task_id}` until a terminal decision is reached.
+///
+/// This function blocks the agent→server task for this message, which is correct
+/// for stdio — the MCP protocol is sequential per-connection. The server→agent
+/// task and heartbeat continue concurrently.
+///
+/// Implements: REQ-CORE-008/F-016
+async fn poll_approval_status(
+    client: &reqwest::Client,
+    task_url: &str,
+    poll_interval: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    profile: Profile,
+) -> ApprovalPollResult {
+    for cycle in 0..MAX_POLL_CYCLES {
+        // Check shutdown between polls.
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                return ApprovalPollResult::Shutdown;
+            }
+            _ = tokio::time::sleep(poll_interval) => {}
+        }
+
+        // GET task status.
+        let resp = match client
+            .get(task_url)
+            .timeout(Duration::from_millis(TASK_STATUS_TIMEOUT_MS))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(cycle, error = %e, "approval poll: HTTP error");
+                if profile == Profile::Production {
+                    return ApprovalPollResult::Error;
+                }
+                // Dev mode: retry on transient errors.
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            tracing::warn!(cycle, status = %resp.status(), "approval poll: non-200");
+            continue;
+        }
+
+        let status: TaskStatusResponse = match resp.json().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(cycle, error = %e, "approval poll: parse error");
+                continue;
+            }
+        };
+
+        match status.decision {
+            Some(ApprovalOutcome::Approved) => return ApprovalPollResult::Approved,
+            Some(ApprovalOutcome::Rejected) => {
+                return ApprovalPollResult::Rejected(status.reason);
+            }
+            Some(ApprovalOutcome::Expired) => return ApprovalPollResult::Expired,
+            Some(ApprovalOutcome::Cancelled) => return ApprovalPollResult::Cancelled,
+            None => {
+                // Still pending — continue polling.
+                tracing::debug!(cycle, "approval poll: still pending");
+            }
+        }
+    }
+
+    tracing::warn!(
+        max_cycles = MAX_POLL_CYCLES,
+        "approval poll: cycle limit reached"
+    );
+    ApprovalPollResult::Timeout
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -523,6 +633,7 @@ async fn agent_to_server(
                         task_id: None,
                         policy_id: None,
                         reason: None,
+                        poll_interval_ms: None,
                         shutdown: false,
                     }
                 }
@@ -543,6 +654,7 @@ async fn agent_to_server(
                     task_id: None,
                     policy_id: None,
                     reason: None,
+                    poll_interval_ms: None,
                     shutdown: false,
                 }
             }
@@ -591,22 +703,128 @@ async fn agent_to_server(
                 // Notifications have no id — silently drop denials for them.
             }
             GovernanceDecision::PendingApproval => {
-                // TODO: Implement approval polling (tasks/get endpoint).
-                // For now, stub as Forward.
-                tracing::debug!(server_id, method, "PendingApproval stubbed as Forward");
-                child_stdin
-                    .write_all(buf.as_bytes())
-                    .await
-                    .map_err(|e| StdioError::Framing {
-                        server_id: server_id.clone(),
-                        direction: StreamDirection::AgentToServer,
-                        source: FramingError::Io(e),
-                    })?;
-                child_stdin.flush().await.map_err(|e| StdioError::Framing {
-                    server_id: server_id.clone(),
-                    direction: StreamDirection::AgentToServer,
-                    source: FramingError::Io(e),
-                })?;
+                // Poll the governance task status endpoint until a decision
+                // is reached or the operation times out / shuts down.
+                let task_id = match eval_resp.task_id.as_deref() {
+                    Some(id) => id,
+                    None => {
+                        tracing::error!(server_id, "PendingApproval without task_id — denying");
+                        if let Some(id) = id_from_kind(&msg.kind) {
+                            let deny_line = format_deny_response(&id, &server_id, None);
+                            agent_stdout
+                                .write_all(deny_line.as_bytes())
+                                .await
+                                .map_err(StdioError::StdioIo)?;
+                            agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
+                        }
+                        continue;
+                    }
+                };
+
+                let poll_interval = Duration::from_millis(
+                    eval_resp
+                        .poll_interval_ms
+                        .unwrap_or(DEFAULT_APPROVAL_POLL_MS),
+                );
+                let task_url = format!("{governance_endpoint}/governance/task/{task_id}");
+
+                tracing::info!(
+                    server_id,
+                    task_id,
+                    method,
+                    poll_ms = poll_interval.as_millis() as u64,
+                    "PendingApproval — starting poll loop"
+                );
+
+                let outcome =
+                    poll_approval_status(&client, &task_url, poll_interval, shutdown_rx, profile)
+                        .await;
+
+                match outcome {
+                    ApprovalPollResult::Approved => {
+                        tracing::info!(server_id, task_id, "approval granted — forwarding");
+                        child_stdin.write_all(buf.as_bytes()).await.map_err(|e| {
+                            StdioError::Framing {
+                                server_id: server_id.clone(),
+                                direction: StreamDirection::AgentToServer,
+                                source: FramingError::Io(e),
+                            }
+                        })?;
+                        child_stdin.flush().await.map_err(|e| StdioError::Framing {
+                            server_id: server_id.clone(),
+                            direction: StreamDirection::AgentToServer,
+                            source: FramingError::Io(e),
+                        })?;
+                    }
+                    ApprovalPollResult::Rejected(reason) => {
+                        tracing::info!(
+                            server_id,
+                            task_id,
+                            ?reason,
+                            "approval rejected — sending deny"
+                        );
+                        if let Some(id) = id_from_kind(&msg.kind) {
+                            let deny_line = format_deny_response(
+                                &id,
+                                &server_id,
+                                eval_resp.policy_id.as_deref(),
+                            );
+                            agent_stdout
+                                .write_all(deny_line.as_bytes())
+                                .await
+                                .map_err(StdioError::StdioIo)?;
+                            agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
+                        }
+                    }
+                    ApprovalPollResult::Expired | ApprovalPollResult::Cancelled => {
+                        tracing::info!(
+                            server_id,
+                            task_id,
+                            result = ?outcome,
+                            "approval expired/cancelled — sending deny"
+                        );
+                        if let Some(id) = id_from_kind(&msg.kind) {
+                            let deny_line = format_deny_response(
+                                &id,
+                                &server_id,
+                                eval_resp.policy_id.as_deref(),
+                            );
+                            agent_stdout
+                                .write_all(deny_line.as_bytes())
+                                .await
+                                .map_err(StdioError::StdioIo)?;
+                            agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
+                        }
+                    }
+                    ApprovalPollResult::Timeout | ApprovalPollResult::Error => {
+                        tracing::warn!(
+                            server_id,
+                            task_id,
+                            result = ?outcome,
+                            "approval poll failed — sending deny"
+                        );
+                        if let Some(id) = id_from_kind(&msg.kind) {
+                            let deny_line = format_deny_response(
+                                &id,
+                                &server_id,
+                                eval_resp.policy_id.as_deref(),
+                            );
+                            agent_stdout
+                                .write_all(deny_line.as_bytes())
+                                .await
+                                .map_err(StdioError::StdioIo)?;
+                            agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
+                        }
+                    }
+                    ApprovalPollResult::Shutdown => {
+                        tracing::info!(
+                            server_id,
+                            task_id,
+                            "shutdown during approval poll — breaking"
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
