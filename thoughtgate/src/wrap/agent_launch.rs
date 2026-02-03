@@ -416,20 +416,29 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         let scheduler_state = if config.requires_approval_engine() {
             let cancel_token = CancellationToken::new();
 
-            let adapter: Arc<dyn ApprovalAdapter> =
-                match SlackConfig::from_env().and_then(SlackAdapter::new) {
-                    Ok(adapter) => {
-                        tracing::info!("Slack adapter initialized for approval polling");
-                        Arc::new(adapter)
+            let adapter: Arc<dyn ApprovalAdapter> = match SlackConfig::from_env()
+                .and_then(SlackAdapter::new)
+            {
+                Ok(adapter) => {
+                    tracing::info!("Slack adapter initialized for approval polling");
+                    Arc::new(adapter)
+                }
+                Err(e) => {
+                    if profile == Profile::Production {
+                        return Err(StdioError::ConfigParseError {
+                            path: args.thoughtgate_config.clone(),
+                            reason: format!(
+                                "approval adapter required in production but failed to initialize: {e}"
+                            ),
+                        });
                     }
-                    Err(e) => {
-                        tracing::info!(
-                            error = %e,
-                            "Slack adapter unavailable — using mock adapter (auto-approve)"
-                        );
-                        Arc::new(MockAdapter::new(Duration::from_secs(1), true))
-                    }
-                };
+                    tracing::info!(
+                        error = %e,
+                        "Slack adapter unavailable — using mock adapter (auto-approve in development)"
+                    );
+                    Arc::new(MockAdapter::new(Duration::from_secs(1), true))
+                }
+            };
 
             let scheduler = Arc::new(PollingScheduler::new(
                 adapter,
