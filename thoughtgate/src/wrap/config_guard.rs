@@ -36,8 +36,6 @@ pub struct ConfigGuard {
     /// The flock is released when this handle is dropped — the field is intentionally
     /// never read; it exists solely to keep the lock alive for the guard's lifetime.
     _lock_file: File,
-    /// Path to the lock file (for cleanup on drop).
-    lock_path: PathBuf,
     /// Whether `restore()` has already been called (prevents double-restore).
     restored: AtomicBool,
 }
@@ -69,7 +67,6 @@ impl ConfigGuard {
             config_path: config_path.to_path_buf(),
             backup_path: backup_path.to_path_buf(),
             _lock_file: lock_file,
-            lock_path,
             restored: AtomicBool::new(false),
         })
     }
@@ -112,9 +109,10 @@ impl ConfigGuard {
 impl Drop for ConfigGuard {
     fn drop(&mut self) {
         let _ = self.restore();
-        // Advisory flock is released when the File handle is dropped (implicit).
-        // Remove the lock file from disk.
-        let _ = std::fs::remove_file(&self.lock_path);
+        // Advisory flock is released when the File handle (_lock_file) is dropped
+        // immediately after this. The lock file is intentionally left on disk —
+        // removing it creates a TOCTOU race where a new process could create a
+        // fresh inode and acquire a lock on it before the old handle is closed.
     }
 }
 

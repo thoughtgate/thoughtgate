@@ -282,10 +282,11 @@ fn test_config_backup_restore_full_cycle() {
         "config should be restored to original"
     );
 
-    // Verify lock file removed.
+    // Lock file persists on disk (flock is what provides mutual exclusion,
+    // not the file's existence). Removing it in Drop would create a TOCTOU race.
     assert!(
-        !lock_path.exists(),
-        "lock file should be removed after drop"
+        lock_path.exists(),
+        "lock file should persist after drop (flock released, file remains)"
     );
 
     // Verify backup file removed.
