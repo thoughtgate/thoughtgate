@@ -11,9 +11,9 @@
 
 use http::{Request, Response};
 use std::sync::Arc;
-use thoughtgate_core::inspector::{Decision, InspectionContext, Inspector};
+use thoughtgate_core::inspector::{Decision, InspectionContext, InspectionError, Inspector};
 use thoughtgate_proxy::buffered_forwarder::BufferedForwarder;
-use thoughtgate_proxy::error::{ProxyError, ProxyResult};
+use thoughtgate_proxy::error::ProxyError;
 use thoughtgate_proxy::proxy_config::ProxyConfig;
 
 /// Test inspector that panics unconditionally
@@ -29,7 +29,7 @@ impl Inspector for PanicInspector {
         &self,
         _body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         panic!("Intentional panic for testing");
     }
 }
@@ -47,7 +47,7 @@ impl Inspector for ConditionalPanicInspector {
         &self,
         body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         if body.len() > 3 && body[0] == 0xDE && body[1] == 0xAD {
             panic!("Panic on 0xDEAD pattern");
         }
@@ -68,7 +68,7 @@ impl Inspector for SuccessInspector {
         &self,
         _body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         Ok(Decision::Approve)
     }
 }
@@ -170,7 +170,7 @@ async fn test_panic_stops_chain_processing() {
             &self,
             _body: &[u8],
             _ctx: InspectionContext<'_>,
-        ) -> ProxyResult<Decision> {
+        ) -> Result<Decision, InspectionError> {
             panic!("This should never be reached");
         }
     }
@@ -238,7 +238,7 @@ async fn test_panic_with_string_message() {
             &self,
             _body: &[u8],
             _ctx: InspectionContext<'_>,
-        ) -> ProxyResult<Decision> {
+        ) -> Result<Decision, InspectionError> {
             panic!("{}", "Formatted panic message".to_string());
         }
     }

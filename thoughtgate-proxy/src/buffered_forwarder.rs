@@ -662,7 +662,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use http::StatusCode;
-    use thoughtgate_core::inspector::NoOpInspector;
+    use thoughtgate_core::inspector::{InspectionError, NoOpInspector};
 
     /// Test inspector that always approves
     struct ApproveInspector;

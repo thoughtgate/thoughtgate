@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 
-use thoughtgate_core::inspector::{Decision, InspectionContext, Inspector};
+use thoughtgate_core::inspector::{Decision, InspectionContext, InspectionError, Inspector};
 use thoughtgate_proxy::buffered_forwarder::BufferedForwarder;
 use thoughtgate_proxy::error::ProxyError;
 use thoughtgate_proxy::proxy_config::ProxyConfig;
@@ -47,7 +47,7 @@ impl Inspector for ApproveInspector {
         &self,
         _body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         Ok(Decision::Approve)
     }
 }
@@ -65,7 +65,7 @@ impl Inspector for AppendInspector {
         &self,
         body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         let mut modified = body.to_vec();
         modified.extend_from_slice(&self.0);
         Ok(Decision::Modify(Bytes::from(modified)))
@@ -85,7 +85,7 @@ impl Inspector for RejectInspector {
         &self,
         _body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         Ok(Decision::Reject(self.0))
     }
 }
@@ -103,7 +103,7 @@ impl Inspector for PanickingInspector {
         &self,
         _body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         panic!("Intentional panic from test inspector");
     }
 }
@@ -123,7 +123,7 @@ impl Inspector for EmptyBodyTracker {
         &self,
         body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         self.received_empty
             .store(body.is_empty(), std::sync::atomic::Ordering::SeqCst);
         Ok(Decision::Approve)
@@ -178,7 +178,7 @@ impl Inspector for SlowInspector {
         &self,
         _body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         tokio::time::sleep(self.0).await;
         Ok(Decision::Approve)
     }
@@ -443,7 +443,7 @@ async fn test_chain_short_circuit_on_reject() {
             &self,
             _body: &[u8],
             _ctx: InspectionContext<'_>,
-        ) -> Result<Decision, ProxyError> {
+        ) -> Result<Decision, InspectionError> {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(Decision::Approve)
         }

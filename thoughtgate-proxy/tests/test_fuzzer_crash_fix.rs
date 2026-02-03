@@ -8,7 +8,7 @@
 
 use http::Request;
 use std::sync::Arc;
-use thoughtgate_core::inspector::{Decision, InspectionContext, Inspector};
+use thoughtgate_core::inspector::{Decision, InspectionContext, InspectionError, Inspector};
 use thoughtgate_proxy::buffered_forwarder::BufferedForwarder;
 use thoughtgate_proxy::error::ProxyError;
 use thoughtgate_proxy::proxy_config::ProxyConfig;
@@ -26,13 +26,13 @@ impl Inspector for ErrorInspector {
         &self,
         body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         // Return error on 0xDEAD pattern (previously caused panic)
         if body.len() > 3 && body[0] == 0xDE && body[1] == 0xAD {
-            return Err(ProxyError::InspectorError(
-                "error-inspector".to_string(),
-                "Intentional error for testing".to_string(),
-            ));
+            return Err(InspectionError::Failed {
+                name: "error-inspector".to_string(),
+                reason: "Intentional error for testing".to_string(),
+            });
         }
         Ok(Decision::Approve)
     }
@@ -53,7 +53,7 @@ impl Inspector for ModifyInspector {
         &self,
         _body: &[u8],
         _ctx: InspectionContext<'_>,
-    ) -> Result<Decision, ProxyError> {
+    ) -> Result<Decision, InspectionError> {
         Ok(Decision::Modify(bytes::Bytes::from(
             self.modification.clone(),
         )))
