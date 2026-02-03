@@ -400,6 +400,7 @@ async fn test_mock_adapter_instant_approval() {
         expires_at: Utc::now() + chrono::Duration::minutes(5),
         created_at: Utc::now(),
         correlation_id: "test-123".to_string(),
+        request_span_context: None,
     };
 
     // Post request
@@ -439,6 +440,7 @@ async fn test_mock_adapter_delayed_approval() {
         expires_at: Utc::now() + chrono::Duration::minutes(5),
         created_at: Utc::now(),
         correlation_id: "test-456".to_string(),
+        request_span_context: None,
     };
 
     let reference = adapter.post_approval_request(&request).await.unwrap();

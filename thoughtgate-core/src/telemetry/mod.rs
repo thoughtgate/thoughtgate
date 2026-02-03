@@ -19,6 +19,7 @@
 
 pub mod cardinality;
 pub mod prom_metrics;
+pub mod propagation;
 pub mod spans;
 pub mod trace_context;
 
@@ -63,6 +64,9 @@ pub use trace_context::{
     DeserializedContext, SerializedTraceContext, deserialize_span_context, serialize_span_context,
 };
 
+// Re-export propagation utilities (REQ-OBS-002 §7.1, §7.2)
+pub use propagation::{extract_context_from_headers, inject_context_into_headers};
+
 // Re-export prometheus-client metrics
 pub use cardinality::CardinalityLimiter;
 pub use prom_metrics::ThoughtGateMetrics;
@@ -70,8 +74,10 @@ pub use prom_metrics::ThoughtGateMetrics;
 // Re-export BoxedSpan for convenience (callers need to annotate span type)
 pub use opentelemetry::global::BoxedSpan;
 
+use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 
 /// Configuration for OpenTelemetry tracing initialization.
@@ -219,8 +225,14 @@ impl TelemetryGuard {
 /// ```
 ///
 /// Implements: REQ-OBS-002 §8.1 (Export Pipeline Architecture)
+/// Implements: REQ-OBS-002 §7.1-7.2 (W3C Trace Context Propagation)
 /// Implements: REQ-OBS-002 §12/B-OBS2-003 (Zero Overhead When Disabled)
 pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
+    // Install W3C TraceContext as global text map propagator
+    // This enables automatic extraction/injection of traceparent and tracestate headers
+    // Implements: REQ-OBS-002 §7.1, §7.2
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
     let resource = Resource::builder()
         .with_service_name(config.service_name.clone())
         .build();

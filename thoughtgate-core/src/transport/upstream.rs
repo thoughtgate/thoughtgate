@@ -321,6 +321,7 @@ impl UpstreamClient {
     /// Forward a single request to upstream (single attempt, no retry).
     ///
     /// Implements: REQ-CORE-003/F-004 (Upstream Forwarding)
+    /// Implements: REQ-OBS-002 §7.2 (Outbound Trace Context Injection)
     #[tracing::instrument(skip(self, request), fields(method = %request.method, correlation_id = %request.correlation_id))]
     async fn forward_once(
         &self,
@@ -339,10 +340,24 @@ impl UpstreamClient {
         // Build JSON-RPC request
         let jsonrpc_request = request.to_jsonrpc_request();
 
+        // Inject W3C trace context into outbound request headers.
+        // This enables end-to-end distributed tracing - upstream will see
+        // traceparent header linking back to ThoughtGate's MCP span.
+        // The correlation_id is added to tracestate for additional correlation.
+        // Implements: REQ-OBS-002 §7.2
+        let current_ctx = opentelemetry::Context::current();
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        crate::telemetry::inject_context_into_headers(
+            &current_ctx,
+            &mut trace_headers,
+            Some(&correlation_id),
+        );
+
         let response = self
             .client
             .post(url)
             .header("Content-Type", "application/json")
+            .headers(trace_headers)
             .json(&jsonrpc_request)
             .send()
             .await
@@ -414,6 +429,7 @@ impl UpstreamClient {
     /// * `Ok(Vec<JsonRpcResponse>)` - Responses from upstream
     /// * `Err(ThoughtGateError::InvalidRequest)` - If the batch is empty
     /// * `Err(ThoughtGateError)` - If the batch request failed
+    /// Implements: REQ-OBS-002 §7.2 (Outbound Trace Context Injection)
     #[tracing::instrument(skip(self, requests), fields(batch_size = requests.len()))]
     pub async fn forward_batch(
         &self,
@@ -437,10 +453,22 @@ impl UpstreamClient {
         // Build batch of JSON-RPC requests
         let jsonrpc_requests: Vec<_> = requests.iter().map(|r| r.to_jsonrpc_request()).collect();
 
+        // Inject W3C trace context into outbound batch request headers.
+        // Uses "batch" as the correlation identifier in tracestate.
+        // Implements: REQ-OBS-002 §7.2
+        let current_ctx = opentelemetry::Context::current();
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        crate::telemetry::inject_context_into_headers(
+            &current_ctx,
+            &mut trace_headers,
+            Some("batch"),
+        );
+
         let response = self
             .client
             .post(url)
             .header("Content-Type", "application/json")
+            .headers(trace_headers)
             .json(&jsonrpc_requests)
             .send()
             .await

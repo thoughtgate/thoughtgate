@@ -67,6 +67,7 @@ impl ApprovalAdapter for E2eApprovalAdapter {
             // Poll immediately (instant approval)
             next_poll_at: std::time::Instant::now(),
             poll_count: 0,
+            dispatch_trace_context: None,
         })
     }
 
@@ -300,6 +301,7 @@ async fn test_e2e_rejection_flow() {
                 posted_at: chrono::Utc::now(),
                 next_poll_at: std::time::Instant::now(),
                 poll_count: 0,
+                dispatch_trace_context: None,
             })
         }
 

@@ -130,6 +130,7 @@ impl McpMessageType {
 /// without exposing sensitive data like tool arguments.
 ///
 /// Implements: REQ-OBS-002 §5.1
+/// Implements: REQ-OBS-002 §7.1 (Parent Context for Trace Propagation)
 pub struct McpSpanData<'a> {
     /// JSON-RPC method name (e.g., "tools/call")
     pub method: &'a str,
@@ -141,6 +142,10 @@ pub struct McpSpanData<'a> {
     pub correlation_id: &'a str,
     /// Tool name for tools/call requests
     pub tool_name: Option<&'a str>,
+    /// Optional parent context for W3C trace propagation.
+    /// When provided, the MCP span becomes a child of the caller's span.
+    /// When None, ThoughtGate becomes the trace root.
+    pub parent_context: Option<&'a Context>,
 }
 
 /// Data needed to start an approval dispatch span.
@@ -184,19 +189,25 @@ pub struct ApprovalCallbackData<'a> {
 ///
 /// Returns a `BoxedSpan` since `global::tracer()` returns `BoxedTracer`.
 ///
+/// When `data.parent_context` is provided, the span becomes a child of the
+/// caller's span (W3C Trace Context propagation). When `None`, ThoughtGate
+/// starts a new trace.
+///
 /// # Arguments
 ///
-/// * `data` - Span data containing method, message type, and correlation info
+/// * `data` - Span data containing method, message type, correlation info, and optional parent context
 ///
 /// # Example
 ///
 /// ```ignore
+/// let parent_ctx = extract_context_from_headers(request.headers());
 /// let data = McpSpanData {
 ///     method: "tools/call",
 ///     message_type: McpMessageType::Request,
 ///     message_id: Some("42".to_string()),
 ///     correlation_id: "req-abc123",
 ///     tool_name: Some("web_search"),
+///     parent_context: Some(&parent_ctx),
 /// };
 /// let mut span = start_mcp_span(&data);
 /// // ... process request ...
@@ -204,6 +215,7 @@ pub struct ApprovalCallbackData<'a> {
 /// ```
 ///
 /// Implements: REQ-OBS-002 §5.1
+/// Implements: REQ-OBS-002 §7.1 (Parent Context for Trace Propagation)
 pub fn start_mcp_span(data: &McpSpanData<'_>) -> BoxedSpan {
     let tracer = global::tracer("thoughtgate");
 
@@ -222,11 +234,17 @@ pub fn start_mcp_span(data: &McpSpanData<'_>) -> BoxedSpan {
         attributes.push(KeyValue::new(GENAI_TOOL_NAME, tool.to_string()));
     }
 
-    tracer
+    let builder = tracer
         .span_builder(data.method.to_string())
         .with_kind(SpanKind::Server)
-        .with_attributes(attributes)
-        .start(&tracer)
+        .with_attributes(attributes);
+
+    // Start span with parent context if provided, otherwise start fresh
+    // This enables W3C Trace Context propagation (REQ-OBS-002 §7.1)
+    match data.parent_context {
+        Some(ctx) => builder.start_with_context(&tracer, ctx),
+        None => builder.start(&tracer),
+    }
 }
 
 /// Finish an MCP span with result attributes.
@@ -491,6 +509,7 @@ mod tests {
             message_id: Some("42".to_string()),
             correlation_id: "test-corr-123",
             tool_name: Some("web_search"),
+            parent_context: None,
         };
 
         let mut span: BoxedSpan = start_mcp_span(&data);
@@ -516,6 +535,7 @@ mod tests {
             message_id: Some("99".to_string()),
             correlation_id: "test-err-456",
             tool_name: None,
+            parent_context: None,
         };
 
         let mut span: BoxedSpan = start_mcp_span(&data);
@@ -557,6 +577,7 @@ mod tests {
             message_id: None,
             correlation_id: "test-notif-789",
             tool_name: None,
+            parent_context: None,
         };
 
         let mut span: BoxedSpan = start_mcp_span(&data);
@@ -764,6 +785,107 @@ mod tests {
             finished.span_context.trace_id(),
             opentelemetry::trace::TraceId::INVALID,
             "Should have valid trace_id even with corrupted context"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Parent Context Tests (REQ-OBS-002 §7.1)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_mcp_span_with_parent_context() {
+        use opentelemetry::trace::{SpanId, TraceFlags, TraceId, TraceState};
+
+        let (provider, exporter) = setup_test_provider();
+
+        // Create a mock parent span context (simulating extracted from headers)
+        let parent_trace_id = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        let parent_span_id = SpanId::from_hex("00f067aa0ba902b7").unwrap();
+        let parent_ctx = SpanContext::new(
+            parent_trace_id,
+            parent_span_id,
+            TraceFlags::SAMPLED,
+            true, // is_remote = true (extracted from headers)
+            TraceState::default(),
+        );
+
+        // Create a context with the remote span context
+        let parent_context = Context::new().with_remote_span_context(parent_ctx);
+
+        let data = McpSpanData {
+            method: "tools/call",
+            message_type: McpMessageType::Request,
+            message_id: Some("123".to_string()),
+            correlation_id: "test-parent-ctx",
+            tool_name: Some("test_tool"),
+            parent_context: Some(&parent_context),
+        };
+
+        let mut span: BoxedSpan = start_mcp_span(&data);
+        finish_mcp_span(&mut span, false, None, None);
+        drop(span);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        // MCP span should inherit the parent's trace_id
+        assert_eq!(
+            finished.span_context.trace_id(),
+            parent_trace_id,
+            "MCP span should inherit parent trace_id"
+        );
+        // MCP span should have a different span_id (its own)
+        assert_ne!(
+            finished.span_context.span_id(),
+            parent_span_id,
+            "MCP span should have its own span_id"
+        );
+        // Parent span ID should be set to the remote parent
+        assert_eq!(
+            finished.parent_span_id, parent_span_id,
+            "MCP span should have parent_span_id pointing to remote parent"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_mcp_span_without_parent_context_is_root() {
+        use opentelemetry::trace::{SpanId, TraceId};
+
+        let (provider, exporter) = setup_test_provider();
+
+        let data = McpSpanData {
+            method: "tools/call",
+            message_type: McpMessageType::Request,
+            message_id: Some("456".to_string()),
+            correlation_id: "test-no-parent",
+            tool_name: None,
+            parent_context: None,
+        };
+
+        let mut span: BoxedSpan = start_mcp_span(&data);
+        finish_mcp_span(&mut span, false, None, None);
+        drop(span);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        // Span should have a valid trace_id (auto-generated)
+        assert_ne!(
+            finished.span_context.trace_id(),
+            TraceId::INVALID,
+            "Root span should have valid trace_id"
+        );
+        // Span should have no parent (is root)
+        assert_eq!(
+            finished.parent_span_id,
+            SpanId::INVALID,
+            "Root span should have no parent_span_id"
         );
     }
 }

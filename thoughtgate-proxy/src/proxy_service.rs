@@ -231,11 +231,18 @@ impl ProxyService {
     ///
     /// # Traceability
     /// - Implements: REQ-CORE-003 (MCP Transport & Routing)
+    /// - Implements: REQ-OBS-002 §7.1 (W3C Trace Context Extraction)
     async fn handle_mcp_request(
         &self,
         req: Request<Incoming>,
         mcp_handler: Arc<McpHandler>,
     ) -> ProxyResult<Response<UnifiedBody>> {
+        // Extract W3C trace context BEFORE dropping headers.
+        // This allows MCP spans to become children of the caller's trace.
+        // Implements: REQ-OBS-002 §7.1
+        let trace_context =
+            thoughtgate_core::telemetry::extract_context_from_headers(req.headers());
+
         // Buffer the request body with stream-level size enforcement.
         // Using Limited prevents full memory allocation for oversized payloads —
         // the read is aborted as soon as cumulative bytes exceed the limit.
@@ -265,9 +272,12 @@ impl ProxyService {
 
         debug!(size = body_bytes.len(), "Collected MCP request body");
 
-        // Handle the MCP request - returns (StatusCode, Bytes) directly
-        // This avoids double-buffering (Simplification #5)
-        let (status, response_bytes) = mcp_handler.handle(body_bytes).await;
+        // Handle the MCP request with trace context - returns (StatusCode, Bytes) directly.
+        // This avoids double-buffering (Simplification #5).
+        // The trace context enables W3C trace propagation (REQ-OBS-002 §7.1).
+        let (status, response_bytes) = mcp_handler
+            .handle_with_context(body_bytes, trace_context)
+            .await;
 
         // Build unified response directly from bytes
         // Full<Bytes> has Infallible error - convert using absurd pattern

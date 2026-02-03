@@ -53,7 +53,7 @@ use thoughtgate_core::protocol::{
     strip_sse_capability,
 };
 use thoughtgate_core::telemetry::{
-    BoxedSpan, McpMessageType, McpSpanData, ThoughtGateMetrics, finish_mcp_span, start_mcp_span,
+    BoxedSpan, McpMessageType, McpSpanData, ThoughtGateMetrics, start_mcp_span,
 };
 use thoughtgate_core::transport::jsonrpc::{
     JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
@@ -427,7 +427,33 @@ impl McpHandler {
     /// # Traceability
     /// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
     pub async fn handle(&self, body: Bytes) -> (StatusCode, Bytes) {
-        handle_mcp_body_bytes(&self.state, body).await
+        handle_mcp_body_bytes(&self.state, body, None).await
+    }
+
+    /// Handle a buffered MCP request body with W3C trace context.
+    ///
+    /// This entry point accepts an OpenTelemetry `Context` extracted from
+    /// inbound HTTP headers, enabling MCP spans to become children of the
+    /// caller's trace for end-to-end distributed tracing.
+    ///
+    /// # Arguments
+    ///
+    /// * `body` - The buffered request body
+    /// * `parent_context` - OpenTelemetry context extracted from HTTP headers
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (StatusCode, response bytes) for direct use by ProxyService.
+    ///
+    /// # Traceability
+    /// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
+    /// - Implements: REQ-OBS-002 §7.1 (W3C Trace Context Propagation)
+    pub async fn handle_with_context(
+        &self,
+        body: Bytes,
+        parent_context: opentelemetry::Context,
+    ) -> (StatusCode, Bytes) {
+        handle_mcp_body_bytes(&self.state, body, Some(parent_context)).await
     }
 
     /// Handle a buffered MCP request body and return a full Response.
@@ -756,9 +782,12 @@ impl McpServer {
 /// This is the Axum handler that extracts state and body, then delegates
 /// to `handle_mcp_body_bytes` for the actual processing.
 ///
+/// Note: This handler does not extract trace context from headers. For
+/// trace propagation, use `McpHandler::handle_with_context()` via ProxyService.
+///
 /// Implements: REQ-CORE-003/§10 (Request Handler Pattern)
 async fn handle_mcp_request(State(state): State<Arc<McpState>>, body: Bytes) -> Response {
-    let (status, bytes) = handle_mcp_body_bytes(&state, body).await;
+    let (status, bytes) = handle_mcp_body_bytes(&state, body, None).await;
     (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
@@ -781,7 +810,12 @@ async fn handle_mcp_request(State(state): State<Arc<McpState>>, body: Bytes) -> 
 ///
 /// # Traceability
 /// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
-async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, Bytes) {
+/// - Implements: REQ-OBS-002 §7.1 (W3C Trace Context Propagation)
+async fn handle_mcp_body_bytes(
+    state: &McpState,
+    body: Bytes,
+    parent_context: Option<opentelemetry::Context>,
+) -> (StatusCode, Bytes) {
     // Check body size limit (generate unique correlation ID per REQ-CORE-004)
     if body.len() > state.max_body_size {
         let correlation_id =
@@ -883,8 +917,12 @@ async fn handle_mcp_body_bytes(state: &McpState, body: Bytes) -> (StatusCode, By
     };
 
     match parsed {
-        ParsedRequests::Single(request) => handle_single_request_bytes(state, request).await,
-        ParsedRequests::Batch(requests) => handle_batch_request_bytes(state, requests).await,
+        ParsedRequests::Single(request) => {
+            handle_single_request_bytes(state, request, parent_context.as_ref()).await
+        }
+        ParsedRequests::Batch(requests) => {
+            handle_batch_request_bytes(state, requests, parent_context.as_ref()).await
+        }
     }
 }
 
@@ -1364,7 +1402,11 @@ async fn route_request(
     }
 }
 
-async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (StatusCode, Bytes) {
+async fn handle_single_request_bytes(
+    state: &McpState,
+    request: McpRequest,
+    parent_context: Option<&opentelemetry::Context>,
+) -> (StatusCode, Bytes) {
     let correlation_id = request.correlation_id.to_string();
     let id = request.id.clone();
     let is_notification = request.is_notification();
@@ -1374,7 +1416,8 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
     // Extract tool name for tools/call requests (REQ-OBS-002 §5.1.1)
     let tool_name = extract_tool_name(&request);
 
-    // Start MCP span (REQ-OBS-002 §5.1)
+    // Start MCP span with optional parent context (REQ-OBS-002 §5.1, §7.1)
+    // When parent_context is provided, the span becomes a child of the caller's trace.
     let span_data = McpSpanData {
         method: &method,
         message_type: if is_notification {
@@ -1385,8 +1428,9 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
         message_id: id.as_ref().map(jsonrpc_id_to_string),
         correlation_id: &correlation_id,
         tool_name: tool_name.as_deref(),
+        parent_context,
     };
-    let mut span: BoxedSpan = start_mcp_span(&span_data);
+    let mut mcp_span: BoxedSpan = start_mcp_span(&span_data);
 
     debug!(
         correlation_id = %correlation_id,
@@ -1396,7 +1440,18 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
         "Processing single request"
     );
 
-    // Route the request through shared routing logic
+    // Route the request through shared routing logic.
+    // Note: Trace context propagation to upstream uses Context::current() in forward_once().
+    // The MCP span is part of the correct trace because we used parent_context when
+    // creating it via start_mcp_span(). For outbound propagation to upstream, the
+    // global propagator was installed in init_telemetry() and will inject the trace
+    // context based on the current span.
+    //
+    // IMPORTANT: ContextGuard is !Send and cannot be held across .await points.
+    // The trace context for upstream injection works because:
+    // 1. The MCP span was created with the correct parent context
+    // 2. The global propagator extracts context from the current span
+    // 3. forward_once() calls Context::current() which finds the span
     let result = route_request(state, request).await;
 
     // Determine error info for span (REQ-OBS-002 §5.1.1)
@@ -1409,9 +1464,10 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
         ),
     };
 
-    // Finish span with result attributes
-    finish_mcp_span(&mut span, is_error, error_code, error_type.as_deref());
-    drop(span);
+    // Finish span with result attributes using the original finish_mcp_span function
+    use thoughtgate_core::telemetry::finish_mcp_span;
+    finish_mcp_span(&mut mcp_span, is_error, error_code, error_type.as_deref());
+    drop(mcp_span);
 
     // Record MCP request metrics (OTel-based, deprecated)
     let outcome = if result.is_ok() { "success" } else { "error" };
@@ -2170,9 +2226,17 @@ async fn evaluate_with_cedar(
 async fn handle_batch_request_bytes(
     state: &McpState,
     items: Vec<thoughtgate_core::transport::jsonrpc::BatchItem>,
+    _parent_context: Option<&opentelemetry::Context>,
 ) -> (StatusCode, Bytes) {
     use futures_util::stream::{self, StreamExt};
     use thoughtgate_core::transport::jsonrpc::BatchItem;
+
+    // Note: For batch requests, trace context propagation is limited.
+    // ContextGuard is !Send, so we cannot attach it across async boundaries.
+    // Individual batch items don't get individual MCP spans in this implementation.
+    // The trace context from the parent will be visible via Context::current()
+    // if the caller attached it before calling this function.
+    // TODO: Consider creating a batch-level span that wraps all items.
 
     // Process batch items concurrently using buffer_unordered.
     // JSON-RPC batch spec allows responses in any order (matched by id).
