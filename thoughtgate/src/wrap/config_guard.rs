@@ -82,6 +82,16 @@ impl ConfigGuard {
     /// (e.g., `Drop` + signal handler).
     ///
     /// Implements: REQ-CORE-008 §10.2
+    /// Disable config restoration on drop.
+    ///
+    /// Sets the internal `restored` flag to `true` so that neither `restore()`
+    /// nor `Drop` will copy the backup over the config. Used when `--no-restore`
+    /// is set — the lock is still held for the guard's lifetime, but the config
+    /// is left in its rewritten state.
+    pub fn skip_restore(&self) {
+        self.restored.store(true, Ordering::SeqCst);
+    }
+
     pub fn restore(&self) -> Result<(), ConfigError> {
         // Swap returns the *previous* value. If it was already true, we've
         // already restored — return immediately.
