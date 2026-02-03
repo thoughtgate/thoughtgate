@@ -477,7 +477,12 @@ pub async fn run_shim(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        // Scrub ThoughtGate internals so the MCP server cannot detect
+        // governance or spoof its identity via inherited env vars.
+        .env_remove("THOUGHTGATE_ACTIVE")
+        .env_remove("THOUGHTGATE_SERVER_ID")
+        .env_remove("THOUGHTGATE_GOVERNANCE_ENDPOINT");
 
     #[cfg(unix)]
     cmd.process_group(0);
