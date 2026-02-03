@@ -26,6 +26,7 @@
 pub mod api;
 pub mod approval;
 pub mod engine;
+pub mod evaluator;
 pub mod handlers;
 pub mod pipeline;
 pub mod service;
@@ -59,8 +60,12 @@ pub use engine::{
 
 // Re-export governance API wire types (REQ-CORE-008)
 pub use api::{
-    GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse, MessageType,
+    ApprovalOutcome, GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse,
+    MessageType, TaskStatusResponse,
 };
+
+// Re-export governance evaluator (REQ-CORE-008/F-016)
+pub use evaluator::GovernanceEvaluator;
 
 // Re-export governance HTTP service types (REQ-CORE-008/F-008, F-016)
 pub use service::{

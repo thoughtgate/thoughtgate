@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::StreamDirection;
+use crate::governance::TaskStatus;
 use crate::jsonrpc::JsonRpcId;
 use crate::profile::Profile;
 
@@ -72,6 +73,12 @@ pub struct GovernanceEvaluateResponse {
     /// Human-readable reason for the decision (for audit/logging).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Poll interval hint in ms for PendingApproval decisions.
+    ///
+    /// When `decision` is `PendingApproval`, the shim should poll
+    /// `GET /governance/task/{task_id}` at this interval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
     /// When true, the shim must initiate graceful shutdown (F-018).
     /// Set by the governance service when `wrap` triggers shutdown (F-019).
     pub shutdown: bool,
@@ -89,6 +96,46 @@ pub enum GovernanceDecision {
     Deny,
     /// Message requires approval — shim must poll `GET /governance/task/{task_id}`.
     PendingApproval,
+}
+
+/// Response from `GET /governance/task/{task_id}`.
+///
+/// Returns the current task status and approval outcome so the shim can
+/// determine whether to forward, deny, or continue polling.
+///
+/// Implements: REQ-CORE-008/F-016
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskStatusResponse {
+    /// The task ID being queried.
+    pub task_id: String,
+    /// Current task lifecycle status.
+    pub status: TaskStatus,
+    /// Approval outcome, if a terminal decision has been reached.
+    /// `None` means the task is still pending approval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<ApprovalOutcome>,
+    /// Human-readable reason (e.g., rejection reason from approver).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Outcome of an approval workflow as seen by the shim.
+///
+/// Maps from the internal `ApprovalDecision` + terminal task states into
+/// a simplified enum the shim can act on directly.
+///
+/// Implements: REQ-CORE-008/F-016
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalOutcome {
+    /// Approval granted — shim should forward the original message.
+    Approved,
+    /// Approval explicitly rejected by a human reviewer.
+    Rejected,
+    /// Task expired before a decision was made (TTL elapsed).
+    Expired,
+    /// Task was cancelled (e.g., by another governance action).
+    Cancelled,
 }
 
 #[cfg(test)]
@@ -123,6 +170,7 @@ mod tests {
             task_id: None,
             policy_id: Some("policy-1".to_string()),
             reason: None,
+            poll_interval_ms: None,
             shutdown: false,
         };
 
@@ -141,6 +189,7 @@ mod tests {
             task_id: None,
             policy_id: None,
             reason: Some("service shutting down".to_string()),
+            poll_interval_ms: None,
             shutdown: true,
         };
 
@@ -158,6 +207,7 @@ mod tests {
             task_id: Some("tg_abc123".to_string()),
             policy_id: Some("require-approval".to_string()),
             reason: None,
+            poll_interval_ms: Some(5000),
             shutdown: false,
         };
 
@@ -207,6 +257,7 @@ mod tests {
             task_id: None,
             policy_id: None,
             reason: None,
+            poll_interval_ms: None,
             shutdown: false,
         };
 
@@ -215,6 +266,7 @@ mod tests {
         assert!(!json.contains("task_id"));
         assert!(!json.contains("policy_id"));
         assert!(!json.contains("reason"));
+        assert!(!json.contains("poll_interval_ms"));
         // Required fields always present
         assert!(json.contains("decision"));
         assert!(json.contains("shutdown"));

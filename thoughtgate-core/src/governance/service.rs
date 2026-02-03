@@ -10,9 +10,10 @@
 //! The service binds to a configurable port (default: 0 for OS-assigned
 //! ephemeral) and exposes four endpoints:
 //!
-//! - `POST /governance/evaluate` — 4-gate governance evaluation (stub: always Forward)
+//! - `POST /governance/evaluate` — 4-gate governance evaluation
 //! - `POST /governance/heartbeat` — shim liveness signal + shutdown notification
 //! - `POST /governance/shutdown` — trigger graceful shutdown of all shims
+//! - `GET /governance/task/{task_id}` — task approval status polling
 //! - `GET /healthz` — health check for shim readiness polling (F-016a)
 
 use std::collections::HashMap;
@@ -20,14 +21,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use super::api::{GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse};
+use super::api::{
+    ApprovalOutcome, GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse,
+    TaskStatusResponse,
+};
+use super::evaluator::GovernanceEvaluator;
+use super::task::{ApprovalDecision, TaskStatus, TaskStore};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared State
@@ -39,6 +45,9 @@ use super::api::{GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvalua
 /// flag is piggy-backed onto every evaluate and heartbeat response so that
 /// shims can detect when `wrap` wants them to drain (F-016 shutdown coordination).
 ///
+/// When `evaluator` is `Some`, the evaluate handler delegates to the 4-gate
+/// governance logic. When `None` (stub mode), it always returns Forward.
+///
 /// Implements: REQ-CORE-008/F-008
 pub struct GovernanceServiceState {
     /// Shutdown flag — set to `true` when `wrap` wants all shims to drain.
@@ -48,14 +57,40 @@ pub struct GovernanceServiceState {
     /// Connected shim tracking: server_id → last heartbeat timestamp.
     /// Used to detect stale shims that have stopped sending heartbeats.
     shims: tokio::sync::Mutex<HashMap<String, Instant>>,
+
+    /// Governance evaluator for 4-gate evaluation. When `None`, the
+    /// evaluate endpoint operates in stub mode (always Forward).
+    evaluator: Option<Arc<GovernanceEvaluator>>,
+
+    /// Task store for approval workflow tasks. Required when `evaluator`
+    /// is `Some` — used by the task status endpoint.
+    task_store: Option<Arc<TaskStore>>,
 }
 
 impl GovernanceServiceState {
-    /// Create a new governance service state with shutdown flag unset.
+    /// Create a new governance service state in stub mode (always Forward).
     pub fn new() -> Self {
         Self {
             shutdown: AtomicBool::new(false),
             shims: tokio::sync::Mutex::new(HashMap::new()),
+            evaluator: None,
+            task_store: None,
+        }
+    }
+
+    /// Create a governance service state with a real evaluator and task store.
+    ///
+    /// When constructed this way, the evaluate endpoint delegates to the
+    /// evaluator's 4-gate logic, and the task status endpoint queries
+    /// the task store.
+    ///
+    /// Implements: REQ-CORE-008/F-016
+    pub fn with_evaluator(evaluator: Arc<GovernanceEvaluator>, task_store: Arc<TaskStore>) -> Self {
+        Self {
+            shutdown: AtomicBool::new(false),
+            shims: tokio::sync::Mutex::new(HashMap::new()),
+            evaluator: Some(evaluator),
+            task_store: Some(task_store),
         }
     }
 
@@ -121,6 +156,7 @@ pub fn governance_router(state: Arc<GovernanceServiceState>) -> Router {
         .route("/governance/evaluate", post(evaluate_handler))
         .route("/governance/heartbeat", post(heartbeat_handler))
         .route("/governance/shutdown", post(shutdown_handler))
+        .route("/governance/task/{task_id}", get(task_status_handler))
         .route("/healthz", get(healthz_handler))
         .with_state(state)
 }
@@ -128,8 +164,8 @@ pub fn governance_router(state: Arc<GovernanceServiceState>) -> Router {
 /// Handle `POST /governance/evaluate`.
 ///
 /// Receives a classified JSON-RPC message from a shim and returns a governance
-/// decision. Currently a stub that always returns `Forward` — real Cedar policy
-/// evaluation will be wired in later.
+/// decision. Delegates to the [`GovernanceEvaluator`] when configured, otherwise
+/// operates in stub mode (always Forward).
 ///
 /// The `shutdown` field is piggy-backed onto every response so the shim can
 /// detect shutdown without waiting for the next heartbeat.
@@ -137,16 +173,25 @@ pub fn governance_router(state: Arc<GovernanceServiceState>) -> Router {
 /// Implements: REQ-CORE-008/F-016
 async fn evaluate_handler(
     State(state): State<Arc<GovernanceServiceState>>,
-    Json(_req): Json<GovernanceEvaluateRequest>,
+    Json(req): Json<GovernanceEvaluateRequest>,
 ) -> Json<GovernanceEvaluateResponse> {
-    // Stub: always forward. Real Cedar evaluation wired in later.
-    Json(GovernanceEvaluateResponse {
-        decision: GovernanceDecision::Forward,
-        task_id: None,
-        policy_id: None,
-        reason: None,
-        shutdown: state.shutdown.load(Ordering::SeqCst),
-    })
+    let shutdown = state.shutdown.load(Ordering::SeqCst);
+
+    if let Some(ref evaluator) = state.evaluator {
+        let mut resp = evaluator.evaluate(&req).await;
+        resp.shutdown = shutdown;
+        Json(resp)
+    } else {
+        // Stub mode (backward compat): always forward.
+        Json(GovernanceEvaluateResponse {
+            decision: GovernanceDecision::Forward,
+            task_id: None,
+            policy_id: None,
+            reason: None,
+            poll_interval_ms: None,
+            shutdown,
+        })
+    }
 }
 
 /// Handle `POST /governance/heartbeat`.
@@ -181,6 +226,53 @@ async fn heartbeat_handler(
 async fn shutdown_handler(State(state): State<Arc<GovernanceServiceState>>) -> StatusCode {
     state.shutdown.store(true, Ordering::SeqCst);
     StatusCode::OK
+}
+
+/// Handle `GET /governance/task/{task_id}`.
+///
+/// Returns the current task status and approval outcome so the shim can
+/// determine whether to forward, deny, or continue polling. Maps internal
+/// task state to the simplified [`ApprovalOutcome`] the shim needs.
+///
+/// Returns 404 if the task_id is unknown or the task store is not configured.
+///
+/// Implements: REQ-CORE-008/F-016
+async fn task_status_handler(
+    State(state): State<Arc<GovernanceServiceState>>,
+    Path(task_id): Path<String>,
+) -> Result<Json<TaskStatusResponse>, StatusCode> {
+    let task_store = state.task_store.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+
+    let task_id_parsed = task_id.parse().map_err(|_| StatusCode::NOT_FOUND)?;
+    let task = task_store
+        .get(&task_id_parsed)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Map internal task state to shim-visible approval outcome.
+    // The shim cares about the *approval decision*, not the execution lifecycle.
+    let (decision, reason) = if let Some(ref approval) = task.approval {
+        // Primary signal: the approval record (set by PollingScheduler).
+        match &approval.decision {
+            ApprovalDecision::Approved => (Some(ApprovalOutcome::Approved), None),
+            ApprovalDecision::Rejected { reason } => {
+                (Some(ApprovalOutcome::Rejected), reason.clone())
+            }
+        }
+    } else {
+        // No approval record — check terminal states.
+        match task.status {
+            TaskStatus::Expired => (Some(ApprovalOutcome::Expired), None),
+            TaskStatus::Cancelled => (Some(ApprovalOutcome::Cancelled), None),
+            _ => (None, None), // Still pending (InputRequired, Working, etc.)
+        }
+    };
+
+    Ok(Json(TaskStatusResponse {
+        task_id,
+        status: task.status,
+        decision,
+        reason,
+    }))
 }
 
 /// Handle `GET /healthz`.
@@ -351,5 +443,246 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+
+    // ── Evaluator-backed service tests ──────────────────────────────────
+
+    fn test_config() -> Arc<crate::config::Config> {
+        Arc::new(
+            serde_saphyr::from_str(
+                r#"
+schema: 1
+sources:
+  - id: test-server
+    kind: mcp
+    url: http://localhost:3000
+    expose:
+      mode: blocklist
+      tools:
+        - "blocked_*"
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "denied_*"
+      action: deny
+"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn start_evaluator_service() -> (u16, Arc<GovernanceServiceState>, Arc<TaskStore>) {
+        use crate::governance::evaluator::GovernanceEvaluator;
+        use crate::governance::task::Principal;
+
+        let config = test_config();
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let principal = Principal::new("test-app");
+        let evaluator = Arc::new(GovernanceEvaluator::new(
+            config,
+            None,
+            task_store.clone(),
+            principal,
+            Profile::Production,
+        ));
+
+        let state = Arc::new(GovernanceServiceState::with_evaluator(
+            evaluator,
+            task_store.clone(),
+        ));
+        let (port, _handle) = start_governance_service(0, state.clone()).await.unwrap();
+        (port, state, task_store)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_evaluate_with_evaluator_forward() {
+        let (port, _state, _) = start_evaluator_service().await;
+
+        let client = reqwest::Client::new();
+        let req = GovernanceEvaluateRequest {
+            server_id: "test-server".to_string(),
+            direction: StreamDirection::AgentToServer,
+            method: "tools/call".to_string(),
+            id: Some(crate::jsonrpc::JsonRpcId::Number(1)),
+            params: Some(serde_json::json!({"name": "safe_tool"})),
+            message_type: MessageType::Request,
+            profile: Profile::Production,
+        };
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/governance/evaluate"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: GovernanceEvaluateResponse = resp.json().await.unwrap();
+        assert_eq!(body.decision, GovernanceDecision::Forward);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_evaluate_with_evaluator_deny() {
+        let (port, _state, _) = start_evaluator_service().await;
+
+        let client = reqwest::Client::new();
+        let req = GovernanceEvaluateRequest {
+            server_id: "test-server".to_string(),
+            direction: StreamDirection::AgentToServer,
+            method: "tools/call".to_string(),
+            id: Some(crate::jsonrpc::JsonRpcId::Number(1)),
+            params: Some(serde_json::json!({"name": "denied_delete"})),
+            message_type: MessageType::Request,
+            profile: Profile::Production,
+        };
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/governance/evaluate"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: GovernanceEvaluateResponse = resp.json().await.unwrap();
+        assert_eq!(body.decision, GovernanceDecision::Deny);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_evaluate_with_evaluator_deny_blocked_tool() {
+        let (port, _state, _) = start_evaluator_service().await;
+
+        let client = reqwest::Client::new();
+        let req = GovernanceEvaluateRequest {
+            server_id: "test-server".to_string(),
+            direction: StreamDirection::AgentToServer,
+            method: "tools/call".to_string(),
+            id: Some(crate::jsonrpc::JsonRpcId::Number(1)),
+            params: Some(serde_json::json!({"name": "blocked_admin"})),
+            message_type: MessageType::Request,
+            profile: Profile::Production,
+        };
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/governance/evaluate"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: GovernanceEvaluateResponse = resp.json().await.unwrap();
+        assert_eq!(body.decision, GovernanceDecision::Deny);
+        assert!(body.reason.as_deref().unwrap_or("").contains("not exposed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_task_status_not_found() {
+        let (port, _state, _) = start_evaluator_service().await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{port}/governance/task/tg_nonexistent"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_task_status_pending() {
+        use crate::governance::engine::TimeoutAction;
+        use crate::governance::task::{Principal, ToolCallRequest};
+        use crate::jsonrpc::JsonRpcId;
+
+        let (port, _state, task_store) = start_evaluator_service().await;
+
+        // Manually create a task in InputRequired state.
+        let tool_req = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "deploy".to_string(),
+            arguments: serde_json::json!({}),
+            mcp_request_id: JsonRpcId::Number(1),
+        };
+        let task = task_store
+            .create(
+                tool_req.clone(),
+                tool_req,
+                Principal::new("test"),
+                None,
+                TimeoutAction::Deny,
+            )
+            .unwrap();
+        let task_id = task.id.to_string();
+        task_store
+            .transition(&task.id, TaskStatus::InputRequired, None)
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/governance/task/{task_id}"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: TaskStatusResponse = resp.json().await.unwrap();
+        assert_eq!(body.task_id, task_id);
+        assert_eq!(body.status, TaskStatus::InputRequired);
+        assert!(body.decision.is_none()); // No approval yet.
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_task_status_approved() {
+        use crate::governance::engine::TimeoutAction;
+        use crate::governance::task::{ApprovalDecision, Principal, ToolCallRequest};
+        use crate::jsonrpc::JsonRpcId;
+        use std::time::Duration;
+
+        let (port, _state, task_store) = start_evaluator_service().await;
+
+        // Create task, transition to InputRequired, then record approval.
+        let tool_req = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "deploy".to_string(),
+            arguments: serde_json::json!({}),
+            mcp_request_id: JsonRpcId::Number(1),
+        };
+        let task = task_store
+            .create(
+                tool_req.clone(),
+                tool_req,
+                Principal::new("test"),
+                None,
+                TimeoutAction::Deny,
+            )
+            .unwrap();
+        let task_id = task.id.to_string();
+        task_store
+            .transition(&task.id, TaskStatus::InputRequired, None)
+            .unwrap();
+        task_store
+            .record_approval(
+                &task.id,
+                ApprovalDecision::Approved,
+                "reviewer".to_string(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/governance/task/{task_id}"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: TaskStatusResponse = resp.json().await.unwrap();
+        assert_eq!(body.decision, Some(ApprovalOutcome::Approved));
     }
 }
