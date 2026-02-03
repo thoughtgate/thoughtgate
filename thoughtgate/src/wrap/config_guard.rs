@@ -74,14 +74,6 @@ impl ConfigGuard {
         })
     }
 
-    /// Restore the original config from backup.
-    ///
-    /// This method is idempotent: the first call performs the restore, subsequent
-    /// calls return `Ok(())` immediately. Uses `AtomicBool::swap` with `SeqCst`
-    /// ordering to ensure exactly-once semantics across concurrent callers
-    /// (e.g., `Drop` + signal handler).
-    ///
-    /// Implements: REQ-CORE-008 §10.2
     /// Disable config restoration on drop.
     ///
     /// Sets the internal `restored` flag to `true` so that neither `restore()`
@@ -92,6 +84,14 @@ impl ConfigGuard {
         self.restored.store(true, Ordering::SeqCst);
     }
 
+    /// Restore the original config from backup.
+    ///
+    /// This method is idempotent: the first call performs the restore, subsequent
+    /// calls return `Ok(())` immediately. Uses `AtomicBool::swap` with `SeqCst`
+    /// ordering to ensure exactly-once semantics across concurrent callers
+    /// (e.g., `Drop` + signal handler).
+    ///
+    /// Implements: REQ-CORE-008 §10.2
     pub fn restore(&self) -> Result<(), ConfigError> {
         // Swap returns the *previous* value. If it was already true, we've
         // already restored — return immediately.

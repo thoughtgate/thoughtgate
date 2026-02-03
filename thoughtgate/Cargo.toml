@@ -27,6 +27,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 fs2 = "0.4"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+proptest = "1.0"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["signal", "process"] }

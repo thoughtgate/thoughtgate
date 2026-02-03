@@ -24,6 +24,9 @@ Thumbs.db
 # Test artifacts
 bench_metrics.json
 
+# Proptest regression files
+proptest-regressions/
+
 # Docusaurus
 website/node_modules/
 website/build/
