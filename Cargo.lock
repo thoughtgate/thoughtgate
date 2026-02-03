@@ -3721,6 +3721,7 @@ dependencies = [
  "thoughtgate-core",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
