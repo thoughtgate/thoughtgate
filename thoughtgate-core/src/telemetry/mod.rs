@@ -73,8 +73,16 @@ pub use trace_context::{
     DeserializedContext, SerializedTraceContext, deserialize_span_context, serialize_span_context,
 };
 
-// Re-export propagation utilities (REQ-OBS-002 §7.1, §7.2)
-pub use propagation::{extract_context_from_headers, inject_context_into_headers};
+// Re-export propagation utilities (REQ-OBS-002 §7.1, §7.2, §7.3)
+pub use propagation::{
+    // Stdio transport (§7.3)
+    StdioTraceContext,
+    // HTTP transport (§7.1, §7.2)
+    extract_context_from_headers,
+    extract_context_from_meta,
+    inject_context_into_headers,
+    inject_context_into_meta,
+};
 
 // Re-export prometheus-client metrics
 pub use cardinality::CardinalityLimiter;

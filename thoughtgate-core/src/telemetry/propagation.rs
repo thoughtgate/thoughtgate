@@ -1,6 +1,9 @@
-//! W3C Trace Context propagation for HTTP transport.
+//! W3C Trace Context propagation for HTTP and stdio transports.
 //!
-//! Provides extract/inject helpers for traceparent and tracestate HTTP headers.
+//! Provides extract/inject helpers for:
+//! - HTTP headers (`traceparent`, `tracestate`)
+//! - Stdio JSON-RPC `params._meta` fields (for Claude Desktop, Cursor, VS Code, Windsurf)
+//!
 //! Works with both `http::HeaderMap` and `reqwest::header::HeaderMap` (they are
 //! the same type - reqwest re-exports from http crate).
 //!
@@ -24,10 +27,12 @@
 //! # Traceability
 //! - Implements: REQ-OBS-002 §7.1 (Inbound Trace Context Extraction)
 //! - Implements: REQ-OBS-002 §7.2 (Outbound Trace Context Injection)
+//! - Implements: REQ-OBS-002 §7.3 (Stdio Transport Propagation)
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use opentelemetry::Context;
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,6 +198,220 @@ fn augment_tracestate(headers: &mut HeaderMap, session_id: &str) {
 
     if let Ok(val) = HeaderValue::from_str(&new_value) {
         headers.insert(tracestate_key, val);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stdio Transport Propagation (REQ-OBS-002 §7.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extractor for JSON-RPC `params._meta` fields (stdio transport).
+///
+/// Implements the OTel `Extractor` trait for W3C trace context stored in
+/// JSON-RPC params._meta fields, enabling trace propagation through stdio
+/// transports used by Claude Desktop, Cursor, VS Code, and Windsurf.
+struct MetaExtractor<'a>(&'a serde_json::Map<String, serde_json::Value>);
+
+impl Extractor for MetaExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key)?.as_str()
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Injector for JSON-RPC result `_meta` fields (stdio transport).
+///
+/// Implements the OTel `Injector` trait for W3C trace context injection
+/// into JSON-RPC response _meta fields.
+struct MetaInjector<'a>(&'a mut serde_json::Map<String, serde_json::Value>);
+
+impl Injector for MetaInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0
+            .insert(key.to_string(), serde_json::Value::String(value));
+    }
+}
+
+/// Result of extracting trace context from stdio `_meta` field.
+///
+/// Includes the extracted OpenTelemetry context and the modified params
+/// with `_meta.traceparent`/`_meta.tracestate` stripped for upstream forwarding.
+#[derive(Debug)]
+pub struct StdioTraceContext {
+    /// The extracted OpenTelemetry context (may be empty if no traceparent).
+    pub context: Context,
+
+    /// The params with `_meta.traceparent` and `_meta.tracestate` removed.
+    /// If `_meta` becomes empty after stripping, it is also removed.
+    pub stripped_params: Option<serde_json::Value>,
+
+    /// Whether a valid trace context was extracted.
+    pub had_trace_context: bool,
+}
+
+/// Extract trace context from JSON-RPC `params._meta` field (stdio transport).
+///
+/// Per REQ-OBS-002 §7.3, stdio transports use `params._meta.traceparent` and
+/// `params._meta.tracestate` for trace propagation since there are no HTTP headers.
+///
+/// This function:
+/// 1. Extracts `traceparent` and `tracestate` from `params._meta` if present
+/// 2. Creates an OpenTelemetry context from the extracted trace data
+/// 3. Strips `_meta.traceparent` and `_meta.tracestate` from params to avoid
+///    breaking strict upstream MCP servers that reject unknown fields
+///
+/// # Arguments
+///
+/// * `params` - The JSON-RPC params value (may or may not have `_meta`)
+///
+/// # Returns
+///
+/// A [`StdioTraceContext`] containing the extracted context and stripped params.
+///
+/// # Example
+///
+/// ```ignore
+/// let params = json!({
+///     "_meta": {
+///         "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+///     },
+///     "name": "calculator",
+///     "arguments": { "a": 1 }
+/// });
+///
+/// let result = extract_context_from_meta(Some(&params));
+/// assert!(result.had_trace_context);
+/// // result.stripped_params has _meta.traceparent removed
+/// ```
+///
+/// Implements: REQ-OBS-002 §7.3
+pub fn extract_context_from_meta(params: Option<&serde_json::Value>) -> StdioTraceContext {
+    let propagator = TraceContextPropagator::new();
+
+    // Handle None params
+    let Some(params) = params else {
+        return StdioTraceContext {
+            context: Context::current(),
+            stripped_params: None,
+            had_trace_context: false,
+        };
+    };
+
+    // Get _meta object if present
+    let Some(meta) = params.get("_meta").and_then(|m| m.as_object()) else {
+        return StdioTraceContext {
+            context: Context::current(),
+            stripped_params: Some(params.clone()),
+            had_trace_context: false,
+        };
+    };
+
+    // Extract trace context
+    let context = propagator.extract(&MetaExtractor(meta));
+
+    // Check if we actually extracted a valid trace context
+    let span_context = context.span().span_context().clone();
+    let had_trace_context = span_context.is_valid() && span_context.is_remote();
+
+    // Strip traceparent and tracestate from _meta
+    let mut stripped_meta = meta.clone();
+    stripped_meta.remove("traceparent");
+    stripped_meta.remove("tracestate");
+
+    // Rebuild params with stripped _meta (or without _meta if empty)
+    let stripped_params = if let Some(obj) = params.as_object() {
+        let mut new_obj = obj.clone();
+        if stripped_meta.is_empty() {
+            new_obj.remove("_meta");
+        } else {
+            new_obj.insert(
+                "_meta".to_string(),
+                serde_json::Value::Object(stripped_meta),
+            );
+        }
+        Some(serde_json::Value::Object(new_obj))
+    } else {
+        Some(params.clone())
+    };
+
+    StdioTraceContext {
+        context,
+        stripped_params,
+        had_trace_context,
+    }
+}
+
+/// Inject trace context into JSON-RPC response `result._meta` field.
+///
+/// Per REQ-OBS-002 §7.3.2, when returning a response over stdio, ThoughtGate
+/// injects trace context into the response's `result._meta` field.
+///
+/// # Arguments
+///
+/// * `cx` - The OpenTelemetry context containing the current span
+/// * `result` - Mutable JSON-RPC result value to inject into
+/// * `session_id` - Optional session identifier to add to tracestate
+///
+/// # Example
+///
+/// ```ignore
+/// let mut result = json!({ "content": [...] });
+/// inject_context_into_meta(&Context::current(), &mut result, Some("session-123"));
+/// // result now has _meta.traceparent and _meta.tracestate
+/// ```
+///
+/// Implements: REQ-OBS-002 §7.3.2
+pub fn inject_context_into_meta(
+    cx: &Context,
+    result: &mut serde_json::Value,
+    session_id: Option<&str>,
+) {
+    let propagator = TraceContextPropagator::new();
+
+    // Ensure result is an object
+    let obj = match result.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+
+    // Get or create _meta
+    let meta = obj
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    let meta_obj = match meta.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+
+    // Inject trace context
+    propagator.inject_context(cx, &mut MetaInjector(meta_obj));
+
+    // Augment tracestate with thoughtgate session identifier
+    if let Some(sid) = session_id {
+        if let Some(existing_ts) = meta_obj.get("tracestate").and_then(|v| v.as_str()) {
+            // Parse existing entries, remove any old thoughtgate entry, prepend new
+            let entries: Vec<&str> = existing_ts
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && !s.starts_with("thoughtgate="))
+                .collect();
+            let tg_entry = format!("thoughtgate={}", sid);
+            let mut all_entries = vec![tg_entry.as_str()];
+            all_entries.extend(entries.into_iter().take(31));
+            meta_obj.insert(
+                "tracestate".to_string(),
+                serde_json::Value::String(all_entries.join(",")),
+            );
+        } else {
+            meta_obj.insert(
+                "tracestate".to_string(),
+                serde_json::Value::String(format!("thoughtgate={}", sid)),
+            );
+        }
     }
 }
 
@@ -425,5 +644,207 @@ mod tests {
 
         // Should not be inserted due to invalid value
         assert!(!headers.contains_key("test-header"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Stdio Transport Tests (REQ-OBS-002 §7.3)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_from_meta_valid_traceparent() {
+        use serde_json::json;
+
+        let params = json!({
+            "_meta": {
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            },
+            "name": "calculator",
+            "arguments": { "a": 1 }
+        });
+
+        let result = extract_context_from_meta(Some(&params));
+
+        assert!(result.had_trace_context);
+
+        // Verify extracted context
+        let span = result.context.span();
+        let span_context = span.span_context();
+        assert!(span_context.is_valid());
+        assert!(span_context.is_remote());
+        assert_eq!(
+            span_context.trace_id(),
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap()
+        );
+        assert_eq!(
+            span_context.span_id(),
+            SpanId::from_hex("00f067aa0ba902b7").unwrap()
+        );
+
+        // Verify traceparent was stripped
+        let stripped = result.stripped_params.unwrap();
+        assert!(stripped.get("_meta").is_none() || stripped["_meta"].get("traceparent").is_none());
+        // Other params preserved
+        assert_eq!(stripped["name"], "calculator");
+        assert_eq!(stripped["arguments"]["a"], 1);
+    }
+
+    #[test]
+    fn test_extract_from_meta_with_tracestate() {
+        use serde_json::json;
+
+        let params = json!({
+            "_meta": {
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                "tracestate": "vendor=value,other=data"
+            },
+            "name": "test"
+        });
+
+        let result = extract_context_from_meta(Some(&params));
+
+        assert!(result.had_trace_context);
+
+        // Verify tracestate preserved in context
+        let span_context = result.context.span().span_context().clone();
+        let header = span_context.trace_state().header();
+        assert!(header.contains("vendor=value"));
+
+        // Verify both traceparent and tracestate stripped
+        let stripped = result.stripped_params.unwrap();
+        assert!(stripped.get("_meta").is_none());
+    }
+
+    #[test]
+    fn test_extract_from_meta_no_meta() {
+        use serde_json::json;
+
+        let params = json!({
+            "name": "calculator",
+            "arguments": { "a": 1 }
+        });
+
+        let result = extract_context_from_meta(Some(&params));
+
+        assert!(!result.had_trace_context);
+
+        // Params unchanged
+        let stripped = result.stripped_params.unwrap();
+        assert_eq!(stripped, params);
+    }
+
+    #[test]
+    fn test_extract_from_meta_none_params() {
+        let result = extract_context_from_meta(None);
+
+        assert!(!result.had_trace_context);
+        assert!(result.stripped_params.is_none());
+    }
+
+    #[test]
+    fn test_extract_from_meta_preserves_other_meta_fields() {
+        use serde_json::json;
+
+        let params = json!({
+            "_meta": {
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                "custom_field": "preserved"
+            },
+            "name": "test"
+        });
+
+        let result = extract_context_from_meta(Some(&params));
+
+        assert!(result.had_trace_context);
+
+        // Custom field should be preserved
+        let stripped = result.stripped_params.unwrap();
+        assert!(stripped.get("_meta").is_some());
+        assert_eq!(stripped["_meta"]["custom_field"], "preserved");
+        assert!(stripped["_meta"].get("traceparent").is_none());
+    }
+
+    #[test]
+    fn test_extract_from_meta_invalid_traceparent() {
+        use serde_json::json;
+
+        let params = json!({
+            "_meta": {
+                "traceparent": "invalid-format"
+            },
+            "name": "test"
+        });
+
+        let result = extract_context_from_meta(Some(&params));
+
+        // Invalid traceparent should not create a remote context
+        assert!(!result.had_trace_context);
+    }
+
+    #[test]
+    fn test_inject_into_meta_basic() {
+        use opentelemetry::trace::Tracer;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use serde_json::json;
+
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("test");
+        let span = tracer.start("test-span");
+        let cx = Context::current_with_span(span);
+
+        let mut result = json!({
+            "content": [{ "type": "text", "text": "hello" }]
+        });
+
+        inject_context_into_meta(&cx, &mut result, None);
+
+        // Should have _meta.traceparent
+        assert!(result.get("_meta").is_some());
+        let traceparent = result["_meta"]["traceparent"].as_str().unwrap();
+        assert!(traceparent.starts_with("00-"));
+        assert_eq!(traceparent.len(), 55);
+    }
+
+    #[test]
+    fn test_inject_into_meta_with_session_id() {
+        use opentelemetry::trace::Tracer;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use serde_json::json;
+
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("test");
+        let span = tracer.start("test-span");
+        let cx = Context::current_with_span(span);
+
+        let mut result = json!({ "content": [] });
+
+        inject_context_into_meta(&cx, &mut result, Some("session-xyz"));
+
+        // Should have tracestate with thoughtgate entry
+        let tracestate = result["_meta"]["tracestate"].as_str().unwrap();
+        assert!(tracestate.contains("thoughtgate=session-xyz"));
+    }
+
+    #[test]
+    fn test_inject_into_meta_preserves_existing_meta() {
+        use opentelemetry::trace::Tracer;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use serde_json::json;
+
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("test");
+        let span = tracer.start("test-span");
+        let cx = Context::current_with_span(span);
+
+        let mut result = json!({
+            "_meta": { "existing": "value" },
+            "content": []
+        });
+
+        inject_context_into_meta(&cx, &mut result, None);
+
+        // Existing _meta field preserved
+        assert_eq!(result["_meta"]["existing"], "value");
+        // traceparent added
+        assert!(result["_meta"]["traceparent"].is_string());
     }
 }

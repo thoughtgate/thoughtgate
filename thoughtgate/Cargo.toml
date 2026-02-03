@@ -30,6 +30,10 @@ which = "7"
 fs2 = "0.4"
 tokio-util = { version = "0.7", features = ["rt"] }
 
+# OpenTelemetry for trace context propagation (REQ-OBS-002 §7.3)
+opentelemetry = { version = "=0.31.0" }
+opentelemetry_sdk = { version = "=0.31.0" }
+
 [dev-dependencies]
 proptest = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

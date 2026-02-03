@@ -1,11 +1,26 @@
-//! Bidirectional stdio proxy with governance evaluation.
+//! Bidirectional stdio proxy with governance evaluation and trace context propagation.
 //!
 //! Implements: REQ-CORE-008 §7.4 (F-011 through F-017), §7.5 (F-018)
+//! Implements: REQ-OBS-002 §7.3 (Stdio Transport Trace Context Propagation)
 //!
 //! This module contains the main shim proxy function [`run_shim`] which spawns
 //! an MCP server child process, proxies stdin/stdout bidirectionally with
 //! governance evaluation on the agent→server path, sends periodic heartbeats,
 //! and handles graceful shutdown.
+//!
+//! # Trace Context Propagation
+//!
+//! The shim extracts W3C trace context from `params._meta.traceparent` and
+//! `params._meta.tracestate` fields in incoming JSON-RPC messages. This enables
+//! distributed tracing through stdio-based MCP clients (Claude Desktop, Cursor,
+//! VS Code, Windsurf). The trace context is:
+//!
+//! 1. Extracted from the incoming message's `_meta` field
+//! 2. Forwarded to the governance service via HTTP headers
+//! 3. Stripped from the message before forwarding to the MCP server
+//!
+//! This design ensures upstream MCP servers with strict schema validation don't
+//! reject requests containing unknown fields.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +38,7 @@ use thoughtgate_core::governance::service::HeartbeatRequest;
 use thoughtgate_core::jsonrpc::JsonRpcMessageKind;
 use thoughtgate_core::metrics::StdioMetrics;
 use thoughtgate_core::profile::Profile;
+use thoughtgate_core::telemetry::extract_context_from_meta;
 
 use crate::error::{FramingError, StdioError};
 use crate::shim::ndjson::{detect_smuggling, parse_stdio_message};
@@ -182,6 +198,61 @@ fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<thoughtgate_core::jsonrpc::
         }
         JsonRpcMessageKind::Notification { .. } => None,
     }
+}
+
+/// Rebuild a JSON-RPC message with new params.
+///
+/// Used to strip `_meta.traceparent` and `_meta.tracestate` before forwarding
+/// to the upstream MCP server, as many servers use strict schema validation
+/// and will reject unknown fields.
+///
+/// Implements: REQ-OBS-002 §7.3
+fn rebuild_message_with_params(
+    kind: &JsonRpcMessageKind,
+    params: Option<&serde_json::Value>,
+) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "jsonrpc".to_string(),
+        serde_json::Value::String("2.0".to_string()),
+    );
+
+    match kind {
+        JsonRpcMessageKind::Request { id, method } => {
+            obj.insert(
+                "id".to_string(),
+                serde_json::to_value(id).unwrap_or(serde_json::Value::Null),
+            );
+            obj.insert(
+                "method".to_string(),
+                serde_json::Value::String(method.clone()),
+            );
+            if let Some(p) = params {
+                obj.insert("params".to_string(), p.clone());
+            }
+        }
+        JsonRpcMessageKind::Notification { method } => {
+            obj.insert(
+                "method".to_string(),
+                serde_json::Value::String(method.clone()),
+            );
+            if let Some(p) = params {
+                obj.insert("params".to_string(), p.clone());
+            }
+        }
+        JsonRpcMessageKind::Response { id } => {
+            obj.insert(
+                "id".to_string(),
+                serde_json::to_value(id).unwrap_or(serde_json::Value::Null),
+            );
+            // Responses use result/error, not params - but we handle them separately
+        }
+    }
+
+    let mut json =
+        serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".to_string());
+    json.push('\n');
+    json
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -828,23 +899,64 @@ async fn agent_to_server(
             continue;
         }
 
+        // REQ-OBS-002 §7.3: Extract trace context from _meta for stdio transport.
+        // This enables distributed tracing through stdio-based MCP clients
+        // (Claude Desktop, Cursor, VS Code, Windsurf).
+        let trace_ctx = extract_context_from_meta(msg.params.as_ref());
+        let stripped_params = trace_ctx.stripped_params.clone();
+
+        // Build the message to forward (with _meta.traceparent stripped if present).
+        // Only rebuild if we actually extracted trace context to avoid unnecessary overhead.
+        let forward_bytes: Vec<u8> = if trace_ctx.had_trace_context {
+            rebuild_message_with_params(&msg.kind, stripped_params.as_ref()).into_bytes()
+        } else {
+            raw_buf.clone()
+        };
+
+        if trace_ctx.had_trace_context {
+            tracing::debug!(
+                server_id,
+                method,
+                "extracted trace context from _meta, stripped for upstream"
+            );
+        }
+
         // F-016: Governance evaluation via HTTP.
+        // Use stripped params to avoid sending trace context in the body.
         let eval_req = GovernanceEvaluateRequest {
             server_id: server_id.clone(),
             direction: StreamDirection::AgentToServer,
             method: method.clone(),
             id: id_from_kind(&msg.kind),
-            params: msg.params.clone(),
+            params: stripped_params,
             message_type: message_type_from_kind(&msg.kind),
             profile,
         };
 
-        let eval_result = client
+        // Build HTTP request, adding traceparent/tracestate headers if extracted.
+        let mut request = client
             .post(&evaluate_url)
             .timeout(Duration::from_millis(EVALUATE_TIMEOUT_MS))
-            .json(&eval_req)
-            .send()
-            .await;
+            .json(&eval_req);
+
+        // Propagate trace context via HTTP headers to governance service.
+        if trace_ctx.had_trace_context {
+            use opentelemetry::propagation::TextMapPropagator;
+            use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+            let propagator = TraceContextPropagator::new();
+            let mut carrier = std::collections::HashMap::new();
+            propagator.inject_context(&trace_ctx.context, &mut carrier);
+
+            if let Some(tp) = carrier.get("traceparent") {
+                request = request.header("traceparent", tp);
+            }
+            if let Some(ts) = carrier.get("tracestate") {
+                request = request.header("tracestate", ts);
+            }
+        }
+
+        let eval_result = request.send().await;
 
         let eval_resp: GovernanceEvaluateResponse = match eval_result {
             Ok(resp) => match resp.json().await {
@@ -950,8 +1062,9 @@ async fn agent_to_server(
 
         match eval_resp.decision {
             GovernanceDecision::Forward => {
+                // Forward with _meta.traceparent stripped (REQ-OBS-002 §7.3).
                 child_stdin
-                    .write_all(&raw_buf)
+                    .write_all(&forward_bytes)
                     .await
                     .map_err(|e| StdioError::Framing {
                         server_id: server_id.clone(),
@@ -1029,14 +1142,14 @@ async fn agent_to_server(
                 match outcome {
                     ApprovalPollResult::Approved => {
                         tracing::info!(server_id, task_id, "approval granted — forwarding");
-                        child_stdin
-                            .write_all(&raw_buf)
-                            .await
-                            .map_err(|e| StdioError::Framing {
+                        // Forward with _meta.traceparent stripped (REQ-OBS-002 §7.3).
+                        child_stdin.write_all(&forward_bytes).await.map_err(|e| {
+                            StdioError::Framing {
                                 server_id: server_id.clone(),
                                 direction: StreamDirection::AgentToServer,
                                 source: FramingError::Io(e),
-                            })?;
+                            }
+                        })?;
                         child_stdin.flush().await.map_err(|e| StdioError::Framing {
                             server_id: server_id.clone(),
                             direction: StreamDirection::AgentToServer,
@@ -1672,5 +1785,74 @@ mod tests {
     #[test]
     fn test_sampling_not_passthrough_ec019() {
         assert!(!is_passthrough("sampling/createMessage"));
+    }
+
+    // ── REQ-OBS-002 §7.3 Trace Context Propagation Tests ────────────────
+
+    /// TC-OBS2-006: Verify rebuild_message_with_params produces valid NDJSON.
+    #[test]
+    fn test_rebuild_message_request() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(1),
+            method: "tools/call".to_string(),
+        };
+        let params = serde_json::json!({
+            "name": "test_tool",
+            "arguments": { "a": 1 }
+        });
+
+        let rebuilt = rebuild_message_with_params(&kind, Some(&params));
+        assert!(rebuilt.ends_with('\n'), "should end with newline");
+
+        let parsed: serde_json::Value = serde_json::from_str(rebuilt.trim()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 1);
+        assert_eq!(parsed["method"], "tools/call");
+        assert_eq!(parsed["params"]["name"], "test_tool");
+    }
+
+    #[test]
+    fn test_rebuild_message_notification() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "initialized".to_string(),
+        };
+
+        let rebuilt = rebuild_message_with_params(&kind, None);
+        let parsed: serde_json::Value = serde_json::from_str(rebuilt.trim()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["method"], "initialized");
+        assert!(parsed.get("id").is_none());
+        assert!(parsed.get("params").is_none());
+    }
+
+    #[test]
+    fn test_rebuild_message_strips_meta() {
+        use thoughtgate_core::telemetry::extract_context_from_meta;
+
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(42),
+            method: "tools/call".to_string(),
+        };
+        let params = serde_json::json!({
+            "_meta": {
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            },
+            "name": "calculator"
+        });
+
+        // Extract trace context (which strips _meta.traceparent)
+        let trace_ctx = extract_context_from_meta(Some(&params));
+        assert!(trace_ctx.had_trace_context);
+
+        // Rebuild with stripped params
+        let rebuilt = rebuild_message_with_params(&kind, trace_ctx.stripped_params.as_ref());
+        let parsed: serde_json::Value = serde_json::from_str(rebuilt.trim()).unwrap();
+
+        // Verify _meta.traceparent is gone but other params preserved
+        assert_eq!(parsed["params"]["name"], "calculator");
+        assert!(
+            parsed["params"].get("_meta").is_none(),
+            "empty _meta should be removed"
+        );
     }
 }
