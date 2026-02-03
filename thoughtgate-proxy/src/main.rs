@@ -133,6 +133,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics::init_metrics(&meter);
     }
 
+    // Initialize OpenTelemetry tracing (REQ-OBS-002)
+    let telemetry_config = thoughtgate_core::telemetry::TelemetryConfig::from_env();
+    let telemetry_guard = thoughtgate_core::telemetry::init_telemetry(&telemetry_config)
+        .map_err(|e| format!("Failed to initialize telemetry: {e}"))?;
+    if telemetry_config.enabled {
+        info!(
+            endpoint = telemetry_config.otlp_endpoint.as_deref().unwrap_or("default"),
+            service_name = %telemetry_config.service_name,
+            "OpenTelemetry tracing enabled (OTLP HTTP/protobuf)"
+        );
+    } else {
+        debug!("OpenTelemetry tracing disabled");
+    }
+
     // Phase 3: Create unified shutdown token
     // Implements: REQ-CORE-005/F-004 (Unified Shutdown)
     let shutdown = CancellationToken::new();
@@ -463,6 +477,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Drain requests
     // Implements: REQ-CORE-005/F-005
     let drain_result = lifecycle.drain_requests().await;
+
+    // Flush pending telemetry spans before exit (REQ-OBS-002/B-OBS2-002)
+    if let Err(e) = telemetry_guard.shutdown() {
+        warn!(error = %e, "Telemetry shutdown error (non-fatal)");
+    }
 
     // Mark as stopped
     lifecycle.mark_stopped();

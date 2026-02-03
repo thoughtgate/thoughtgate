@@ -28,6 +28,7 @@ pub mod metrics;
 pub mod policy;
 pub mod profile;
 pub mod protocol;
+pub mod telemetry;
 pub mod transport;
 
 // ─────────────────────────────────────────────────────────────────────────────
