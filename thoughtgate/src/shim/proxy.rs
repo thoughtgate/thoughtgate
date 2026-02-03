@@ -172,6 +172,100 @@ fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<thoughtgate_core::jsonrpc::
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Bounded Line Reading (DoS Protection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read a single line from an async buffered reader, enforcing a byte limit.
+///
+/// Unlike bare `read_line`, this function will not allocate unbounded memory
+/// if the peer sends a continuous stream of bytes without a newline delimiter.
+/// If the accumulated bytes exceed `max_bytes` before a newline is found, the
+/// buffer is drained and a `FramingError::MessageTooLarge` is returned.
+///
+/// # Returns
+///
+/// - `Ok(n)` where `n > 0`: a complete line was read into `buf`
+/// - `Ok(0)`: EOF reached
+/// - `Err(FramingError::MessageTooLarge)`: line exceeded `max_bytes` without newline
+/// - `Err(FramingError::Io)`: underlying I/O error
+///
+/// Implements: REQ-CORE-008 §5.2 (message size limit)
+async fn bounded_read_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    max_bytes: usize,
+) -> Result<usize, FramingError> {
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf().await.map_err(FramingError::Io)?;
+
+        // EOF — return what we have (or 0 if nothing).
+        if available.is_empty() {
+            return Ok(total);
+        }
+
+        // Scan for newline in the available buffer.
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                // Found newline at `pos`. Consume up to and including it.
+                let to_consume = pos + 1;
+                if total + to_consume > max_bytes {
+                    // Drain the oversized data so the reader isn't stuck.
+                    reader.consume(to_consume);
+                    return Err(FramingError::MessageTooLarge { max_bytes });
+                }
+
+                // Copy bytes from the internal buffer before consuming.
+                let chunk = &available[..to_consume];
+                let s = String::from_utf8_lossy(chunk);
+                buf.push_str(&s);
+                total += to_consume;
+                reader.consume(to_consume);
+                return Ok(total);
+            }
+            None => {
+                // No newline yet — consume all available bytes.
+                let len = available.len();
+                if total + len > max_bytes {
+                    // Drain all available data and continue draining until newline or EOF.
+                    reader.consume(len);
+                    drain_until_newline(reader).await;
+                    return Err(FramingError::MessageTooLarge { max_bytes });
+                }
+
+                // Copy bytes from the internal buffer before consuming.
+                let s = String::from_utf8_lossy(available);
+                buf.push_str(&s);
+                total += len;
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+/// Drain bytes from a reader until a newline or EOF is reached.
+///
+/// Used after detecting an oversized line to skip the remainder of the
+/// offending message so the reader is positioned at the start of the next line.
+async fn drain_until_newline<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) {
+    loop {
+        match reader.fill_buf().await {
+            Ok([]) => return, // EOF
+            Ok(buf) => {
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let consume = pos + 1;
+                    reader.consume(consume);
+                    return;
+                }
+                let len = buf.len();
+                reader.consume(len);
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Approval Polling (PendingApproval)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -575,12 +669,36 @@ async fn agent_to_server(
                 tracing::debug!(server_id, "agent→server: shutdown signal received");
                 break;
             }
-            result = reader.read_line(&mut buf) => {
-                result.map_err(|e| StdioError::Framing {
-                    server_id: server_id.clone(),
-                    direction: StreamDirection::AgentToServer,
-                    source: FramingError::Io(e),
-                })?
+            result = bounded_read_line(
+                &mut reader,
+                &mut buf,
+                crate::shim::ndjson::MAX_MESSAGE_BYTES,
+            ) => {
+                match result {
+                    Ok(n) => n,
+                    Err(FramingError::MessageTooLarge { .. }) => {
+                        metrics.record_framing_error(&server_id, "message_too_large");
+                        tracing::warn!(
+                            server_id,
+                            "agent→server: message exceeded size limit, skipping"
+                        );
+                        continue;
+                    }
+                    Err(FramingError::Io(e)) => {
+                        return Err(StdioError::Framing {
+                            server_id: server_id.clone(),
+                            direction: StreamDirection::AgentToServer,
+                            source: FramingError::Io(e),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(StdioError::Framing {
+                            server_id: server_id.clone(),
+                            direction: StreamDirection::AgentToServer,
+                            source: e,
+                        });
+                    }
+                }
             }
         };
 
@@ -962,12 +1080,36 @@ async fn server_to_agent(
                 tracing::debug!(server_id, "server→agent: shutdown signal received");
                 break;
             }
-            result = reader.read_line(&mut buf) => {
-                result.map_err(|e| StdioError::Framing {
-                    server_id: server_id.clone(),
-                    direction: StreamDirection::ServerToAgent,
-                    source: FramingError::Io(e),
-                })?
+            result = bounded_read_line(
+                &mut reader,
+                &mut buf,
+                crate::shim::ndjson::MAX_MESSAGE_BYTES,
+            ) => {
+                match result {
+                    Ok(n) => n,
+                    Err(FramingError::MessageTooLarge { .. }) => {
+                        metrics.record_framing_error(&server_id, "message_too_large");
+                        tracing::warn!(
+                            server_id,
+                            "server→agent: message exceeded size limit, skipping"
+                        );
+                        continue;
+                    }
+                    Err(FramingError::Io(e)) => {
+                        return Err(StdioError::Framing {
+                            server_id: server_id.clone(),
+                            direction: StreamDirection::ServerToAgent,
+                            source: FramingError::Io(e),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(StdioError::Framing {
+                            server_id: server_id.clone(),
+                            direction: StreamDirection::ServerToAgent,
+                            source: e,
+                        });
+                    }
+                }
             }
         };
 
