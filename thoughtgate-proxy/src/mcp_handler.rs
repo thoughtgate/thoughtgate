@@ -53,7 +53,8 @@ use thoughtgate_core::protocol::{
     strip_sse_capability,
 };
 use thoughtgate_core::telemetry::{
-    BoxedSpan, McpMessageType, McpSpanData, ThoughtGateMetrics, start_mcp_span,
+    BoxedSpan, CedarSpanData, McpMessageType, McpSpanData, ThoughtGateMetrics, finish_cedar_span,
+    start_cedar_span, start_mcp_span,
 };
 use thoughtgate_core::transport::jsonrpc::{
     JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
@@ -1868,6 +1869,10 @@ async fn route_through_gates(
     if let Some(source) = config.get_source(source_id) {
         let expose: thoughtgate_core::config::ExposeConfig = source.expose();
         if !expose.is_visible(&resource_name) {
+            // Record gate 1 block metric (REQ-OBS-002 §6.1/MC-002)
+            if let Some(ref metrics) = state.tg_metrics {
+                metrics.record_gate_decision("gate1", "block");
+            }
             warn!(
                 resource = %resource_name,
                 method = %request.method,
@@ -1879,12 +1884,20 @@ async fn route_through_gates(
                 source_id: source_id.to_string(),
             });
         }
+        // Record gate 1 pass metric (REQ-OBS-002 §6.1/MC-002)
+        if let Some(ref metrics) = state.tg_metrics {
+            metrics.record_gate_decision("gate1", "pass");
+        }
         debug!(resource = %resource_name, method = %request.method, "Gate 1 passed: resource is visible");
     } else {
         // Source not found in config — fail closed
         // This indicates a misconfiguration (get_source_id returns a name
         // that doesn't match any configured source). Allowing traffic through
         // would bypass visibility checks entirely.
+        // Record gate 1 block metric (REQ-OBS-002 §6.1/MC-002)
+        if let Some(ref metrics) = state.tg_metrics {
+            metrics.record_gate_decision("gate1", "block");
+        }
         warn!(
             resource = %resource_name,
             source = %source_id,
@@ -1927,6 +1940,17 @@ async fn route_through_gates(
     // ========================================================================
     // Route by Gate 2 Action
     // ========================================================================
+
+    // Record gate 2 decision metric (REQ-OBS-002 §6.1/MC-002)
+    if let Some(ref metrics) = state.tg_metrics {
+        let outcome = match match_result.action {
+            Action::Forward => "forward",
+            Action::Deny => "deny",
+            Action::Approve => "approve",
+            Action::Policy => "policy",
+        };
+        metrics.record_gate_decision("gate2", outcome);
+    }
 
     match match_result.action {
         Action::Forward => {
@@ -2028,6 +2052,13 @@ async fn start_approval_flow(
         .map_err(|e| ThoughtGateError::ServiceUnavailable {
             reason: format!("Failed to start approval: {}", e),
         })?;
+
+    // Record gate 4 started metric (REQ-OBS-002 §6.1/MC-002)
+    // Also record approval request pending (REQ-OBS-002 §6.1/MC-005)
+    if let Some(ref metrics) = state.tg_metrics {
+        metrics.record_gate_decision("gate4", "started");
+        metrics.record_approval_request("slack", "pending");
+    }
 
     info!(
         task_id = %result.task_id,
@@ -2146,8 +2177,42 @@ async fn evaluate_with_cedar(
         },
     };
 
-    // Evaluate Cedar policy
-    match state.cedar_engine.evaluate_v2(&cedar_request) {
+    // ========================================================================
+    // Cedar Policy Evaluation with Telemetry (REQ-OBS-002 §5.3, §6.1/MC-004)
+    // ========================================================================
+
+    // Create Cedar span data
+    let cedar_span_data = CedarSpanData {
+        tool_name: resource_name.clone(),
+        policy_id: Some(policy_id.clone()),
+    };
+
+    // Start Cedar span as child of current context
+    let mut cedar_span = start_cedar_span(&cedar_span_data, &opentelemetry::Context::current());
+
+    // Time the evaluation
+    let eval_start = std::time::Instant::now();
+    let cedar_result = state.cedar_engine.evaluate_v2(&cedar_request);
+    let eval_duration_ms = eval_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Determine decision string for telemetry
+    let decision_str = match &cedar_result {
+        CedarDecision::Permit { .. } => "allow",
+        CedarDecision::Forbid { .. } => "deny",
+    };
+
+    // Finish Cedar span with attributes
+    finish_cedar_span(&mut cedar_span, decision_str, &policy_id, eval_duration_ms);
+
+    // Record Cedar metrics (REQ-OBS-002 §6.1/MC-004, §6.2/MH-002)
+    if let Some(ref metrics) = state.tg_metrics {
+        metrics.record_cedar_eval(decision_str, &policy_id, eval_duration_ms);
+        // Record gate 3 decision
+        metrics.record_gate_decision("gate3", decision_str);
+    }
+
+    // Process the Cedar decision
+    match cedar_result {
         CedarDecision::Permit { .. } => {
             // For action: policy, Cedar permit → Gate 4 (approval workflow)
             // Per REQ-CORE-003 Section 8: policy action always goes to Gate 4 after permit

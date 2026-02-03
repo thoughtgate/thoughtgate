@@ -461,6 +461,99 @@ pub fn current_span_context() -> SpanContext {
     Context::current().span().span_context().clone()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Cedar Span Functions (REQ-OBS-002 §5.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cedar policy evaluation span attribute: tool name being evaluated.
+pub const CEDAR_TOOL_NAME: &str = "cedar.tool_name";
+
+/// Cedar policy evaluation span attribute: policy decision.
+pub const CEDAR_DECISION: &str = "cedar.decision";
+
+/// Cedar policy evaluation span attribute: determining policy ID.
+pub const CEDAR_POLICY_ID: &str = "cedar.policy_id";
+
+/// Cedar policy evaluation span attribute: evaluation duration in milliseconds.
+pub const CEDAR_DURATION_MS: &str = "cedar.duration_ms";
+
+/// Data needed to start a Cedar evaluation span.
+///
+/// Implements: REQ-OBS-002 §5.3 (Cedar Evaluation Spans)
+pub struct CedarSpanData {
+    /// Tool name or resource being evaluated.
+    pub tool_name: String,
+    /// Policy ID from governance rules, if any.
+    pub policy_id: Option<String>,
+}
+
+/// Start a Cedar policy evaluation span as a child of the current context.
+///
+/// Span name: `cedar.evaluate`
+/// Span kind: INTERNAL
+///
+/// # Arguments
+///
+/// * `data` - Span data containing tool name and optional policy ID
+/// * `parent_cx` - Parent OpenTelemetry context (typically from MCP span)
+///
+/// # Returns
+///
+/// A `BoxedSpan` that should be finished with `finish_cedar_span`.
+///
+/// # Example
+///
+/// ```ignore
+/// let data = CedarSpanData {
+///     tool_name: "web_search".to_string(),
+///     policy_id: Some("sensitive-tools".to_string()),
+/// };
+/// let mut span = start_cedar_span(&data, &Context::current());
+/// // ... evaluate Cedar policy ...
+/// finish_cedar_span(&mut span, "allow", "policy-1", 0.15);
+/// ```
+///
+/// Implements: REQ-OBS-002 §5.3
+pub fn start_cedar_span(data: &CedarSpanData, parent_cx: &Context) -> BoxedSpan {
+    let tracer = global::tracer("thoughtgate");
+
+    let mut attributes = vec![KeyValue::new(CEDAR_TOOL_NAME, data.tool_name.clone())];
+
+    if let Some(ref policy_id) = data.policy_id {
+        attributes.push(KeyValue::new(CEDAR_POLICY_ID, policy_id.clone()));
+    }
+
+    tracer
+        .span_builder("cedar.evaluate")
+        .with_kind(SpanKind::Internal)
+        .with_attributes(attributes)
+        .start_with_context(&tracer, parent_cx)
+}
+
+/// Finish a Cedar evaluation span with decision attributes.
+///
+/// Sets the decision, policy ID, and duration attributes, then ends the span.
+///
+/// # Arguments
+///
+/// * `span` - The span to finish (from `start_cedar_span`)
+/// * `decision` - Cedar decision ("allow" or "deny")
+/// * `policy_id` - Determining policy ID
+/// * `duration_ms` - Evaluation duration in milliseconds
+///
+/// Implements: REQ-OBS-002 §5.3
+pub fn finish_cedar_span(span: &mut impl Span, decision: &str, policy_id: &str, duration_ms: f64) {
+    span.set_attribute(KeyValue::new(CEDAR_DECISION, decision.to_string()));
+    span.set_attribute(KeyValue::new(CEDAR_POLICY_ID, policy_id.to_string()));
+    span.set_attribute(KeyValue::new(CEDAR_DURATION_MS, duration_ms));
+    span.set_status(Status::Ok);
+    span.end();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper Functions
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Derive GenAI operation name from MCP method.
 ///
 /// Maps JSON-RPC method names to semantic GenAI operation names.
@@ -887,5 +980,85 @@ mod tests {
             SpanId::INVALID,
             "Root span should have no parent_span_id"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cedar Span Tests (REQ-OBS-002 §5.3 / TC-OBS2-002)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_cedar_span_created() {
+        let (provider, exporter) = setup_test_provider();
+
+        let data = CedarSpanData {
+            tool_name: "web_search".to_string(),
+            policy_id: Some("sensitive-tools".to_string()),
+        };
+
+        let mut span = start_cedar_span(&data, &Context::current());
+        finish_cedar_span(&mut span, "allow", "policy-1", 0.15);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.name.as_ref(), "cedar.evaluate");
+        assert_eq!(finished.span_kind, opentelemetry::trace::SpanKind::Internal);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cedar_span_with_deny_decision() {
+        let (provider, exporter) = setup_test_provider();
+
+        let data = CedarSpanData {
+            tool_name: "delete_database".to_string(),
+            policy_id: Some("admin-only".to_string()),
+        };
+
+        let mut span = start_cedar_span(&data, &Context::current());
+        finish_cedar_span(&mut span, "deny", "admin-policy", 0.08);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.name.as_ref(), "cedar.evaluate");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cedar_span_as_child_of_mcp_span() {
+        use opentelemetry::trace::{TraceContextExt, Tracer};
+
+        let (provider, exporter) = setup_test_provider();
+        let tracer = global::tracer("test");
+
+        // Create parent MCP span
+        let parent_span = tracer.start("tools/call");
+        let parent_cx = Context::current().with_span(parent_span);
+
+        // Create Cedar span as child
+        let cedar_data = CedarSpanData {
+            tool_name: "test_tool".to_string(),
+            policy_id: None,
+        };
+        let mut cedar_span = start_cedar_span(&cedar_data, &parent_cx);
+        finish_cedar_span(&mut cedar_span, "allow", "default", 0.05);
+
+        // End parent span
+        drop(parent_cx);
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        // Both parent and child should be exported
+        assert_eq!(spans.len(), 2, "Should have both parent and child spans");
+
+        // Find the Cedar span
+        let cedar = spans.iter().find(|s| s.name.as_ref() == "cedar.evaluate");
+        assert!(cedar.is_some(), "Cedar span should exist");
     }
 }

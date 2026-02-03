@@ -22,6 +22,7 @@ use thoughtgate_core::transport::UpstreamForwarder;
 
 /// Captured headers from upstream request.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // body is captured for debugging but not always read
 struct CapturedRequest {
     headers: Vec<(String, String)>,
     body: Option<Value>,

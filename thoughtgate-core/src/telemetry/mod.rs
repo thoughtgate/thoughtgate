@@ -27,6 +27,12 @@ pub use spans::{
     // Approval Span Types and Functions (REQ-OBS-002 §5.4)
     ApprovalCallbackData,
     ApprovalDispatchData,
+    // Cedar Span Constants and Types (REQ-OBS-002 §5.3)
+    CEDAR_DECISION,
+    CEDAR_DURATION_MS,
+    CEDAR_POLICY_ID,
+    CEDAR_TOOL_NAME,
+    CedarSpanData,
     // MCP Span Constants
     ERROR_TYPE,
     GENAI_OPERATION_NAME,
@@ -53,9 +59,12 @@ pub use spans::{
     THOUGHTGATE_TRACE_CONTEXT_RECOVERED,
     current_span_context,
     finish_approval_callback_span,
+    // Cedar Span Functions (REQ-OBS-002 §5.3)
+    finish_cedar_span,
     finish_mcp_span,
     start_approval_callback_span,
     start_approval_dispatch_span,
+    start_cedar_span,
     start_mcp_span,
 };
 
