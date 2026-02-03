@@ -38,6 +38,9 @@ pub use spans::{
     GENAI_OPERATION_NAME,
     GENAI_TOOL_CALL_ID,
     GENAI_TOOL_NAME,
+    // Gateway Decision Span Types and Functions (REQ-OBS-002 §5.3)
+    GateOutcomes,
+    GatewayDecisionSpanData,
     MCP_ERROR_CODE,
     MCP_MESSAGE_ID,
     MCP_MESSAGE_TYPE,
@@ -54,17 +57,28 @@ pub use spans::{
     THOUGHTGATE_APPROVAL_TARGET,
     THOUGHTGATE_APPROVAL_TIMEOUT_S,
     THOUGHTGATE_APPROVAL_USER,
+    THOUGHTGATE_GATE_APPROVAL,
+    THOUGHTGATE_GATE_CEDAR,
+    THOUGHTGATE_GATE_GOVERNANCE,
+    THOUGHTGATE_GATE_VISIBILITY,
+    THOUGHTGATE_GOVERNANCE_RULE_ID,
+    THOUGHTGATE_POLICY_EVALUATED,
     THOUGHTGATE_REQUEST_ID,
     THOUGHTGATE_TASK_ID,
     THOUGHTGATE_TRACE_CONTEXT_RECOVERED,
+    THOUGHTGATE_UPSTREAM_LATENCY_MS,
+    THOUGHTGATE_UPSTREAM_TARGET,
     current_span_context,
     finish_approval_callback_span,
     // Cedar Span Functions (REQ-OBS-002 §5.3)
     finish_cedar_span,
+    // Gateway Decision Span Functions (REQ-OBS-002 §5.3)
+    finish_gateway_decision_span,
     finish_mcp_span,
     start_approval_callback_span,
     start_approval_dispatch_span,
     start_cedar_span,
+    start_gateway_decision_span,
     start_mcp_span,
 };
 

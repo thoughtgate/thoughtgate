@@ -258,6 +258,8 @@ pub struct ApprovalEngine {
     executing: dashmap::DashSet<TaskId>,
     /// Handle for the background scheduler task, used to detect crashes
     scheduler_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ThoughtGate Prometheus metrics (MC-007/MC-008: task counters).
+    tg_metrics: Option<Arc<crate::telemetry::ThoughtGateMetrics>>,
 }
 
 impl ApprovalEngine {
@@ -321,7 +323,26 @@ impl ApprovalEngine {
             config,
             executing: dashmap::DashSet::new(),
             scheduler_handle: tokio::sync::Mutex::new(None),
+            tg_metrics: None,
         }
+    }
+
+    /// Set the ThoughtGate metrics for task counter reporting.
+    ///
+    /// Implements: REQ-OBS-002/MC-007, MC-008 (task created/completed counters)
+    ///
+    /// After calling this, the engine will update the `thoughtgate_tasks_created_total`
+    /// and `thoughtgate_tasks_completed_total` counters on task lifecycle events.
+    pub fn set_metrics(&mut self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) {
+        self.tg_metrics = Some(metrics);
+    }
+
+    /// Builder-style method to set metrics.
+    ///
+    /// Implements: REQ-OBS-002/MC-007, MC-008 (task created/completed counters)
+    pub fn with_metrics(mut self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) -> Self {
+        self.set_metrics(metrics);
+        self
     }
 
     /// Spawn background tasks for the approval engine.
@@ -451,9 +472,13 @@ impl ApprovalEngine {
             "Approval workflow started, task created"
         );
 
-        // Record governance metrics
+        // Record governance metrics (legacy OTel)
         if let Some(metrics) = crate::metrics::get_governance_metrics() {
             metrics.record_task_created();
+        }
+        // Record MC-007: tasks_created_total (prometheus-client)
+        if let Some(ref metrics) = self.tg_metrics {
+            metrics.record_task_created("approval");
         }
 
         // F-002.3: Return task ID immediately (scheduler polls in background)
@@ -715,6 +740,10 @@ impl ApprovalEngine {
                         metrics.record_approval_latency(d);
                     }
                 }
+                // Record MC-008: tasks_completed_total (prometheus-client)
+                if let Some(ref metrics) = self.tg_metrics {
+                    metrics.record_task_completed("approval", "completed");
+                }
                 Ok(result)
             }
             PipelineResult::Failure {
@@ -734,6 +763,10 @@ impl ApprovalEngine {
                 if let Some(metrics) = crate::metrics::get_governance_metrics() {
                     metrics.record_task_terminal("failed");
                     metrics.record_pipeline_failure(&format!("{stage:?}"));
+                }
+                // Record MC-008: tasks_completed_total (prometheus-client)
+                if let Some(ref metrics) = self.tg_metrics {
+                    metrics.record_task_completed("approval", "failed");
                 }
 
                 // Map failure to appropriate error

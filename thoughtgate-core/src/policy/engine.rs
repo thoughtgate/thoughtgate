@@ -133,6 +133,9 @@ pub struct CedarEngine {
 
     /// Legacy v0.1 statistics counters
     stats: Arc<Stats>,
+
+    /// ThoughtGate Prometheus metrics (MG-003: cedar_policies_loaded gauge).
+    tg_metrics: Option<Arc<crate::telemetry::ThoughtGateMetrics>>,
 }
 
 /// v0.2 statistics.
@@ -200,7 +203,29 @@ impl CedarEngine {
                 reload_count: AtomicU64::new(0),
                 last_reload: arc_swap::ArcSwap::new(Arc::new(None)),
             }),
+            tg_metrics: None,
         })
+    }
+
+    /// Set the ThoughtGate metrics for gauge reporting.
+    ///
+    /// Implements: REQ-OBS-002/MG-003 (cedar_policies_loaded gauge)
+    ///
+    /// After calling this, the engine will update the `thoughtgate_cedar_policies_loaded`
+    /// gauge on initialization and after each reload.
+    pub fn set_metrics(&mut self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) {
+        // Set the initial gauge value
+        let policy_count = self.policies.load().policies().count() as i64;
+        metrics.cedar_policies_loaded.set(policy_count);
+        self.tg_metrics = Some(metrics);
+    }
+
+    /// Builder-style method to set metrics.
+    ///
+    /// Implements: REQ-OBS-002/MG-003 (cedar_policies_loaded gauge)
+    pub fn with_metrics(mut self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) -> Self {
+        self.set_metrics(metrics);
+        self
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -979,6 +1004,7 @@ impl CedarEngine {
                 // Use the retried source on success
                 drop(source);
                 return {
+                    let policy_count = policies.policies().count();
                     self.policies.store(Arc::new(policies));
                     self.annotations.store(Arc::new(annotations));
                     self.source.store(Arc::new(retry_source));
@@ -986,6 +1012,10 @@ impl CedarEngine {
                     self.stats
                         .last_reload
                         .store(Arc::new(Some(std::time::SystemTime::now())));
+                    // Update MG-003 gauge
+                    if let Some(ref metrics) = self.tg_metrics {
+                        metrics.cedar_policies_loaded.set(policy_count as i64);
+                    }
                     info!("Policies reloaded successfully (after retry)");
                     Ok(())
                 };
@@ -993,6 +1023,7 @@ impl CedarEngine {
         };
 
         // Atomic swap
+        let policy_count = new_policies.policies().count();
         self.policies.store(Arc::new(new_policies));
         self.annotations.store(Arc::new(new_annotations));
         self.source.store(Arc::new(source));
@@ -1000,6 +1031,10 @@ impl CedarEngine {
         self.stats
             .last_reload
             .store(Arc::new(Some(std::time::SystemTime::now())));
+        // Update MG-003 gauge
+        if let Some(ref metrics) = self.tg_metrics {
+            metrics.cedar_policies_loaded.set(policy_count as i64);
+        }
 
         info!("Policies reloaded successfully");
         Ok(())

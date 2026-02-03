@@ -851,7 +851,6 @@ struct TaskEntry {
 /// Implements: REQ-GOV-001/§10
 ///
 /// Uses DashMap for lock-free concurrent access to tasks.
-#[derive(Debug)]
 pub struct TaskStore {
     /// Task storage keyed by TaskId
     tasks: DashMap<TaskId, TaskEntry>,
@@ -864,6 +863,20 @@ pub struct TaskStore {
     /// Atomic counter of pending tasks per principal (keyed by rate_limit_key).
     /// Prevents TOCTOU race between count check and insert in `create()`.
     pending_by_principal: DashMap<String, AtomicUsize>,
+    /// Optional Prometheus metrics for gauge updates (REQ-OBS-002 §6.4/MG-002).
+    /// When set, the tasks_pending gauge is updated on task creation/completion.
+    tg_metrics: Option<Arc<crate::telemetry::ThoughtGateMetrics>>,
+}
+
+impl std::fmt::Debug for TaskStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskStore")
+            .field("tasks_count", &self.tasks.len())
+            .field("config", &self.config)
+            .field("pending_count", &self.pending_count.load(Ordering::Acquire))
+            .field("has_metrics", &self.tg_metrics.is_some())
+            .finish()
+    }
 }
 
 impl TaskStore {
@@ -878,6 +891,7 @@ impl TaskStore {
             config,
             pending_count: AtomicUsize::new(0),
             pending_by_principal: DashMap::new(),
+            tg_metrics: None,
         }
     }
 
@@ -887,6 +901,34 @@ impl TaskStore {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(TaskStoreConfig::default())
+    }
+
+    /// Sets the Prometheus metrics for gauge updates.
+    ///
+    /// When set, the `tasks_pending` gauge is updated whenever tasks
+    /// are created or transition to terminal states.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-002
+    pub fn set_metrics(&mut self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) {
+        self.tg_metrics = Some(metrics);
+    }
+
+    /// Creates a new task store with metrics wired for gauge updates.
+    ///
+    /// Implements: REQ-GOV-001/§10, REQ-OBS-002 §6.4/MG-002
+    #[must_use]
+    pub fn with_metrics(
+        config: TaskStoreConfig,
+        metrics: Arc<crate::telemetry::ThoughtGateMetrics>,
+    ) -> Self {
+        Self {
+            tasks: DashMap::new(),
+            by_principal: DashMap::new(),
+            config,
+            pending_count: AtomicUsize::new(0),
+            pending_by_principal: DashMap::new(),
+            tg_metrics: Some(metrics),
+        }
     }
 
     /// Returns the store configuration.
@@ -902,8 +944,22 @@ impl TaskStore {
     /// Must be called exactly once when a task transitions from non-terminal
     /// to terminal. Caller is responsible for ensuring the task was previously
     /// non-terminal (i.e., `was_terminal == false`).
+    ///
+    /// Also updates the Prometheus gauge if metrics are configured
+    /// (REQ-OBS-002 §6.4/MG-002).
     fn decrement_pending_counters(&self, task: &Task) {
-        self.pending_count.fetch_sub(1, Ordering::Release);
+        let new_count = self.pending_count.fetch_sub(1, Ordering::Release) - 1;
+
+        // Update Prometheus gauge (REQ-OBS-002 §6.4/MG-002)
+        if let Some(ref metrics) = self.tg_metrics {
+            metrics
+                .tasks_pending
+                .get_or_create(&crate::telemetry::prom_metrics::TaskTypeLabels {
+                    task_type: "approval".to_string(),
+                })
+                .set(new_count as i64);
+        }
+
         let principal_key = task.principal.rate_limit_key();
         if let Some(counter) = self.pending_by_principal.get(&principal_key) {
             let prev = counter.fetch_sub(1, Ordering::Release);
@@ -1017,7 +1073,17 @@ impl TaskStore {
             .or_default()
             .push(task_id);
 
-        // Global slot was already reserved via compare_exchange above
+        // Update Prometheus gauge (REQ-OBS-002 §6.4/MG-002)
+        // Note: pending_count was already incremented via compare_exchange above
+        if let Some(ref metrics) = self.tg_metrics {
+            metrics
+                .tasks_pending
+                .get_or_create(&crate::telemetry::prom_metrics::TaskTypeLabels {
+                    task_type: "approval".to_string(),
+                })
+                .set(self.pending_count.load(Ordering::Acquire) as i64);
+        }
+
         Ok(task_arc)
     }
 
@@ -1336,6 +1402,10 @@ impl TaskStore {
                 {
                     entry.terminal_at = Some(now);
                     self.decrement_pending_counters(&entry.task);
+                    // Record MC-008: tasks_completed_total (prometheus-client) with outcome=expired
+                    if let Some(ref metrics) = self.tg_metrics {
+                        metrics.record_task_completed("approval", "expired");
+                    }
                     entry.notify.notify_waiters();
                     expired += 1;
                     tracing::warn!(

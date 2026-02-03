@@ -100,6 +100,42 @@ pub const THOUGHTGATE_APPROVAL_LATENCY_S: &str = "thoughtgate.approval.latency_s
 pub const THOUGHTGATE_TRACE_CONTEXT_RECOVERED: &str = "thoughtgate.trace_context.recovered";
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Gateway Decision Span Attribute Constants (REQ-OBS-002 §5.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Gate 1 (visibility) outcome: "pass" or "block"
+/// Requirement: Required for gateway decision spans
+pub const THOUGHTGATE_GATE_VISIBILITY: &str = "thoughtgate.gate.visibility";
+
+/// Gate 2 (governance rules) outcome: "forward", "deny", "approve", or "policy"
+/// Requirement: Required for gateway decision spans
+pub const THOUGHTGATE_GATE_GOVERNANCE: &str = "thoughtgate.gate.governance";
+
+/// Gate 3 (Cedar policy) outcome: "allow" or "deny"
+/// Requirement: Conditional (present if Gate 3 evaluated)
+pub const THOUGHTGATE_GATE_CEDAR: &str = "thoughtgate.gate.cedar";
+
+/// Gate 4 (approval) outcome: "started", "approved", "rejected", or "timeout"
+/// Requirement: Conditional (present if Gate 4 evaluated)
+pub const THOUGHTGATE_GATE_APPROVAL: &str = "thoughtgate.gate.approval";
+
+/// Governance rule ID that matched (from Gate 2)
+/// Requirement: Conditional (present if a rule matched)
+pub const THOUGHTGATE_GOVERNANCE_RULE_ID: &str = "thoughtgate.governance.rule_id";
+
+/// Upstream target URL or identifier
+/// Requirement: Required for gateway decision spans
+pub const THOUGHTGATE_UPSTREAM_TARGET: &str = "thoughtgate.upstream.target";
+
+/// Upstream call latency in milliseconds
+/// Requirement: Conditional (present if upstream was called)
+pub const THOUGHTGATE_UPSTREAM_LATENCY_MS: &str = "thoughtgate.upstream.latency_ms";
+
+/// Whether Cedar policy was evaluated (true/false)
+/// Requirement: Required for gateway decision spans
+pub const THOUGHTGATE_POLICY_EVALUATED: &str = "thoughtgate.policy.evaluated";
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -176,6 +212,38 @@ pub struct ApprovalCallbackData<'a> {
     pub trace_context_recovered: bool,
     /// Optional span context to link to (from the dispatch span)
     pub link_to: Option<&'a SpanContext>,
+}
+
+/// Data needed to start a gateway decision span.
+///
+/// Implements: REQ-OBS-002 §5.3 (Gateway Decision Span)
+pub struct GatewayDecisionSpanData<'a> {
+    /// ThoughtGate correlation ID
+    pub request_id: &'a str,
+    /// Upstream target URL or identifier
+    pub upstream_target: &'a str,
+}
+
+/// Accumulated gate outcomes for finishing the decision span.
+///
+/// As each gate is evaluated, the outcome is recorded here. When the span
+/// is finished, these outcomes are added as attributes.
+///
+/// Implements: REQ-OBS-002 §5.3
+#[derive(Debug, Default, Clone)]
+pub struct GateOutcomes {
+    /// Gate 1 (visibility) outcome: "pass" or "block"
+    pub visibility: Option<String>,
+    /// Gate 2 (governance rules) outcome: "forward", "deny", "approve", or "policy"
+    pub governance: Option<String>,
+    /// Gate 3 (Cedar policy) outcome: "allow" or "deny"
+    pub cedar: Option<String>,
+    /// Gate 4 (approval) outcome: "started", "approved", "rejected", or "timeout"
+    pub approval: Option<String>,
+    /// Governance rule ID that matched (from Gate 2)
+    pub governance_rule_id: Option<String>,
+    /// Whether Cedar policy was evaluated
+    pub policy_evaluated: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -459,6 +527,126 @@ pub fn finish_approval_callback_span(
 /// The `SpanContext` of the currently active span.
 pub fn current_span_context() -> SpanContext {
     Context::current().span().span_context().clone()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gateway Decision Span Functions (REQ-OBS-002 §5.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Start a gateway decision span using the global tracer provider.
+///
+/// This span tracks the overall decision-making process across all 4 gates,
+/// recording which gates were evaluated and their outcomes.
+///
+/// Span name: `thoughtgate.decision`
+/// Span kind: INTERNAL
+///
+/// # Arguments
+///
+/// * `data` - Span data containing request ID and upstream target
+/// * `parent_cx` - Parent OpenTelemetry context (typically from MCP span)
+///
+/// # Returns
+///
+/// A `BoxedSpan` that should be finished with `finish_gateway_decision_span`.
+///
+/// # Example
+///
+/// ```ignore
+/// let data = GatewayDecisionSpanData {
+///     request_id: "req-abc123",
+///     upstream_target: "http://mcp-server:3000",
+/// };
+/// let mut span = start_gateway_decision_span(&data, &Context::current());
+/// // ... route through gates ...
+/// let outcomes = GateOutcomes {
+///     visibility: Some("pass".to_string()),
+///     governance: Some("forward".to_string()),
+///     ..Default::default()
+/// };
+/// finish_gateway_decision_span(&mut span, &outcomes, Some(15.5));
+/// ```
+///
+/// Implements: REQ-OBS-002 §5.3
+pub fn start_gateway_decision_span(
+    data: &GatewayDecisionSpanData<'_>,
+    parent_cx: &Context,
+) -> BoxedSpan {
+    let tracer = global::tracer("thoughtgate");
+
+    let attributes = vec![
+        KeyValue::new(THOUGHTGATE_REQUEST_ID, data.request_id.to_string()),
+        KeyValue::new(
+            THOUGHTGATE_UPSTREAM_TARGET,
+            data.upstream_target.to_string(),
+        ),
+    ];
+
+    tracer
+        .span_builder("thoughtgate.decision")
+        .with_kind(SpanKind::Internal)
+        .with_attributes(attributes)
+        .start_with_context(&tracer, parent_cx)
+}
+
+/// Finish a gateway decision span with gate outcome attributes.
+///
+/// Records the outcomes of each gate that was evaluated, along with optional
+/// upstream latency.
+///
+/// # Arguments
+///
+/// * `span` - The span to finish (from `start_gateway_decision_span`)
+/// * `outcomes` - Gate outcomes collected during request processing
+/// * `upstream_latency_ms` - Optional upstream call latency in milliseconds
+///
+/// Implements: REQ-OBS-002 §5.3
+pub fn finish_gateway_decision_span(
+    span: &mut impl Span,
+    outcomes: &GateOutcomes,
+    upstream_latency_ms: Option<f64>,
+) {
+    // Add gate outcome attributes
+    if let Some(ref visibility) = outcomes.visibility {
+        span.set_attribute(KeyValue::new(
+            THOUGHTGATE_GATE_VISIBILITY,
+            visibility.clone(),
+        ));
+    }
+
+    if let Some(ref governance) = outcomes.governance {
+        span.set_attribute(KeyValue::new(
+            THOUGHTGATE_GATE_GOVERNANCE,
+            governance.clone(),
+        ));
+    }
+
+    if let Some(ref cedar) = outcomes.cedar {
+        span.set_attribute(KeyValue::new(THOUGHTGATE_GATE_CEDAR, cedar.clone()));
+    }
+
+    if let Some(ref approval) = outcomes.approval {
+        span.set_attribute(KeyValue::new(THOUGHTGATE_GATE_APPROVAL, approval.clone()));
+    }
+
+    if let Some(ref rule_id) = outcomes.governance_rule_id {
+        span.set_attribute(KeyValue::new(
+            THOUGHTGATE_GOVERNANCE_RULE_ID,
+            rule_id.clone(),
+        ));
+    }
+
+    span.set_attribute(KeyValue::new(
+        THOUGHTGATE_POLICY_EVALUATED,
+        outcomes.policy_evaluated,
+    ));
+
+    if let Some(latency) = upstream_latency_ms {
+        span.set_attribute(KeyValue::new(THOUGHTGATE_UPSTREAM_LATENCY_MS, latency));
+    }
+
+    span.set_status(Status::Ok);
+    span.end();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1060,5 +1248,94 @@ mod tests {
         // Find the Cedar span
         let cedar = spans.iter().find(|s| s.name.as_ref() == "cedar.evaluate");
         assert!(cedar.is_some(), "Cedar span should exist");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Gateway Decision Span Tests (REQ-OBS-002 §5.3)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_gateway_decision_span_created() {
+        let (provider, exporter) = setup_test_provider();
+
+        let data = GatewayDecisionSpanData {
+            request_id: "req-test-123",
+            upstream_target: "http://mcp-server:3000",
+        };
+
+        let mut span = start_gateway_decision_span(&data, &Context::current());
+        let outcomes = GateOutcomes {
+            visibility: Some("pass".to_string()),
+            governance: Some("forward".to_string()),
+            ..Default::default()
+        };
+        finish_gateway_decision_span(&mut span, &outcomes, Some(15.5));
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.name.as_ref(), "thoughtgate.decision");
+        assert_eq!(finished.span_kind, opentelemetry::trace::SpanKind::Internal);
+    }
+
+    #[test]
+    #[serial]
+    fn test_gateway_decision_span_with_all_gates() {
+        let (provider, exporter) = setup_test_provider();
+
+        let data = GatewayDecisionSpanData {
+            request_id: "req-full-flow",
+            upstream_target: "http://backend:8080",
+        };
+
+        let mut span = start_gateway_decision_span(&data, &Context::current());
+        let outcomes = GateOutcomes {
+            visibility: Some("pass".to_string()),
+            governance: Some("policy".to_string()),
+            cedar: Some("allow".to_string()),
+            approval: Some("approved".to_string()),
+            governance_rule_id: Some("rule-sensitive-tools".to_string()),
+            policy_evaluated: true,
+        };
+        finish_gateway_decision_span(&mut span, &outcomes, Some(250.0));
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.name.as_ref(), "thoughtgate.decision");
+    }
+
+    #[test]
+    #[serial]
+    fn test_gateway_decision_span_partial_gates() {
+        let (provider, exporter) = setup_test_provider();
+
+        let data = GatewayDecisionSpanData {
+            request_id: "req-fast-forward",
+            upstream_target: "http://backend:8080",
+        };
+
+        let mut span = start_gateway_decision_span(&data, &Context::current());
+        // Fast-forward path: only Gate 1 and 2 evaluated
+        let outcomes = GateOutcomes {
+            visibility: Some("pass".to_string()),
+            governance: Some("forward".to_string()),
+            governance_rule_id: Some("rule-allow-all".to_string()),
+            policy_evaluated: false,
+            ..Default::default()
+        };
+        finish_gateway_decision_span(&mut span, &outcomes, Some(5.0));
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter.get_finished_spans().expect("should get spans");
+        assert_eq!(spans.len(), 1);
+
+        let finished = &spans[0];
+        assert_eq!(finished.name.as_ref(), "thoughtgate.decision");
     }
 }

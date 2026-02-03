@@ -515,17 +515,53 @@ pub async fn create_governance_components(
     config: Option<&Config>,
     shutdown: CancellationToken,
 ) -> Result<(TaskHandler, Arc<CedarEngine>, Option<Arc<ApprovalEngine>>), ThoughtGateError> {
-    // Create task store and handler for SEP-1686 task methods
-    let task_store = Arc::new(TaskStore::with_defaults());
+    create_governance_components_with_metrics(upstream, config, shutdown, None).await
+}
+
+/// Create governance components with optional Prometheus metrics for gauge updates.
+///
+/// This variant accepts `ThoughtGateMetrics` to wire the `tasks_pending` gauge
+/// (REQ-OBS-002 §6.4/MG-002).
+///
+/// # Arguments
+///
+/// * `upstream` - Upstream forwarder for approved requests
+/// * `config` - Optional YAML config (enables Gate 1, 2, 4)
+/// * `shutdown` - Cancellation token for graceful shutdown
+/// * `tg_metrics` - Optional Prometheus metrics for gauge updates
+///
+/// # Returns
+///
+/// Tuple of (TaskHandler, CedarEngine, optional ApprovalEngine)
+#[allow(clippy::type_complexity)]
+pub async fn create_governance_components_with_metrics(
+    upstream: Arc<dyn UpstreamForwarder>,
+    config: Option<&Config>,
+    shutdown: CancellationToken,
+    tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+) -> Result<(TaskHandler, Arc<CedarEngine>, Option<Arc<ApprovalEngine>>), ThoughtGateError> {
+    // Create task store with optional metrics wiring (REQ-OBS-002 §6.4/MG-002)
+    let task_store = if let Some(ref metrics) = tg_metrics {
+        Arc::new(TaskStore::with_metrics(
+            thoughtgate_core::governance::task::TaskStoreConfig::default(),
+            metrics.clone(),
+        ))
+    } else {
+        Arc::new(TaskStore::with_defaults())
+    };
     let task_handler = TaskHandler::new(task_store.clone());
 
-    // Create Cedar policy engine (Gate 3)
-    let cedar_engine =
-        Arc::new(
-            CedarEngine::new().map_err(|e| ThoughtGateError::ServiceUnavailable {
-                reason: format!("Failed to create Cedar engine: {}", e),
-            })?,
-        );
+    // Create Cedar policy engine (Gate 3) with optional metrics wiring (REQ-OBS-002 §6.4/MG-003)
+    let cedar_engine = {
+        let engine = CedarEngine::new().map_err(|e| ThoughtGateError::ServiceUnavailable {
+            reason: format!("Failed to create Cedar engine: {}", e),
+        })?;
+        if let Some(ref metrics) = tg_metrics {
+            Arc::new(engine.with_metrics(metrics.clone()))
+        } else {
+            Arc::new(engine)
+        }
+    };
 
     // Create ApprovalEngine only if config uses approval rules (Gate 4)
     // This avoids requiring Slack credentials when approvals are not used
@@ -568,6 +604,13 @@ pub async fn create_governance_components(
             engine_config,
             shutdown,
         );
+
+        // Wire metrics for task counters (REQ-OBS-002 §6.4/MC-007, MC-008)
+        let engine = if let Some(ref metrics) = tg_metrics {
+            engine.with_metrics(metrics.clone())
+        } else {
+            engine
+        };
 
         // Spawn background polling loop for approval decisions
         // Implements: REQ-GOV-003/F-002, REQ-GOV-001/F-008

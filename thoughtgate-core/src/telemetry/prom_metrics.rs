@@ -158,6 +158,26 @@ pub struct TaskTypeLabels {
     pub task_type: String,
 }
 
+/// Labels for task created counters.
+///
+/// Implements: REQ-OBS-002 §6.1/MC-007
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TaskCreatedLabels {
+    /// Task type (e.g., "approval")
+    pub task_type: String,
+}
+
+/// Labels for task completed counters.
+///
+/// Implements: REQ-OBS-002 §6.1/MC-008
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TaskCompletedLabels {
+    /// Task type (e.g., "approval")
+    pub task_type: String,
+    /// Task outcome (e.g., "completed", "failed", "expired", "cancelled")
+    pub outcome: String,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Histogram Bucket Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +250,12 @@ pub struct ThoughtGateMetrics {
 
     /// MC-009: Telemetry items dropped due to full export queue.
     pub telemetry_dropped_total: Family<SignalLabels, Counter>,
+
+    /// MC-007: SEP-1686 tasks created.
+    pub tasks_created_total: Family<TaskCreatedLabels, Counter>,
+
+    /// MC-008: SEP-1686 tasks completed (by outcome).
+    pub tasks_completed_total: Family<TaskCompletedLabels, Counter>,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Histograms (§6.2)
@@ -337,6 +363,20 @@ impl ThoughtGateMetrics {
             telemetry_dropped_total.clone(),
         );
 
+        let tasks_created_total = Family::<TaskCreatedLabels, Counter>::default();
+        registry.register(
+            "thoughtgate_tasks_created_total",
+            "SEP-1686 tasks created by type",
+            tasks_created_total.clone(),
+        );
+
+        let tasks_completed_total = Family::<TaskCompletedLabels, Counter>::default();
+        registry.register(
+            "thoughtgate_tasks_completed_total",
+            "SEP-1686 tasks completed by type and outcome",
+            tasks_completed_total.clone(),
+        );
+
         // ─────────────────────────────────────────────────────────────────────
         // Histograms (with static bucket slices for efficiency)
         // ─────────────────────────────────────────────────────────────────────
@@ -429,6 +469,8 @@ impl ThoughtGateMetrics {
             approval_requests_total,
             upstream_requests_total,
             telemetry_dropped_total,
+            tasks_created_total,
+            tasks_completed_total,
             request_duration_ms,
             cedar_evaluation_duration_ms,
             upstream_duration_ms,
@@ -629,6 +671,38 @@ impl ThoughtGateMetrics {
             })
             .observe(duration_secs);
     }
+
+    /// Record a SEP-1686 task creation.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_type` - Type of task (e.g., "approval")
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-007
+    pub fn record_task_created(&self, task_type: &str) {
+        self.tasks_created_total
+            .get_or_create(&TaskCreatedLabels {
+                task_type: task_type.to_string(),
+            })
+            .inc();
+    }
+
+    /// Record a SEP-1686 task completion.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_type` - Type of task (e.g., "approval")
+    /// * `outcome` - Task outcome (e.g., "completed", "failed", "expired", "cancelled")
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-008
+    pub fn record_task_completed(&self, task_type: &str, outcome: &str) {
+        self.tasks_completed_total
+            .get_or_create(&TaskCompletedLabels {
+                task_type: task_type.to_string(),
+                outcome: outcome.to_string(),
+            })
+            .inc();
+    }
 }
 
 #[cfg(test)]
@@ -722,5 +796,29 @@ mod tests {
             .expect("encoding should succeed");
 
         assert!(buffer.contains("thoughtgate_request_payload_size_bytes"));
+    }
+
+    #[test]
+    fn test_task_counters() {
+        let mut registry = Registry::default();
+        let metrics = ThoughtGateMetrics::new(&mut registry);
+
+        // Record task lifecycle events
+        metrics.record_task_created("approval");
+        metrics.record_task_created("approval");
+        metrics.record_task_completed("approval", "completed");
+        metrics.record_task_completed("approval", "failed");
+        metrics.record_task_completed("approval", "expired");
+
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("encoding should succeed");
+
+        assert!(buffer.contains("thoughtgate_tasks_created_total"));
+        assert!(buffer.contains("thoughtgate_tasks_completed_total"));
+        assert!(buffer.contains("task_type=\"approval\""));
+        assert!(buffer.contains("outcome=\"completed\""));
+        assert!(buffer.contains("outcome=\"failed\""));
+        assert!(buffer.contains("outcome=\"expired\""));
     }
 }

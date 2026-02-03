@@ -29,7 +29,9 @@ use thoughtgate_core::transport::upstream::{UpstreamClient, UpstreamConfig};
 use thoughtgate_proxy::admin::AdminServer;
 use thoughtgate_proxy::error::ProxyError;
 use thoughtgate_proxy::logging_layer::logging_layer;
-use thoughtgate_proxy::mcp_handler::{McpHandler, McpHandlerConfig, create_governance_components};
+use thoughtgate_proxy::mcp_handler::{
+    McpHandler, McpHandlerConfig, create_governance_components_with_metrics,
+};
 use thoughtgate_proxy::ports::{admin_port, outbound_port};
 use thoughtgate_proxy::proxy_config::ProxyConfig;
 use thoughtgate_proxy::proxy_service::ProxyService;
@@ -149,6 +151,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Implements: REQ-CORE-005/F-004 (Unified Shutdown)
     let shutdown = CancellationToken::new();
 
+    // Start uptime gauge updater (REQ-OBS-002 §6.4/MG-004)
+    let uptime_metrics = tg_metrics.clone();
+    let startup_instant = std::time::Instant::now();
+    let uptime_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    uptime_metrics.uptime_seconds.set(startup_instant.elapsed().as_secs() as i64);
+                }
+                _ = uptime_shutdown.cancelled() => {
+                    break;
+                }
+            }
+        }
+    });
+
     // Phase 4: Start admin server on dedicated port
     // Implements: REQ-CORE-005/F-002, F-003, REQ-CORE-005/§5.1
     let admin_port_val = admin_port();
@@ -249,8 +269,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Create governance components (TaskHandler, CedarEngine, ApprovalEngine)
         // IMPORTANT: The TaskHandler contains the shared TaskStore that ApprovalEngine uses
+        // Pass metrics for tasks_pending gauge (REQ-OBS-002 §6.4/MG-002)
         let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), Some(config), shutdown.clone()).await?;
+            create_governance_components_with_metrics(
+                upstream.clone(),
+                Some(config),
+                shutdown.clone(),
+                Some(tg_metrics.clone()),
+            )
+            .await?;
 
         // Create MCP handler with full governance
         // Use the same TaskStore that ApprovalEngine uses for task coordination
