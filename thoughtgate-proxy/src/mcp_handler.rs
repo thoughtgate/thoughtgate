@@ -53,7 +53,7 @@ use thoughtgate_core::protocol::{
     strip_sse_capability,
 };
 use thoughtgate_core::telemetry::{
-    BoxedSpan, McpMessageType, McpSpanData, finish_mcp_span, start_mcp_span,
+    BoxedSpan, McpMessageType, McpSpanData, ThoughtGateMetrics, finish_mcp_span, start_mcp_span,
 };
 use thoughtgate_core::transport::jsonrpc::{
     JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
@@ -180,6 +180,8 @@ pub struct McpState {
     pub buffered_bytes: AtomicUsize,
     /// Maximum aggregate buffered bytes before rejecting new requests.
     pub max_aggregate_buffer: usize,
+    /// Prometheus metrics for request counting and latency (REQ-OBS-002 §6).
+    pub tg_metrics: Option<Arc<ThoughtGateMetrics>>,
 }
 
 /// Configuration for the MCP handler.
@@ -310,6 +312,7 @@ impl McpHandler {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: config.max_aggregate_buffer,
+            tg_metrics: None,
         });
 
         Self { state }
@@ -339,6 +342,7 @@ impl McpHandler {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: config.max_aggregate_buffer,
+            tg_metrics: None,
         });
 
         Self { state }
@@ -357,6 +361,7 @@ impl McpHandler {
     /// * `handler_config` - Handler configuration (body size, concurrency)
     /// * `yaml_config` - Optional YAML configuration (Gates 1 & 2)
     /// * `approval_engine` - Optional approval engine (Gate 4)
+    /// * `tg_metrics` - Optional Prometheus metrics (REQ-OBS-002 §6)
     ///
     /// # Returns
     ///
@@ -364,6 +369,7 @@ impl McpHandler {
     ///
     /// # Traceability
     /// - Implements: REQ-GOV-002 (Governance Pipeline)
+    /// - Implements: REQ-OBS-002 §6 (Prometheus Metrics)
     #[must_use]
     pub fn with_governance(
         upstream: Arc<dyn UpstreamForwarder>,
@@ -372,6 +378,7 @@ impl McpHandler {
         handler_config: McpHandlerConfig,
         yaml_config: Option<Arc<Config>>,
         approval_engine: Option<Arc<ApprovalEngine>>,
+        tg_metrics: Option<Arc<ThoughtGateMetrics>>,
     ) -> Self {
         let task_handler = TaskHandler::new(task_store);
         let semaphore = Arc::new(Semaphore::new(handler_config.max_concurrent_requests));
@@ -389,6 +396,7 @@ impl McpHandler {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: handler_config.max_aggregate_buffer,
+            tg_metrics,
         });
 
         Self { state }
@@ -582,6 +590,7 @@ impl McpServer {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
+            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
         });
 
         Ok(Self {
@@ -623,6 +632,7 @@ impl McpServer {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
+            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
         });
 
         Ok(Self {
@@ -676,6 +686,7 @@ impl McpServer {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
+            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
         });
 
         Ok(Self {
@@ -1402,10 +1413,21 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
     finish_mcp_span(&mut span, is_error, error_code, error_type.as_deref());
     drop(span);
 
-    // Record MCP request metrics
+    // Record MCP request metrics (OTel-based, deprecated)
     let outcome = if result.is_ok() { "success" } else { "error" };
     if let Some(mcp_metrics) = thoughtgate_core::metrics::get_mcp_metrics() {
         mcp_metrics.record_request(&method, outcome, request_start.elapsed().as_secs_f64());
+    }
+
+    // Record prometheus-client metrics (REQ-OBS-002 §6.1, §6.2)
+    if let Some(ref metrics) = state.tg_metrics {
+        let duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+        metrics.record_request(&method, tool_name.as_deref(), outcome);
+        metrics.record_request_duration(&method, tool_name.as_deref(), duration_ms);
+
+        if let Err(ref e) = result {
+            metrics.record_error(e.error_type_name(), &method);
+        }
     }
 
     // Handle notification - no response (empty body with 204)
@@ -2320,6 +2342,7 @@ mod tests {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
+            tg_metrics: None,
         })
     }
 
@@ -2494,6 +2517,7 @@ mod tests {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
+            tg_metrics: None,
         });
 
         let router = Router::new()
@@ -2541,6 +2565,7 @@ mod tests {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
+            tg_metrics: None,
         });
 
         // Router with DefaultBodyLimit disabled - we check size manually and return JSON-RPC error
@@ -2881,6 +2906,7 @@ mod tests {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
+            tg_metrics: None,
         })
     }
 
@@ -3137,6 +3163,7 @@ mod tests {
             capability_cache: Arc::new(CapabilityCache::new()),
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
+            tg_metrics: None,
         })
     }
 

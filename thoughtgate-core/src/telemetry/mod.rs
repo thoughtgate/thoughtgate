@@ -7,13 +7,18 @@
 //! # Submodules
 //!
 //! - [`spans`] - MCP span instrumentation with OTel GenAI semantic conventions
+//! - [`prom_metrics`] - Prometheus metrics using prometheus-client crate
+//! - [`cardinality`] - Cardinality limiter for metric labels
 //!
 //! # Traceability
 //! - Implements: REQ-OBS-002 §11.1 (Crate Selection)
 //! - Implements: REQ-OBS-002 §12/B-OBS2-001 (Telemetry Disabled by Default)
 //! - Implements: REQ-OBS-002 §12/B-OBS2-002 (Graceful Degradation on Export Failure)
 //! - Implements: REQ-OBS-002 §12/B-OBS2-003 (Zero Overhead When Disabled)
+//! - Implements: REQ-OBS-002 §6.1-6.5 (Prometheus Metrics)
 
+pub mod cardinality;
+pub mod prom_metrics;
 pub mod spans;
 
 pub use spans::{
@@ -34,6 +39,10 @@ pub use spans::{
     finish_mcp_span,
     start_mcp_span,
 };
+
+// Re-export prometheus-client metrics
+pub use cardinality::CardinalityLimiter;
+pub use prom_metrics::ThoughtGateMetrics;
 
 // Re-export BoxedSpan for convenience (callers need to annotate span type)
 pub use opentelemetry::global::BoxedSpan;

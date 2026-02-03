@@ -742,6 +742,7 @@ async fn test_gate2_forward_action_passthrough() {
         McpHandlerConfig::default(),
         None, // No YAML config = Cedar-only mode (default forward)
         None, // No approval engine
+        None, // No prometheus metrics
     );
 
     // Send a tools/call request
@@ -827,6 +828,7 @@ async fn test_gate2_deny_action_rejects() {
         McpHandlerConfig::default(),
         Some(Arc::new(config)),
         None, // No approval engine
+        None, // No prometheus metrics
     );
 
     // Send a tools/call request for the denied tool
@@ -898,7 +900,8 @@ async fn test_gate3_cedar_permit_continues() {
         task_store,
         McpHandlerConfig::default(),
         None, // Cedar-only mode
-        None,
+        None, // No approval engine
+        None, // No prometheus metrics
     );
 
     let request = json!({
@@ -978,7 +981,8 @@ async fn test_non_tool_methods_bypass_governance() {
         task_store,
         McpHandlerConfig::default(),
         Some(Arc::new(config)),
-        None,
+        None, // No approval engine
+        None, // No prometheus metrics
     );
 
     // tools/list should bypass governance even with deny-all config
@@ -1066,8 +1070,9 @@ async fn test_task_methods_handled_locally() {
         cedar_engine,
         task_store,
         McpHandlerConfig::default(),
-        None,
-        None,
+        None, // No YAML config
+        None, // No approval engine
+        None, // No prometheus metrics
     );
 
     // tasks/get should be handled locally
@@ -1144,8 +1149,9 @@ async fn test_batch_requests_processed_correctly() {
         cedar_engine,
         task_store,
         McpHandlerConfig::default(),
-        None,
-        None,
+        None, // No YAML config
+        None, // No approval engine
+        None, // No prometheus metrics
     );
 
     // Batch with multiple request types
@@ -1226,8 +1232,9 @@ async fn test_invalid_json_returns_parse_error() {
         cedar_engine,
         task_store,
         McpHandlerConfig::default(),
-        None,
-        None,
+        None, // No YAML config
+        None, // No approval engine
+        None, // No prometheus metrics
     );
 
     // Send invalid JSON

@@ -2,20 +2,34 @@
 //!
 //! # Traceability
 //! - Implements: REQ-CORE-005/§5.1 (Admin Server)
+//! - Implements: REQ-OBS-002 §6 (Prometheus Metrics Endpoint)
 //!
 //! # Overview
 //!
 //! The admin server runs on a dedicated port (default: 7469) and provides:
 //!
 //! - **Health Endpoints**: `/health` (liveness) and `/ready` (readiness)
-//! - **Metrics Endpoint**: `/metrics` (Prometheus format)
+//! - **Metrics Endpoint**: `/metrics` (OpenMetrics format via prometheus-client)
 //!
 //! This is separate from the main proxy port to allow:
 //! - Independent health monitoring
 //! - Security isolation (admin endpoints not exposed to proxy clients)
 //! - Dedicated resource allocation
+//!
+//! # Metrics Migration Note
+//!
+//! The `/metrics` endpoint now uses `prometheus-client` crate with OpenMetrics format.
+//! Previous OTel-based metrics (`mcp_*`, etc.) are replaced by `thoughtgate_*` prefixed
+//! metrics. This is an intentional migration per REQ-OBS-002.
 
-use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Router,
+    extract::State,
+    http::{StatusCode, header},
+    response::IntoResponse,
+    routing::get,
+};
+use prometheus_client::registry::Registry;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -67,6 +81,8 @@ impl AdminServerConfig {
 pub struct AdminState {
     /// Lifecycle manager for health checks.
     pub lifecycle: Arc<LifecycleManager>,
+    /// Prometheus registry for metrics endpoint (REQ-OBS-002 §6).
+    pub prom_registry: Arc<Registry>,
 }
 
 /// Admin server for health checks and metrics.
@@ -84,28 +100,41 @@ impl AdminServer {
     /// # Arguments
     ///
     /// * `lifecycle` - Lifecycle manager for health checks
+    /// * `prom_registry` - Prometheus registry for metrics
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// use thoughtgate_proxy::admin::AdminServer;
     /// use thoughtgate_core::lifecycle::LifecycleManager;
+    /// use prometheus_client::registry::Registry;
     ///
     /// let lifecycle = Arc::new(LifecycleManager::new(Default::default()));
-    /// let admin = AdminServer::new(lifecycle);
+    /// let prom_registry = Arc::new(Registry::default());
+    /// let admin = AdminServer::new(lifecycle, prom_registry);
     /// ```
-    pub fn new(lifecycle: Arc<LifecycleManager>) -> Self {
+    pub fn new(lifecycle: Arc<LifecycleManager>, prom_registry: Arc<Registry>) -> Self {
         Self {
             config: AdminServerConfig::default(),
-            state: AdminState { lifecycle },
+            state: AdminState {
+                lifecycle,
+                prom_registry,
+            },
         }
     }
 
     /// Create a new admin server with custom configuration.
-    pub fn with_config(lifecycle: Arc<LifecycleManager>, config: AdminServerConfig) -> Self {
+    pub fn with_config(
+        lifecycle: Arc<LifecycleManager>,
+        prom_registry: Arc<Registry>,
+        config: AdminServerConfig,
+    ) -> Self {
         Self {
             config,
-            state: AdminState { lifecycle },
+            state: AdminState {
+                lifecycle,
+                prom_registry,
+            },
         }
     }
 
@@ -189,33 +218,32 @@ async fn readiness_handler(State(state): State<AdminState>) -> impl IntoResponse
     }
 }
 
-/// Metrics handler (Prometheus format).
+/// Metrics handler using prometheus-client (OpenMetrics format).
 ///
-/// Returns metrics in Prometheus text format.
+/// Returns metrics in OpenMetrics text format. This replaces the previous
+/// OTel-prometheus based metrics handler.
 ///
 /// # Traceability
-/// - Implements: REQ-OBS-001 (Metrics)
-async fn metrics_handler() -> impl IntoResponse {
-    use prometheus::{Encoder, TextEncoder};
+/// - Implements: REQ-OBS-002 §6 (Prometheus Metrics Endpoint)
+async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    let mut buffer = String::new();
 
-    let metrics = prometheus::default_registry().gather();
-    let encoder = TextEncoder::new();
-    let mut buffer = Vec::new();
-
-    if let Err(e) = encoder.encode(&metrics, &mut buffer) {
+    if let Err(e) = prometheus_client::encoding::text::encode(&mut buffer, &state.prom_registry) {
         error!(error = %e, "Failed to encode metrics");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to encode metrics",
+            format!("Failed to encode metrics: {}", e),
         )
             .into_response();
     }
 
-    let metrics_string = String::from_utf8_lossy(&buffer).to_string();
     (
         StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        metrics_string,
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        buffer,
     )
         .into_response()
 }
@@ -231,13 +259,21 @@ mod tests {
 
     fn create_test_state() -> AdminState {
         let lifecycle = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
-        AdminState { lifecycle }
+        let prom_registry = Arc::new(Registry::default());
+        AdminState {
+            lifecycle,
+            prom_registry,
+        }
     }
 
     #[tokio::test]
     async fn test_health_endpoint() {
         let state = create_test_state();
-        let admin = AdminServer::with_config(state.lifecycle.clone(), AdminServerConfig::default());
+        let admin = AdminServer::with_config(
+            state.lifecycle.clone(),
+            state.prom_registry.clone(),
+            AdminServerConfig::default(),
+        );
         let router = admin.router();
 
         let request = Request::builder()
@@ -256,7 +292,11 @@ mod tests {
     #[tokio::test]
     async fn test_readiness_endpoint_not_ready() {
         let state = create_test_state();
-        let admin = AdminServer::with_config(state.lifecycle.clone(), AdminServerConfig::default());
+        let admin = AdminServer::with_config(
+            state.lifecycle.clone(),
+            state.prom_registry.clone(),
+            AdminServerConfig::default(),
+        );
         let router = admin.router();
 
         // Lifecycle starts not ready
@@ -275,7 +315,11 @@ mod tests {
         let state = create_test_state();
         state.lifecycle.mark_ready();
 
-        let admin = AdminServer::with_config(state.lifecycle.clone(), AdminServerConfig::default());
+        let admin = AdminServer::with_config(
+            state.lifecycle.clone(),
+            state.prom_registry.clone(),
+            AdminServerConfig::default(),
+        );
         let router = admin.router();
 
         let request = Request::builder()
@@ -294,7 +338,11 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_endpoint() {
         let state = create_test_state();
-        let admin = AdminServer::with_config(state.lifecycle.clone(), AdminServerConfig::default());
+        let admin = AdminServer::with_config(
+            state.lifecycle.clone(),
+            state.prom_registry.clone(),
+            AdminServerConfig::default(),
+        );
         let router = admin.router();
 
         let request = Request::builder()
@@ -306,6 +354,53 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         // Metrics endpoint should return 200 OK
         assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify Content-Type is OpenMetrics
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("Content-Type header should be present");
+        assert!(
+            content_type
+                .to_str()
+                .expect("Content-Type should be valid string")
+                .contains("openmetrics")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_with_registered_metrics() {
+        use thoughtgate_core::telemetry::ThoughtGateMetrics;
+
+        // Create registry with actual metrics registered
+        let mut registry = Registry::default();
+        let metrics = ThoughtGateMetrics::new(&mut registry);
+
+        // Record some metrics
+        metrics.record_request("tools/call", Some("test_tool"), "success");
+        metrics.record_request_duration("tools/call", Some("test_tool"), 42.5);
+
+        let lifecycle = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
+        let prom_registry = Arc::new(registry);
+        let admin =
+            AdminServer::with_config(lifecycle, prom_registry, AdminServerConfig::default());
+        let router = admin.router();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&body);
+
+        // Verify our metrics are present
+        assert!(body_str.contains("thoughtgate_requests_total"));
+        assert!(body_str.contains("thoughtgate_request_duration_ms"));
     }
 
     #[test]

@@ -147,6 +147,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug!("OpenTelemetry tracing disabled");
     }
 
+    // Initialize prometheus-client registry and metrics (REQ-OBS-002 §6)
+    let mut prom_registry = prometheus_client::registry::Registry::default();
+    let tg_metrics = Arc::new(thoughtgate_core::telemetry::ThoughtGateMetrics::new(
+        &mut prom_registry,
+    ));
+    let prom_registry = Arc::new(prom_registry);
+
     // Phase 3: Create unified shutdown token
     // Implements: REQ-CORE-005/F-004 (Unified Shutdown)
     let shutdown = CancellationToken::new();
@@ -156,10 +163,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_port_val = admin_port();
     let admin_shutdown = shutdown.clone();
     let admin_lifecycle = lifecycle.clone();
+    let admin_prom_registry = prom_registry.clone();
     let admin_bind = cli_config.bind.clone();
     tokio::spawn(async move {
         let admin_server = AdminServer::with_config(
             admin_lifecycle,
+            admin_prom_registry,
             thoughtgate_proxy::admin::AdminServerConfig {
                 port: admin_port_val,
                 bind_addr: admin_bind,
@@ -243,6 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             McpHandlerConfig::from_env(),
             Some(Arc::new(config.clone())),
             approval_engine,
+            Some(tg_metrics.clone()), // Prometheus metrics (REQ-OBS-002 §6)
         );
 
         info!(

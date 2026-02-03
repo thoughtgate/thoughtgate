@@ -84,6 +84,9 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-prometheus = "0.31"
 prometheus = "0.14"
 
+# Prometheus metrics with prometheus-client (REQ-OBS-002 §6)
+prometheus-client = "0.24.0"
+
 [features]
 default = ["metrics"]
 mock = []
