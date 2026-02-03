@@ -88,6 +88,7 @@ http = "1"
 serde.workspace = true
 serde_json.workspace = true
 opentelemetry-stdout = { version = "=0.31.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.31.0", features = ["testing"] }
 
 [[bench]]
 name = "policy_eval"

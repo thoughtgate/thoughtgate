@@ -52,6 +52,9 @@ use thoughtgate_core::protocol::{
     extract_upstream_sse_support, extract_upstream_task_support, inject_task_capability,
     strip_sse_capability,
 };
+use thoughtgate_core::telemetry::{
+    BoxedSpan, McpMessageType, McpSpanData, finish_mcp_span, start_mcp_span,
+};
 use thoughtgate_core::transport::jsonrpc::{
     JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
 };
@@ -1357,6 +1360,23 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
     let method = request.method.clone();
     let request_start = std::time::Instant::now();
 
+    // Extract tool name for tools/call requests (REQ-OBS-002 §5.1.1)
+    let tool_name = extract_tool_name(&request);
+
+    // Start MCP span (REQ-OBS-002 §5.1)
+    let span_data = McpSpanData {
+        method: &method,
+        message_type: if is_notification {
+            McpMessageType::Notification
+        } else {
+            McpMessageType::Request
+        },
+        message_id: id.as_ref().map(jsonrpc_id_to_string),
+        correlation_id: &correlation_id,
+        tool_name: tool_name.as_deref(),
+    };
+    let mut span: BoxedSpan = start_mcp_span(&span_data);
+
     debug!(
         correlation_id = %correlation_id,
         method = %request.method,
@@ -1367,6 +1387,20 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
 
     // Route the request through shared routing logic
     let result = route_request(state, request).await;
+
+    // Determine error info for span (REQ-OBS-002 §5.1.1)
+    let (is_error, error_code, error_type): (bool, Option<i32>, Option<String>) = match &result {
+        Ok(_) => (false, None, None),
+        Err(e) => (
+            true,
+            Some(e.to_jsonrpc_code()),
+            Some(e.error_type_name().to_string()),
+        ),
+    };
+
+    // Finish span with result attributes
+    finish_mcp_span(&mut span, is_error, error_code, error_type.as_deref());
+    drop(span);
 
     // Record MCP request metrics
     let outcome = if result.is_ok() { "success" } else { "error" };
@@ -1390,6 +1424,32 @@ async fn handle_single_request_bytes(state: &McpState, request: McpRequest) -> (
     match result {
         Ok(response) => json_bytes(&response),
         Err(e) => error_bytes(id, &e, &correlation_id),
+    }
+}
+
+/// Extract tool name from tools/call request params.
+///
+/// Implements: REQ-OBS-002 §5.1.1 (gen_ai.tool.name attribute)
+fn extract_tool_name(request: &McpRequest) -> Option<String> {
+    if request.method != "tools/call" {
+        return None;
+    }
+    request
+        .params
+        .as_ref()?
+        .get("name")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Convert JsonRpcId to string for span attributes.
+///
+/// Implements: REQ-OBS-002 §5.1.1 (mcp.message.id attribute)
+fn jsonrpc_id_to_string(id: &JsonRpcId) -> String {
+    match id {
+        JsonRpcId::Number(n) => n.to_string(),
+        JsonRpcId::String(s) => s.clone(),
+        JsonRpcId::Null => "null".to_string(),
     }
 }
 

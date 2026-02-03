@@ -4,11 +4,39 @@
 //! It initializes the OpenTelemetry tracer provider with OTLP HTTP/protobuf export
 //! and manages the provider lifecycle (startup and graceful shutdown).
 //!
+//! # Submodules
+//!
+//! - [`spans`] - MCP span instrumentation with OTel GenAI semantic conventions
+//!
 //! # Traceability
 //! - Implements: REQ-OBS-002 §11.1 (Crate Selection)
 //! - Implements: REQ-OBS-002 §12/B-OBS2-001 (Telemetry Disabled by Default)
 //! - Implements: REQ-OBS-002 §12/B-OBS2-002 (Graceful Degradation on Export Failure)
 //! - Implements: REQ-OBS-002 §12/B-OBS2-003 (Zero Overhead When Disabled)
+
+pub mod spans;
+
+pub use spans::{
+    // Constants
+    ERROR_TYPE,
+    GENAI_OPERATION_NAME,
+    GENAI_TOOL_CALL_ID,
+    GENAI_TOOL_NAME,
+    MCP_ERROR_CODE,
+    MCP_MESSAGE_ID,
+    MCP_MESSAGE_TYPE,
+    MCP_METHOD_NAME,
+    MCP_RESULT_IS_ERROR,
+    MCP_SESSION_ID,
+    McpMessageType,
+    McpSpanData,
+    THOUGHTGATE_REQUEST_ID,
+    finish_mcp_span,
+    start_mcp_span,
+};
+
+// Re-export BoxedSpan for convenience (callers need to annotate span type)
+pub use opentelemetry::global::BoxedSpan;
 
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
