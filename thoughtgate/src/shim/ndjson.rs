@@ -403,6 +403,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_no_id_no_method() {
+        // EC-STDIO-017: Valid JSON with jsonrpc:"2.0" but neither id nor method.
+        // Should be classified as Unclassifiable → MalformedJson.
+        let line = r#"{"jsonrpc":"2.0"}"#;
+        let err = parse_stdio_message(line).unwrap_err();
+        assert!(
+            matches!(err, FramingError::MalformedJson { ref reason } if reason.contains("neither id nor method")),
+            "expected MalformedJson for unclassifiable message, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_smuggling_empty_after_newline() {
         // Trailing newline only — no smuggled content.
         let mut raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#.to_vec();
