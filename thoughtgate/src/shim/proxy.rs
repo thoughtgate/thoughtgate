@@ -10,9 +10,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout};
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 use thoughtgate_core::StreamDirection;
 use thoughtgate_core::governance::api::{
@@ -60,6 +60,10 @@ const DEFAULT_APPROVAL_POLL_MS: u64 = 5000;
 /// compromised governance service returning very low values.
 const MIN_APPROVAL_POLL_MS: u64 = 100;
 
+/// Maximum poll interval to prevent a compromised governance service from
+/// stalling the shim indefinitely with very high values.
+const MAX_APPROVAL_POLL_MS: u64 = 30_000;
+
 /// Request timeout for GET /governance/task/{id} (ms).
 const TASK_STATUS_TIMEOUT_MS: u64 = 5000;
 
@@ -99,8 +103,8 @@ fn is_passthrough(method: &str) -> bool {
 /// Format a JSON-RPC error response for a denied message.
 ///
 /// Returns a complete NDJSON line (with trailing newline) containing a
-/// JSON-RPC 2.0 error response with code -32001 and ThoughtGate denial
-/// details in the `data` field.
+/// JSON-RPC 2.0 error response with code -32003 (PolicyDenied) and
+/// ThoughtGate denial details in the `data` field.
 ///
 /// Implements: REQ-CORE-008/F-012
 fn format_deny_response(
@@ -119,12 +123,17 @@ fn format_deny_response(
         "jsonrpc": "2.0",
         "id": id_json,
         "error": {
-            "code": -32001,
+            "code": -32003,
             "message": "Denied by ThoughtGate policy",
             "data": data,
         }
     });
-    let mut line = serde_json::to_string(&response).unwrap_or_default();
+    // Static fallback: the json!() macro above should always serialize, but
+    // guard against truly pathological id values. An empty string + '\n' would
+    // be an unparseable NDJSON line for the agent.
+    let mut line = serde_json::to_string(&response).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32003,"message":"Denied by ThoughtGate policy"}}"#.to_string()
+    });
     line.push('\n');
     line
 }
@@ -176,6 +185,21 @@ fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<thoughtgate_core::jsonrpc::
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared Stdout Writer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Atomically write data to the shared agent stdout and flush.
+///
+/// Both `agent_to_server` (deny responses) and `server_to_agent` (forwarded
+/// data) write to the same stdout fd. This helper ensures writes are serialized
+/// through a `Mutex` so NDJSON lines are never interleaved.
+async fn write_stdout(stdout: &Mutex<Stdout>, data: &[u8]) -> Result<(), std::io::Error> {
+    let mut guard = stdout.lock().await;
+    guard.write_all(data).await?;
+    guard.flush().await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Bounded Line Reading (DoS Protection)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -185,6 +209,10 @@ fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<thoughtgate_core::jsonrpc::
 /// if the peer sends a continuous stream of bytes without a newline delimiter.
 /// If the accumulated bytes exceed `max_bytes` before a newline is found, the
 /// buffer is drained and a `FramingError::MessageTooLarge` is returned.
+///
+/// Raw bytes are accumulated into a `Vec<u8>` to avoid corrupting multi-byte
+/// UTF-8 characters that straddle internal buffer boundaries. The caller
+/// converts to `String` after the full line is assembled.
 ///
 /// # Returns
 ///
@@ -196,7 +224,7 @@ fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<thoughtgate_core::jsonrpc::
 /// Implements: REQ-CORE-008 §5.2 (message size limit)
 async fn bounded_read_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
-    buf: &mut String,
+    buf: &mut Vec<u8>,
     max_bytes: usize,
 ) -> Result<usize, FramingError> {
     let mut total = 0usize;
@@ -219,10 +247,7 @@ async fn bounded_read_line<R: tokio::io::AsyncBufRead + Unpin>(
                     return Err(FramingError::MessageTooLarge { max_bytes });
                 }
 
-                // Copy bytes from the internal buffer before consuming.
-                let chunk = &available[..to_consume];
-                let s = String::from_utf8_lossy(chunk);
-                buf.push_str(&s);
+                buf.extend_from_slice(&available[..to_consume]);
                 total += to_consume;
                 reader.consume(to_consume);
                 return Ok(total);
@@ -237,9 +262,7 @@ async fn bounded_read_line<R: tokio::io::AsyncBufRead + Unpin>(
                     return Err(FramingError::MessageTooLarge { max_bytes });
                 }
 
-                // Copy bytes from the internal buffer before consuming.
-                let s = String::from_utf8_lossy(available);
-                buf.push_str(&s);
+                buf.extend_from_slice(available);
                 total += len;
                 reader.consume(len);
             }
@@ -345,11 +368,12 @@ async fn poll_approval_status(
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(cycle, error = %e, "approval poll: HTTP error");
                 if profile == Profile::Production {
+                    tracing::warn!(cycle, error = %e, "approval poll: HTTP error");
                     return ApprovalPollResult::Error;
                 }
-                // Dev mode: retry on transient errors.
+                // Dev mode: retry on transient errors (debug level to reduce noise).
+                tracing::debug!(cycle, error = %e, "approval poll: HTTP error (dev retry)");
                 continue;
             }
         };
@@ -412,7 +436,12 @@ async fn poll_governance_healthz(
     let mut delay_ms = HEALTHZ_INITIAL_BACKOFF_MS;
 
     for attempt in 1..=HEALTHZ_MAX_ATTEMPTS {
-        match client.get(&url).send().await {
+        match client
+            .get(&url)
+            .timeout(Duration::from_millis(HEALTHZ_MAX_BACKOFF_MS))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!(attempt, "governance service is healthy");
                 return Ok(());
@@ -535,6 +564,10 @@ pub async fn run_shim(
 
     // ── Spawn concurrent tasks ───────────────────────────────────────────
 
+    // Shared stdout handle — both tasks write NDJSON to the agent's stdout.
+    // Serialized through a Mutex to prevent interleaved lines.
+    let agent_stdout: Arc<Mutex<Stdout>> = Arc::new(Mutex::new(tokio::io::stdout()));
+
     // Task 1: Agent → Server
     let a2s_handle = {
         let server_id = server_id.clone();
@@ -544,6 +577,7 @@ pub async fn run_shim(
         let mut shutdown_rx = shutdown_rx.clone();
         let shutdown_tx = shutdown_tx.clone();
         let pending = pending.clone();
+        let agent_stdout = agent_stdout.clone();
 
         tokio::spawn(async move {
             agent_to_server(
@@ -553,6 +587,7 @@ pub async fn run_shim(
                 client,
                 metrics,
                 child_stdin,
+                agent_stdout,
                 &mut shutdown_rx,
                 shutdown_tx,
                 pending,
@@ -567,9 +602,18 @@ pub async fn run_shim(
         let metrics = metrics.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         let pending = pending.clone();
+        let agent_stdout = agent_stdout.clone();
 
         tokio::spawn(async move {
-            server_to_agent(server_id, metrics, child_stdout, &mut shutdown_rx, pending).await
+            server_to_agent(
+                server_id,
+                metrics,
+                child_stdout,
+                agent_stdout,
+                &mut shutdown_rx,
+                pending,
+            )
+            .await
         })
     };
 
@@ -579,9 +623,17 @@ pub async fn run_shim(
         let governance_endpoint = governance_endpoint.clone();
         let client = client.clone();
         let shutdown_tx = shutdown_tx.clone();
+        let shutdown_rx = shutdown_rx.clone();
 
         tokio::spawn(async move {
-            heartbeat_loop(server_id, governance_endpoint, client, shutdown_tx).await;
+            heartbeat_loop(
+                server_id,
+                governance_endpoint,
+                client,
+                shutdown_tx,
+                shutdown_rx,
+            )
+            .await;
         })
     };
 
@@ -659,18 +711,18 @@ async fn agent_to_server(
     client: reqwest::Client,
     metrics: StdioMetrics,
     mut child_stdin: tokio::process::ChildStdin,
+    agent_stdout: Arc<Mutex<Stdout>>,
     shutdown_rx: &mut watch::Receiver<bool>,
     shutdown_tx: watch::Sender<bool>,
     pending: Arc<tokio::sync::Mutex<PendingRequests>>,
 ) -> Result<(), StdioError> {
     let agent_stdin = tokio::io::stdin();
     let mut reader = BufReader::new(agent_stdin);
-    let mut agent_stdout = tokio::io::stdout();
-    let mut buf = String::new();
+    let mut raw_buf = Vec::new();
     let evaluate_url = format!("{governance_endpoint}/governance/evaluate");
 
     loop {
-        buf.clear();
+        raw_buf.clear();
 
         let bytes_read = tokio::select! {
             biased;
@@ -680,7 +732,7 @@ async fn agent_to_server(
             }
             result = bounded_read_line(
                 &mut reader,
-                &mut buf,
+                &mut raw_buf,
                 crate::shim::ndjson::MAX_MESSAGE_BYTES,
             ) => {
                 match result {
@@ -717,13 +769,18 @@ async fn agent_to_server(
             break;
         }
 
+        // Convert raw bytes to string (full line is contiguous, so lossy
+        // conversion handles any genuinely invalid UTF-8 without splitting
+        // multi-byte characters across buffer boundaries).
+        let buf = String::from_utf8_lossy(&raw_buf);
+
         // Skip empty lines (lenient parsing per §10.2).
         if buf.trim().is_empty() {
             continue;
         }
 
-        // F-014: Smuggling detection (before parsing).
-        let smuggled = detect_smuggling(buf.as_bytes());
+        // F-014: Smuggling detection on raw bytes (before parsing).
+        let smuggled = detect_smuggling(&raw_buf);
 
         // F-013: Parse the NDJSON line.
         let msg = match parse_stdio_message(&buf) {
@@ -756,7 +813,7 @@ async fn agent_to_server(
         // F-017: Passthrough messages bypass governance.
         if is_passthrough(&method) {
             child_stdin
-                .write_all(buf.as_bytes())
+                .write_all(&raw_buf)
                 .await
                 .map_err(|e| StdioError::Framing {
                     server_id: server_id.clone(),
@@ -794,8 +851,20 @@ async fn agent_to_server(
                 Ok(body) => body,
                 Err(e) => {
                     tracing::error!(server_id, error = %e, "failed to parse governance response");
-                    // Fail-closed in production, forward in development.
+                    // Fail-closed in production: send deny so agent sees an error
+                    // rather than a silently dropped request.
                     if profile == Profile::Production {
+                        metrics.record_governance_decision(
+                            &server_id,
+                            "deny",
+                            &format!("{profile:?}"),
+                        );
+                        if let Some(id) = id_from_kind(&msg.kind) {
+                            let deny_line = format_deny_response(&id, &server_id, None);
+                            write_stdout(&agent_stdout, deny_line.as_bytes())
+                                .await
+                                .map_err(StdioError::StdioIo)?;
+                        }
                         continue;
                     }
                     tracing::warn!(
@@ -814,9 +883,16 @@ async fn agent_to_server(
             },
             Err(e) => {
                 tracing::error!(server_id, error = %e, "governance evaluate request failed");
-                // Fail-closed in production, forward in development.
+                // Fail-closed in production: send deny so agent sees an error
+                // rather than a silently dropped request.
                 if profile == Profile::Production {
                     metrics.record_governance_decision(&server_id, "deny", &format!("{profile:?}"));
+                    if let Some(id) = id_from_kind(&msg.kind) {
+                        let deny_line = format_deny_response(&id, &server_id, None);
+                        write_stdout(&agent_stdout, deny_line.as_bytes())
+                            .await
+                            .map_err(StdioError::StdioIo)?;
+                    }
                     continue;
                 }
                 tracing::warn!(
@@ -875,7 +951,7 @@ async fn agent_to_server(
         match eval_resp.decision {
             GovernanceDecision::Forward => {
                 child_stdin
-                    .write_all(buf.as_bytes())
+                    .write_all(&raw_buf)
                     .await
                     .map_err(|e| StdioError::Framing {
                         server_id: server_id.clone(),
@@ -904,11 +980,9 @@ async fn agent_to_server(
                 if let Some(id) = id_from_kind(&msg.kind) {
                     let deny_line =
                         format_deny_response(&id, &server_id, eval_resp.policy_id.as_deref());
-                    agent_stdout
-                        .write_all(deny_line.as_bytes())
+                    write_stdout(&agent_stdout, deny_line.as_bytes())
                         .await
                         .map_err(StdioError::StdioIo)?;
-                    agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
                 }
                 // Notifications have no id — silently drop denials for them.
             }
@@ -921,11 +995,9 @@ async fn agent_to_server(
                         tracing::error!(server_id, "PendingApproval without task_id — denying");
                         if let Some(id) = id_from_kind(&msg.kind) {
                             let deny_line = format_deny_response(&id, &server_id, None);
-                            agent_stdout
-                                .write_all(deny_line.as_bytes())
+                            write_stdout(&agent_stdout, deny_line.as_bytes())
                                 .await
                                 .map_err(StdioError::StdioIo)?;
-                            agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
                         }
                         continue;
                     }
@@ -935,7 +1007,7 @@ async fn agent_to_server(
                     eval_resp
                         .poll_interval_ms
                         .unwrap_or(DEFAULT_APPROVAL_POLL_MS)
-                        .max(MIN_APPROVAL_POLL_MS),
+                        .clamp(MIN_APPROVAL_POLL_MS, MAX_APPROVAL_POLL_MS),
                 );
                 let task_url = format!("{governance_endpoint}/governance/task/{task_id}");
 
@@ -957,13 +1029,14 @@ async fn agent_to_server(
                 match outcome {
                     ApprovalPollResult::Approved => {
                         tracing::info!(server_id, task_id, "approval granted — forwarding");
-                        child_stdin.write_all(buf.as_bytes()).await.map_err(|e| {
-                            StdioError::Framing {
+                        child_stdin
+                            .write_all(&raw_buf)
+                            .await
+                            .map_err(|e| StdioError::Framing {
                                 server_id: server_id.clone(),
                                 direction: StreamDirection::AgentToServer,
                                 source: FramingError::Io(e),
-                            }
-                        })?;
+                            })?;
                         child_stdin.flush().await.map_err(|e| StdioError::Framing {
                             server_id: server_id.clone(),
                             direction: StreamDirection::AgentToServer,
@@ -995,11 +1068,9 @@ async fn agent_to_server(
                                 &server_id,
                                 eval_resp.policy_id.as_deref(),
                             );
-                            agent_stdout
-                                .write_all(deny_line.as_bytes())
+                            write_stdout(&agent_stdout, deny_line.as_bytes())
                                 .await
                                 .map_err(StdioError::StdioIo)?;
-                            agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
                         }
                     }
                     ApprovalPollResult::Expired | ApprovalPollResult::Cancelled => {
@@ -1015,11 +1086,9 @@ async fn agent_to_server(
                                 &server_id,
                                 eval_resp.policy_id.as_deref(),
                             );
-                            agent_stdout
-                                .write_all(deny_line.as_bytes())
+                            write_stdout(&agent_stdout, deny_line.as_bytes())
                                 .await
                                 .map_err(StdioError::StdioIo)?;
-                            agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
                         }
                     }
                     ApprovalPollResult::Timeout | ApprovalPollResult::Error => {
@@ -1035,11 +1104,9 @@ async fn agent_to_server(
                                 &server_id,
                                 eval_resp.policy_id.as_deref(),
                             );
-                            agent_stdout
-                                .write_all(deny_line.as_bytes())
+                            write_stdout(&agent_stdout, deny_line.as_bytes())
                                 .await
                                 .map_err(StdioError::StdioIo)?;
-                            agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
                         }
                     }
                     ApprovalPollResult::Shutdown => {
@@ -1074,15 +1141,15 @@ async fn server_to_agent(
     server_id: String,
     metrics: StdioMetrics,
     child_stdout: tokio::process::ChildStdout,
+    agent_stdout: Arc<Mutex<Stdout>>,
     shutdown_rx: &mut watch::Receiver<bool>,
     pending: Arc<tokio::sync::Mutex<PendingRequests>>,
 ) -> Result<(), StdioError> {
     let mut reader = BufReader::new(child_stdout);
-    let mut agent_stdout = tokio::io::stdout();
-    let mut buf = String::new();
+    let mut raw_buf = Vec::new();
 
     loop {
-        buf.clear();
+        raw_buf.clear();
 
         let bytes_read = tokio::select! {
             biased;
@@ -1092,7 +1159,7 @@ async fn server_to_agent(
             }
             result = bounded_read_line(
                 &mut reader,
-                &mut buf,
+                &mut raw_buf,
                 crate::shim::ndjson::MAX_MESSAGE_BYTES,
             ) => {
                 match result {
@@ -1129,13 +1196,16 @@ async fn server_to_agent(
             break;
         }
 
+        // Convert raw bytes to string (full line is contiguous).
+        let buf = String::from_utf8_lossy(&raw_buf);
+
         // Skip empty lines.
         if buf.trim().is_empty() {
             continue;
         }
 
-        // F-014: Smuggling detection (log only for server→agent in v0.3).
-        if detect_smuggling(buf.as_bytes()) {
+        // F-014: Smuggling detection on raw bytes (log only for server→agent in v0.3).
+        if detect_smuggling(&raw_buf) {
             metrics.record_framing_error(&server_id, "smuggling");
             tracing::warn!(
                 server_id,
@@ -1198,12 +1268,10 @@ async fn server_to_agent(
             }
         }
 
-        // Always forward raw line to agent stdout.
-        agent_stdout
-            .write_all(buf.as_bytes())
+        // Always forward raw bytes to agent stdout.
+        write_stdout(&agent_stdout, &raw_buf)
             .await
             .map_err(StdioError::StdioIo)?;
-        agent_stdout.flush().await.map_err(StdioError::StdioIo)?;
     }
 
     Ok(())
@@ -1227,6 +1295,7 @@ async fn heartbeat_loop(
     governance_endpoint: String,
     client: reqwest::Client,
     shutdown_tx: watch::Sender<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let url = format!("{governance_endpoint}/governance/heartbeat");
     let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
@@ -1235,7 +1304,15 @@ async fn heartbeat_loop(
     interval.tick().await;
 
     loop {
-        interval.tick().await;
+        // Wait for next interval OR shutdown signal (whichever comes first).
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                tracing::debug!(server_id, "heartbeat: shutdown signal, stopping");
+                break;
+            }
+            _ = interval.tick() => {}
+        }
 
         let req = HeartbeatRequest {
             server_id: server_id.clone(),
@@ -1420,7 +1497,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["id"], 42);
-        assert_eq!(parsed["error"]["code"], -32001);
+        assert_eq!(parsed["error"]["code"], -32003);
         assert_eq!(parsed["error"]["message"], "Denied by ThoughtGate policy");
         assert_eq!(parsed["error"]["data"]["server_id"], "filesystem");
         assert_eq!(parsed["error"]["data"]["policy_id"], "pol-001");
@@ -1440,7 +1517,7 @@ mod tests {
         let line = format_deny_response(&JsonRpcId::Null, "sqlite", Some("pol-002"));
         let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert!(parsed["id"].is_null());
-        assert_eq!(parsed["error"]["code"], -32001);
+        assert_eq!(parsed["error"]["code"], -32003);
     }
 
     #[test]

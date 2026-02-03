@@ -155,6 +155,10 @@ impl Drop for ConfigGuard {
         // immediately after this. The lock file is intentionally left on disk —
         // removing it creates a TOCTOU race where a new process could create a
         // fresh inode and acquire a lock on it before the old handle is closed.
+        //
+        // Lock files are zero-byte sentinels and accumulate across sessions.
+        // A future `thoughtgate wrap --cleanup` command can safely remove stale
+        // lock files when no instances are running.
     }
 }
 
