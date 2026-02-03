@@ -101,6 +101,44 @@ pub struct TelemetryConfig {
     /// OTel resource `service.name` attribute.
     /// Default: "thoughtgate"
     pub service_name: String,
+
+    /// Additional resource attributes.
+    pub resource_attributes: std::collections::HashMap<String, String>,
+
+    /// Head sampling rate (0.0 to 1.0).
+    pub sample_rate: f64,
+
+    /// Batch processor settings.
+    pub batch: BatchSettings,
+}
+
+/// Batch span processor settings.
+///
+/// Implements: REQ-OBS-002 §8.2 (Batch Configuration)
+#[derive(Debug, Clone)]
+pub struct BatchSettings {
+    /// Maximum spans in the export queue.
+    pub max_queue_size: usize,
+
+    /// Maximum spans per export batch.
+    pub max_export_batch_size: usize,
+
+    /// Delay between scheduled exports.
+    pub scheduled_delay: std::time::Duration,
+
+    /// Export timeout.
+    pub export_timeout: std::time::Duration,
+}
+
+impl Default for BatchSettings {
+    fn default() -> Self {
+        Self {
+            max_queue_size: 2048,
+            max_export_batch_size: 512,
+            scheduled_delay: std::time::Duration::from_millis(5000),
+            export_timeout: std::time::Duration::from_millis(30000),
+        }
+    }
 }
 
 impl Default for TelemetryConfig {
@@ -109,6 +147,9 @@ impl Default for TelemetryConfig {
             enabled: false,
             otlp_endpoint: None,
             service_name: "thoughtgate".to_string(),
+            resource_attributes: std::collections::HashMap::new(),
+            sample_rate: 1.0,
+            batch: BatchSettings::default(),
         }
     }
 }
@@ -137,6 +178,86 @@ impl TelemetryConfig {
             enabled,
             otlp_endpoint,
             service_name,
+            resource_attributes: std::collections::HashMap::new(),
+            sample_rate: 1.0,
+            batch: BatchSettings::default(),
+        }
+    }
+
+    /// Create configuration from YAML config with env var overrides.
+    ///
+    /// Priority: OTEL_EXPORTER_OTLP_ENDPOINT env var > YAML > defaults
+    ///
+    /// Implements: REQ-OBS-002 §8.2, §8.5
+    pub fn from_yaml_config(yaml: Option<&crate::config::TelemetryYamlConfig>) -> Self {
+        let yaml = yaml.cloned().unwrap_or_default();
+
+        // OTEL_EXPORTER_OTLP_ENDPOINT env var overrides YAML
+        let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .ok()
+            .or_else(|| yaml.otlp.as_ref().map(|o| o.endpoint.clone()));
+
+        // Warn if gRPC protocol requested (v0.2: HTTP/protobuf only)
+        if let Some(ref otlp) = yaml.otlp {
+            if otlp.protocol == "grpc" {
+                tracing::warn!(
+                    "OTLP gRPC protocol not supported in v0.2, falling back to http/protobuf"
+                );
+            }
+        }
+
+        // Warn if tail sampling requested (v0.2: head only)
+        let sample_rate = if let Some(ref sampling) = yaml.sampling {
+            if sampling.strategy == "tail" {
+                tracing::warn!(
+                    sample_rate = sampling.success_sample_rate,
+                    "Tail sampling not yet implemented in v0.2, falling back to head sampling"
+                );
+            }
+            sampling.success_sample_rate
+        } else {
+            1.0
+        };
+
+        // Build resource attributes from config + K8s env vars
+        let mut resource_attributes = yaml.resource.unwrap_or_default();
+        for (env_var, attr_name) in [
+            ("K8S_NAMESPACE", "k8s.namespace.name"),
+            ("K8S_POD_NAME", "k8s.pod.name"),
+            ("K8S_NODE_NAME", "k8s.node.name"),
+            ("DEPLOY_ENV", "deployment.environment"),
+        ] {
+            if let Ok(val) = std::env::var(env_var) {
+                resource_attributes.insert(attr_name.to_string(), val);
+            }
+        }
+
+        // Service name: config > OTEL_SERVICE_NAME > default
+        let service_name = resource_attributes
+            .get("service.name")
+            .cloned()
+            .or_else(|| std::env::var("OTEL_SERVICE_NAME").ok())
+            .unwrap_or_else(|| "thoughtgate".to_string());
+
+        // Batch settings
+        let batch = yaml
+            .batch
+            .as_ref()
+            .map(|b| BatchSettings {
+                max_queue_size: b.max_queue_size,
+                max_export_batch_size: b.max_export_batch_size,
+                scheduled_delay: std::time::Duration::from_millis(b.scheduled_delay_ms),
+                export_timeout: std::time::Duration::from_millis(b.export_timeout_ms),
+            })
+            .unwrap_or_default();
+
+        Self {
+            enabled: yaml.enabled,
+            otlp_endpoint,
+            service_name,
+            resource_attributes,
+            sample_rate,
+            batch,
         }
     }
 }
@@ -201,7 +322,8 @@ impl TelemetryGuard {
 ///
 /// When `config.enabled` is `true`:
 /// - Creates an OTLP HTTP/protobuf span exporter
-/// - Wraps it in a `BatchSpanProcessor`
+/// - Wraps it in a `BatchSpanProcessor` with configurable batch settings
+/// - Configures head sampling via `TraceIdRatioBased` sampler
 /// - Builds an `SdkTracerProvider` with the processor
 /// - Sets it as the global tracer provider
 ///
@@ -226,16 +348,25 @@ impl TelemetryGuard {
 ///
 /// Implements: REQ-OBS-002 §8.1 (Export Pipeline Architecture)
 /// Implements: REQ-OBS-002 §7.1-7.2 (W3C Trace Context Propagation)
+/// Implements: REQ-OBS-002 §8.5 (Head Sampling)
 /// Implements: REQ-OBS-002 §12/B-OBS2-003 (Zero Overhead When Disabled)
 pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
+    use opentelemetry::KeyValue;
+    use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, Sampler};
+
     // Install W3C TraceContext as global text map propagator
     // This enables automatic extraction/injection of traceparent and tracestate headers
     // Implements: REQ-OBS-002 §7.1, §7.2
     global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let resource = Resource::builder()
-        .with_service_name(config.service_name.clone())
-        .build();
+    // Build resource with service name and additional attributes
+    let mut resource_builder = Resource::builder().with_service_name(config.service_name.clone());
+
+    for (key, value) in &config.resource_attributes {
+        resource_builder =
+            resource_builder.with_attribute(KeyValue::new(key.clone(), value.clone()));
+    }
+    let resource = resource_builder.build();
 
     let provider = if config.enabled {
         // Build OTLP HTTP/protobuf exporter
@@ -251,9 +382,32 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
                 reason: e.to_string(),
             })?;
 
+        // Configure batch processor (B-OBS2-002: queue overflow drops newest)
+        // Note: max_export_timeout requires experimental feature flag, using SDK defaults
+        let batch_config = BatchConfigBuilder::default()
+            .with_max_queue_size(config.batch.max_queue_size)
+            .with_max_export_batch_size(config.batch.max_export_batch_size)
+            .with_scheduled_delay(config.batch.scheduled_delay)
+            .build();
+
+        let batch_processor = BatchSpanProcessor::builder(exporter)
+            .with_batch_config(batch_config)
+            .build();
+
+        // Configure head sampler (TraceIdRatioBased for consistency)
+        // Implements: REQ-OBS-002 §8.5
+        let sampler = if config.sample_rate >= 1.0 {
+            Sampler::AlwaysOn
+        } else if config.sample_rate <= 0.0 {
+            Sampler::AlwaysOff
+        } else {
+            Sampler::TraceIdRatioBased(config.sample_rate)
+        };
+
         SdkTracerProvider::builder()
             .with_resource(resource)
-            .with_batch_exporter(exporter)
+            .with_sampler(sampler)
+            .with_span_processor(batch_processor)
             .build()
     } else {
         // No processors = noop provider. Tracers from this provider
@@ -279,6 +433,8 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.otlp_endpoint.is_none());
         assert_eq!(config.service_name, "thoughtgate");
+        assert_eq!(config.sample_rate, 1.0);
+        assert_eq!(config.batch.max_queue_size, 2048);
     }
 
     #[test]
@@ -287,6 +443,9 @@ mod tests {
             enabled: false,
             otlp_endpoint: None,
             service_name: "test-noop".to_string(),
+            resource_attributes: std::collections::HashMap::new(),
+            sample_rate: 1.0,
+            batch: BatchSettings::default(),
         };
         let guard = init_telemetry(&config).expect("init should succeed when disabled");
 
@@ -327,5 +486,117 @@ mod tests {
         let _tracer = guard.provider().tracer("test-di");
 
         guard.shutdown().expect("shutdown should succeed");
+    }
+
+    #[test]
+    fn test_telemetry_disabled_no_export() {
+        let config = TelemetryConfig {
+            enabled: false,
+            otlp_endpoint: Some("http://should-not-be-called:4318".to_string()),
+            service_name: "test".to_string(),
+            resource_attributes: std::collections::HashMap::new(),
+            sample_rate: 1.0,
+            batch: BatchSettings::default(),
+        };
+
+        let guard = init_telemetry(&config).expect("init should succeed");
+        let tracer = guard.provider().tracer("test");
+        let span = tracer.start("test-span");
+        drop(span);
+        guard.shutdown().expect("shutdown should succeed");
+        // Provider has no exporters, so no network calls made
+    }
+
+    #[test]
+    fn test_batch_settings_default() {
+        let batch = BatchSettings::default();
+        assert_eq!(batch.max_queue_size, 2048);
+        assert_eq!(batch.max_export_batch_size, 512);
+        assert_eq!(
+            batch.scheduled_delay,
+            std::time::Duration::from_millis(5000)
+        );
+        assert_eq!(
+            batch.export_timeout,
+            std::time::Duration::from_millis(30000)
+        );
+    }
+
+    #[test]
+    fn test_from_yaml_config_none() {
+        // When no YAML config is provided, should use defaults
+        let config = TelemetryConfig::from_yaml_config(None);
+        assert!(!config.enabled);
+        assert!(config.otlp_endpoint.is_none());
+        assert_eq!(config.sample_rate, 1.0);
+    }
+
+    #[test]
+    fn test_from_yaml_config_with_values() {
+        use crate::config::{BatchConfig, OtlpConfig, SamplingConfig, TelemetryYamlConfig};
+
+        let yaml_config = TelemetryYamlConfig {
+            enabled: true,
+            otlp: Some(OtlpConfig {
+                endpoint: "http://test-collector:4318".to_string(),
+                protocol: "http/protobuf".to_string(),
+            }),
+            prometheus: None,
+            sampling: Some(SamplingConfig {
+                strategy: "head".to_string(),
+                success_sample_rate: 0.5,
+            }),
+            batch: Some(BatchConfig {
+                max_queue_size: 4096,
+                max_export_batch_size: 1024,
+                scheduled_delay_ms: 10000,
+                export_timeout_ms: 60000,
+            }),
+            resource: Some({
+                let mut map = std::collections::HashMap::new();
+                map.insert("service.name".to_string(), "test-service".to_string());
+                map
+            }),
+        };
+
+        let config = TelemetryConfig::from_yaml_config(Some(&yaml_config));
+        assert!(config.enabled);
+        assert_eq!(
+            config.otlp_endpoint,
+            Some("http://test-collector:4318".to_string())
+        );
+        assert_eq!(config.sample_rate, 0.5);
+        assert_eq!(config.service_name, "test-service");
+        assert_eq!(config.batch.max_queue_size, 4096);
+        assert_eq!(config.batch.max_export_batch_size, 1024);
+    }
+
+    #[test]
+    fn test_head_sampling_rate() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler};
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .with_sampler(Sampler::TraceIdRatioBased(0.5))
+            .build();
+
+        let tracer = provider.tracer("test");
+        for i in 0..1000 {
+            let span = tracer.start(format!("span-{}", i));
+            drop(span);
+        }
+
+        provider.force_flush().expect("flush should succeed");
+        let spans = exporter
+            .get_finished_spans()
+            .expect("get spans should succeed");
+        let count = spans.len();
+        // 50% sampling should give ~500 spans (allow 40-60%)
+        assert!(
+            count > 400 && count < 600,
+            "Expected ~500 spans, got {}",
+            count
+        );
     }
 }

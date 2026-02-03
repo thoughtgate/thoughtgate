@@ -53,6 +53,10 @@ pub struct Config {
     /// Cedar policy configuration.
     #[serde(default)]
     pub cedar: Option<CedarConfig>,
+
+    /// Telemetry configuration (REQ-OBS-002).
+    #[serde(default)]
+    pub telemetry: Option<TelemetryYamlConfig>,
 }
 
 impl Config {
@@ -639,6 +643,147 @@ pub struct CedarConfig {
     pub schema: Option<PathBuf>,
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 7.7 Telemetry Configuration (REQ-OBS-002)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// YAML configuration for telemetry (tracing and metrics export).
+///
+/// # Traceability
+/// - Implements: REQ-OBS-002 §8.2 (OTLP Export Configuration)
+/// - Implements: REQ-OBS-002 §8.5 (Sampling Strategies)
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TelemetryYamlConfig {
+    /// Master enable/disable switch for OTLP trace export.
+    /// Default: false (B-OBS2-001: disabled by default)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// OTLP export configuration.
+    #[serde(default)]
+    pub otlp: Option<OtlpConfig>,
+
+    /// Prometheus metrics configuration.
+    #[serde(default)]
+    pub prometheus: Option<PrometheusYamlConfig>,
+
+    /// Sampling configuration.
+    #[serde(default)]
+    pub sampling: Option<SamplingConfig>,
+
+    /// Batch processor configuration.
+    #[serde(default)]
+    pub batch: Option<BatchConfig>,
+
+    /// Resource attributes for OTLP export.
+    #[serde(default)]
+    pub resource: Option<HashMap<String, String>>,
+}
+
+/// OTLP exporter configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OtlpConfig {
+    /// OTLP HTTP endpoint (e.g., "http://otel-collector:4318").
+    pub endpoint: String,
+
+    /// Protocol: only "http/protobuf" supported in v0.2.
+    #[serde(default = "default_otlp_protocol")]
+    pub protocol: String,
+}
+
+fn default_otlp_protocol() -> String {
+    "http/protobuf".to_string()
+}
+
+/// Prometheus metrics configuration.
+///
+/// Note: default_true() is already defined at line 196 in schema.rs
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PrometheusYamlConfig {
+    /// Enable Prometheus /metrics endpoint. Default: true
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PrometheusYamlConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Sampling configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SamplingConfig {
+    /// Sampling strategy: "head" only in v0.2.
+    #[serde(default = "default_sampling_strategy")]
+    pub strategy: String,
+
+    /// Sample rate for successful requests (0.0 to 1.0).
+    #[serde(default = "default_sample_rate")]
+    pub success_sample_rate: f64,
+}
+
+fn default_sampling_strategy() -> String {
+    "head".to_string()
+}
+
+fn default_sample_rate() -> f64 {
+    1.0
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            strategy: "head".to_string(),
+            success_sample_rate: 1.0,
+        }
+    }
+}
+
+/// Batch span processor configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BatchConfig {
+    /// Maximum spans in the export queue.
+    #[serde(default = "default_max_queue_size")]
+    pub max_queue_size: usize,
+
+    /// Maximum spans per export batch.
+    #[serde(default = "default_max_export_batch_size")]
+    pub max_export_batch_size: usize,
+
+    /// Delay between scheduled exports in milliseconds.
+    #[serde(default = "default_scheduled_delay_ms")]
+    pub scheduled_delay_ms: u64,
+
+    /// Export timeout in milliseconds.
+    #[serde(default = "default_export_timeout_ms")]
+    pub export_timeout_ms: u64,
+}
+
+fn default_max_queue_size() -> usize {
+    2048
+}
+fn default_max_export_batch_size() -> usize {
+    512
+}
+fn default_scheduled_delay_ms() -> u64 {
+    5000
+}
+fn default_export_timeout_ms() -> u64 {
+    30000
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_size: 2048,
+            max_export_batch_size: 512,
+            scheduled_delay_ms: 5000,
+            export_timeout_ms: 30000,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,5 +945,94 @@ mod tests {
         assert_eq!(Action::Approve.to_string(), "approve");
         assert_eq!(Action::Deny.to_string(), "deny");
         assert_eq!(Action::Policy.to_string(), "policy");
+    }
+
+    #[test]
+    fn test_telemetry_config_parsing() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://localhost:8080
+governance:
+  defaults:
+    action: forward
+telemetry:
+  enabled: true
+  otlp:
+    endpoint: "http://otel-collector:4318"
+    protocol: http/protobuf
+  sampling:
+    strategy: head
+    success_sample_rate: 0.10
+  batch:
+    max_queue_size: 4096
+    scheduled_delay_ms: 10000
+  resource:
+    service.name: my-thoughtgate
+    deployment.environment: staging
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+
+        let telemetry = config.telemetry.unwrap();
+        assert!(telemetry.enabled);
+        assert_eq!(
+            telemetry.otlp.as_ref().unwrap().endpoint,
+            "http://otel-collector:4318"
+        );
+        assert_eq!(
+            telemetry.sampling.as_ref().unwrap().success_sample_rate,
+            0.10
+        );
+        assert_eq!(telemetry.batch.as_ref().unwrap().max_queue_size, 4096);
+        assert_eq!(
+            telemetry
+                .resource
+                .as_ref()
+                .unwrap()
+                .get("service.name")
+                .unwrap(),
+            "my-thoughtgate"
+        );
+    }
+
+    #[test]
+    fn test_telemetry_config_defaults() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://localhost:8080
+governance:
+  defaults:
+    action: forward
+telemetry:
+  enabled: false
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+
+        let telemetry = config.telemetry.unwrap();
+        assert!(!telemetry.enabled);
+        assert!(telemetry.otlp.is_none());
+        assert!(telemetry.sampling.is_none());
+        assert!(telemetry.batch.is_none());
+    }
+
+    #[test]
+    fn test_telemetry_config_absent() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://localhost:8080
+governance:
+  defaults:
+    action: forward
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        assert!(config.telemetry.is_none());
     }
 }

@@ -134,18 +134,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize OpenTelemetry tracing (REQ-OBS-002)
-    let telemetry_config = thoughtgate_core::telemetry::TelemetryConfig::from_env();
-    let telemetry_guard = thoughtgate_core::telemetry::init_telemetry(&telemetry_config)
-        .map_err(|e| format!("Failed to initialize telemetry: {e}"))?;
-    if telemetry_config.enabled {
-        info!(
-            endpoint = telemetry_config.otlp_endpoint.as_deref().unwrap_or("default"),
-            service_name = %telemetry_config.service_name,
-            "OpenTelemetry tracing enabled (OTLP HTTP/protobuf)"
-        );
-    } else {
-        debug!("OpenTelemetry tracing disabled");
-    }
+    // Note: yaml_config is not yet loaded at this point, so we initialize telemetry
+    // after config loading. For now, we declare the guard variable here.
+    let telemetry_guard: thoughtgate_core::telemetry::TelemetryGuard;
 
     // Initialize prometheus-client registry and metrics (REQ-OBS-002 §6)
     let mut prom_registry = prometheus_client::registry::Registry::default();
@@ -229,6 +220,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+
+    // Initialize OpenTelemetry tracing from YAML config (REQ-OBS-002)
+    let telemetry_config = thoughtgate_core::telemetry::TelemetryConfig::from_yaml_config(
+        yaml_config.as_ref().and_then(|c| c.telemetry.as_ref()),
+    );
+    telemetry_guard = thoughtgate_core::telemetry::init_telemetry(&telemetry_config)
+        .map_err(|e| format!("Failed to initialize telemetry: {e}"))?;
+    if telemetry_config.enabled {
+        info!(
+            endpoint = telemetry_config.otlp_endpoint.as_deref().unwrap_or("default"),
+            service_name = %telemetry_config.service_name,
+            sample_rate = telemetry_config.sample_rate,
+            max_queue_size = telemetry_config.batch.max_queue_size,
+            "OpenTelemetry tracing enabled (OTLP HTTP/protobuf, head sampling)"
+        );
+    } else {
+        debug!("OpenTelemetry tracing disabled");
+    }
 
     // Create MCP handler with governance if config exists
     let mcp_handler: Option<Arc<McpHandler>> = if let Some(ref config) = yaml_config {

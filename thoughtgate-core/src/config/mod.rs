@@ -47,8 +47,9 @@ pub use loader::{
     substitute_env_vars, validate,
 };
 pub use schema::{
-    Action, ApprovalDestination, CedarConfig, Config, ExposeConfig, Governance, GovernanceDefaults,
-    HumanWorkflow, MatchResult, Rule, Source, SourceFilter, TimeoutAction, WebhookAuth,
+    Action, ApprovalDestination, BatchConfig, CedarConfig, Config, ExposeConfig, Governance,
+    GovernanceDefaults, HumanWorkflow, MatchResult, OtlpConfig, PrometheusYamlConfig, Rule,
+    SamplingConfig, Source, SourceFilter, TelemetryYamlConfig, TimeoutAction, WebhookAuth,
 };
 
 #[cfg(test)]
