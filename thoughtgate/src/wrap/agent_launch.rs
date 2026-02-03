@@ -655,7 +655,7 @@ mod tests {
         let path = resolve_shim_binary();
         assert!(path.is_ok(), "should resolve current exe path");
         let path = path.unwrap();
-        assert!(path.to_string_lossy().len() > 0);
+        assert!(!path.to_string_lossy().is_empty());
     }
 
     #[test]

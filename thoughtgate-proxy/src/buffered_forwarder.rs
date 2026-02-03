@@ -47,7 +47,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy_config::ProxyConfig;
-use thoughtgate_core::inspector::{Decision, InspectionContext, Inspector};
+use thoughtgate_core::inspector::{Decision, InspectionContext, InspectionError, Inspector};
 use thoughtgate_core::metrics::{AmberPathTimer, InspectorTimer, get_amber_metrics};
 
 /// Helper type alias for bodies that may include trailers.
@@ -537,7 +537,7 @@ impl BufferedForwarder {
         // 1. We don't share mutable state with the panic handler
         // 2. The inspector trait requires Send + Sync
         // 3. We immediately handle the result after the await
-        let result = AssertUnwindSafe(inspector.inspect(body, ctx.clone_for_inspector()))
+        let result = AssertUnwindSafe(inspector.inspect(body, *ctx))
             .catch_unwind()
             .await;
 
@@ -657,19 +657,6 @@ impl BufferedForwarder {
     }
 }
 
-// Helper trait to clone InspectionContext for spawned tasks
-impl<'a> InspectionContext<'a> {
-    /// Create an owned version of the context for use in spawned tasks.
-    ///
-    /// Note: This is a workaround for the lifetime issues with async inspection.
-    /// In practice, inspectors should be fast enough to not require spawning.
-    fn clone_for_inspector(&self) -> InspectionContext<'a> {
-        match self {
-            InspectionContext::Request(parts) => InspectionContext::Request(parts),
-            InspectionContext::Response(parts) => InspectionContext::Response(parts),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -691,7 +678,7 @@ mod tests {
             &self,
             _body: &[u8],
             _ctx: InspectionContext<'_>,
-        ) -> Result<Decision, ProxyError> {
+        ) -> Result<Decision, InspectionError> {
             Ok(Decision::Approve)
         }
     }
@@ -709,7 +696,7 @@ mod tests {
             &self,
             body: &[u8],
             _ctx: InspectionContext<'_>,
-        ) -> Result<Decision, ProxyError> {
+        ) -> Result<Decision, InspectionError> {
             let mut modified = body.to_vec();
             modified.extend_from_slice(self.0);
             Ok(Decision::Modify(Bytes::from(modified)))
@@ -729,7 +716,7 @@ mod tests {
             &self,
             _body: &[u8],
             _ctx: InspectionContext<'_>,
-        ) -> Result<Decision, ProxyError> {
+        ) -> Result<Decision, InspectionError> {
             Ok(Decision::Reject(self.0))
         }
     }
@@ -917,7 +904,7 @@ mod tests {
             &self,
             _body: &[u8],
             _ctx: InspectionContext<'_>,
-        ) -> Result<Decision, ProxyError> {
+        ) -> Result<Decision, InspectionError> {
             panic!("Test panic from inspector");
         }
     }

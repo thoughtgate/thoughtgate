@@ -101,7 +101,7 @@ impl Decision {
 ///
 /// # Traceability
 /// - Implements: REQ-CORE-002 F-003 (InspectionContext)
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum InspectionContext<'a> {
     /// Context for inspecting a request body.
     Request(&'a http::request::Parts),
