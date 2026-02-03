@@ -47,7 +47,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy_config::ProxyConfig;
-use thoughtgate_core::inspector::{Decision, InspectionContext, InspectionError, Inspector};
+use thoughtgate_core::inspector::{Decision, InspectionContext, Inspector};
 use thoughtgate_core::metrics::{AmberPathTimer, InspectorTimer, get_amber_metrics};
 
 /// Helper type alias for bodies that may include trailers.

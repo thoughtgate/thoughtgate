@@ -415,8 +415,8 @@ mod tests {
         );
     }
 
-    /// EC-STDIO-016: Missing jsonrpc field.
-    /// (Also covered by test_parse_missing_jsonrpc above — explicit tag here.)
+    // EC-STDIO-016: Missing jsonrpc field.
+    // (Also covered by test_parse_missing_jsonrpc above — explicit tag here.)
 
     /// EC-STDIO-027: Partial line (no trailing newline) parses correctly.
     #[test]
