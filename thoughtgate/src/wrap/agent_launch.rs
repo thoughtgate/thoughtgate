@@ -483,7 +483,14 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         "governance service started on 127.0.0.1:{gov_port}"
     );
 
-    // ── F-005/F-006: Rewrite config ────────────────────────────────────────
+    // ── Acquire config lock before rewriting ─────────────────────────────
+    // Lock must be acquired *before* rewrite_config to prevent a TOCTOU race
+    // where two concurrent instances both read the original config, then
+    // overwrite each other's rewrites.
+    let mut guard =
+        ConfigGuard::lock(&config_path).map_err(|e| config_err_to_stdio(e, &config_path))?;
+
+    // ── F-005/F-006: Rewrite config (under lock) ─────────────────────────
     let shim_options = ShimOptions {
         server_id: String::new(), // per-server; rewrite sets each server_id
         governance_endpoint: governance_endpoint.clone(),
@@ -495,14 +502,13 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         .rewrite_config(&config_path, &servers, &shim_binary, &shim_options)
         .map_err(|e| config_err_to_stdio(e, &config_path))?;
 
+    // Now that the backup exists, enable restore-on-drop.
+    guard.set_backup(&backup_path);
+
     tracing::info!(
         backup_path = %backup_path.display(),
-        "config rewritten, backup created"
+        "config rewritten under lock, backup created"
     );
-
-    // ── Acquire lock via ConfigGuard ───────────────────────────────────────
-    let guard = ConfigGuard::new(&config_path, &backup_path)
-        .map_err(|e| config_err_to_stdio(e, &config_path))?;
 
     // If --no-restore, disable the guard's automatic restore on drop.
     if args.no_restore {

@@ -26,12 +26,25 @@ use crate::wrap::config_adapter::ConfigError;
 /// its entire lifetime, preventing concurrent `thoughtgate wrap` invocations
 /// from corrupting the same config file.
 ///
+/// # Two-phase usage
+///
+/// For race-free config rewriting, acquire the lock **before** mutating the
+/// config and set the backup path afterwards:
+///
+/// ```ignore
+/// let guard = ConfigGuard::lock(&config_path)?;   // 1. acquire lock
+/// let backup = adapter.rewrite_config(...)?;       // 2. rewrite under lock
+/// guard.set_backup(&backup);                       // 3. enable restore-on-drop
+/// ```
+///
 /// Implements: REQ-CORE-008 §10.2
 pub struct ConfigGuard {
     /// Path to the agent's config file.
     config_path: PathBuf,
     /// Path to the backup created before rewriting.
-    backup_path: PathBuf,
+    /// `None` until `set_backup()` is called — if the guard is dropped before
+    /// a backup path is set, no restore is attempted (the config was never modified).
+    backup_path: Option<PathBuf>,
     /// Open file handle holding the advisory flock.
     /// The flock is released when this handle is dropped — the field is intentionally
     /// never read; it exists solely to keep the lock alive for the guard's lifetime.
@@ -41,19 +54,18 @@ pub struct ConfigGuard {
 }
 
 impl ConfigGuard {
-    /// Create a new config guard with an exclusive advisory lock.
+    /// Acquire an exclusive advisory lock on the config file.
     ///
     /// Acquires `flock(LOCK_EX | LOCK_NB)` on `<config_path>.thoughtgate-lock`.
     /// Returns `ConfigError::Locked` if another ThoughtGate instance already
     /// holds the lock.
     ///
-    /// # Arguments
-    ///
-    /// * `config_path` - The agent's config file path (will be restored on drop).
-    /// * `backup_path` - The backup file created by the adapter's `rewrite_config`.
+    /// The returned guard does **not** yet know about a backup file. Call
+    /// [`set_backup`](Self::set_backup) after rewriting the config to enable
+    /// restore-on-drop.
     ///
     /// Implements: REQ-CORE-008 §5.3
-    pub fn new(config_path: &Path, backup_path: &Path) -> Result<Self, ConfigError> {
+    pub fn lock(config_path: &Path) -> Result<Self, ConfigError> {
         let mut lock_path_os = config_path.as_os_str().to_os_string();
         lock_path_os.push(".thoughtgate-lock");
         let lock_path = PathBuf::from(lock_path_os);
@@ -65,10 +77,33 @@ impl ConfigGuard {
 
         Ok(Self {
             config_path: config_path.to_path_buf(),
-            backup_path: backup_path.to_path_buf(),
+            backup_path: None,
             _lock_file: lock_file,
             restored: AtomicBool::new(false),
         })
+    }
+
+    /// Convenience constructor that acquires the lock and sets the backup path
+    /// in one step.
+    ///
+    /// Equivalent to calling [`lock`](Self::lock) followed by
+    /// [`set_backup`](Self::set_backup). Useful in tests and cases where the
+    /// backup already exists before locking.
+    ///
+    /// Implements: REQ-CORE-008 §5.3
+    pub fn new(config_path: &Path, backup_path: &Path) -> Result<Self, ConfigError> {
+        let mut guard = Self::lock(config_path)?;
+        guard.set_backup(backup_path);
+        Ok(guard)
+    }
+
+    /// Set the backup path for restore-on-drop.
+    ///
+    /// Must be called after the config has been rewritten and a backup created.
+    /// Until this is called, dropping the guard only releases the lock without
+    /// attempting any file restoration.
+    pub fn set_backup(&mut self, backup_path: &Path) {
+        self.backup_path = Some(backup_path.to_path_buf());
     }
 
     /// Disable config restoration on drop.
@@ -96,11 +131,18 @@ impl ConfigGuard {
             return Ok(());
         }
 
+        // If no backup path was set, the config was never rewritten — nothing
+        // to restore.
+        let backup_path = match &self.backup_path {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
         // Copy backup over config.
-        std::fs::copy(&self.backup_path, &self.config_path)?;
+        std::fs::copy(backup_path, &self.config_path)?;
 
         // Best-effort removal of backup file.
-        let _ = std::fs::remove_file(&self.backup_path);
+        let _ = std::fs::remove_file(backup_path);
 
         Ok(())
     }
@@ -121,12 +163,19 @@ mod tests {
     use super::*;
 
     fn temp_dir_unique() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
         use std::time::SystemTime;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let d = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap();
-        let dir =
-            std::env::temp_dir().join(format!("tg-guard-{}-{}", d.as_secs(), d.subsec_nanos()));
+        let seq = COUNTER.fetch_add(1, AtOrd::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "tg-guard-{}-{}-{}",
+            d.as_secs(),
+            d.subsec_nanos(),
+            seq
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -195,6 +244,79 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("original"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_two_phase_lock_then_set_backup() {
+        let dir = temp_dir_unique();
+        let config_path = dir.join("config.json");
+        let backup_path = dir.join("config.json.thoughtgate-backup");
+
+        std::fs::write(&config_path, r#"{"original": true}"#).unwrap();
+
+        // Phase 1: acquire lock (no backup yet).
+        let mut guard = ConfigGuard::lock(&config_path).unwrap();
+
+        // Simulate rewrite: overwrite config and create backup.
+        std::fs::write(&backup_path, r#"{"original": true}"#).unwrap();
+        std::fs::write(&config_path, r#"{"rewritten": true}"#).unwrap();
+
+        // Phase 2: set backup path.
+        guard.set_backup(&backup_path);
+
+        // Drop should restore.
+        drop(guard);
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("original"),
+            "config should be restored after two-phase lock+set_backup"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lock_drop_without_backup_does_not_restore() {
+        let dir = temp_dir_unique();
+        let config_path = dir.join("config.json");
+
+        std::fs::write(&config_path, r#"{"original": true}"#).unwrap();
+
+        {
+            // Lock without setting backup — simulates rewrite failure.
+            let _guard = ConfigGuard::lock(&config_path).unwrap();
+            // Overwrite config (simulating partial work).
+            std::fs::write(&config_path, r#"{"partially_rewritten": true}"#).unwrap();
+            // Guard dropped here without set_backup — should NOT attempt restore.
+        }
+
+        // Config should remain in its (partially) rewritten state since no
+        // backup path was ever set.
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("partially_rewritten"),
+            "config should not be restored when no backup was set"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lock_blocks_concurrent_lock() {
+        let dir = temp_dir_unique();
+        let config_path = dir.join("config.json");
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let guard1 = ConfigGuard::lock(&config_path).unwrap();
+        let result = ConfigGuard::lock(&config_path);
+        assert!(
+            matches!(result, Err(ConfigError::Locked)),
+            "second lock() should fail while first is held"
+        );
+
+        drop(guard1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
