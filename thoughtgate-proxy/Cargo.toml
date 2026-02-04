@@ -78,12 +78,11 @@ tracing-appender = "0.2"
 # Memory allocator (reduces fragmentation under load)
 mimalloc = "0.1"
 
-# OpenTelemetry + Prometheus (REQ-OBS-001)
-opentelemetry = { version = "0.31", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-prometheus = "0.31"
+# OpenTelemetry types for trace context propagation (REQ-OBS-002 §7)
+# Note: SDK is in dev-dependencies for testing; metrics use prometheus-client
+opentelemetry = "0.31"
 
-# Prometheus metrics with prometheus-client (REQ-OBS-002 §6)
+# Prometheus metrics (REQ-OBS-002 §6)
 prometheus-client = "0.24.0"
 
 [features]
