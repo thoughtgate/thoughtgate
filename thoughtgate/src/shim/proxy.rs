@@ -35,10 +35,12 @@ use thoughtgate_core::governance::api::{
     MessageType, TaskStatusResponse,
 };
 use thoughtgate_core::governance::service::HeartbeatRequest;
-use thoughtgate_core::jsonrpc::JsonRpcMessageKind;
+use thoughtgate_core::jsonrpc::{JsonRpcId, JsonRpcMessageKind};
 use thoughtgate_core::metrics::StdioMetrics;
 use thoughtgate_core::profile::Profile;
-use thoughtgate_core::telemetry::extract_context_from_meta;
+use thoughtgate_core::telemetry::{
+    McpMessageType, McpSpanData, extract_context_from_meta, finish_mcp_span, start_mcp_span,
+};
 
 use crate::error::{FramingError, StdioError};
 use crate::shim::ndjson::{detect_smuggling, parse_stdio_message};
@@ -173,6 +175,8 @@ fn framing_error_type(e: &FramingError) -> &'static str {
 ///
 /// Returns the method for requests and notifications, or `"response"` for
 /// responses (which have no method field).
+///
+/// Implements: REQ-CORE-008/F-013 (NDJSON Message Classification)
 fn method_from_kind(kind: &JsonRpcMessageKind) -> &str {
     match kind {
         JsonRpcMessageKind::Request { method, .. } => method.as_str(),
@@ -182,6 +186,11 @@ fn method_from_kind(kind: &JsonRpcMessageKind) -> &str {
 }
 
 /// Derive the [`MessageType`] from a parsed [`JsonRpcMessageKind`].
+///
+/// Maps JSON-RPC message kinds to governance API message types for
+/// evaluation requests.
+///
+/// Implements: REQ-CORE-008/F-016 (Governance Integration)
 fn message_type_from_kind(kind: &JsonRpcMessageKind) -> MessageType {
     match kind {
         JsonRpcMessageKind::Request { .. } => MessageType::Request,
@@ -191,13 +200,31 @@ fn message_type_from_kind(kind: &JsonRpcMessageKind) -> MessageType {
 }
 
 /// Extract the JSON-RPC ID from a message kind, if present.
-fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<thoughtgate_core::jsonrpc::JsonRpcId> {
+///
+/// Returns `Some(id)` for requests and responses, `None` for notifications.
+///
+/// Implements: REQ-CORE-008/F-015 (Request ID Tracking)
+fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<JsonRpcId> {
     match kind {
         JsonRpcMessageKind::Request { id, .. } | JsonRpcMessageKind::Response { id } => {
             Some(id.clone())
         }
         JsonRpcMessageKind::Notification { .. } => None,
     }
+}
+
+/// Convert a JsonRpcId to a string for span attributes.
+fn jsonrpc_id_to_string(id: &JsonRpcId) -> String {
+    match id {
+        JsonRpcId::Number(n) => n.to_string(),
+        JsonRpcId::String(s) => s.clone(),
+        JsonRpcId::Null => "null".to_string(),
+    }
+}
+
+/// Extract the tool name from a parsed message's params, if it's a tools/call.
+fn extract_tool_name(params: Option<&serde_json::Value>) -> Option<String> {
+    params?.get("name")?.as_str().map(|s| s.to_string())
 }
 
 /// Rebuild a JSON-RPC message with new params.
@@ -902,7 +929,9 @@ async fn agent_to_server(
         // REQ-OBS-002 §7.3: Extract trace context from _meta for stdio transport.
         // This enables distributed tracing through stdio-based MCP clients
         // (Claude Desktop, Cursor, VS Code, Windsurf).
-        let trace_ctx = extract_context_from_meta(msg.params.as_ref());
+        // Default: strip trace fields (propagate_upstream: false) to avoid breaking
+        // strict schema servers. Set propagate_upstream: true in config for trace-aware upstreams.
+        let trace_ctx = extract_context_from_meta(msg.params.as_ref(), false);
         let stripped_params = trace_ctx.stripped_params.clone();
 
         // Build the message to forward (with _meta.traceparent stripped if present).
@@ -920,6 +949,27 @@ async fn agent_to_server(
                 "extracted trace context from _meta, stripped for upstream"
             );
         }
+
+        // REQ-OBS-002 §5.1: Create MCP span for this message
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let tool_name = extract_tool_name(msg.params.as_ref());
+        let span_data = McpSpanData {
+            method: &method,
+            message_type: match &msg.kind {
+                JsonRpcMessageKind::Request { .. } => McpMessageType::Request,
+                JsonRpcMessageKind::Notification { .. } => McpMessageType::Notification,
+                JsonRpcMessageKind::Response { .. } => McpMessageType::Request, // Responses are handled in server_to_agent
+            },
+            message_id: id_from_kind(&msg.kind).map(|id| jsonrpc_id_to_string(&id)),
+            correlation_id: &correlation_id,
+            tool_name: tool_name.as_deref(),
+            parent_context: if trace_ctx.had_trace_context {
+                Some(&trace_ctx.context)
+            } else {
+                None
+            },
+        };
+        let mut mcp_span = start_mcp_span(&span_data);
 
         // F-016: Governance evaluation via HTTP.
         // Use stripped params to avoid sending trace context in the body.
@@ -977,6 +1027,13 @@ async fn agent_to_server(
                                 .await
                                 .map_err(StdioError::StdioIo)?;
                         }
+                        // REQ-OBS-002 §5.1: Finish MCP span (governance parse error)
+                        finish_mcp_span(
+                            &mut mcp_span,
+                            true,
+                            Some(-32603),
+                            Some("governance_parse_error"),
+                        );
                         continue;
                     }
                     tracing::warn!(
@@ -1005,6 +1062,13 @@ async fn agent_to_server(
                             .await
                             .map_err(StdioError::StdioIo)?;
                     }
+                    // REQ-OBS-002 §5.1: Finish MCP span (governance request failed)
+                    finish_mcp_span(
+                        &mut mcp_span,
+                        true,
+                        Some(-32000),
+                        Some("governance_unavailable"),
+                    );
                     continue;
                 }
                 tracing::warn!(
@@ -1088,6 +1152,9 @@ async fn agent_to_server(
                         },
                     );
                 }
+
+                // REQ-OBS-002 §5.1: Finish MCP span (success)
+                finish_mcp_span(&mut mcp_span, false, None, None);
             }
             GovernanceDecision::Deny => {
                 if let Some(id) = id_from_kind(&msg.kind) {
@@ -1098,6 +1165,9 @@ async fn agent_to_server(
                         .map_err(StdioError::StdioIo)?;
                 }
                 // Notifications have no id — silently drop denials for them.
+
+                // REQ-OBS-002 §5.1: Finish MCP span (policy denied)
+                finish_mcp_span(&mut mcp_span, true, Some(-32003), Some("policy_denied"));
             }
             GovernanceDecision::PendingApproval => {
                 // Poll the governance task status endpoint until a decision
@@ -1112,6 +1182,8 @@ async fn agent_to_server(
                                 .await
                                 .map_err(StdioError::StdioIo)?;
                         }
+                        // REQ-OBS-002 §5.1: Finish MCP span (internal error - no task_id)
+                        finish_mcp_span(&mut mcp_span, true, Some(-32603), Some("internal_error"));
                         continue;
                     }
                 };
@@ -1167,6 +1239,9 @@ async fn agent_to_server(
                                 },
                             );
                         }
+
+                        // REQ-OBS-002 §5.1: Finish MCP span (approval granted)
+                        finish_mcp_span(&mut mcp_span, false, None, None);
                     }
                     ApprovalPollResult::Rejected(reason) => {
                         tracing::info!(
@@ -1185,6 +1260,14 @@ async fn agent_to_server(
                                 .await
                                 .map_err(StdioError::StdioIo)?;
                         }
+
+                        // REQ-OBS-002 §5.1: Finish MCP span (approval rejected)
+                        finish_mcp_span(
+                            &mut mcp_span,
+                            true,
+                            Some(-32007),
+                            Some("approval_rejected"),
+                        );
                     }
                     ApprovalPollResult::Expired | ApprovalPollResult::Cancelled => {
                         tracing::info!(
@@ -1203,6 +1286,13 @@ async fn agent_to_server(
                                 .await
                                 .map_err(StdioError::StdioIo)?;
                         }
+
+                        // REQ-OBS-002 §5.1: Finish MCP span (expired/cancelled)
+                        let error_type = match outcome {
+                            ApprovalPollResult::Expired => "approval_expired",
+                            _ => "approval_cancelled",
+                        };
+                        finish_mcp_span(&mut mcp_span, true, Some(-32005), Some(error_type));
                     }
                     ApprovalPollResult::Timeout | ApprovalPollResult::Error => {
                         tracing::warn!(
@@ -1221,6 +1311,13 @@ async fn agent_to_server(
                                 .await
                                 .map_err(StdioError::StdioIo)?;
                         }
+
+                        // REQ-OBS-002 §5.1: Finish MCP span (timeout/error)
+                        let error_type = match outcome {
+                            ApprovalPollResult::Timeout => "approval_timeout",
+                            _ => "approval_error",
+                        };
+                        finish_mcp_span(&mut mcp_span, true, Some(-32008), Some(error_type));
                     }
                     ApprovalPollResult::Shutdown => {
                         tracing::info!(
@@ -1228,6 +1325,8 @@ async fn agent_to_server(
                             task_id,
                             "shutdown during approval poll — breaking"
                         );
+                        // REQ-OBS-002 §5.1: Finish MCP span (shutdown)
+                        finish_mcp_span(&mut mcp_span, true, Some(-32013), Some("shutdown"));
                         break;
                     }
                 }
@@ -1840,8 +1939,8 @@ mod tests {
             "name": "calculator"
         });
 
-        // Extract trace context (which strips _meta.traceparent)
-        let trace_ctx = extract_context_from_meta(Some(&params));
+        // Extract trace context (which strips _meta.traceparent when propagate_upstream=false)
+        let trace_ctx = extract_context_from_meta(Some(&params), false);
         assert!(trace_ctx.had_trace_context);
 
         // Rebuild with stripped params

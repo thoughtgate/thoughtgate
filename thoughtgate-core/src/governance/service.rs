@@ -22,11 +22,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+
+use crate::telemetry::{
+    GateOutcomes, GatewayDecisionSpanData, extract_context_from_headers,
+    finish_gateway_decision_span, start_gateway_decision_span,
+};
 
 use super::api::{
     ApprovalOutcome, GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse,
@@ -170,28 +175,74 @@ pub fn governance_router(state: Arc<GovernanceServiceState>) -> Router {
 /// The `shutdown` field is piggy-backed onto every response so the shim can
 /// detect shutdown without waiting for the next heartbeat.
 ///
+/// Extracts W3C trace context from `traceparent`/`tracestate` HTTP headers
+/// sent by the shim, enabling distributed tracing through stdio transport.
+///
 /// Implements: REQ-CORE-008/F-016
+/// Implements: REQ-OBS-002 §7.1 (Trace Context Extraction)
 async fn evaluate_handler(
     State(state): State<Arc<GovernanceServiceState>>,
+    headers: HeaderMap,
     Json(req): Json<GovernanceEvaluateRequest>,
 ) -> Json<GovernanceEvaluateResponse> {
     let shutdown = state.shutdown.load(Ordering::SeqCst);
 
-    if let Some(ref evaluator) = state.evaluator {
+    // REQ-OBS-002 §7.1: Extract trace context from HTTP headers
+    let parent_ctx = extract_context_from_headers(&headers);
+
+    // Generate correlation ID for this request
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+
+    // Create gateway decision span with extracted parent context
+    let span_data = GatewayDecisionSpanData {
+        request_id: &correlation_id,
+        upstream_target: &req.server_id,
+    };
+    let mut decision_span = start_gateway_decision_span(&span_data, &parent_ctx);
+
+    let resp = if let Some(ref evaluator) = state.evaluator {
         let mut resp = evaluator.evaluate(&req).await;
         resp.shutdown = shutdown;
-        Json(resp)
+        resp
     } else {
         // Stub mode (backward compat): always forward.
-        Json(GovernanceEvaluateResponse {
+        GovernanceEvaluateResponse {
             decision: GovernanceDecision::Forward,
             task_id: None,
             policy_id: None,
             reason: None,
             poll_interval_ms: None,
             shutdown,
-        })
-    }
+        }
+    };
+
+    // Populate gate outcomes from the response for span attributes
+    let outcomes = GateOutcomes {
+        visibility: Some("pass".to_string()), // Gate 1 always passes in v0.3
+        governance: Some(match resp.decision {
+            GovernanceDecision::Forward => "forward".to_string(),
+            GovernanceDecision::Deny => "deny".to_string(),
+            GovernanceDecision::PendingApproval => "approve".to_string(),
+        }),
+        cedar: resp.policy_id.as_ref().map(|_| {
+            match resp.decision {
+                GovernanceDecision::Forward => "allow".to_string(),
+                GovernanceDecision::Deny => "deny".to_string(),
+                GovernanceDecision::PendingApproval => "allow".to_string(), // Cedar allowed, approval required
+            }
+        }),
+        approval: if resp.task_id.is_some() {
+            Some("started".to_string())
+        } else {
+            None
+        },
+        governance_rule_id: resp.policy_id.clone(),
+        policy_evaluated: resp.policy_id.is_some(),
+    };
+
+    finish_gateway_decision_span(&mut decision_span, &outcomes, None);
+
+    Json(resp)
 }
 
 /// Handle `POST /governance/heartbeat`.

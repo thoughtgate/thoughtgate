@@ -74,6 +74,9 @@ prometheus = "0.14"
 # Prometheus metrics with prometheus-client (REQ-OBS-002 §6)
 prometheus-client = "0.24.0"
 
+# Fast, non-poisoning mutex (replaces std::sync::Mutex per CLAUDE.md safety rules)
+parking_lot = "0.12"
+
 [features]
 default = ["metrics"]
 metrics = []

@@ -678,6 +678,27 @@ pub struct TelemetryYamlConfig {
     /// Resource attributes for OTLP export.
     #[serde(default)]
     pub resource: Option<HashMap<String, String>>,
+
+    /// Stdio transport configuration (REQ-OBS-002 §7.3).
+    #[serde(default)]
+    pub stdio: Option<StdioTelemetryConfig>,
+}
+
+/// Stdio transport telemetry configuration.
+///
+/// # Traceability
+/// - Implements: REQ-OBS-002 §7.3.1 (Stdio Transport Propagation)
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StdioTelemetryConfig {
+    /// If true, preserve `_meta.traceparent` and `_meta.tracestate` when
+    /// forwarding to upstream MCP servers.
+    ///
+    /// Default: false (strip trace fields to avoid breaking strict schema servers).
+    ///
+    /// Set to true when the upstream MCP server is trace-aware and can accept
+    /// W3C trace context in the `_meta` field.
+    #[serde(default)]
+    pub propagate_upstream: bool,
 }
 
 /// OTLP exporter configuration.

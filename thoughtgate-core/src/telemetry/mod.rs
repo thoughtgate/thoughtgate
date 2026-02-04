@@ -588,6 +588,7 @@ mod tests {
                 map.insert("service.name".to_string(), "test-service".to_string());
                 map
             }),
+            stdio: None,
         };
 
         let config = TelemetryConfig::from_yaml_config(Some(&yaml_config));

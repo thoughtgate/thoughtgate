@@ -3,7 +3,8 @@
 //! Implements: REQ-OBS-002 §6.5 (Cardinality Management)
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 /// Limits cardinality of metric labels to prevent unbounded time series growth.
 ///
@@ -30,10 +31,7 @@ impl CardinalityLimiter {
     /// If the value is new and we're under the limit, registers and returns it.
     /// If we're at the limit and the value is unknown, returns "__other__".
     pub fn resolve<'a>(&self, value: &'a str) -> &'a str {
-        let mut known = self
-            .known
-            .lock()
-            .expect("cardinality limiter lock poisoned");
+        let mut known = self.known.lock();
         if known.contains(value) {
             value
         } else if known.len() < self.max_values {
@@ -47,10 +45,7 @@ impl CardinalityLimiter {
     /// Returns the current count of distinct values.
     #[cfg(test)]
     pub fn count(&self) -> usize {
-        self.known
-            .lock()
-            .expect("cardinality limiter lock poisoned")
-            .len()
+        self.known.lock().len()
     }
 }
 

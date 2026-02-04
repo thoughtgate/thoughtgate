@@ -230,71 +230,113 @@ pub struct ThoughtGateMetrics {
     // ─────────────────────────────────────────────────────────────────────────
     // Counters (§6.1)
     // ─────────────────────────────────────────────────────────────────────────
-    /// MC-001: Total MCP requests processed.
+    /// Total MCP requests processed.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-001
     pub requests_total: Family<RequestLabels, Counter>,
 
-    /// MC-002: Decision counts per gate.
+    /// Decision counts per gate (cedar, governance_rule).
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-002
     pub decisions_total: Family<DecisionLabels, Counter>,
 
-    /// MC-003: Error counts by type.
+    /// Error counts by type and method.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-003
     pub errors_total: Family<ErrorLabels, Counter>,
 
-    /// MC-004: Cedar policy evaluation counts.
+    /// Cedar policy evaluation counts by decision and policy_id.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-004
     pub cedar_evaluations_total: Family<CedarEvalLabels, Counter>,
 
-    /// MC-005: Approval request counts by channel and outcome.
+    /// Approval request counts by channel and outcome.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-005
     pub approval_requests_total: Family<ApprovalLabels, Counter>,
 
-    /// MC-006: Upstream MCP server call counts.
+    /// Upstream MCP server call counts by target and status_code.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-006
     pub upstream_requests_total: Family<UpstreamLabels, Counter>,
 
-    /// MC-009: Telemetry items dropped due to full export queue.
+    /// Telemetry items dropped due to full export queue.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-009
     pub telemetry_dropped_total: Family<SignalLabels, Counter>,
 
-    /// MC-007: SEP-1686 tasks created.
+    /// SEP-1686 tasks created by type.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-007
     pub tasks_created_total: Family<TaskCreatedLabels, Counter>,
 
-    /// MC-008: SEP-1686 tasks completed (by outcome).
+    /// SEP-1686 tasks completed by type and outcome.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-008
     pub tasks_completed_total: Family<TaskCompletedLabels, Counter>,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Histograms (§6.2)
     // ─────────────────────────────────────────────────────────────────────────
-    /// MH-001: End-to-end request latency in milliseconds.
+    /// End-to-end request latency in milliseconds.
+    ///
+    /// Implements: REQ-OBS-002 §6.2/MH-001
     pub request_duration_ms: Family<DurationLabels, Histogram>,
 
-    /// MH-002: Cedar policy evaluation latency in milliseconds.
+    /// Cedar policy evaluation latency in milliseconds.
+    ///
+    /// Implements: REQ-OBS-002 §6.2/MH-002
     pub cedar_evaluation_duration_ms: Family<CedarDurationLabels, Histogram>,
 
-    /// MH-003: Upstream MCP server call latency in milliseconds.
+    /// Upstream MCP server call latency in milliseconds.
+    ///
+    /// Implements: REQ-OBS-002 §6.2/MH-003
     pub upstream_duration_ms: Family<TargetLabels, Histogram>,
 
-    /// MH-004: Approval wait time in seconds.
+    /// Approval wait time in seconds (from dispatch to callback).
+    ///
+    /// Implements: REQ-OBS-002 §6.2/MH-004
     pub approval_wait_duration_s: Family<ApprovalLabels, Histogram>,
 
-    /// MH-005: Request/response payload sizes in bytes.
+    /// Request/response payload sizes in bytes.
+    ///
+    /// Implements: REQ-OBS-002 §6.2/MH-005
     pub request_payload_size_bytes: Family<PayloadLabels, Histogram>,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Gauges (§6.4)
     // ─────────────────────────────────────────────────────────────────────────
-    /// MG-001: Active MCP connections.
-    /// TODO(Prompt 5+): Wire to connection lifecycle hooks.
+    /// Active MCP connections by transport type.
+    ///
+    /// Wired: main.rs connection lifecycle hooks.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-001
     pub connections_active: Family<TransportLabels, Gauge>,
 
-    /// MG-002: Currently pending approval tasks.
-    /// TODO(Prompt 5+): Wire to TaskStore add/remove.
+    /// Currently pending approval tasks by task_type.
+    ///
+    /// Wired: task.rs TaskStore add/remove.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-002
     pub tasks_pending: Family<TaskTypeLabels, Gauge>,
 
-    /// MG-003: Number of loaded Cedar policies.
-    /// TODO(Prompt 5+): Wire to PolicyEngine reload.
+    /// Number of loaded Cedar policies.
+    ///
+    /// Wired: engine.rs PolicyEngine initialization.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-003
     pub cedar_policies_loaded: Gauge,
 
-    /// MG-004: Process uptime in seconds.
-    /// TODO(Prompt 5+): Wire to tokio::time::Instant at startup.
+    /// Process uptime in seconds.
+    ///
+    /// Wired: main.rs startup instant tracking.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-004
     pub uptime_seconds: Gauge,
 
-    /// MG-005: Unix timestamp of last configuration reload.
+    /// Unix timestamp of last configuration reload.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-005
     pub config_reload_timestamp: Gauge,
 
     // ─────────────────────────────────────────────────────────────────────────

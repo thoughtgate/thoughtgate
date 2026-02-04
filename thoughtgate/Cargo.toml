@@ -34,6 +34,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 opentelemetry = { version = "=0.31.0" }
 opentelemetry_sdk = { version = "=0.31.0" }
 
+# UUID for correlation IDs (REQ-OBS-002)
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
 proptest = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

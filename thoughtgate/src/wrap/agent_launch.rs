@@ -476,6 +476,14 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
     let (gov_port, gov_handle) = start_governance_service(args.governance_port, gov_state.clone())
         .await
         .map_err(StdioError::StdioIo)?;
+
+    // Validate port before constructing URL (defensive check for edge case)
+    if gov_port == 0 {
+        return Err(StdioError::ServerSpawnError {
+            server_id: "governance".to_string(),
+            reason: "governance service bound to port 0".to_string(),
+        });
+    }
     let governance_endpoint = format!("http://127.0.0.1:{gov_port}");
 
     tracing::info!(

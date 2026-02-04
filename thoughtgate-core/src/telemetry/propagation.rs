@@ -260,16 +260,18 @@ pub struct StdioTraceContext {
 /// This function:
 /// 1. Extracts `traceparent` and `tracestate` from `params._meta` if present
 /// 2. Creates an OpenTelemetry context from the extracted trace data
-/// 3. Strips `_meta.traceparent` and `_meta.tracestate` from params to avoid
-///    breaking strict upstream MCP servers that reject unknown fields
+/// 3. Optionally strips `_meta.traceparent` and `_meta.tracestate` from params
+///    to avoid breaking strict upstream MCP servers that reject unknown fields
 ///
 /// # Arguments
 ///
 /// * `params` - The JSON-RPC params value (may or may not have `_meta`)
+/// * `propagate_upstream` - If true, preserve trace fields in `stripped_params`.
+///   If false (default), strip `_meta.traceparent`/`_meta.tracestate`.
 ///
 /// # Returns
 ///
-/// A [`StdioTraceContext`] containing the extracted context and stripped params.
+/// A [`StdioTraceContext`] containing the extracted context and optionally stripped params.
 ///
 /// # Example
 ///
@@ -282,13 +284,21 @@ pub struct StdioTraceContext {
 ///     "arguments": { "a": 1 }
 /// });
 ///
-/// let result = extract_context_from_meta(Some(&params));
+/// // Default: strip trace fields
+/// let result = extract_context_from_meta(Some(&params), false);
 /// assert!(result.had_trace_context);
 /// // result.stripped_params has _meta.traceparent removed
+///
+/// // Propagate: preserve trace fields for trace-aware upstreams
+/// let result = extract_context_from_meta(Some(&params), true);
+/// // result.stripped_params preserves _meta.traceparent
 /// ```
 ///
-/// Implements: REQ-OBS-002 §7.3
-pub fn extract_context_from_meta(params: Option<&serde_json::Value>) -> StdioTraceContext {
+/// Implements: REQ-OBS-002 §7.3, §7.3.1
+pub fn extract_context_from_meta(
+    params: Option<&serde_json::Value>,
+    propagate_upstream: bool,
+) -> StdioTraceContext {
     let propagator = TraceContextPropagator::new();
 
     // Handle None params
@@ -316,25 +326,32 @@ pub fn extract_context_from_meta(params: Option<&serde_json::Value>) -> StdioTra
     let span_context = context.span().span_context().clone();
     let had_trace_context = span_context.is_valid() && span_context.is_remote();
 
-    // Strip traceparent and tracestate from _meta
-    let mut stripped_meta = meta.clone();
-    stripped_meta.remove("traceparent");
-    stripped_meta.remove("tracestate");
-
-    // Rebuild params with stripped _meta (or without _meta if empty)
-    let stripped_params = if let Some(obj) = params.as_object() {
-        let mut new_obj = obj.clone();
-        if stripped_meta.is_empty() {
-            new_obj.remove("_meta");
-        } else {
-            new_obj.insert(
-                "_meta".to_string(),
-                serde_json::Value::Object(stripped_meta),
-            );
-        }
-        Some(serde_json::Value::Object(new_obj))
-    } else {
+    // Conditionally strip traceparent and tracestate from _meta
+    // If propagate_upstream is true, preserve trace fields for trace-aware upstreams
+    let stripped_params = if propagate_upstream {
+        // Preserve _meta as-is (trace-aware upstream)
         Some(params.clone())
+    } else {
+        // Strip traceparent and tracestate from _meta
+        let mut stripped_meta = meta.clone();
+        stripped_meta.remove("traceparent");
+        stripped_meta.remove("tracestate");
+
+        // Rebuild params with stripped _meta (or without _meta if empty)
+        if let Some(obj) = params.as_object() {
+            let mut new_obj = obj.clone();
+            if stripped_meta.is_empty() {
+                new_obj.remove("_meta");
+            } else {
+                new_obj.insert(
+                    "_meta".to_string(),
+                    serde_json::Value::Object(stripped_meta),
+                );
+            }
+            Some(serde_json::Value::Object(new_obj))
+        } else {
+            Some(params.clone())
+        }
     };
 
     StdioTraceContext {
@@ -662,7 +679,7 @@ mod tests {
             "arguments": { "a": 1 }
         });
 
-        let result = extract_context_from_meta(Some(&params));
+        let result = extract_context_from_meta(Some(&params), false);
 
         assert!(result.had_trace_context);
 
@@ -700,7 +717,7 @@ mod tests {
             "name": "test"
         });
 
-        let result = extract_context_from_meta(Some(&params));
+        let result = extract_context_from_meta(Some(&params), false);
 
         assert!(result.had_trace_context);
 
@@ -723,7 +740,7 @@ mod tests {
             "arguments": { "a": 1 }
         });
 
-        let result = extract_context_from_meta(Some(&params));
+        let result = extract_context_from_meta(Some(&params), false);
 
         assert!(!result.had_trace_context);
 
@@ -734,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_extract_from_meta_none_params() {
-        let result = extract_context_from_meta(None);
+        let result = extract_context_from_meta(None, false);
 
         assert!(!result.had_trace_context);
         assert!(result.stripped_params.is_none());
@@ -752,7 +769,7 @@ mod tests {
             "name": "test"
         });
 
-        let result = extract_context_from_meta(Some(&params));
+        let result = extract_context_from_meta(Some(&params), false);
 
         assert!(result.had_trace_context);
 
@@ -774,10 +791,37 @@ mod tests {
             "name": "test"
         });
 
-        let result = extract_context_from_meta(Some(&params));
+        let result = extract_context_from_meta(Some(&params), false);
 
         // Invalid traceparent should not create a remote context
         assert!(!result.had_trace_context);
+    }
+
+    #[test]
+    fn test_extract_from_meta_propagate_upstream_preserves_trace_fields() {
+        use serde_json::json;
+
+        let params = json!({
+            "_meta": {
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                "tracestate": "vendor=value"
+            },
+            "name": "test"
+        });
+
+        // With propagate_upstream=true, trace fields should be preserved
+        let result = extract_context_from_meta(Some(&params), true);
+
+        assert!(result.had_trace_context);
+
+        // Trace fields should NOT be stripped
+        let stripped = result.stripped_params.unwrap();
+        assert!(stripped.get("_meta").is_some());
+        assert_eq!(
+            stripped["_meta"]["traceparent"],
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        assert_eq!(stripped["_meta"]["tracestate"], "vendor=value");
     }
 
     #[test]
