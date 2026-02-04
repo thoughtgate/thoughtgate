@@ -37,27 +37,6 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
-// Prometheus Metrics
-// ============================================================================
-
-/// Histogram for Cedar policy evaluation duration (seconds).
-/// Enables p99 monitoring per REQ-OBS-001.
-static CEDAR_EVAL_DURATION: LazyLock<prometheus::Histogram> = LazyLock::new(|| {
-    let opts = prometheus::HistogramOpts::new(
-        "cedar_eval_duration_seconds",
-        "Duration of Cedar policy evaluation in seconds",
-    )
-    .buckets(vec![
-        0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
-    ]);
-    let h = prometheus::Histogram::with_opts(opts).expect("BUG: invalid histogram opts");
-    prometheus::default_registry()
-        .register(Box::new(h.clone()))
-        .expect("BUG: failed to register cedar_eval_duration_seconds");
-    h
-});
-
-// ============================================================================
 // Cached Cedar Entity Type Names
 // ============================================================================
 // These are parsed once at first access and reused for every evaluation,
@@ -306,9 +285,6 @@ impl CedarEngine {
         self.stats_v2
             .total_eval_time_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-
-        // Record to Prometheus histogram for p99 monitoring
-        CEDAR_EVAL_DURATION.observe(elapsed.as_secs_f64());
 
         // Convert response to CedarDecision
         match response.decision() {

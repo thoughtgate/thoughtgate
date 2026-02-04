@@ -69,7 +69,6 @@ opentelemetry = { version = "=0.31.0", features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "=0.31.0", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "=0.31.0", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
 opentelemetry-prometheus = "=0.31.0"
-prometheus = "0.14"
 
 # Prometheus metrics with prometheus-client (REQ-OBS-002 §6)
 prometheus-client = "0.24.0"

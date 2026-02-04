@@ -307,6 +307,9 @@ pub mod error_codes {
     /// Rate limited
     pub const RATE_LIMITED: i32 = -32013;
 
+    /// Governance rule denied (Gate 2)
+    pub const GOVERNANCE_RULE_DENIED: i32 = -32014;
+
     /// Tool not exposed (Gate 1)
     pub const TOOL_NOT_EXPOSED: i32 = -32015;
 }

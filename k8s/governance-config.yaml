@@ -1,0 +1,50 @@
+# Governance ConfigMap for ThoughtGate K8s Integration Tests
+#
+# This ConfigMap provides governance rules for testing the 4-gate decision flow
+# in a Kubernetes environment. It configures:
+# - Default forward action for most tools
+# - Deny rules for delete_* and *_unsafe patterns
+#
+# Implements: REQ-GOV-002 (Governance Rules)
+# Implements: REQ-CORE-003 (4-Gate Decision Flow)
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thoughtgate-governance
+  labels:
+    app: thoughtgate
+    component: governance
+    purpose: integration-test
+data:
+  config.yaml: |
+    # ThoughtGate Governance Configuration
+    # Schema version 1 - v0.3 format
+    schema: 1
+
+    # Upstream MCP server connection
+    # In K8s, this resolves to the mock-mcp service
+    sources:
+      - id: upstream
+        kind: mcp
+        url: http://mock-mcp
+
+    # Governance rules - 4-gate model
+    governance:
+      # Default action when no rule matches
+      defaults:
+        action: forward
+
+      # Rules are evaluated in order - first match wins
+      rules:
+        # Deny any tool starting with "delete_"
+        # Examples: delete_user, delete_file, delete_all
+        - match: "delete_*"
+          action: deny
+
+        # Deny any tool ending with "_unsafe"
+        # Examples: run_unsafe, exec_unsafe, eval_unsafe
+        - match: "*_unsafe"
+          action: deny
+
+        # All other tools are forwarded (from defaults)

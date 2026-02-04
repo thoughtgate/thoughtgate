@@ -6,6 +6,8 @@
 //! - Test fixtures and data builders
 //! - Custom assertions
 
+#![allow(unused_imports)] // Re-exports may not be used by all test files
+
 pub mod fixtures;
 pub mod mock_upstream;
 pub mod test_client;
