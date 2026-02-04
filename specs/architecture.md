@@ -434,7 +434,7 @@ approval:                           # Gate 4: workflow definitions
     destination:
       type: slack
       channel: "#approvals"
-      token_env: SLACK_BOT_TOKEN    # Env var containing bot token
+      token_env: THOUGHTGATE_SLACK_BOT_TOKEN    # Env var containing bot token
       mention:                      # Optional: users/groups to @mention
         - "@oncall"
     timeout: 10m                    # Approval timeout
@@ -507,7 +507,7 @@ Environment variables can override specific settings but cannot define complex s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SLACK_BOT_TOKEN` | (from config) | Slack Bot OAuth token |
+| `THOUGHTGATE_SLACK_BOT_TOKEN` | (from config) | Slack Bot OAuth token |
 | `THOUGHTGATE_APPROVAL_POLL_INTERVAL_SECS` | `5` | Base poll interval |
 | `THOUGHTGATE_APPROVAL_POLL_MAX_INTERVAL_SECS` | `30` | Max poll interval (with backoff) |
 | `THOUGHTGATE_SLACK_RATE_LIMIT_PER_SEC` | `1` | Slack API rate limit |
@@ -636,7 +636,7 @@ spec:
     - containerPort: 7469  # Admin (health, ready, metrics)
       name: admin
     env:
-    - name: SLACK_BOT_TOKEN
+    - name: THOUGHTGATE_SLACK_BOT_TOKEN
       valueFrom:
         secretKeyRef:
           name: thoughtgate-secrets
@@ -1034,7 +1034,7 @@ approval:
 
 **Required environment variable:**
 ```
-SLACK_BOT_TOKEN=xoxb-your-bot-token
+THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-bot-token
 ```
 
 ### 14.3 Decision Flow (Quick Reference - v0.2)

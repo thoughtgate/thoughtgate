@@ -268,7 +268,9 @@ cargo bench --bench policy_eval
 ### Environment Variables
 ```bash
 THOUGHTGATE_UPSTREAM=http://mcp-server:3000  # Required
-THOUGHTGATE_LISTEN=0.0.0.0:8080
+THOUGHTGATE_OUTBOUND_PORT=7467               # Main proxy port (default: 7467)
+THOUGHTGATE_ADMIN_PORT=7469                  # Admin/health port (default: 7469)
+THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml  # Optional YAML config
 THOUGHTGATE_POLICIES=/etc/thoughtgate/policies/
 THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-...
 THOUGHTGATE_SLACK_CHANNEL=#approvals

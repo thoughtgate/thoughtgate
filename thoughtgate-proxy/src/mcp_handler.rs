@@ -114,20 +114,22 @@ impl McpServerConfig {
     ///
     /// # Environment Variables
     ///
-    /// - `THOUGHTGATE_LISTEN` (default: "0.0.0.0:8080"): Listen address
     /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
     /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
     /// - `THOUGHTGATE_MAX_BATCH_SIZE` (default: 100): Max JSON-RPC batch array length
     ///
     /// Plus all upstream configuration variables (see `UpstreamConfig::from_env`).
     ///
+    /// # Note
+    ///
+    /// The `listen_addr` field is not configurable via environment variable.
+    /// Production deployments use `THOUGHTGATE_OUTBOUND_PORT` and `THOUGHTGATE_ADMIN_PORT`
+    /// via `ports.rs` instead. This field is only used by `McpHandler::run()` for testing.
+    ///
     /// # Errors
     ///
     /// Returns error if upstream configuration is invalid.
     pub fn from_env() -> Result<Self, ThoughtGateError> {
-        let listen_addr =
-            std::env::var("THOUGHTGATE_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-
         let max_body_size: usize = std::env::var("THOUGHTGATE_MAX_REQUEST_BODY_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -144,7 +146,7 @@ impl McpServerConfig {
             .unwrap_or(100);
 
         Ok(Self {
-            listen_addr,
+            listen_addr: "0.0.0.0:8080".to_string(), // Not configurable; use ports.rs in production
             max_body_size,
             max_concurrent_requests,
             max_batch_size,

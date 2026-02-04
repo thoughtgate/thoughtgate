@@ -173,7 +173,7 @@ approval:
   default:
     destination:
       type: slack
-      token_env: SLACK_BOT_TOKEN  # Read at runtime, not substituted
+      token_env: THOUGHTGATE_SLACK_BOT_TOKEN  # Read at runtime, not substituted
 ```
 
 **Substitution rules:**
@@ -1607,7 +1607,7 @@ approval:
     destination:
       type: slack
       channel: "#approvals"
-      token_env: SLACK_BOT_TOKEN
+      token_env: THOUGHTGATE_SLACK_BOT_TOKEN
     timeout: 10m
     on_timeout: deny
 
@@ -1632,7 +1632,7 @@ telemetry:
 **Required environment variables:**
 ```bash
 export UPSTREAM_URL=http://mcp-server:3000
-export SLACK_BOT_TOKEN=xoxb-your-token
+export THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-token
 export DEPLOY_ENV=production  # Optional, defaults to "production"
 ```
 

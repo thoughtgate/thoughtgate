@@ -93,7 +93,7 @@ Set environment variables and start the proxy:
 
 ```bash
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
-export SLACK_BOT_TOKEN=xoxb-your-token
+export THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-token
 
 ./target/release/thoughtgate-proxy
 ```

@@ -126,7 +126,7 @@ spec:
 ```yaml
 # Use Kubernetes secrets for Slack token
 env:
-  - name: SLACK_BOT_TOKEN
+  - name: THOUGHTGATE_SLACK_BOT_TOKEN
     valueFrom:
       secretKeyRef:
         name: thoughtgate-secrets
@@ -211,7 +211,7 @@ spec:
       env:
         - name: THOUGHTGATE_CONFIG
           value: "/etc/thoughtgate/config.yaml"
-        - name: SLACK_BOT_TOKEN
+        - name: THOUGHTGATE_SLACK_BOT_TOKEN
           valueFrom:
             secretKeyRef:
               name: thoughtgate-secrets

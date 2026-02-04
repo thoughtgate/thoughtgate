@@ -50,7 +50,7 @@ time curl http://your-upstream:3000/health
 
 ```bash
 # Verify token is set
-echo $SLACK_BOT_TOKEN | head -c 10
+echo $THOUGHTGATE_SLACK_BOT_TOKEN | head -c 10
 
 # Check ThoughtGate logs for Slack errors
 docker logs thoughtgate 2>&1 | grep -i slack

@@ -72,7 +72,7 @@ cedar:
 | `THOUGHTGATE_CONFIG` | Yes | — | Path to YAML configuration file |
 | `THOUGHTGATE_OUTBOUND_PORT` | No | `7467` | Port for proxy traffic |
 | `THOUGHTGATE_ADMIN_PORT` | No | `7469` | Port for health/metrics endpoints |
-| `SLACK_BOT_TOKEN` | For approvals | — | Slack Bot OAuth token (`xoxb-...`) |
+| `THOUGHTGATE_SLACK_BOT_TOKEN` | For approvals | — | Slack Bot OAuth token (`xoxb-...`) |
 | `SLACK_CHANNEL` | No | `#approvals` | Default channel for approval messages |
 
 ## Port Model
