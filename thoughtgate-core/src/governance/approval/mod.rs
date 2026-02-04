@@ -349,7 +349,18 @@ pub struct PollingConfig {
     pub base_interval: Duration,
     /// Maximum polling interval (after backoff)
     pub max_interval: Duration,
-    /// Maximum concurrent polls
+    /// Maximum concurrent approval polls (soft limit).
+    ///
+    /// This is a "best effort" limit with a small TOCTOU window: the capacity
+    /// check happens before the async `post_approval_request` call, so under
+    /// high concurrency the actual count may briefly exceed this value. This
+    /// is acceptable because:
+    ///
+    /// 1. The overshoot is bounded by concurrent `submit()` calls in flight
+    /// 2. The system self-corrects as tasks complete
+    /// 3. No unbounded growth occurs—new submissions are rejected once at limit
+    ///
+    /// For strict limits, use external rate limiting (e.g., semaphore) upstream.
     pub max_concurrent: usize,
     /// How long an approval is valid after being granted
     pub approval_valid_for: Duration,

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -117,6 +117,35 @@ impl GovernanceServiceState {
 impl Default for GovernanceServiceState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Shims that haven't sent a heartbeat within this duration are considered stale.
+///
+/// The heartbeat interval is 5 seconds, so 15 seconds (3× interval) provides
+/// enough margin for network jitter while still cleaning up disconnected shims
+/// promptly. This prevents unbounded HashMap growth from shims that disconnect
+/// without proper cleanup.
+const STALE_SHIM_THRESHOLD: Duration = Duration::from_secs(15);
+
+impl GovernanceServiceState {
+    /// Remove shims that haven't sent a heartbeat recently.
+    ///
+    /// Shims are expected to heartbeat every 5 seconds. Entries older than
+    /// [`STALE_SHIM_THRESHOLD`] (15 seconds = 3× interval) are considered stale
+    /// and removed to prevent unbounded HashMap growth from disconnected shims.
+    ///
+    /// This method is called opportunistically during heartbeat handling to
+    /// piggyback on the existing lock acquisition.
+    pub async fn cleanup_stale_shims(&self) {
+        let now = Instant::now();
+        let mut shims = self.shims.lock().await;
+        let before_count = shims.len();
+        shims.retain(|_, last_seen| now.duration_since(*last_seen) < STALE_SHIM_THRESHOLD);
+        let removed = before_count - shims.len();
+        if removed > 0 {
+            tracing::debug!(removed, "Cleaned up stale shim entries");
+        }
     }
 }
 
@@ -250,6 +279,9 @@ async fn evaluate_handler(
 /// Updates the last-seen timestamp for the shim and returns the current
 /// shutdown flag. Shims must send a heartbeat every 5 seconds when idle.
 ///
+/// Also performs opportunistic cleanup of stale shim entries to prevent
+/// unbounded HashMap growth from disconnected shims.
+///
 /// Implements: REQ-CORE-008/F-016
 async fn heartbeat_handler(
     State(state): State<Arc<GovernanceServiceState>>,
@@ -259,6 +291,10 @@ async fn heartbeat_handler(
         let mut shims = state.shims.lock().await;
         shims.insert(req.server_id, Instant::now());
     }
+
+    // Opportunistic cleanup of stale shims (piggybacks on heartbeat traffic).
+    // This is called after releasing the lock above to avoid holding it during cleanup.
+    state.cleanup_stale_shims().await;
 
     Json(HeartbeatResponse {
         shutdown: state.shutdown.load(Ordering::SeqCst),
@@ -735,5 +771,61 @@ governance:
         assert_eq!(resp.status(), 200);
         let body: TaskStatusResponse = resp.json().await.unwrap();
         assert_eq!(body.decision, Some(ApprovalOutcome::Approved));
+    }
+
+    // ── Stale shim cleanup tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cleanup_stale_shims_removes_old_entries() {
+        let state = GovernanceServiceState::new();
+
+        // Insert a shim with an artificially old timestamp
+        {
+            let mut shims = state.shims.lock().await;
+            // Insert an entry that appears to be from 20 seconds ago (stale)
+            let stale_time = Instant::now() - Duration::from_secs(20);
+            shims.insert("stale-server".to_string(), stale_time);
+            // Insert a fresh entry
+            shims.insert("fresh-server".to_string(), Instant::now());
+        }
+
+        // Verify both entries exist before cleanup
+        {
+            let shims = state.shims.lock().await;
+            assert_eq!(shims.len(), 2);
+        }
+
+        // Run cleanup
+        state.cleanup_stale_shims().await;
+
+        // Only the fresh entry should remain
+        {
+            let shims = state.shims.lock().await;
+            assert_eq!(shims.len(), 1);
+            assert!(shims.contains_key("fresh-server"));
+            assert!(!shims.contains_key("stale-server"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_shims_keeps_recent_entries() {
+        let state = GovernanceServiceState::new();
+
+        // Insert entries that are within the threshold (fresh)
+        {
+            let mut shims = state.shims.lock().await;
+            shims.insert("server-1".to_string(), Instant::now());
+            shims.insert("server-2".to_string(), Instant::now() - Duration::from_secs(10));
+            shims.insert("server-3".to_string(), Instant::now() - Duration::from_secs(14));
+        }
+
+        // Run cleanup
+        state.cleanup_stale_shims().await;
+
+        // All entries should remain (all within 15s threshold)
+        {
+            let shims = state.shims.lock().await;
+            assert_eq!(shims.len(), 3);
+        }
     }
 }

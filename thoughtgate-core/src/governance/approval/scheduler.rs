@@ -159,12 +159,34 @@ impl PollingScheduler {
     /// Posts the approval request to the external system and schedules
     /// polling for the decision.
     ///
+    /// # Capacity Limiting (Soft Limit)
+    ///
+    /// The capacity check is a "best effort" soft limit. There is a small
+    /// TOCTOU window between the capacity check and the actual insertion:
+    ///
+    /// ```text
+    /// if self.references.len() >= max_concurrent { ... }  // Check
+    /// self.rate_limiter.until_ready().await;              // Await point 1
+    /// let reference = adapter.post_approval_request().await?;  // Await point 2
+    /// self.references.insert(task_id, reference);         // Insert
+    /// ```
+    ///
+    /// Under high concurrency, multiple `submit()` calls may pass the check
+    /// simultaneously, causing the actual count to briefly exceed
+    /// `max_concurrent`. This is acceptable because:
+    ///
+    /// - The overshoot is bounded by concurrent calls in flight
+    /// - The system self-corrects as tasks complete
+    /// - No unbounded growth occurs
+    ///
     /// # Errors
     ///
-    /// Returns `AdapterError` if posting fails.
+    /// Returns `AdapterError::RateLimited` if at capacity, or propagates
+    /// adapter errors from `post_approval_request`.
     #[tracing::instrument(skip(self, request), fields(task_id = %request.task_id))]
     pub async fn submit(&self, request: ApprovalRequest) -> Result<(), AdapterError> {
-        // Check capacity - reject if at limit to prevent unbounded growth
+        // Check capacity - reject if at limit to prevent unbounded growth.
+        // NOTE: This is a soft limit with a TOCTOU gap (see doc comment above).
         if self.references.len() >= self.config.max_concurrent {
             warn!(
                 task_id = %request.task_id,
