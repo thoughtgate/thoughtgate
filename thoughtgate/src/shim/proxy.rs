@@ -36,10 +36,10 @@ use thoughtgate_core::governance::api::{
 };
 use thoughtgate_core::governance::service::HeartbeatRequest;
 use thoughtgate_core::jsonrpc::{JsonRpcId, JsonRpcMessageKind};
-use thoughtgate_core::metrics::StdioMetrics;
 use thoughtgate_core::profile::Profile;
 use thoughtgate_core::telemetry::{
-    McpMessageType, McpSpanData, extract_context_from_meta, finish_mcp_span, start_mcp_span,
+    McpMessageType, McpSpanData, ThoughtGateMetrics, extract_context_from_meta, finish_mcp_span,
+    start_mcp_span,
 };
 
 use crate::error::{FramingError, StdioError};
@@ -578,7 +578,7 @@ async fn poll_governance_healthz(
 /// # Arguments
 ///
 /// * `opts` - Shim configuration (server_id, governance endpoint, profile).
-/// * `metrics` - Stdio metrics collector (use `StdioMetrics::noop()` for tests).
+/// * `metrics` - Optional metrics collector (use `None` for tests).
 /// * `server_command` - The MCP server command to spawn.
 /// * `server_args` - Arguments for the server command.
 ///
@@ -594,7 +594,7 @@ async fn poll_governance_healthz(
 /// Implements: REQ-CORE-008/F-011, F-012, F-016, F-018
 pub async fn run_shim(
     opts: ShimOptions,
-    metrics: StdioMetrics,
+    metrics: Option<Arc<ThoughtGateMetrics>>,
     server_command: String,
     server_args: Vec<String>,
 ) -> Result<i32, StdioError> {
@@ -623,8 +623,9 @@ pub async fn run_shim(
         reason: e.to_string(),
     })?;
 
-    metrics.increment_active_servers();
-    metrics.record_server_state(&server_id, "running");
+    if let Some(ref m) = metrics {
+        m.increment_stdio_active_servers();
+    }
     tracing::info!(server_id, server_command, "server process spawned");
 
     // ── Build reqwest client ─────────────────────────────────────────────
@@ -807,7 +808,7 @@ async fn agent_to_server(
     governance_endpoint: String,
     profile: Profile,
     client: reqwest::Client,
-    metrics: StdioMetrics,
+    metrics: Option<Arc<ThoughtGateMetrics>>,
     mut child_stdin: tokio::process::ChildStdin,
     agent_stdout: Arc<Mutex<Stdout>>,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -836,7 +837,9 @@ async fn agent_to_server(
                 match result {
                     Ok(n) => n,
                     Err(FramingError::MessageTooLarge { .. }) => {
-                        metrics.record_framing_error(&server_id, "message_too_large");
+                        if let Some(ref m) = metrics {
+                            m.record_stdio_framing_error(&server_id, "message_too_large");
+                        }
                         tracing::warn!(
                             server_id,
                             "agent→server: message exceeded size limit, skipping"
@@ -884,7 +887,9 @@ async fn agent_to_server(
         let msg = match parse_stdio_message(&buf) {
             Ok(msg) => msg,
             Err(e) => {
-                metrics.record_framing_error(&server_id, framing_error_type(&e));
+                if let Some(ref m) = metrics {
+                    m.record_stdio_framing_error(&server_id, framing_error_type(&e));
+                }
                 tracing::warn!(server_id, error = %e, "agent→server framing error, skipping");
                 continue;
             }
@@ -892,7 +897,9 @@ async fn agent_to_server(
 
         // Handle smuggling per profile (F-014).
         if smuggled {
-            metrics.record_framing_error(&server_id, "smuggling");
+            if let Some(ref m) = metrics {
+                m.record_stdio_framing_error(&server_id, "smuggling");
+            }
             if profile == Profile::Production {
                 tracing::warn!(server_id, "smuggling detected, rejecting message");
                 continue;
@@ -906,7 +913,9 @@ async fn agent_to_server(
         let method = method_from_kind(&msg.kind).to_string();
 
         // NFR-002: Record every parsed message.
-        metrics.record_message(&server_id, "agent_to_server", &method);
+        if let Some(ref m) = metrics {
+            m.record_stdio_message(&server_id, "agent_to_server", &method);
+        }
 
         // F-017: Passthrough messages bypass governance.
         if is_passthrough(&method) {
@@ -1016,11 +1025,13 @@ async fn agent_to_server(
                     // Fail-closed in production: send deny so agent sees an error
                     // rather than a silently dropped request.
                     if profile == Profile::Production {
-                        metrics.record_governance_decision(
-                            &server_id,
-                            "deny",
-                            &format!("{profile:?}"),
-                        );
+                        if let Some(ref m) = metrics {
+                            m.record_stdio_governance_decision(
+                                &server_id,
+                                "deny",
+                                &format!("{profile:?}"),
+                            );
+                        }
                         if let Some(id) = id_from_kind(&msg.kind) {
                             let deny_line = format_deny_response(&id, &server_id, None);
                             write_stdout(&agent_stdout, deny_line.as_bytes())
@@ -1055,7 +1066,13 @@ async fn agent_to_server(
                 // Fail-closed in production: send deny so agent sees an error
                 // rather than a silently dropped request.
                 if profile == Profile::Production {
-                    metrics.record_governance_decision(&server_id, "deny", &format!("{profile:?}"));
+                    if let Some(ref m) = metrics {
+                        m.record_stdio_governance_decision(
+                            &server_id,
+                            "deny",
+                            &format!("{profile:?}"),
+                        );
+                    }
                     if let Some(id) = id_from_kind(&msg.kind) {
                         let deny_line = format_deny_response(&id, &server_id, None);
                         write_stdout(&agent_stdout, deny_line.as_bytes())
@@ -1092,7 +1109,9 @@ async fn agent_to_server(
             GovernanceDecision::Deny => "deny",
             GovernanceDecision::PendingApproval => "pending_approval",
         };
-        metrics.record_governance_decision(&server_id, decision_str, &format!("{profile:?}"));
+        if let Some(ref m) = metrics {
+            m.record_stdio_governance_decision(&server_id, decision_str, &format!("{profile:?}"));
+        }
 
         // NFR-002: Structured audit log entry.
         {
@@ -1209,7 +1228,9 @@ async fn agent_to_server(
                 let outcome =
                     poll_approval_status(&client, &task_url, poll_interval, shutdown_rx, profile)
                         .await;
-                metrics.record_approval_latency(&server_id, approval_start.elapsed());
+                if let Some(ref m) = metrics {
+                    m.record_stdio_approval_latency(&server_id, approval_start.elapsed());
+                }
 
                 match outcome {
                     ApprovalPollResult::Approved => {
@@ -1351,7 +1372,7 @@ async fn agent_to_server(
 /// Implements: REQ-CORE-008/F-012 (server→agent), F-015
 async fn server_to_agent(
     server_id: String,
-    metrics: StdioMetrics,
+    metrics: Option<Arc<ThoughtGateMetrics>>,
     child_stdout: tokio::process::ChildStdout,
     agent_stdout: Arc<Mutex<Stdout>>,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -1377,7 +1398,9 @@ async fn server_to_agent(
                 match result {
                     Ok(n) => n,
                     Err(FramingError::MessageTooLarge { .. }) => {
-                        metrics.record_framing_error(&server_id, "message_too_large");
+                        if let Some(ref m) = metrics {
+                            m.record_stdio_framing_error(&server_id, "message_too_large");
+                        }
                         tracing::warn!(
                             server_id,
                             "server→agent: message exceeded size limit, skipping"
@@ -1418,7 +1441,9 @@ async fn server_to_agent(
 
         // F-014: Smuggling detection on raw bytes (log only for server→agent in v0.3).
         if detect_smuggling(&raw_buf) {
-            metrics.record_framing_error(&server_id, "smuggling");
+            if let Some(ref m) = metrics {
+                m.record_stdio_framing_error(&server_id, "smuggling");
+            }
             tracing::warn!(
                 server_id,
                 "smuggling detected in server→agent message (logged only)"
@@ -1430,7 +1455,9 @@ async fn server_to_agent(
             Ok(msg) => {
                 let method = method_from_kind(&msg.kind);
                 // NFR-002: Record every parsed message.
-                metrics.record_message(&server_id, "server_to_agent", method);
+                if let Some(ref m) = metrics {
+                    m.record_stdio_message(&server_id, "server_to_agent", method);
+                }
 
                 // NFR-002: Structured audit log for server→agent.
                 tracing::info!(
@@ -1471,7 +1498,9 @@ async fn server_to_agent(
             }
             Err(e) => {
                 // NFR-002: Record framing error.
-                metrics.record_framing_error(&server_id, framing_error_type(&e));
+                if let Some(ref m) = metrics {
+                    m.record_stdio_framing_error(&server_id, framing_error_type(&e));
+                }
                 tracing::warn!(
                     server_id,
                     error = %e,
@@ -1585,19 +1614,28 @@ async fn heartbeat_loop(
 async fn shutdown_server(
     server_id: &str,
     child: &mut tokio::process::Child,
-    metrics: &StdioMetrics,
+    metrics: &Option<Arc<ThoughtGateMetrics>>,
     shutdown_req: &crate::shim::lifecycle::ShutdownRequest,
 ) -> Result<i32, StdioError> {
-    metrics.record_server_state(server_id, "shutting_down");
-    tracing::info!(server_id, "initiating graceful shutdown");
+    tracing::info!(
+        server_id,
+        state = "shutting_down",
+        "initiating graceful shutdown"
+    );
 
     // Step 2: Wait for server to exit after stdin is closed.
     match tokio::time::timeout(shutdown_req.stdin_close_grace, child.wait()).await {
         Ok(Ok(status)) => {
             let code = status.code().unwrap_or(-1);
-            tracing::info!(server_id, code, "server exited after stdin close");
-            metrics.decrement_active_servers();
-            metrics.record_server_state(server_id, "stopped");
+            tracing::info!(
+                server_id,
+                code,
+                state = "stopped",
+                "server exited after stdin close"
+            );
+            if let Some(m) = metrics {
+                m.decrement_stdio_active_servers();
+            }
             return Ok(code);
         }
         Ok(Err(e)) => {
@@ -1623,9 +1661,15 @@ async fn shutdown_server(
     match tokio::time::timeout(shutdown_req.sigterm_grace, child.wait()).await {
         Ok(Ok(status)) => {
             let code = status.code().unwrap_or(-1);
-            tracing::info!(server_id, code, "server exited after SIGTERM");
-            metrics.decrement_active_servers();
-            metrics.record_server_state(server_id, "stopped");
+            tracing::info!(
+                server_id,
+                code,
+                state = "stopped",
+                "server exited after SIGTERM"
+            );
+            if let Some(m) = metrics {
+                m.decrement_stdio_active_servers();
+            }
             return Ok(code);
         }
         Ok(Err(e)) => {
@@ -1645,10 +1689,16 @@ async fn shutdown_server(
     // Step 6: Collect exit code (F-021: zombie prevention).
     let status = child.wait().await.map_err(StdioError::StdioIo)?;
     let code = status.code().unwrap_or(-1);
-    tracing::info!(server_id, code, "server exited after SIGKILL");
+    tracing::info!(
+        server_id,
+        code,
+        state = "stopped",
+        "server exited after SIGKILL"
+    );
 
-    metrics.decrement_active_servers();
-    metrics.record_server_state(server_id, "stopped");
+    if let Some(m) = metrics {
+        m.decrement_stdio_active_servers();
+    }
     Ok(code)
 }
 

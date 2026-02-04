@@ -21,6 +21,7 @@ pub mod cardinality;
 pub mod prom_metrics;
 pub mod propagation;
 pub mod spans;
+pub mod timers;
 pub mod trace_context;
 
 pub use spans::{
@@ -101,6 +102,9 @@ pub use propagation::{
 // Re-export prometheus-client metrics
 pub use cardinality::CardinalityLimiter;
 pub use prom_metrics::ThoughtGateMetrics;
+
+// Re-export RAII timer helpers (REQ-CORE-002 NFR-001)
+pub use timers::{AmberPathTimer, InspectorTimer};
 
 // Re-export BoxedSpan for convenience (callers need to annotate span type)
 pub use opentelemetry::global::BoxedSpan;

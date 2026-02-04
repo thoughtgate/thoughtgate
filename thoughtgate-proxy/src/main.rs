@@ -118,24 +118,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Implements: REQ-CORE-005/F-001 (startup timeout)
     let startup_deadline = std::time::Instant::now() + lifecycle.config().startup_timeout;
 
-    // Initialize OpenTelemetry metrics (REQ-CORE-001 NFR-001)
-    #[cfg(feature = "metrics")]
-    {
-        use opentelemetry::global;
-        use opentelemetry_sdk::metrics::SdkMeterProvider;
-        use thoughtgate_core::metrics;
-
-        let exporter = opentelemetry_prometheus::exporter()
-            .with_registry(prometheus::default_registry().clone())
-            .build()?;
-
-        let provider = SdkMeterProvider::builder().with_reader(exporter).build();
-        global::set_meter_provider(provider.clone());
-
-        let meter = global::meter("thoughtgate");
-        metrics::init_metrics(&meter);
-    }
-
     // Initialize OpenTelemetry tracing (REQ-OBS-002)
     // Note: yaml_config is not yet loaded at this point, so we initialize telemetry
     // after config loading. For now, we declare the guard variable here.

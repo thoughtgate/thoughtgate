@@ -24,7 +24,6 @@ pub mod governance;
 pub mod inspector;
 pub mod jsonrpc;
 pub mod lifecycle;
-pub mod metrics;
 pub mod policy;
 pub mod profile;
 pub mod protocol;

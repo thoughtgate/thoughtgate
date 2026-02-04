@@ -36,12 +36,7 @@ impl StreamMetrics {
     pub fn record_bytes(&mut self, count: usize) {
         self.bytes_transferred += count as u64;
         self.chunks_count += 1;
-
-        // Record metrics if available (REQ-CORE-001 NFR-001)
-        #[cfg(feature = "metrics")]
-        if let Some(metrics) = thoughtgate_core::metrics::get_metrics() {
-            metrics.record_chunk_size(count as u64);
-        }
+        // Metrics recording is done via ThoughtGateMetrics in the calling context
     }
 
     /// Record that trailers were received.

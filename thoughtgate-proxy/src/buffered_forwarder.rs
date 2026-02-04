@@ -48,7 +48,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy_config::ProxyConfig;
 use thoughtgate_core::inspector::{Decision, InspectionContext, Inspector};
-use thoughtgate_core::metrics::{AmberPathTimer, InspectorTimer, get_amber_metrics};
+use thoughtgate_core::telemetry::{AmberPathTimer, InspectorTimer, ThoughtGateMetrics};
 
 /// Helper type alias for bodies that may include trailers.
 ///
@@ -97,6 +97,9 @@ pub struct BufferedForwarder {
 
     /// Registered inspectors (executed in order)
     inspectors: Arc<Vec<Arc<dyn Inspector>>>,
+
+    /// Optional metrics collector (REQ-CORE-002 NFR-001)
+    metrics: Option<Arc<ThoughtGateMetrics>>,
 }
 
 impl BufferedForwarder {
@@ -115,6 +118,7 @@ impl BufferedForwarder {
             config,
             semaphore,
             inspectors: Arc::new(Vec::new()),
+            metrics: None,
         }
     }
 
@@ -130,7 +134,16 @@ impl BufferedForwarder {
             config,
             semaphore,
             inspectors: Arc::new(inspectors),
+            metrics: None,
         }
+    }
+
+    /// Attach metrics to this forwarder.
+    ///
+    /// Implements: REQ-CORE-002 NFR-001
+    pub fn with_metrics(mut self, metrics: Arc<ThoughtGateMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Register an inspector to the chain.
@@ -177,16 +190,15 @@ impl BufferedForwarder {
             Ok(permit) => permit,
             Err(_) => {
                 warn!("Amber Path semaphore exhausted, rejecting request");
-                if let Some(m) = get_amber_metrics() {
-                    m.record_error("semaphore");
+                if let Some(ref m) = self.metrics {
+                    m.record_amber_error("semaphore");
                 }
                 return Err(ProxyError::BufferSemaphoreExhausted);
             }
         };
 
         // Start metrics timer AFTER acquiring permit
-        let metrics = get_amber_metrics();
-        let timer = metrics.clone().map(AmberPathTimer::new);
+        let timer = self.metrics.clone().map(AmberPathTimer::new);
 
         debug!("Acquired Amber Path permit, processing request");
 
@@ -261,16 +273,15 @@ impl BufferedForwarder {
             Ok(permit) => permit,
             Err(_) => {
                 warn!("Amber Path semaphore exhausted, rejecting response");
-                if let Some(m) = get_amber_metrics() {
-                    m.record_error("semaphore");
+                if let Some(ref m) = self.metrics {
+                    m.record_amber_error("semaphore");
                 }
                 return Err(ProxyError::BufferSemaphoreExhausted);
             }
         };
 
         // Start metrics timer AFTER acquiring permit
-        let metrics = get_amber_metrics();
-        let timer = metrics.clone().map(AmberPathTimer::new);
+        let timer = self.metrics.clone().map(AmberPathTimer::new);
 
         debug!("Acquired Amber Path permit, processing response");
 
@@ -436,9 +447,6 @@ impl BufferedForwarder {
             return Ok(None);
         }
 
-        // Get metrics for inspector timing
-        let metrics = get_amber_metrics();
-
         // Use Cow for zero-copy when possible (Section 7)
         let mut current_bytes: Cow<'_, [u8]> = Cow::Borrowed(body);
         let mut modified_storage: Option<Bytes> = None;
@@ -448,7 +456,8 @@ impl BufferedForwarder {
             debug!(inspector = inspector_name, "Running inspector");
 
             // Start inspector timer
-            let timer = metrics
+            let timer = self
+                .metrics
                 .clone()
                 .map(|m| InspectorTimer::new(m, inspector_name));
 
@@ -466,8 +475,8 @@ impl BufferedForwarder {
                 Decision::Approve => {
                     debug!(inspector = inspector_name, "Inspector approved");
                     // Record approval metric
-                    if let Some(ref m) = metrics {
-                        m.record_inspection("approve");
+                    if let Some(ref m) = self.metrics {
+                        m.record_amber_inspection("approve");
                     }
                     continue;
                 }
@@ -479,8 +488,8 @@ impl BufferedForwarder {
                         "Inspector modified payload"
                     );
                     // Record modification metric
-                    if let Some(ref m) = metrics {
-                        m.record_inspection("modify");
+                    if let Some(ref m) = self.metrics {
+                        m.record_amber_inspection("modify");
                     }
                     // Store the efficient Bytes handle for final return
                     modified_storage = Some(new_bytes.clone());
@@ -494,8 +503,8 @@ impl BufferedForwarder {
                         "Inspector rejected payload"
                     );
                     // Record rejection metric
-                    if let Some(ref m) = metrics {
-                        m.record_inspection("reject");
+                    if let Some(ref m) = self.metrics {
+                        m.record_amber_inspection("reject");
                     }
                     return Err(ProxyError::Rejected(inspector_name.to_string(), status));
                 }

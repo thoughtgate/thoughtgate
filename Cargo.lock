@@ -3871,6 +3871,7 @@ dependencies = [
  "prometheus",
  "prometheus-client",
  "proptest",
+ "rand",
  "regex",
  "reqwest",
  "serde",

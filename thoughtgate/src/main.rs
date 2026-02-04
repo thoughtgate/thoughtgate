@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use thoughtgate_core::metrics::StdioMetrics;
 use thoughtgate_core::profile::Profile;
 
 use thoughtgate::cli::{ShimArgs, WrapArgs};
@@ -78,8 +77,6 @@ async fn run_shim_from_args(args: ShimArgs) -> i32 {
         config_path: PathBuf::from("/dev/null"),
     };
 
-    let metrics = StdioMetrics::noop();
-
     if args.command.is_empty() {
         eprintln!("thoughtgate shim: no server command specified");
         return 1;
@@ -88,7 +85,7 @@ async fn run_shim_from_args(args: ShimArgs) -> i32 {
     let server_command = args.command[0].clone();
     let server_args = args.command[1..].to_vec();
 
-    match run_shim(opts, metrics, server_command, server_args).await {
+    match run_shim(opts, None, server_command, server_args).await {
         Ok(code) => code,
         Err(e) => {
             tracing::error!(error = %e, "shim failed");

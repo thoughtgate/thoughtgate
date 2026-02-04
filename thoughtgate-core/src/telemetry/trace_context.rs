@@ -275,40 +275,27 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Generate a new random trace ID.
+/// Generate a new random trace ID using cryptographically secure randomness.
+///
+/// Uses `rand::thread_rng()` which provides a thread-local CSPRNG seeded from
+/// the operating system's entropy source. This ensures globally unique trace IDs
+/// per W3C Trace Context specification requirements.
+///
+/// Implements: REQ-OBS-002 §7.4.2 (graceful degradation with new trace)
 fn generate_trace_id() -> TraceId {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Simple trace ID generation using timestamp + random-ish values
-    // In production, you'd use a proper random source
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut bytes = [0u8; 16];
-    // now is u128, so to_be_bytes gives 16 bytes
-    let now_bytes = now.to_be_bytes();
-    bytes[..8].copy_from_slice(&now_bytes[8..16]); // Take lower 8 bytes
-    // Add some variation to the second half
-    let variation = now.wrapping_mul(0x517cc1b727220a95);
-    let var_bytes = variation.to_be_bytes();
-    bytes[8..].copy_from_slice(&var_bytes[8..16]); // Take lower 8 bytes
-    TraceId::from_bytes(bytes)
+    use rand::Rng;
+    TraceId::from_bytes(rand::rng().random())
 }
 
-/// Generate a new random span ID.
+/// Generate a new random span ID using cryptographically secure randomness.
+///
+/// Uses `rand::thread_rng()` which provides a thread-local CSPRNG seeded from
+/// the operating system's entropy source.
+///
+/// Implements: REQ-OBS-002 §7.4.2 (graceful degradation with new trace)
 fn generate_span_id() -> SpanId {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    // XOR with a constant to add variation
-    let mixed = now ^ 0x9e3779b97f4a7c15_u128;
-    // Take only the lower 8 bytes for span ID (u128 has 16 bytes)
-    let full_bytes = mixed.to_be_bytes();
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&full_bytes[8..16]);
-    SpanId::from_bytes(bytes)
+    use rand::Rng;
+    SpanId::from_bytes(rand::rng().random())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

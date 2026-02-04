@@ -1528,13 +1528,8 @@ async fn handle_single_request_bytes(
     finish_mcp_span(&mut mcp_span, is_error, error_code, error_type.as_deref());
     drop(mcp_span);
 
-    // Record MCP request metrics (OTel-based, deprecated)
-    let outcome = if result.is_ok() { "success" } else { "error" };
-    if let Some(mcp_metrics) = thoughtgate_core::metrics::get_mcp_metrics() {
-        mcp_metrics.record_request(&method, outcome, request_start.elapsed().as_secs_f64());
-    }
-
     // Record prometheus-client metrics (REQ-OBS-002 §6.1, §6.2)
+    let outcome = if result.is_ok() { "success" } else { "error" };
     if let Some(ref metrics) = state.tg_metrics {
         let duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
         metrics.record_request(&method, tool_name.as_deref(), outcome);

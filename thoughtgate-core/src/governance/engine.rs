@@ -476,10 +476,6 @@ impl ApprovalEngine {
             "Approval workflow started, task created"
         );
 
-        // Record governance metrics (legacy OTel)
-        if let Some(metrics) = crate::metrics::get_governance_metrics() {
-            metrics.record_task_created();
-        }
         // Record MC-007: tasks_created_total (prometheus-client)
         if let Some(ref metrics) = self.tg_metrics {
             metrics.record_task_created("approval");
@@ -737,13 +733,6 @@ impl ApprovalEngine {
                 if let Err(e) = self.task_store.complete(task_id, result.clone()) {
                     error!(task_id = %task_id, error = %e, "Failed to complete task");
                 }
-                if let Some(metrics) = crate::metrics::get_governance_metrics() {
-                    metrics.record_task_terminal("completed");
-                    let latency = task.created_at.signed_duration_since(chrono::Utc::now());
-                    if let Ok(d) = (-latency).to_std() {
-                        metrics.record_approval_latency(d);
-                    }
-                }
                 // Record MC-008: tasks_completed_total (prometheus-client)
                 if let Some(ref metrics) = self.tg_metrics {
                     metrics.record_task_completed("approval", "completed");
@@ -763,10 +752,6 @@ impl ApprovalEngine {
                 };
                 if let Err(e) = self.task_store.fail(task_id, failure) {
                     error!(task_id = %task_id, error = %e, "Failed to record task failure");
-                }
-                if let Some(metrics) = crate::metrics::get_governance_metrics() {
-                    metrics.record_task_terminal("failed");
-                    metrics.record_pipeline_failure(&format!("{stage:?}"));
                 }
                 // Record MC-008: tasks_completed_total (prometheus-client)
                 if let Some(ref metrics) = self.tg_metrics {

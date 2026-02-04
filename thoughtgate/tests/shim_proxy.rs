@@ -11,7 +11,6 @@ use std::sync::Arc;
 use thoughtgate::shim::proxy::run_shim;
 use thoughtgate::wrap::config_adapter::ShimOptions;
 use thoughtgate_core::governance::service::{GovernanceServiceState, start_governance_service};
-use thoughtgate_core::metrics::StdioMetrics;
 use thoughtgate_core::profile::Profile;
 
 /// Start a test governance service on an ephemeral port.
@@ -40,7 +39,7 @@ async fn test_server_crash_handled_gracefully() {
     // and return without hanging.
     let (port, _state) = start_test_governance().await;
     let opts = test_opts("crash-server", port);
-    let metrics = StdioMetrics::noop();
+    let metrics = None;
 
     let result = run_shim(opts, metrics, "false".to_string(), vec![]).await;
 
@@ -66,7 +65,7 @@ async fn test_governance_unavailable_returns_error() {
         profile: Profile::Production,
         config_path: std::path::PathBuf::from("/dev/null"),
     };
-    let metrics = StdioMetrics::noop();
+    let metrics = None;
 
     let result = run_shim(opts, metrics, "cat".to_string(), vec![]).await;
 
@@ -85,7 +84,7 @@ async fn test_governance_unavailable_returns_error() {
 async fn test_server_spawn_failure() {
     let (port, _state) = start_test_governance().await;
     let opts = test_opts("bad-server", port);
-    let metrics = StdioMetrics::noop();
+    let metrics = None;
 
     // Try to spawn a command that doesn't exist.
     let result = run_shim(
@@ -115,7 +114,7 @@ async fn test_shutdown_via_governance() {
     state.trigger_shutdown();
 
     let opts = test_opts("shutdown-server", port);
-    let metrics = StdioMetrics::noop();
+    let metrics = None;
 
     // `sleep 60` would normally run for 60 seconds, but the shim should
     // detect the shutdown flag from the governance service and terminate it.
