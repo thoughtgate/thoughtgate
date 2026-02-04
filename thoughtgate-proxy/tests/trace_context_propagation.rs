@@ -10,6 +10,7 @@
 use axum::{Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
 use opentelemetry::trace::{SpanId, TraceContextExt, TraceFlags, TraceId, TracerProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use serial_test::serial;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -286,6 +287,7 @@ async fn test_inject_context_into_headers() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_mcp_span_inherits_parent_trace_id() {
     use opentelemetry::trace::TraceState;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
@@ -345,6 +347,7 @@ async fn test_mcp_span_inherits_parent_trace_id() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_new_trace_when_no_parent() {
     use opentelemetry_sdk::trace::InMemorySpanExporter;
 
