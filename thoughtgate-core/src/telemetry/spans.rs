@@ -466,22 +466,16 @@ pub fn start_approval_callback_span(data: &ApprovalCallbackData<'_>) -> BoxedSpa
         .with_attributes(attributes);
 
     // Add span link to the dispatch span (if available)
+    // Per REQ-OBS-002 §5.4: "Span links, not parent-child" for approval workflows.
+    // The callback span starts a NEW trace (new trace_id) and uses a span link
+    // to correlate back to the dispatch span. This avoids multi-hour parent-child
+    // spans that would distort latency histograms.
     if let Some(link_ctx) = data.link_to {
         builder = builder.with_links(vec![Link::new(link_ctx.clone(), vec![], 0)]);
     }
 
-    // If we have a link context with a valid trace ID, we want to be part of that trace
-    // but NOT as a child span. We achieve this by creating a context with the trace ID
-    // but not setting it as the parent.
-    if let Some(link_ctx) = data.link_to {
-        if link_ctx.is_valid() {
-            // Create a new context that preserves the trace_id from the linked span
-            // This keeps us in the same trace while not being a child
-            let parent_ctx = Context::new().with_remote_span_context(link_ctx.clone());
-            return builder.start_with_context(&tracer, &parent_ctx);
-        }
-    }
-
+    // Start a fresh root span - do NOT use start_with_context with the linked
+    // span's context, as that would create a parent-child relationship.
     builder.start(&tracer)
 }
 
@@ -972,7 +966,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_approval_callback_span_shares_trace_id() {
+    fn test_approval_callback_span_uses_link_not_parent() {
         use opentelemetry::trace::{SpanId, TraceFlags, TraceId, TraceState};
 
         let (provider, exporter) = setup_test_provider();
@@ -1006,27 +1000,33 @@ mod tests {
 
         let finished = &spans[0];
 
-        // Callback span should have a link to dispatch span
+        // Callback span should have a link to dispatch span (for trace correlation)
+        // Per REQ-OBS-002 §5.4: "Span links, not parent-child"
         assert_eq!(finished.links.len(), 1, "Callback span should have a link");
         assert_eq!(
             finished.links[0].span_context.span_id(),
             dispatch_span_id,
             "Link should point to the dispatch span"
         );
-
-        // Callback span should share the same trace_id as dispatch
-        // (because we used with_remote_span_context)
         assert_eq!(
-            finished.span_context.trace_id(),
+            finished.links[0].span_context.trace_id(),
             dispatch_trace_id,
-            "Callback span should share trace_id with dispatch"
+            "Link should reference the dispatch trace"
         );
 
-        // Callback span should NOT be a child of dispatch (different span_id)
+        // Callback span starts a NEW trace (different trace_id)
+        // This avoids multi-hour parent-child spans per REQ-OBS-002 §5.4
         assert_ne!(
-            finished.span_context.span_id(),
-            dispatch_span_id,
-            "Callback span should have its own span_id (not a child)"
+            finished.span_context.trace_id(),
+            dispatch_trace_id,
+            "Callback span should have its own trace_id (new root span)"
+        );
+
+        // Callback span should have NO parent (it's a root span)
+        assert_eq!(
+            finished.parent_span_id,
+            SpanId::INVALID,
+            "Callback span should be a root span with no parent"
         );
     }
 

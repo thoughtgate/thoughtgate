@@ -955,7 +955,7 @@ impl TaskStore {
             metrics
                 .tasks_pending
                 .get_or_create(&crate::telemetry::prom_metrics::TaskTypeLabels {
-                    task_type: "approval".to_string(),
+                    task_type: std::borrow::Cow::Borrowed("approval"),
                 })
                 .set(new_count as i64);
         }
@@ -1079,7 +1079,7 @@ impl TaskStore {
             metrics
                 .tasks_pending
                 .get_or_create(&crate::telemetry::prom_metrics::TaskTypeLabels {
-                    task_type: "approval".to_string(),
+                    task_type: std::borrow::Cow::Borrowed("approval"),
                 })
                 .set(self.pending_count.load(Ordering::Acquire) as i64);
         }

@@ -4,11 +4,20 @@
 //! all Prometheus metrics for the ThoughtGate proxy. Metrics are exported via the
 //! `/metrics` endpoint on the admin port using OpenMetrics text format.
 //!
+//! # Performance Note
+//!
+//! Label fields use `Cow<'static, str>` to avoid heap allocations for static string
+//! values (like method names "tools/call", status "success", etc.). This reduces
+//! allocator pressure in hot paths. For dynamic values (like tool names from
+//! cardinality limiting), `Cow::Owned` is used.
+//!
 //! # Traceability
 //! - Implements: REQ-OBS-002 §6.1 (Counters)
 //! - Implements: REQ-OBS-002 §6.2 (Histograms)
 //! - Implements: REQ-OBS-002 §6.4 (Gauges)
 //! - Implements: REQ-OBS-002 §6.5 (Cardinality Management)
+
+use std::borrow::Cow;
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -25,15 +34,17 @@ use super::cardinality::CardinalityLimiter;
 
 /// Labels for request counters and duration histograms.
 ///
+/// Uses `Cow<'static, str>` to avoid heap allocations for static label values.
+///
 /// Implements: REQ-OBS-002 §6.1/MC-001
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RequestLabels {
     /// JSON-RPC method name (e.g., "tools/call", "resources/read")
-    pub method: String,
+    pub method: Cow<'static, str>,
     /// Tool name for tools/call requests, "none" otherwise
-    pub tool_name: String,
+    pub tool_name: Cow<'static, str>,
     /// Request outcome: "success" or "error"
-    pub status: String,
+    pub status: Cow<'static, str>,
 }
 
 /// Labels for gate decision counters.
@@ -42,9 +53,9 @@ pub struct RequestLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DecisionLabels {
     /// Gate type (e.g., "cedar", "governance_rule")
-    pub gate: String,
+    pub gate: Cow<'static, str>,
     /// Decision outcome (e.g., "allow", "deny", "approve")
-    pub outcome: String,
+    pub outcome: Cow<'static, str>,
 }
 
 /// Labels for error counters.
@@ -53,9 +64,9 @@ pub struct DecisionLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ErrorLabels {
     /// Error classification (e.g., "policy_denied", "upstream_timeout")
-    pub error_type: String,
+    pub error_type: Cow<'static, str>,
     /// JSON-RPC method that caused the error
-    pub method: String,
+    pub method: Cow<'static, str>,
 }
 
 /// Labels for Cedar evaluation counters.
@@ -64,9 +75,9 @@ pub struct ErrorLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct CedarEvalLabels {
     /// Cedar decision (e.g., "allow", "deny")
-    pub decision: String,
+    pub decision: Cow<'static, str>,
     /// Determining policy ID
-    pub policy_id: String,
+    pub policy_id: Cow<'static, str>,
 }
 
 /// Labels for approval request counters.
@@ -75,9 +86,9 @@ pub struct CedarEvalLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ApprovalLabels {
     /// Approval channel (e.g., "slack", "api")
-    pub channel: String,
+    pub channel: Cow<'static, str>,
     /// Approval outcome (e.g., "approved", "rejected", "timeout")
-    pub outcome: String,
+    pub outcome: Cow<'static, str>,
 }
 
 /// Labels for upstream request counters.
@@ -86,9 +97,9 @@ pub struct ApprovalLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct UpstreamLabels {
     /// Upstream target identifier
-    pub target: String,
+    pub target: Cow<'static, str>,
     /// HTTP status code as string
-    pub status_code: String,
+    pub status_code: Cow<'static, str>,
 }
 
 /// Labels for telemetry dropped counters.
@@ -97,7 +108,7 @@ pub struct UpstreamLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct SignalLabels {
     /// Signal type (e.g., "span", "metric", "log")
-    pub signal: String,
+    pub signal: Cow<'static, str>,
 }
 
 /// Labels for request duration histograms.
@@ -106,9 +117,9 @@ pub struct SignalLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DurationLabels {
     /// JSON-RPC method name
-    pub method: String,
+    pub method: Cow<'static, str>,
     /// Tool name for tools/call requests, "none" otherwise
-    pub tool_name: String,
+    pub tool_name: Cow<'static, str>,
 }
 
 /// Labels for Cedar evaluation duration histograms.
@@ -117,7 +128,7 @@ pub struct DurationLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct CedarDurationLabels {
     /// Cedar decision (e.g., "allow", "deny")
-    pub decision: String,
+    pub decision: Cow<'static, str>,
 }
 
 /// Labels for upstream duration histograms.
@@ -126,7 +137,7 @@ pub struct CedarDurationLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TargetLabels {
     /// Upstream target identifier
-    pub target: String,
+    pub target: Cow<'static, str>,
 }
 
 /// Labels for payload size histograms.
@@ -135,9 +146,9 @@ pub struct TargetLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PayloadLabels {
     /// Direction: "request" or "response"
-    pub direction: String,
+    pub direction: Cow<'static, str>,
     /// JSON-RPC method name
-    pub method: String,
+    pub method: Cow<'static, str>,
 }
 
 /// Labels for active connection gauges.
@@ -146,7 +157,7 @@ pub struct PayloadLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TransportLabels {
     /// Transport type (e.g., "http", "stdio")
-    pub transport: String,
+    pub transport: Cow<'static, str>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,7 +170,7 @@ pub struct TransportLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct GreenPathLabels {
     /// Direction: "upload" or "download"
-    pub direction: String,
+    pub direction: Cow<'static, str>,
 }
 
 /// Labels for green path stream outcome counters.
@@ -168,7 +179,7 @@ pub struct GreenPathLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StreamOutcomeLabels {
     /// Outcome: "success", "error", or "upgrade"
-    pub outcome: String,
+    pub outcome: Cow<'static, str>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -181,7 +192,7 @@ pub struct StreamOutcomeLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct InspectorLabels {
     /// Inspector name (cardinality-limited)
-    pub inspector_name: String,
+    pub inspector_name: Cow<'static, str>,
 }
 
 /// Labels for amber path inspection decision counters.
@@ -190,7 +201,7 @@ pub struct InspectorLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct AmberDecisionLabels {
     /// Decision: "approve", "modify", or "reject"
-    pub decision: String,
+    pub decision: Cow<'static, str>,
 }
 
 /// Labels for amber path error counters.
@@ -199,7 +210,7 @@ pub struct AmberDecisionLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct AmberErrorLabels {
     /// Error type: "timeout", "limit", "semaphore", "panic", "compressed", "dropped"
-    pub error_type: String,
+    pub error_type: Cow<'static, str>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,11 +223,11 @@ pub struct AmberErrorLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StdioMessageLabels {
     /// Server identifier (cardinality-limited)
-    pub server_id: String,
+    pub server_id: Cow<'static, str>,
     /// Direction: "agent_to_server" or "server_to_agent"
-    pub direction: String,
+    pub direction: Cow<'static, str>,
     /// JSON-RPC method name
-    pub method: String,
+    pub method: Cow<'static, str>,
 }
 
 /// Labels for stdio governance decision counters.
@@ -225,11 +236,11 @@ pub struct StdioMessageLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StdioDecisionLabels {
     /// Server identifier (cardinality-limited)
-    pub server_id: String,
+    pub server_id: Cow<'static, str>,
     /// Decision: "forward", "deny", "pending_approval"
-    pub decision: String,
+    pub decision: Cow<'static, str>,
     /// Profile name
-    pub profile: String,
+    pub profile: Cow<'static, str>,
 }
 
 /// Labels for stdio framing error counters.
@@ -238,9 +249,9 @@ pub struct StdioDecisionLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StdioErrorLabels {
     /// Server identifier (cardinality-limited)
-    pub server_id: String,
+    pub server_id: Cow<'static, str>,
     /// Error type
-    pub error_type: String,
+    pub error_type: Cow<'static, str>,
 }
 
 /// Labels for stdio server-specific histograms.
@@ -249,7 +260,7 @@ pub struct StdioErrorLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StdioServerLabels {
     /// Server identifier (cardinality-limited)
-    pub server_id: String,
+    pub server_id: Cow<'static, str>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -262,7 +273,7 @@ pub struct StdioServerLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PipelineStageLabels {
     /// Pipeline stage that failed
-    pub stage: String,
+    pub stage: Cow<'static, str>,
 }
 
 /// Labels for pending task gauges.
@@ -271,7 +282,7 @@ pub struct PipelineStageLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TaskTypeLabels {
     /// Task type (e.g., "approval")
-    pub task_type: String,
+    pub task_type: Cow<'static, str>,
 }
 
 /// Labels for task created counters.
@@ -280,7 +291,7 @@ pub struct TaskTypeLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TaskCreatedLabels {
     /// Task type (e.g., "approval")
-    pub task_type: String,
+    pub task_type: Cow<'static, str>,
 }
 
 /// Labels for task completed counters.
@@ -289,9 +300,9 @@ pub struct TaskCreatedLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TaskCompletedLabels {
     /// Task type (e.g., "approval")
-    pub task_type: String,
+    pub task_type: Cow<'static, str>,
     /// Task outcome (e.g., "completed", "failed", "expired", "cancelled")
-    pub outcome: String,
+    pub outcome: Cow<'static, str>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -971,9 +982,9 @@ impl ThoughtGateMetrics {
 
         self.requests_total
             .get_or_create(&RequestLabels {
-                method: method.to_string(),
-                tool_name: tool.to_string(),
-                status: status.to_string(),
+                method: Cow::Owned(method.to_string()),
+                tool_name: Cow::Owned(tool.to_string()),
+                status: Cow::Owned(status.to_string()),
             })
             .inc();
     }
@@ -994,8 +1005,8 @@ impl ThoughtGateMetrics {
 
         self.request_duration_ms
             .get_or_create(&DurationLabels {
-                method: method.to_string(),
-                tool_name: tool.to_string(),
+                method: Cow::Owned(method.to_string()),
+                tool_name: Cow::Owned(tool.to_string()),
             })
             .observe(duration_ms);
     }
@@ -1012,14 +1023,14 @@ impl ThoughtGateMetrics {
     pub fn record_cedar_eval(&self, decision: &str, policy_id: &str, duration_ms: f64) {
         self.cedar_evaluations_total
             .get_or_create(&CedarEvalLabels {
-                decision: decision.to_string(),
-                policy_id: policy_id.to_string(),
+                decision: Cow::Owned(decision.to_string()),
+                policy_id: Cow::Owned(policy_id.to_string()),
             })
             .inc();
 
         self.cedar_evaluation_duration_ms
             .get_or_create(&CedarDurationLabels {
-                decision: decision.to_string(),
+                decision: Cow::Owned(decision.to_string()),
             })
             .observe(duration_ms);
     }
@@ -1035,8 +1046,8 @@ impl ThoughtGateMetrics {
     pub fn record_gate_decision(&self, gate: &str, outcome: &str) {
         self.decisions_total
             .get_or_create(&DecisionLabels {
-                gate: gate.to_string(),
-                outcome: outcome.to_string(),
+                gate: Cow::Owned(gate.to_string()),
+                outcome: Cow::Owned(outcome.to_string()),
             })
             .inc();
     }
@@ -1052,8 +1063,8 @@ impl ThoughtGateMetrics {
     pub fn record_error(&self, error_type: &str, method: &str) {
         self.errors_total
             .get_or_create(&ErrorLabels {
-                error_type: error_type.to_string(),
-                method: method.to_string(),
+                error_type: Cow::Owned(error_type.to_string()),
+                method: Cow::Owned(method.to_string()),
             })
             .inc();
     }
@@ -1070,14 +1081,14 @@ impl ThoughtGateMetrics {
     pub fn record_upstream_request(&self, target: &str, status_code: &str, duration_ms: f64) {
         self.upstream_requests_total
             .get_or_create(&UpstreamLabels {
-                target: target.to_string(),
-                status_code: status_code.to_string(),
+                target: Cow::Owned(target.to_string()),
+                status_code: Cow::Owned(status_code.to_string()),
             })
             .inc();
 
         self.upstream_duration_ms
             .get_or_create(&TargetLabels {
-                target: target.to_string(),
+                target: Cow::Owned(target.to_string()),
             })
             .observe(duration_ms);
     }
@@ -1094,8 +1105,8 @@ impl ThoughtGateMetrics {
     pub fn record_payload_size(&self, direction: &str, method: &str, size_bytes: f64) {
         self.request_payload_size_bytes
             .get_or_create(&PayloadLabels {
-                direction: direction.to_string(),
-                method: method.to_string(),
+                direction: Cow::Owned(direction.to_string()),
+                method: Cow::Owned(method.to_string()),
             })
             .observe(size_bytes);
     }
@@ -1113,8 +1124,8 @@ impl ThoughtGateMetrics {
     pub fn record_approval_request(&self, channel: &str, outcome: &str) {
         self.approval_requests_total
             .get_or_create(&ApprovalLabels {
-                channel: channel.to_string(),
-                outcome: outcome.to_string(),
+                channel: Cow::Owned(channel.to_string()),
+                outcome: Cow::Owned(outcome.to_string()),
             })
             .inc();
     }
@@ -1133,8 +1144,8 @@ impl ThoughtGateMetrics {
     pub fn record_approval_wait_duration(&self, channel: &str, outcome: &str, duration_secs: f64) {
         self.approval_wait_duration_s
             .get_or_create(&ApprovalLabels {
-                channel: channel.to_string(),
-                outcome: outcome.to_string(),
+                channel: Cow::Owned(channel.to_string()),
+                outcome: Cow::Owned(outcome.to_string()),
             })
             .observe(duration_secs);
     }
@@ -1149,7 +1160,7 @@ impl ThoughtGateMetrics {
     pub fn record_task_created(&self, task_type: &str) {
         self.tasks_created_total
             .get_or_create(&TaskCreatedLabels {
-                task_type: task_type.to_string(),
+                task_type: Cow::Owned(task_type.to_string()),
             })
             .inc();
     }
@@ -1165,8 +1176,8 @@ impl ThoughtGateMetrics {
     pub fn record_task_completed(&self, task_type: &str, outcome: &str) {
         self.tasks_completed_total
             .get_or_create(&TaskCompletedLabels {
-                task_type: task_type.to_string(),
-                outcome: outcome.to_string(),
+                task_type: Cow::Owned(task_type.to_string()),
+                outcome: Cow::Owned(outcome.to_string()),
             })
             .inc();
     }
@@ -1195,7 +1206,7 @@ impl ThoughtGateMetrics {
     pub fn record_green_bytes(&self, direction: &str, bytes: u64) {
         self.green_bytes_total
             .get_or_create(&GreenPathLabels {
-                direction: direction.to_string(),
+                direction: Cow::Owned(direction.to_string()),
             })
             .inc_by(bytes);
     }
@@ -1220,7 +1231,7 @@ impl ThoughtGateMetrics {
     pub fn record_green_stream(&self, outcome: &str) {
         self.green_streams_total
             .get_or_create(&StreamOutcomeLabels {
-                outcome: outcome.to_string(),
+                outcome: Cow::Owned(outcome.to_string()),
             })
             .inc();
     }
@@ -1264,7 +1275,7 @@ impl ThoughtGateMetrics {
         let limited_name = self.inspector_name_limiter.resolve(inspector_name);
         self.amber_inspector_duration_seconds
             .get_or_create(&InspectorLabels {
-                inspector_name: limited_name.to_string(),
+                inspector_name: Cow::Owned(limited_name.to_string()),
             })
             .observe(seconds);
     }
@@ -1275,7 +1286,7 @@ impl ThoughtGateMetrics {
     pub fn record_amber_inspection(&self, decision: &str) {
         self.amber_inspections_total
             .get_or_create(&AmberDecisionLabels {
-                decision: decision.to_string(),
+                decision: Cow::Owned(decision.to_string()),
             })
             .inc();
     }
@@ -1286,7 +1297,7 @@ impl ThoughtGateMetrics {
     pub fn record_amber_error(&self, error_type: &str) {
         self.amber_errors_total
             .get_or_create(&AmberErrorLabels {
-                error_type: error_type.to_string(),
+                error_type: Cow::Owned(error_type.to_string()),
             })
             .inc();
     }
@@ -1316,9 +1327,9 @@ impl ThoughtGateMetrics {
         let limited_id = self.server_id_limiter.resolve(server_id);
         self.stdio_messages_total
             .get_or_create(&StdioMessageLabels {
-                server_id: limited_id.to_string(),
-                direction: direction.to_string(),
-                method: method.to_string(),
+                server_id: Cow::Owned(limited_id.to_string()),
+                direction: Cow::Owned(direction.to_string()),
+                method: Cow::Owned(method.to_string()),
             })
             .inc();
     }
@@ -1330,9 +1341,9 @@ impl ThoughtGateMetrics {
         let limited_id = self.server_id_limiter.resolve(server_id);
         self.stdio_governance_decisions_total
             .get_or_create(&StdioDecisionLabels {
-                server_id: limited_id.to_string(),
-                decision: decision.to_string(),
-                profile: profile.to_string(),
+                server_id: Cow::Owned(limited_id.to_string()),
+                decision: Cow::Owned(decision.to_string()),
+                profile: Cow::Owned(profile.to_string()),
             })
             .inc();
     }
@@ -1344,8 +1355,8 @@ impl ThoughtGateMetrics {
         let limited_id = self.server_id_limiter.resolve(server_id);
         self.stdio_framing_errors_total
             .get_or_create(&StdioErrorLabels {
-                server_id: limited_id.to_string(),
-                error_type: error_type.to_string(),
+                server_id: Cow::Owned(limited_id.to_string()),
+                error_type: Cow::Owned(error_type.to_string()),
             })
             .inc();
     }
@@ -1371,7 +1382,7 @@ impl ThoughtGateMetrics {
         let limited_id = self.server_id_limiter.resolve(server_id);
         self.stdio_approval_latency_seconds
             .get_or_create(&StdioServerLabels {
-                server_id: limited_id.to_string(),
+                server_id: Cow::Owned(limited_id.to_string()),
             })
             .observe(duration.as_secs_f64());
     }
@@ -1386,7 +1397,7 @@ impl ThoughtGateMetrics {
     pub fn record_pipeline_failure(&self, stage: &str) {
         self.governance_pipeline_failures_total
             .get_or_create(&PipelineStageLabels {
-                stage: stage.to_string(),
+                stage: Cow::Owned(stage.to_string()),
             })
             .inc();
     }

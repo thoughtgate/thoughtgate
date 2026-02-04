@@ -1,7 +1,7 @@
-//! W3C Trace Context propagation for HTTP and stdio transports.
+//! W3C Trace Context and Baggage propagation for HTTP and stdio transports.
 //!
 //! Provides extract/inject helpers for:
-//! - HTTP headers (`traceparent`, `tracestate`)
+//! - HTTP headers (`traceparent`, `tracestate`, `baggage`)
 //! - Stdio JSON-RPC `params._meta` fields (for Claude Desktop, Cursor, VS Code, Windsurf)
 //!
 //! Works with both `http::HeaderMap` and `reqwest::header::HeaderMap` (they are
@@ -24,16 +24,45 @@
 //! - `tracestate`: comma-separated vendor-specific key-value pairs
 //!   - ThoughtGate adds `thoughtgate={session_id}` for downstream correlation
 //!
+//! - `baggage`: W3C Baggage header for request-scoped key-value pairs
+//!   - Carries business context (tenant ID, request ID) across service boundaries
+//!
 //! # Traceability
 //! - Implements: REQ-OBS-002 §7.1 (Inbound Trace Context Extraction)
 //! - Implements: REQ-OBS-002 §7.2 (Outbound Trace Context Injection)
 //! - Implements: REQ-OBS-002 §7.3 (Stdio Transport Propagation)
+//! - Implements: REQ-OBS-002 §7.4.3 (Business Context via Baggage)
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use opentelemetry::Context;
-use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
+use opentelemetry::propagation::{
+    Extractor, Injector, TextMapCompositePropagator, TextMapPropagator,
+};
 use opentelemetry::trace::TraceContextExt;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composite Propagator (TraceContext + Baggage)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Creates a composite propagator that handles both W3C Trace Context and Baggage.
+///
+/// This propagator extracts/injects:
+/// - `traceparent` and `tracestate` headers (trace correlation)
+/// - `baggage` header (business context like tenant ID, request ID)
+///
+/// Per REQ-OBS-002 §7.4.3, baggage carries request-scoped metadata:
+/// - `mcp.request.id`: Original MCP request correlation
+/// - `thoughtgate.task.id`: ThoughtGate task identifier
+/// - `thoughtgate.tenant`: Multi-tenant deployment tenant ID
+///
+/// Implements: REQ-OBS-002 §7.4.3
+fn composite_propagator() -> TextMapCompositePropagator {
+    TextMapCompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ])
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP Header Extractor/Injector
@@ -94,20 +123,23 @@ impl Injector for HeaderInjector<'_> {
 // Extract/Inject Functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Extract trace context from HTTP headers.
+/// Extract trace context and baggage from HTTP headers.
 ///
-/// Parses `traceparent` and `tracestate` headers per W3C Trace Context spec.
+/// Parses headers per W3C specifications:
+/// - `traceparent` and `tracestate` (W3C Trace Context)
+/// - `baggage` (W3C Baggage)
+///
 /// Returns `Context::current()` if no valid traceparent is found (ThoughtGate
 /// becomes the trace root).
 ///
 /// # Arguments
 ///
-/// * `headers` - HTTP headers containing trace context
+/// * `headers` - HTTP headers containing trace context and baggage
 ///
 /// # Returns
 ///
-/// An OpenTelemetry `Context` with the extracted trace context. If no valid
-/// traceparent is found, returns the current context (no remote parent).
+/// An OpenTelemetry `Context` with the extracted trace context and baggage.
+/// If no valid traceparent is found, returns the current context (no remote parent).
 ///
 /// # Example
 ///
@@ -117,23 +149,24 @@ impl Injector for HeaderInjector<'_> {
 ///     .start_with_context(&tracer, &parent_context);
 /// ```
 ///
-/// Implements: REQ-OBS-002 §7.1
+/// Implements: REQ-OBS-002 §7.1, §7.4.3
 pub fn extract_context_from_headers(headers: &HeaderMap) -> Context {
-    let propagator = TraceContextPropagator::new();
+    let propagator = composite_propagator();
     propagator.extract(&HeaderExtractor(headers))
 }
 
-/// Inject trace context into HTTP headers for upstream requests.
+/// Inject trace context and baggage into HTTP headers for upstream requests.
 ///
-/// Adds `traceparent` and `tracestate` headers to outbound requests,
-/// enabling end-to-end distributed tracing across service boundaries.
+/// Adds headers to outbound requests for end-to-end distributed tracing:
+/// - `traceparent` and `tracestate` (W3C Trace Context)
+/// - `baggage` (W3C Baggage for business context)
 ///
 /// Optionally augments tracestate with `thoughtgate={session_id}` for
 /// downstream correlation.
 ///
 /// # Arguments
 ///
-/// * `cx` - The OpenTelemetry context containing the current span
+/// * `cx` - The OpenTelemetry context containing the current span and baggage
 /// * `headers` - Mutable HTTP headers to inject into
 /// * `session_id` - Optional session identifier to add to tracestate
 ///
@@ -142,16 +175,16 @@ pub fn extract_context_from_headers(headers: &HeaderMap) -> Context {
 /// ```ignore
 /// let mut headers = HeaderMap::new();
 /// inject_context_into_headers(&Context::current(), &mut headers, Some("req-abc123"));
-/// // headers now contains traceparent and tracestate
+/// // headers now contains traceparent, tracestate, and baggage
 /// ```
 ///
-/// Implements: REQ-OBS-002 §7.2
+/// Implements: REQ-OBS-002 §7.2, §7.4.3
 pub fn inject_context_into_headers(
     cx: &Context,
     headers: &mut HeaderMap,
     session_id: Option<&str>,
 ) {
-    let propagator = TraceContextPropagator::new();
+    let propagator = composite_propagator();
     propagator.inject_context(cx, &mut HeaderInjector(headers));
 
     // Augment tracestate with thoughtgate session identifier
@@ -252,22 +285,24 @@ pub struct StdioTraceContext {
     pub had_trace_context: bool,
 }
 
-/// Extract trace context from JSON-RPC `params._meta` field (stdio transport).
+/// Extract trace context and baggage from JSON-RPC `params._meta` field (stdio transport).
 ///
-/// Per REQ-OBS-002 §7.3, stdio transports use `params._meta.traceparent` and
-/// `params._meta.tracestate` for trace propagation since there are no HTTP headers.
+/// Per REQ-OBS-002 §7.3, stdio transports use `params._meta` fields for trace
+/// propagation since there are no HTTP headers:
+/// - `_meta.traceparent` and `_meta.tracestate` (W3C Trace Context)
+/// - `_meta.baggage` (W3C Baggage for business context)
 ///
 /// This function:
-/// 1. Extracts `traceparent` and `tracestate` from `params._meta` if present
-/// 2. Creates an OpenTelemetry context from the extracted trace data
-/// 3. Optionally strips `_meta.traceparent` and `_meta.tracestate` from params
-///    to avoid breaking strict upstream MCP servers that reject unknown fields
+/// 1. Extracts trace context and baggage from `params._meta` if present
+/// 2. Creates an OpenTelemetry context from the extracted data
+/// 3. Optionally strips trace fields from params to avoid breaking strict
+///    upstream MCP servers that reject unknown fields
 ///
 /// # Arguments
 ///
 /// * `params` - The JSON-RPC params value (may or may not have `_meta`)
 /// * `propagate_upstream` - If true, preserve trace fields in `stripped_params`.
-///   If false (default), strip `_meta.traceparent`/`_meta.tracestate`.
+///   If false (default), strip `_meta.traceparent`/`_meta.tracestate`/`_meta.baggage`.
 ///
 /// # Returns
 ///
@@ -278,7 +313,8 @@ pub struct StdioTraceContext {
 /// ```ignore
 /// let params = json!({
 ///     "_meta": {
-///         "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+///         "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+///         "baggage": "mcp.request.id=req-123"
 ///     },
 ///     "name": "calculator",
 ///     "arguments": { "a": 1 }
@@ -287,19 +323,19 @@ pub struct StdioTraceContext {
 /// // Default: strip trace fields
 /// let result = extract_context_from_meta(Some(&params), false);
 /// assert!(result.had_trace_context);
-/// // result.stripped_params has _meta.traceparent removed
+/// // result.stripped_params has _meta.traceparent and _meta.baggage removed
 ///
 /// // Propagate: preserve trace fields for trace-aware upstreams
 /// let result = extract_context_from_meta(Some(&params), true);
-/// // result.stripped_params preserves _meta.traceparent
+/// // result.stripped_params preserves _meta.traceparent and _meta.baggage
 /// ```
 ///
-/// Implements: REQ-OBS-002 §7.3, §7.3.1
+/// Implements: REQ-OBS-002 §7.3, §7.3.1, §7.4.3
 pub fn extract_context_from_meta(
     params: Option<&serde_json::Value>,
     propagate_upstream: bool,
 ) -> StdioTraceContext {
-    let propagator = TraceContextPropagator::new();
+    let propagator = composite_propagator();
 
     // Handle None params
     let Some(params) = params else {
@@ -326,16 +362,17 @@ pub fn extract_context_from_meta(
     let span_context = context.span().span_context().clone();
     let had_trace_context = span_context.is_valid() && span_context.is_remote();
 
-    // Conditionally strip traceparent and tracestate from _meta
+    // Conditionally strip trace context fields from _meta
     // If propagate_upstream is true, preserve trace fields for trace-aware upstreams
     let stripped_params = if propagate_upstream {
         // Preserve _meta as-is (trace-aware upstream)
         Some(params.clone())
     } else {
-        // Strip traceparent and tracestate from _meta
+        // Strip traceparent, tracestate, and baggage from _meta
         let mut stripped_meta = meta.clone();
         stripped_meta.remove("traceparent");
         stripped_meta.remove("tracestate");
+        stripped_meta.remove("baggage");
 
         // Rebuild params with stripped _meta (or without _meta if empty)
         if let Some(obj) = params.as_object() {
@@ -361,14 +398,16 @@ pub fn extract_context_from_meta(
     }
 }
 
-/// Inject trace context into JSON-RPC response `result._meta` field.
+/// Inject trace context and baggage into JSON-RPC response `result._meta` field.
 ///
 /// Per REQ-OBS-002 §7.3.2, when returning a response over stdio, ThoughtGate
-/// injects trace context into the response's `result._meta` field.
+/// injects trace context and baggage into the response's `result._meta` field:
+/// - `_meta.traceparent` and `_meta.tracestate` (W3C Trace Context)
+/// - `_meta.baggage` (W3C Baggage for business context)
 ///
 /// # Arguments
 ///
-/// * `cx` - The OpenTelemetry context containing the current span
+/// * `cx` - The OpenTelemetry context containing the current span and baggage
 /// * `result` - Mutable JSON-RPC result value to inject into
 /// * `session_id` - Optional session identifier to add to tracestate
 ///
@@ -377,16 +416,16 @@ pub fn extract_context_from_meta(
 /// ```ignore
 /// let mut result = json!({ "content": [...] });
 /// inject_context_into_meta(&Context::current(), &mut result, Some("session-123"));
-/// // result now has _meta.traceparent and _meta.tracestate
+/// // result now has _meta.traceparent, _meta.tracestate, and _meta.baggage
 /// ```
 ///
-/// Implements: REQ-OBS-002 §7.3.2
+/// Implements: REQ-OBS-002 §7.3.2, §7.4.3
 pub fn inject_context_into_meta(
     cx: &Context,
     result: &mut serde_json::Value,
     session_id: Option<&str>,
 ) {
-    let propagator = TraceContextPropagator::new();
+    let propagator = composite_propagator();
 
     // Ensure result is an object
     let obj = match result.as_object_mut() {

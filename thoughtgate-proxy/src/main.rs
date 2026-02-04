@@ -458,7 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tg_metrics
                             .connections_active
                             .get_or_create(&TransportLabels {
-                                transport: "http".to_string(),
+                                transport: std::borrow::Cow::Borrowed("http"),
                             })
                             .inc();
 
@@ -495,7 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             conn_metrics
                                 .connections_active
                                 .get_or_create(&TransportLabels {
-                                    transport: "http".to_string(),
+                                    transport: std::borrow::Cow::Borrowed("http"),
                                 })
                                 .dec();
 
