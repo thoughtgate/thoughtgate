@@ -39,7 +39,7 @@ use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use crate::StreamDirection;
-use crate::config::{Action, Config};
+use crate::config::{Action, Config, ThoughtGateDefaults};
 use crate::governance::api::{
     GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse, MessageType,
 };
@@ -54,9 +54,6 @@ use crate::profile::Profile;
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Default poll interval hint returned to shims (milliseconds).
-const DEFAULT_POLL_INTERVAL_MS: u64 = 5000;
 
 /// Default task TTL for approval workflows.
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 300;
@@ -433,12 +430,17 @@ impl GovernanceEvaluator {
             );
         }
 
+        // Use centralized default for poll interval (REQ-CFG-001 §5.6)
+        let poll_interval_ms = ThoughtGateDefaults::default()
+            .approval_poll_interval
+            .as_millis() as u64;
+
         GovernanceEvaluateResponse {
             decision: GovernanceDecision::PendingApproval,
             task_id: Some(task_id.to_string()),
             policy_id: policy_id.map(String::from),
             reason: None,
-            poll_interval_ms: Some(DEFAULT_POLL_INTERVAL_MS),
+            poll_interval_ms: Some(poll_interval_ms),
             shutdown: false,
         }
     }

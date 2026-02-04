@@ -16,52 +16,58 @@ use opentelemetry::{
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MCP Span Attribute Constants (OTel GenAI Semconv v1.39.0+)
+//
+// These constants are pub(crate) to keep them as implementation details.
+// External crates should use the span functions (start_mcp_span, etc.) which
+// encapsulate attribute management.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// JSON-RPC method name (e.g., "tools/call", "resources/read")
 /// Requirement: Required
-pub const MCP_METHOD_NAME: &str = "mcp.method.name";
+pub(crate) const MCP_METHOD_NAME: &str = "mcp.method.name";
 
 /// MCP session identifier for correlation
 /// Requirement: Recommended
-pub const MCP_SESSION_ID: &str = "mcp.session.id";
+#[allow(dead_code)] // Reserved for future use
+pub(crate) const MCP_SESSION_ID: &str = "mcp.session.id";
 
 /// JSON-RPC message type discriminator
 /// Values: "request", "response", "notification"
 /// Requirement: Required
-pub const MCP_MESSAGE_TYPE: &str = "mcp.message.type";
+pub(crate) const MCP_MESSAGE_TYPE: &str = "mcp.message.type";
 
 /// JSON-RPC `id` field for request correlation
 /// Requirement: Conditional (present if request has id)
-pub const MCP_MESSAGE_ID: &str = "mcp.message.id";
+pub(crate) const MCP_MESSAGE_ID: &str = "mcp.message.id";
 
 /// Whether MCP returned an error (even if HTTP 200)
 /// Requirement: Required
-pub const MCP_RESULT_IS_ERROR: &str = "mcp.result.is_error";
+pub(crate) const MCP_RESULT_IS_ERROR: &str = "mcp.result.is_error";
 
 /// JSON-RPC error code if present
 /// Requirement: Conditional (present on error)
-pub const MCP_ERROR_CODE: &str = "mcp.error.code";
+pub(crate) const MCP_ERROR_CODE: &str = "mcp.error.code";
 
 /// GenAI operation type (e.g., "execute_tool", "chat")
 /// Requirement: Required
-pub const GENAI_OPERATION_NAME: &str = "gen_ai.operation.name";
+pub(crate) const GENAI_OPERATION_NAME: &str = "gen_ai.operation.name";
 
 /// Tool being invoked (for tools/call)
 /// Requirement: Conditional (present for tools/call)
-pub const GENAI_TOOL_NAME: &str = "gen_ai.tool.name";
+pub(crate) const GENAI_TOOL_NAME: &str = "gen_ai.tool.name";
 
 /// Unique tool call identifier
 /// Requirement: Conditional (present for tools/call)
-pub const GENAI_TOOL_CALL_ID: &str = "gen_ai.tool.call.id";
+#[allow(dead_code)] // Reserved for future use
+pub(crate) const GENAI_TOOL_CALL_ID: &str = "gen_ai.tool.call.id";
 
 /// ThoughtGate internal correlation ID
 /// Requirement: Required
-pub const THOUGHTGATE_REQUEST_ID: &str = "thoughtgate.request_id";
+pub(crate) const THOUGHTGATE_REQUEST_ID: &str = "thoughtgate.request_id";
 
 /// Error classification
 /// Requirement: Conditional (present on error)
-pub const ERROR_TYPE: &str = "error.type";
+pub(crate) const ERROR_TYPE: &str = "error.type";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Approval Span Attribute Constants (REQ-OBS-002 §5.4)
@@ -69,35 +75,35 @@ pub const ERROR_TYPE: &str = "error.type";
 
 /// SEP-1686 task identifier for correlation
 /// Requirement: Required for approval spans
-pub const THOUGHTGATE_TASK_ID: &str = "thoughtgate.task.id";
+pub(crate) const THOUGHTGATE_TASK_ID: &str = "thoughtgate.task.id";
 
 /// Approval integration type (e.g., "slack", "webhook", "teams")
 /// Requirement: Required for approval dispatch/callback spans
-pub const THOUGHTGATE_APPROVAL_CHANNEL: &str = "thoughtgate.approval.channel";
+pub(crate) const THOUGHTGATE_APPROVAL_CHANNEL: &str = "thoughtgate.approval.channel";
 
 /// Target channel/endpoint for approval (redacted if sensitive)
 /// Requirement: Recommended for approval dispatch spans
-pub const THOUGHTGATE_APPROVAL_TARGET: &str = "thoughtgate.approval.target";
+pub(crate) const THOUGHTGATE_APPROVAL_TARGET: &str = "thoughtgate.approval.target";
 
 /// Configured approval timeout in seconds
 /// Requirement: Recommended for approval dispatch spans
-pub const THOUGHTGATE_APPROVAL_TIMEOUT_S: &str = "thoughtgate.approval.timeout_s";
+pub(crate) const THOUGHTGATE_APPROVAL_TIMEOUT_S: &str = "thoughtgate.approval.timeout_s";
 
 /// Human decision outcome (e.g., "approved", "denied")
 /// Requirement: Required for approval callback spans
-pub const THOUGHTGATE_APPROVAL_DECISION: &str = "thoughtgate.approval.decision";
+pub(crate) const THOUGHTGATE_APPROVAL_DECISION: &str = "thoughtgate.approval.decision";
 
 /// Approving user identifier (pseudonymized per REQ-OBS-003)
 /// Requirement: Recommended for approval callback spans
-pub const THOUGHTGATE_APPROVAL_USER: &str = "thoughtgate.approval.user";
+pub(crate) const THOUGHTGATE_APPROVAL_USER: &str = "thoughtgate.approval.user";
 
 /// Wall-clock time from dispatch to callback in seconds
 /// Requirement: Required for approval callback spans
-pub const THOUGHTGATE_APPROVAL_LATENCY_S: &str = "thoughtgate.approval.latency_s";
+pub(crate) const THOUGHTGATE_APPROVAL_LATENCY_S: &str = "thoughtgate.approval.latency_s";
 
 /// Whether trace context was successfully recovered (false if corrupted)
 /// Requirement: Required when graceful degradation occurs
-pub const THOUGHTGATE_TRACE_CONTEXT_RECOVERED: &str = "thoughtgate.trace_context.recovered";
+pub(crate) const THOUGHTGATE_TRACE_CONTEXT_RECOVERED: &str = "thoughtgate.trace_context.recovered";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Gateway Decision Span Attribute Constants (REQ-OBS-002 §5.3)
@@ -105,35 +111,35 @@ pub const THOUGHTGATE_TRACE_CONTEXT_RECOVERED: &str = "thoughtgate.trace_context
 
 /// Gate 1 (visibility) outcome: "pass" or "block"
 /// Requirement: Required for gateway decision spans
-pub const THOUGHTGATE_GATE_VISIBILITY: &str = "thoughtgate.gate.visibility";
+pub(crate) const THOUGHTGATE_GATE_VISIBILITY: &str = "thoughtgate.gate.visibility";
 
 /// Gate 2 (governance rules) outcome: "forward", "deny", "approve", or "policy"
 /// Requirement: Required for gateway decision spans
-pub const THOUGHTGATE_GATE_GOVERNANCE: &str = "thoughtgate.gate.governance";
+pub(crate) const THOUGHTGATE_GATE_GOVERNANCE: &str = "thoughtgate.gate.governance";
 
 /// Gate 3 (Cedar policy) outcome: "allow" or "deny"
 /// Requirement: Conditional (present if Gate 3 evaluated)
-pub const THOUGHTGATE_GATE_CEDAR: &str = "thoughtgate.gate.cedar";
+pub(crate) const THOUGHTGATE_GATE_CEDAR: &str = "thoughtgate.gate.cedar";
 
 /// Gate 4 (approval) outcome: "started", "approved", "rejected", or "timeout"
 /// Requirement: Conditional (present if Gate 4 evaluated)
-pub const THOUGHTGATE_GATE_APPROVAL: &str = "thoughtgate.gate.approval";
+pub(crate) const THOUGHTGATE_GATE_APPROVAL: &str = "thoughtgate.gate.approval";
 
 /// Governance rule ID that matched (from Gate 2)
 /// Requirement: Conditional (present if a rule matched)
-pub const THOUGHTGATE_GOVERNANCE_RULE_ID: &str = "thoughtgate.governance.rule_id";
+pub(crate) const THOUGHTGATE_GOVERNANCE_RULE_ID: &str = "thoughtgate.governance.rule_id";
 
 /// Upstream target URL or identifier
 /// Requirement: Required for gateway decision spans
-pub const THOUGHTGATE_UPSTREAM_TARGET: &str = "thoughtgate.upstream.target";
+pub(crate) const THOUGHTGATE_UPSTREAM_TARGET: &str = "thoughtgate.upstream.target";
 
 /// Upstream call latency in milliseconds
 /// Requirement: Conditional (present if upstream was called)
-pub const THOUGHTGATE_UPSTREAM_LATENCY_MS: &str = "thoughtgate.upstream.latency_ms";
+pub(crate) const THOUGHTGATE_UPSTREAM_LATENCY_MS: &str = "thoughtgate.upstream.latency_ms";
 
 /// Whether Cedar policy was evaluated (true/false)
 /// Requirement: Required for gateway decision spans
-pub const THOUGHTGATE_POLICY_EVALUATED: &str = "thoughtgate.policy.evaluated";
+pub(crate) const THOUGHTGATE_POLICY_EVALUATED: &str = "thoughtgate.policy.evaluated";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -644,20 +650,20 @@ pub fn finish_gateway_decision_span(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Cedar Span Functions (REQ-OBS-002 §5.3)
+// Cedar Span Constants (REQ-OBS-002 §5.3)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Cedar policy evaluation span attribute: tool name being evaluated.
-pub const CEDAR_TOOL_NAME: &str = "cedar.tool_name";
+pub(crate) const CEDAR_TOOL_NAME: &str = "cedar.tool_name";
 
 /// Cedar policy evaluation span attribute: policy decision.
-pub const CEDAR_DECISION: &str = "cedar.decision";
+pub(crate) const CEDAR_DECISION: &str = "cedar.decision";
 
 /// Cedar policy evaluation span attribute: determining policy ID.
-pub const CEDAR_POLICY_ID: &str = "cedar.policy_id";
+pub(crate) const CEDAR_POLICY_ID: &str = "cedar.policy_id";
 
 /// Cedar policy evaluation span attribute: evaluation duration in milliseconds.
-pub const CEDAR_DURATION_MS: &str = "cedar.duration_ms";
+pub(crate) const CEDAR_DURATION_MS: &str = "cedar.duration_ms";
 
 /// Data needed to start a Cedar evaluation span.
 ///

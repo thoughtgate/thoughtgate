@@ -32,10 +32,12 @@ pub mod pipeline;
 pub mod service;
 pub mod task;
 
+// Re-export domain-facing types (stable public API).
+// Internal implementation types (FailureInfo, FailureStage, TaskTransition,
+// ApprovalRecord) are pub(crate) to keep them as implementation details.
 pub use task::{
-    ApprovalDecision, ApprovalRecord, FailureInfo, FailureStage, JsonRpcId, Principal, Task,
-    TaskError, TaskId, TaskStatus, TaskStore, TaskStoreConfig, TaskTransition, ToolCallRequest,
-    ToolCallResult, hash_request,
+    ApprovalDecision, JsonRpcId, Principal, Task, TaskError, TaskId, TaskStatus, TaskStore,
+    TaskStoreConfig, ToolCallRequest, ToolCallResult, hash_request,
 };
 
 // Re-export handler types

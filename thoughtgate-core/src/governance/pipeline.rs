@@ -30,10 +30,9 @@ use crate::policy::{
 };
 use crate::transport::{JsonRpcId, McpRequest, UpstreamForwarder};
 
-use super::{
-    ApprovalRecord, FailureStage, Principal, Task, TaskStatus, ToolCallRequest, ToolCallResult,
-    hash_request,
-};
+use super::{Principal, Task, TaskStatus, ToolCallRequest, ToolCallResult, hash_request};
+// Internal types imported directly from task module
+use super::task::{ApprovalRecord, FailureStage};
 
 /// Parse an environment variable with a warning on invalid values.
 fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(name: &str, default: T) -> T {

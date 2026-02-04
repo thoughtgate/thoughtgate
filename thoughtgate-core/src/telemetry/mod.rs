@@ -24,56 +24,24 @@ pub mod spans;
 pub mod timers;
 pub mod trace_context;
 
+// Re-export span types and functions (stable public API).
+// Span attribute constants are pub(crate) implementation details.
 pub use spans::{
     // Approval Span Types and Functions (REQ-OBS-002 §5.4)
     ApprovalCallbackData,
     ApprovalDispatchData,
-    // Cedar Span Constants and Types (REQ-OBS-002 §5.3)
-    CEDAR_DECISION,
-    CEDAR_DURATION_MS,
-    CEDAR_POLICY_ID,
-    CEDAR_TOOL_NAME,
+    // Cedar Span Types (REQ-OBS-002 §5.3)
     CedarSpanData,
-    // MCP Span Constants
-    ERROR_TYPE,
-    GENAI_OPERATION_NAME,
-    GENAI_TOOL_CALL_ID,
-    GENAI_TOOL_NAME,
-    // Gateway Decision Span Types and Functions (REQ-OBS-002 §5.3)
+    // Gateway Decision Span Types (REQ-OBS-002 §5.3)
     GateOutcomes,
     GatewayDecisionSpanData,
-    MCP_ERROR_CODE,
-    MCP_MESSAGE_ID,
-    MCP_MESSAGE_TYPE,
-    MCP_METHOD_NAME,
-    MCP_RESULT_IS_ERROR,
-    MCP_SESSION_ID,
-    // MCP Span Types and Functions
+    // MCP Span Types
     McpMessageType,
     McpSpanData,
-    // Approval Span Constants (REQ-OBS-002 §5.4)
-    THOUGHTGATE_APPROVAL_CHANNEL,
-    THOUGHTGATE_APPROVAL_DECISION,
-    THOUGHTGATE_APPROVAL_LATENCY_S,
-    THOUGHTGATE_APPROVAL_TARGET,
-    THOUGHTGATE_APPROVAL_TIMEOUT_S,
-    THOUGHTGATE_APPROVAL_USER,
-    THOUGHTGATE_GATE_APPROVAL,
-    THOUGHTGATE_GATE_CEDAR,
-    THOUGHTGATE_GATE_GOVERNANCE,
-    THOUGHTGATE_GATE_VISIBILITY,
-    THOUGHTGATE_GOVERNANCE_RULE_ID,
-    THOUGHTGATE_POLICY_EVALUATED,
-    THOUGHTGATE_REQUEST_ID,
-    THOUGHTGATE_TASK_ID,
-    THOUGHTGATE_TRACE_CONTEXT_RECOVERED,
-    THOUGHTGATE_UPSTREAM_LATENCY_MS,
-    THOUGHTGATE_UPSTREAM_TARGET,
+    // Span Functions (stable API)
     current_span_context,
     finish_approval_callback_span,
-    // Cedar Span Functions (REQ-OBS-002 §5.3)
     finish_cedar_span,
-    // Gateway Decision Span Functions (REQ-OBS-002 §5.3)
     finish_gateway_decision_span,
     finish_mcp_span,
     start_approval_callback_span,

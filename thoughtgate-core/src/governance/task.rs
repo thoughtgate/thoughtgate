@@ -201,6 +201,10 @@ pub enum ApprovalDecision {
 /// Record of an approval decision.
 ///
 /// Implements: REQ-GOV-001/§6.1
+///
+/// Note: This type is not re-exported from the governance module's public API.
+/// It can be imported from `thoughtgate_core::governance::task::ApprovalRecord`
+/// if needed for advanced use cases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRecord {
     /// The approval decision
@@ -222,6 +226,10 @@ pub struct ApprovalRecord {
 /// Stage at which a task failed.
 ///
 /// Implements: REQ-GOV-001/§6.1
+///
+/// Note: This type is not re-exported from the governance module's public API.
+/// It can be imported from `thoughtgate_core::governance::task::FailureStage`
+/// if needed for advanced use cases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureStage {
     /// Failed during pre-approval inspection
@@ -247,6 +255,10 @@ pub enum FailureStage {
 /// Information about why a task failed.
 ///
 /// Implements: REQ-GOV-001/§6.1
+///
+/// Note: This type is not re-exported from the governance module's public API.
+/// It can be imported from `thoughtgate_core::governance::task::FailureInfo`
+/// if needed for advanced use cases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailureInfo {
     /// Stage at which the failure occurred
@@ -401,6 +413,10 @@ impl From<TaskStatus> for crate::protocol::Sep1686Status {
 /// Record of a task state transition for audit trail.
 ///
 /// Implements: REQ-GOV-001/F-001.3
+///
+/// Note: This type is not re-exported from the governance module's public API.
+/// It can be imported from `thoughtgate_core::governance::task::TaskTransition`
+/// if needed for advanced use cases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskTransition {
     /// Previous status
@@ -1267,7 +1283,7 @@ impl TaskStore {
         &self,
         task_id: &TaskId,
         result: ToolCallResult,
-        approval: super::ApprovalRecord,
+        approval: ApprovalRecord,
     ) -> Result<(), TaskError> {
         let mut entry = self
             .tasks

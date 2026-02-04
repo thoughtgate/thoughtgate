@@ -52,8 +52,8 @@ use crate::transport::UpstreamForwarder;
 
 use super::approval::{ApprovalAdapter, ApprovalRequest, PollingConfig, PollingScheduler};
 use super::pipeline::{ApprovalPipeline, ExecutionPipeline, PipelineConfig, PipelineResult};
-use super::task::{FailureInfo, FailureStage, TaskStatus, ToolCallResult};
-use super::{Principal, Task, TaskError, TaskId, TaskStore, ToolCallRequest};
+use super::task::{ApprovalRecord, FailureInfo, FailureStage, TaskStatus, ToolCallResult};
+use super::{ApprovalDecision, Principal, Task, TaskError, TaskId, TaskStore, ToolCallRequest};
 
 // ============================================================================
 // Approval Engine Configuration
@@ -572,8 +572,8 @@ impl ApprovalEngine {
 
                         // Create synthetic approval record for pipeline execution
                         let now = chrono::Utc::now();
-                        let synthetic_approval = super::ApprovalRecord {
-                            decision: super::ApprovalDecision::Approved,
+                        let synthetic_approval = ApprovalRecord {
+                            decision: ApprovalDecision::Approved,
                             decided_by: "system:auto-approve".to_string(),
                             decided_at: now,
                             approval_valid_until: now

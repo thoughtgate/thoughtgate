@@ -326,7 +326,22 @@ fn test_concurrent_lock_rejected() {
     drop(guard1);
 
     // Third lock succeeds (lock was released).
-    let guard3 = ConfigGuard::new(&config_path, &backup_path).unwrap();
+    // Retry with backoff because advisory flock release may not be immediate
+    // on all platforms (especially macOS/APFS).
+    let mut guard3 = None;
+    for i in 0..5 {
+        match ConfigGuard::new(&config_path, &backup_path) {
+            Ok(g) => {
+                guard3 = Some(g);
+                break;
+            }
+            Err(ConfigError::Locked) if i < 4 => {
+                std::thread::sleep(std::time::Duration::from_millis(10 * (i + 1) as u64));
+            }
+            Err(e) => panic!("third lock should succeed after release, got: {e:?}"),
+        }
+    }
+    assert!(guard3.is_some(), "third lock should succeed after retries");
     drop(guard3);
 
     let _ = std::fs::remove_dir_all(&dir);
