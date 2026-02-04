@@ -131,6 +131,26 @@ jobs:
             test-cmd: "cargo test -p thoughtgate-proxy --test unit_peeking -- --nocapture"
           - test-name: "memory"
             test-cmd: "cargo test -p thoughtgate-proxy --test memory_profile -- --nocapture"
+          # Governance smoke tests - full HTTP stack with YAML config (REQ-GOV-002)
+          - test-name: "governance-smoke"
+            test-cmd: "cargo build -p thoughtgate-proxy && cargo test -p thoughtgate-proxy --test governance_smoke -- --nocapture"
+          # Metrics smoke tests - validate /metrics endpoint (REQ-OBS-002)
+          - test-name: "metrics-smoke"
+            test-cmd: "cargo build -p thoughtgate-proxy && cargo test -p thoughtgate-proxy --test metrics_smoke -- --nocapture"
+          # HIGH PRIORITY - Core governance tests (REQ-GOV-001, REQ-GOV-002)
+          - test-name: "governance-integration"
+            test-cmd: "cargo test -p thoughtgate-proxy --test governance_integration -- --nocapture"
+          - test-name: "e2e-approval"
+            test-cmd: "cargo test -p thoughtgate-proxy --test e2e_approval_flow -- --nocapture"
+          # MEDIUM PRIORITY - Feature coverage
+          - test-name: "trace-context"
+            test-cmd: "cargo test -p thoughtgate-proxy --test trace_context_propagation -- --nocapture"
+          - test-name: "edge-cases"
+            test-cmd: "cargo test -p thoughtgate-proxy --test edge_cases -- --nocapture"
+          - test-name: "amber-edge-cases"
+            test-cmd: "cargo test -p thoughtgate-proxy --test amber_edge_cases -- --nocapture"
+          - test-name: "dashboard"
+            test-cmd: "cargo test -p thoughtgate-proxy --test dashboard_validation -- --nocapture"
     
     steps:
       - name: Checkout code
@@ -209,7 +229,7 @@ jobs:
           # - Outbound port (18080): Main proxy for client requests
           # - Admin port (18082): Health checks (/health, /ready)
           # Note: Inbound port (18081) is reserved but not wired yet
-          THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:19999" \
+          THOUGHTGATE_UPSTREAM="http://127.0.0.1:19999" \
           THOUGHTGATE_OUTBOUND_PORT=18080 \
           THOUGHTGATE_ADMIN_PORT=18082 \
           ./target/release/thoughtgate-proxy &
@@ -280,7 +300,7 @@ jobs:
           sleep 1
 
           # Start ThoughtGate proxy (uses default ports: 7467 outbound, 7469 admin)
-          THOUGHTGATE_UPSTREAM_URL="http://127.0.0.1:8888" \
+          THOUGHTGATE_UPSTREAM="http://127.0.0.1:8888" \
           ./target/release/thoughtgate-proxy &
           PROXY_PID=$!
 
@@ -586,6 +606,17 @@ jobs:
         run: |
           docker exec kind-control-plane crictl images | grep thoughtgate || \
           (echo "Failed to load image into Kind" && exit 1)
+
+      # Apply governance ConfigMap for K8s governance testing (REQ-GOV-002)
+      - name: Apply governance ConfigMap
+        run: kubectl apply -f k8s/governance-config.yaml
+
+      # Create k6 governance test script ConfigMap
+      - name: Create k6 governance script ConfigMap
+        run: |
+          kubectl create configmap k6-governance-script \
+            --from-file=governance.js=thoughtgate-proxy/tests/governance-k6.js \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Run Kubernetes integration tests
         run: cargo test -p thoughtgate-proxy --test integration_k8s -- --nocapture

@@ -101,10 +101,18 @@ spec:
           image: thoughtgate:test
           imagePullPolicy: Never
           env:
-            - name: THOUGHTGATE_UPSTREAM_URL
+            - name: THOUGHTGATE_UPSTREAM
               value: "http://mock-mcp"
             - name: THOUGHTGATE_OUTBOUND_PORT
               value: "4141"
+            # Enable governance via YAML config (REQ-GOV-002)
+            - name: THOUGHTGATE_CONFIG
+              value: "/etc/thoughtgate/config.yaml"
+          # Mount governance config
+          volumeMounts:
+            - name: governance-config
+              mountPath: /etc/thoughtgate
+              readOnly: true
           # Set high file descriptor limit for connection handling
           securityContext:
             capabilities:
@@ -118,10 +126,10 @@ spec:
             periodSeconds: 1
             failureThreshold: 3
           resources:
-            limits: 
+            limits:
               cpu: "200m"
               memory: "64Mi"
-            requests: 
+            requests:
               cpu: "50m"
               memory: "32Mi"
           # Handle graceful shutdown when K6 completes
@@ -145,7 +153,11 @@ spec:
       
       volumes:
         - name: scripts
-          configMap: 
+          configMap:
             name: k6-script
         - name: results
           emptyDir: {}
+        # Governance configuration from ConfigMap (REQ-GOV-002)
+        - name: governance-config
+          configMap:
+            name: thoughtgate-governance
