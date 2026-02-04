@@ -30,10 +30,13 @@ features = ["fuzzing"]
 path = "../thoughtgate-proxy"
 features = ["fuzzing", "amber_path"]
 
-# URI parsing and Host header injection
+[dependencies.thoughtgate]
+path = "../thoughtgate"
+
+# REQ-CORE-008: NDJSON parsing and smuggling detection (Critical for stdio transport)
 [[bin]]
-name = "fuzz_uri_parsing"
-path = "fuzz_targets/fuzz_uri_parsing.rs"
+name = "fuzz_ndjson"
+path = "fuzz_targets/fuzz_ndjson.rs"
 test = false
 doc = false
 
@@ -44,10 +47,10 @@ path = "fuzz_targets/fuzz_header_redaction.rs"
 test = false
 doc = false
 
-# End-to-end HTTP request handling
+# HTTP request parsing and URI extraction
 [[bin]]
-name = "fuzz_full_request"
-path = "fuzz_targets/fuzz_full_request.rs"
+name = "fuzz_http_request"
+path = "fuzz_targets/fuzz_http_request.rs"
 test = false
 doc = false
 

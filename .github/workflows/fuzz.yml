@@ -25,22 +25,23 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          # Core HTTP/Request handling
-          - fuzz_uri_parsing
-          - fuzz_header_redaction
-          - fuzz_full_request
-          # REQ-CORE-001: Green Path streaming
-          - fuzz_green_path
-          # REQ-CORE-002: Inspector chain semantics
-          - fuzz_inspector_chain
           # REQ-CORE-003: JSON-RPC 2.0 parsing (Critical)
           - fuzz_jsonrpc
           # REQ-POL-001: Cedar policy evaluation (Critical)
           - fuzz_cedar_policy
-          # REQ-GOV-001: Task lifecycle state machine
-          - fuzz_task_lifecycle
+          # REQ-CORE-008: NDJSON parsing for stdio transport (Critical for v0.3)
+          - fuzz_ndjson
           # REQ-CFG-001: Configuration parsing
           - fuzz_config
+          # REQ-GOV-001: Task lifecycle state machine
+          - fuzz_task_lifecycle
+          # HTTP request parsing and header handling
+          - fuzz_http_request
+          - fuzz_header_redaction
+          # REQ-CORE-001: Green Path streaming (deferred feature)
+          - fuzz_green_path
+          # REQ-CORE-002: Inspector chain semantics (deferred feature)
+          - fuzz_inspector_chain
 
     steps:
       - name: Checkout code

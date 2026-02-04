@@ -1,10 +1,10 @@
 #![no_main]
 
-//! Fuzz target for full request handling with async runtime
+//! Fuzz target for HTTP request parsing and URI extraction
 //!
 //! # Traceability
-//! - Tests: ProxyService::handle_request (end-to-end)
-//! - Attack surface: Complete HTTP request fuzzing
+//! - Tests: ProxyService::extract_target_uri, is_hop_by_hop_header
+//! - Attack surface: Malformed URIs, Host header injection, invalid methods
 
 use arbitrary::Arbitrary;
 use http::{Method, Version};
