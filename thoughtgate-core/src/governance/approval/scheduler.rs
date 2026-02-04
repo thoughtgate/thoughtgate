@@ -97,6 +97,10 @@ pub struct PollingScheduler {
 
     /// Shutdown token
     shutdown: CancellationToken,
+
+    /// Optional prometheus-client metrics for approval wait duration (REQ-OBS-002 §6.2/MH-004)
+    /// Uses ArcSwap to allow setting metrics after construction.
+    tg_metrics: arc_swap::ArcSwapOption<crate::telemetry::ThoughtGateMetrics>,
 }
 
 impl PollingScheduler {
@@ -126,7 +130,18 @@ impl PollingScheduler {
             ))),
             config,
             shutdown,
+            tg_metrics: arc_swap::ArcSwapOption::empty(),
         }
+    }
+
+    /// Set prometheus-client metrics for this scheduler.
+    ///
+    /// Enables recording of approval wait durations.
+    /// Can be called after construction since scheduler is typically wrapped in Arc.
+    ///
+    /// Implements: REQ-OBS-002 §6.2/MH-004
+    pub fn set_metrics(&self, metrics: std::sync::Arc<crate::telemetry::ThoughtGateMetrics>) {
+        self.tg_metrics.store(Some(metrics));
     }
 
     /// Returns the polling configuration.
@@ -306,7 +321,8 @@ impl PollingScheduler {
         // Poll for decision
         match self.adapter.poll_for_decision(&reference).await {
             Ok(Some(poll_result)) => {
-                self.handle_decision(&task_id, poll_result).await;
+                self.handle_decision(&task_id, &reference, poll_result)
+                    .await;
             }
             Ok(None) => {
                 // Still pending, reschedule with backoff
@@ -385,9 +401,29 @@ impl PollingScheduler {
     /// Handle a detected decision.
     ///
     /// Implements: REQ-GOV-003/F-004
-    async fn handle_decision(&self, task_id: &TaskId, poll_result: PollResult) {
+    /// Implements: REQ-OBS-002 §6.2/MH-004 (Approval Wait Duration)
+    async fn handle_decision(
+        &self,
+        task_id: &TaskId,
+        reference: &ApprovalReference,
+        poll_result: PollResult,
+    ) {
         // Remove from polling queue
         self.references.remove(task_id);
+
+        // Calculate approval wait duration (REQ-OBS-002 §6.2/MH-004)
+        let wait_duration_secs =
+            (poll_result.decided_at - reference.posted_at).num_seconds() as f64;
+        let outcome = match poll_result.decision {
+            PollDecision::Approved => "approved",
+            PollDecision::Rejected => "rejected",
+        };
+
+        // Record approval wait duration metric (REQ-OBS-002 §6.2/MH-004)
+        if let Some(metrics) = self.tg_metrics.load().as_ref() {
+            metrics.record_approval_wait_duration(self.adapter.name(), outcome, wait_duration_secs);
+            metrics.record_approval_request(self.adapter.name(), outcome);
+        }
 
         // Convert to task-layer approval decision
         let decision = match poll_result.decision {
@@ -414,6 +450,7 @@ impl PollingScheduler {
                     decision = ?poll_result.decision,
                     decided_by = %poll_result.decided_by,
                     method = %poll_result.method.description(),
+                    wait_duration_secs = wait_duration_secs,
                     "Recorded approval decision"
                 );
             }

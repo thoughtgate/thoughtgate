@@ -146,6 +146,8 @@ pub struct UpstreamClient {
     config: UpstreamConfig,
     /// Pre-computed MCP endpoint URL (avoids `format!()` per request).
     mcp_url: String,
+    /// Optional prometheus-client metrics for upstream request tracking (REQ-OBS-002 §6.1/MC-006)
+    tg_metrics: Option<std::sync::Arc<crate::telemetry::ThoughtGateMetrics>>,
 }
 
 impl UpstreamClient {
@@ -198,7 +200,21 @@ impl UpstreamClient {
             client,
             config,
             mcp_url,
+            tg_metrics: None,
         })
+    }
+
+    /// Add prometheus-client metrics to this upstream client.
+    ///
+    /// Enables recording of upstream request counts and latencies.
+    ///
+    /// Implements: REQ-OBS-002 §6.1/MC-006, §6.2/MH-003
+    pub fn with_metrics(
+        mut self,
+        metrics: std::sync::Arc<crate::telemetry::ThoughtGateMetrics>,
+    ) -> Self {
+        self.tg_metrics = Some(metrics);
+        self
     }
 
     /// Perform a health check to verify upstream connectivity.
@@ -322,6 +338,7 @@ impl UpstreamClient {
     ///
     /// Implements: REQ-CORE-003/F-004 (Upstream Forwarding)
     /// Implements: REQ-OBS-002 §7.2 (Outbound Trace Context Injection)
+    /// Implements: REQ-OBS-002 §6.1/MC-006, §6.2/MH-003 (Upstream Metrics)
     #[tracing::instrument(skip(self, request), fields(method = %request.method, correlation_id = %request.correlation_id))]
     async fn forward_once(
         &self,
@@ -353,6 +370,9 @@ impl UpstreamClient {
             Some(&correlation_id),
         );
 
+        // Start timing for upstream latency metric (REQ-OBS-002 §6.2/MH-003)
+        let upstream_start = std::time::Instant::now();
+
         let response = self
             .client
             .post(url)
@@ -365,6 +385,13 @@ impl UpstreamClient {
 
         // Check HTTP status
         let status = response.status();
+        let status_str = status.as_u16().to_string();
+
+        // Record upstream request metric (REQ-OBS-002 §6.1/MC-006, §6.2/MH-003)
+        let elapsed_ms = upstream_start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(ref metrics) = self.tg_metrics {
+            metrics.record_upstream_request("upstream", &status_str, elapsed_ms);
+        }
 
         // Handle 204 No Content (notification response from upstream)
         if status == reqwest::StatusCode::NO_CONTENT {
@@ -430,6 +457,7 @@ impl UpstreamClient {
     /// * `Err(ThoughtGateError::InvalidRequest)` - If the batch is empty
     /// * `Err(ThoughtGateError)` - If the batch request failed
     /// Implements: REQ-OBS-002 §7.2 (Outbound Trace Context Injection)
+    /// Implements: REQ-OBS-002 §6.1/MC-006, §6.2/MH-003 (Upstream Metrics)
     #[tracing::instrument(skip(self, requests), fields(batch_size = requests.len()))]
     pub async fn forward_batch(
         &self,
@@ -464,6 +492,9 @@ impl UpstreamClient {
             Some("batch"),
         );
 
+        // Start timing for upstream latency metric (REQ-OBS-002 §6.2/MH-003)
+        let upstream_start = std::time::Instant::now();
+
         let response = self
             .client
             .post(url)
@@ -475,6 +506,13 @@ impl UpstreamClient {
             .map_err(|e| self.classify_error(e, "batch"))?;
 
         let status = response.status();
+        let status_str = status.as_u16().to_string();
+
+        // Record upstream request metric (REQ-OBS-002 §6.1/MC-006, §6.2/MH-003)
+        let elapsed_ms = upstream_start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(ref metrics) = self.tg_metrics {
+            metrics.record_upstream_request("upstream", &status_str, elapsed_ms);
+        }
 
         // Handle 204 No Content (all requests were notifications)
         if status == reqwest::StatusCode::NO_CONTENT {

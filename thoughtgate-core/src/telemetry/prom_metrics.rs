@@ -294,6 +294,9 @@ pub struct ThoughtGateMetrics {
     /// TODO(Prompt 5+): Wire to tokio::time::Instant at startup.
     pub uptime_seconds: Gauge,
 
+    /// MG-005: Unix timestamp of last configuration reload.
+    pub config_reload_timestamp: Gauge,
+
     // ─────────────────────────────────────────────────────────────────────────
     // Internal State
     // ─────────────────────────────────────────────────────────────────────────
@@ -461,6 +464,13 @@ impl ThoughtGateMetrics {
             uptime_seconds.clone(),
         );
 
+        let config_reload_timestamp = Gauge::default();
+        registry.register(
+            "thoughtgate_config_reload_timestamp",
+            "Unix timestamp of last configuration reload",
+            config_reload_timestamp.clone(),
+        );
+
         Self {
             requests_total,
             decisions_total,
@@ -480,6 +490,7 @@ impl ThoughtGateMetrics {
             tasks_pending,
             cedar_policies_loaded,
             uptime_seconds,
+            config_reload_timestamp,
             tool_name_limiter: CardinalityLimiter::new(200),
         }
     }
@@ -702,6 +713,20 @@ impl ThoughtGateMetrics {
                 outcome: outcome.to_string(),
             })
             .inc();
+    }
+
+    /// Record configuration reload timestamp.
+    ///
+    /// Updates the config_reload_timestamp gauge to the current Unix timestamp.
+    /// Call this whenever configuration is reloaded (startup or hot-reload).
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-005
+    pub fn record_config_reload(&self) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.config_reload_timestamp.set(timestamp);
     }
 }
 

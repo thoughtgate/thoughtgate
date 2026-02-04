@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thoughtgate_core::config::{self, Version, find_config_file, load_and_validate};
 use thoughtgate_core::lifecycle::{DrainResult, LifecycleConfig, LifecycleManager};
+use thoughtgate_core::telemetry::prom_metrics::TransportLabels;
 use thoughtgate_core::transport::upstream::{UpstreamClient, UpstreamConfig};
 use thoughtgate_proxy::admin::AdminServer;
 use thoughtgate_proxy::error::ProxyError;
@@ -259,13 +260,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug!("OpenTelemetry tracing disabled");
     }
 
+    // Record config reload timestamp (REQ-OBS-002 §6.4/MG-005)
+    // This records the initial config load; future hot-reloads will call this again.
+    if yaml_config.is_some() {
+        tg_metrics.record_config_reload();
+    }
+
     // Create MCP handler with governance if config exists
     let mcp_handler: Option<Arc<McpHandler>> = if let Some(ref config) = yaml_config {
-        // Create upstream client for MCP handler
+        // Create upstream client for MCP handler (with metrics for REQ-OBS-002 §6.1/MC-006)
         let upstream_config = UpstreamConfig::from_env().map_err(|e| {
             format!("MCP governance requires THOUGHTGATE_UPSTREAM environment variable: {e}")
         })?;
-        let upstream = Arc::new(UpstreamClient::new(upstream_config)?);
+        let upstream =
+            Arc::new(UpstreamClient::new(upstream_config)?.with_metrics(tg_metrics.clone()));
 
         // Create governance components (TaskHandler, CedarEngine, ApprovalEngine)
         // IMPORTANT: The TaskHandler contains the shared TaskStore that ApprovalEngine uses
@@ -464,8 +472,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             error!(error = %e, "Failed to configure socket");
                         }
 
+                        // Increment connections_active gauge (REQ-OBS-002 §6.4/MG-001)
+                        tg_metrics
+                            .connections_active
+                            .get_or_create(&TransportLabels {
+                                transport: "http".to_string(),
+                            })
+                            .inc();
+
                         let service_stack = service_stack.clone();
                         let conn_shutdown = shutdown.clone();
+                        let conn_metrics = tg_metrics.clone();
 
                         tokio::spawn(async move {
                             match tokio::time::timeout(
@@ -491,6 +508,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                 }
                             }
+
+                            // Decrement connections_active gauge (REQ-OBS-002 §6.4/MG-001)
+                            conn_metrics
+                                .connections_active
+                                .get_or_create(&TransportLabels {
+                                    transport: "http".to_string(),
+                                })
+                                .dec();
 
                             // Explicit drops for clarity (both happen automatically at scope end)
                             drop(request_guard); // Decrements lifecycle request counter

@@ -330,11 +330,15 @@ impl ApprovalEngine {
     /// Set the ThoughtGate metrics for task counter reporting.
     ///
     /// Implements: REQ-OBS-002/MC-007, MC-008 (task created/completed counters)
+    /// Implements: REQ-OBS-002 §6.2/MH-004 (approval wait duration via scheduler)
     ///
     /// After calling this, the engine will update the `thoughtgate_tasks_created_total`
     /// and `thoughtgate_tasks_completed_total` counters on task lifecycle events.
+    /// Also propagates metrics to the polling scheduler for approval wait duration tracking.
     pub fn set_metrics(&mut self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) {
-        self.tg_metrics = Some(metrics);
+        self.tg_metrics = Some(metrics.clone());
+        // Also set metrics on the scheduler for approval wait duration (MH-004)
+        self.scheduler.set_metrics(metrics);
     }
 
     /// Builder-style method to set metrics.

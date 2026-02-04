@@ -53,8 +53,9 @@ use thoughtgate_core::protocol::{
     strip_sse_capability,
 };
 use thoughtgate_core::telemetry::{
-    BoxedSpan, CedarSpanData, McpMessageType, McpSpanData, ThoughtGateMetrics, finish_cedar_span,
-    start_cedar_span, start_mcp_span,
+    BoxedSpan, CedarSpanData, GateOutcomes, GatewayDecisionSpanData, McpMessageType, McpSpanData,
+    ThoughtGateMetrics, finish_cedar_span, finish_gateway_decision_span, start_cedar_span,
+    start_gateway_decision_span, start_mcp_span,
 };
 use thoughtgate_core::transport::jsonrpc::{
     JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
@@ -912,8 +913,9 @@ async fn handle_mcp_body_bytes(
 
     // Determine how many permits to acquire: 1 for single, batch_size for batch.
     // This prevents a batch of N requests from consuming only 1 concurrency slot.
-    let permit_count = match &parsed {
-        ParsedRequests::Single(_) => 1,
+    // Also extract method name for payload size metrics (REQ-OBS-002 §6.2/MH-005).
+    let (permit_count, inbound_method) = match &parsed {
+        ParsedRequests::Single(req) => (1, req.method.clone()),
         ParsedRequests::Batch(requests) => {
             if requests.len() > state.max_batch_size {
                 let correlation_id =
@@ -927,9 +929,15 @@ async fn handle_mcp_body_bytes(
                 };
                 return error_bytes(None, &error, &correlation_id);
             }
-            requests.len().max(1) as u32
+            // For batch, use "batch" as method label
+            (requests.len().max(1) as u32, "batch".to_string())
         }
     };
+
+    // Record inbound payload size (REQ-OBS-002 §6.2/MH-005)
+    if let Some(ref metrics) = state.tg_metrics {
+        metrics.record_payload_size("inbound", &inbound_method, body_size as f64);
+    }
 
     // Try to acquire semaphore permits weighted by request count (EC-MCP-011)
     let _permit = match state.semaphore.clone().try_acquire_many_owned(permit_count) {
@@ -960,14 +968,21 @@ async fn handle_mcp_body_bytes(
         }
     };
 
-    match parsed {
+    let (status, response_bytes) = match parsed {
         ParsedRequests::Single(request) => {
             handle_single_request_bytes(state, request, parent_context.as_ref()).await
         }
         ParsedRequests::Batch(requests) => {
             handle_batch_request_bytes(state, requests, parent_context.as_ref()).await
         }
+    };
+
+    // Record outbound payload size (REQ-OBS-002 §6.2/MH-005)
+    if let Some(ref metrics) = state.tg_metrics {
+        metrics.record_payload_size("outbound", &inbound_method, response_bytes.len() as f64);
     }
+
+    (status, response_bytes)
 }
 
 // ============================================================================
@@ -1898,6 +1913,29 @@ async fn route_through_gates(
     );
 
     // ========================================================================
+    // Start Gateway Decision Span (REQ-OBS-002 §5.3)
+    // ========================================================================
+    // Tracks the overall decision-making process across all 4 gates.
+    let correlation_id_str = request.correlation_id.to_string();
+    let decision_span_data = GatewayDecisionSpanData {
+        request_id: &correlation_id_str,
+        upstream_target: "upstream",
+    };
+    let mut decision_span =
+        start_gateway_decision_span(&decision_span_data, &opentelemetry::Context::current());
+    let mut gate_outcomes = GateOutcomes::default();
+
+    // Helper to finish span and return result
+    let finish_span_and_return = |span: &mut BoxedSpan,
+                                  outcomes: &GateOutcomes,
+                                  upstream_latency_ms: Option<f64>,
+                                  result: Result<JsonRpcResponse, ThoughtGateError>|
+     -> Result<JsonRpcResponse, ThoughtGateError> {
+        finish_gateway_decision_span(span, outcomes, upstream_latency_ms);
+        result
+    };
+
+    // ========================================================================
     // Gate 1: Visibility Check
     // ========================================================================
     // Check if the tool is visible based on ExposeConfig
@@ -1916,21 +1954,28 @@ async fn route_through_gates(
             if let Some(ref metrics) = state.tg_metrics {
                 metrics.record_gate_decision("gate1", "block");
             }
+            gate_outcomes.visibility = Some("block".to_string());
             warn!(
                 resource = %resource_name,
                 method = %request.method,
                 source = %source_id,
                 "Gate 1: Resource not exposed"
             );
-            return Err(ThoughtGateError::ToolNotExposed {
-                tool: resource_name,
-                source_id: source_id.to_string(),
-            });
+            return finish_span_and_return(
+                &mut decision_span,
+                &gate_outcomes,
+                None,
+                Err(ThoughtGateError::ToolNotExposed {
+                    tool: resource_name,
+                    source_id: source_id.to_string(),
+                }),
+            );
         }
         // Record gate 1 pass metric (REQ-OBS-002 §6.1/MC-002)
         if let Some(ref metrics) = state.tg_metrics {
             metrics.record_gate_decision("gate1", "pass");
         }
+        gate_outcomes.visibility = Some("pass".to_string());
         debug!(resource = %resource_name, method = %request.method, "Gate 1 passed: resource is visible");
     } else {
         // Source not found in config — fail closed
@@ -1941,14 +1986,20 @@ async fn route_through_gates(
         if let Some(ref metrics) = state.tg_metrics {
             metrics.record_gate_decision("gate1", "block");
         }
+        gate_outcomes.visibility = Some("block".to_string());
         warn!(
             resource = %resource_name,
             source = %source_id,
             "Gate 1 blocked: source not found in config"
         );
-        return Err(ThoughtGateError::ServiceUnavailable {
-            reason: format!("Source '{}' not found in configuration", source_id),
-        });
+        return finish_span_and_return(
+            &mut decision_span,
+            &gate_outcomes,
+            None,
+            Err(ThoughtGateError::ServiceUnavailable {
+                reason: format!("Source '{}' not found in configuration", source_id),
+            }),
+        );
     }
 
     // ========================================================================
@@ -1973,54 +2024,87 @@ async fn route_through_gates(
     // ========================================================================
     // Validate that client sent params.task for actions that require it
     // This is checked AFTER Gate 2 because we need to know the action first
-    validate_task_metadata(
+    if let Err(e) = validate_task_metadata(
         &mut request,
         &match_result.action,
         &resource_name,
         state.capability_cache.upstream_supports_tasks(),
-    )?;
-
-    // ========================================================================
-    // Route by Gate 2 Action
-    // ========================================================================
-
-    // Record gate 2 decision metric (REQ-OBS-002 §6.1/MC-002)
-    if let Some(ref metrics) = state.tg_metrics {
+    ) {
+        // Record gate 2 outcome before returning
         let outcome = match match_result.action {
             Action::Forward => "forward",
             Action::Deny => "deny",
             Action::Approve => "approve",
             Action::Policy => "policy",
         };
-        metrics.record_gate_decision("gate2", outcome);
+        gate_outcomes.governance = Some(outcome.to_string());
+        gate_outcomes.governance_rule_id = match_result.matched_rule.clone();
+        return finish_span_and_return(&mut decision_span, &gate_outcomes, None, Err(e));
     }
+
+    // ========================================================================
+    // Route by Gate 2 Action
+    // ========================================================================
+
+    // Record gate 2 decision metric (REQ-OBS-002 §6.1/MC-002)
+    let gate2_outcome = match match_result.action {
+        Action::Forward => "forward",
+        Action::Deny => "deny",
+        Action::Approve => "approve",
+        Action::Policy => "policy",
+    };
+    if let Some(ref metrics) = state.tg_metrics {
+        metrics.record_gate_decision("gate2", gate2_outcome);
+    }
+    gate_outcomes.governance = Some(gate2_outcome.to_string());
+    gate_outcomes.governance_rule_id = match_result.matched_rule.clone();
 
     match match_result.action {
         Action::Forward => {
             // Skip all policy checks, forward directly
             debug!(resource = %resource_name, "Gate 2: Forwarding directly to upstream");
-            state.upstream.forward(&request).await
+            let upstream_start = std::time::Instant::now();
+            let result = state.upstream.forward(&request).await;
+            let upstream_latency_ms = Some(upstream_start.elapsed().as_secs_f64() * 1000.0);
+            finish_span_and_return(
+                &mut decision_span,
+                &gate_outcomes,
+                upstream_latency_ms,
+                result,
+            )
         }
 
         Action::Deny => {
             // Immediate rejection
             warn!(resource = %resource_name, "Gate 2: Request denied by governance rule");
-            Err(ThoughtGateError::GovernanceRuleDenied {
-                tool: resource_name,
-                rule: match_result.matched_rule,
-            })
+            finish_span_and_return(
+                &mut decision_span,
+                &gate_outcomes,
+                None,
+                Err(ThoughtGateError::GovernanceRuleDenied {
+                    tool: resource_name,
+                    rule: match_result.matched_rule,
+                }),
+            )
         }
 
         Action::Approve => {
             // Gate 4: Create approval task
             debug!(resource = %resource_name, "Gate 2 → Gate 4: Starting approval workflow");
-            start_approval_flow(state, request, &resource_name, &match_result).await
+            gate_outcomes.approval = Some("started".to_string());
+            let result = start_approval_flow(state, request, &resource_name, &match_result).await;
+            finish_span_and_return(&mut decision_span, &gate_outcomes, None, result)
         }
 
         Action::Policy => {
             // Gate 3: Cedar evaluation with proper context
             debug!(resource = %resource_name, "Gate 2 → Gate 3: Evaluating Cedar policy");
-            evaluate_with_cedar(state, request, Some(&match_result)).await
+            gate_outcomes.policy_evaluated = true;
+            // Note: evaluate_with_cedar already records gate3 decision and may also
+            // start gate4 (approval flow), so we mark policy_evaluated but don't
+            // duplicate the cedar outcome here - it's recorded in evaluate_with_cedar
+            let result = evaluate_with_cedar(state, request, Some(&match_result)).await;
+            finish_span_and_return(&mut decision_span, &gate_outcomes, None, result)
         }
     }
 }
