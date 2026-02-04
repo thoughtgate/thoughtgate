@@ -10,8 +10,8 @@
 use axum::{Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
 use opentelemetry::trace::{SpanId, TraceContextExt, TraceFlags, TraceId, TracerProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use serial_test::serial;
 use serde_json::{Value, json};
+use serial_test::serial;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
