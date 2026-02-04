@@ -129,25 +129,28 @@ tokio::time::sleep()
 tokio::sync::Mutex
 ```
 
-### Metrics Systems
+### Observability Systems
 
-ThoughtGate uses two metrics systems (intentionally, during migration):
+ThoughtGate uses two observability systems (each for a distinct purpose):
 
-| System | Library | Prefix | Location | Status |
-|--------|---------|--------|----------|--------|
-| **Primary** | `prometheus-client` | `thoughtgate_*` | `telemetry/prom_metrics.rs` | Active (v0.3+) |
-| **Legacy** | OpenTelemetry SDK | `governance_*` | `metrics.rs` | Deprecated (remove v0.4) |
+| Purpose | Library | Location |
+|---------|---------|----------|
+| **Metrics** | `prometheus-client` | `telemetry/prom_metrics.rs` |
+| **Distributed Tracing** | OpenTelemetry SDK | `telemetry/otel.rs` |
 
-**Primary metrics** (`ThoughtGateMetrics` in `prom_metrics.rs`):
+**Metrics** (`ThoughtGateMetrics` in `prom_metrics.rs`):
 - Counters: `thoughtgate_requests_total`, `thoughtgate_tasks_created_total`, `thoughtgate_tasks_completed_total`
 - Gauges: `thoughtgate_connections_active`, `thoughtgate_tasks_pending`, `thoughtgate_cedar_policies_loaded`, `thoughtgate_uptime_seconds`
 - Histograms: `thoughtgate_request_duration_seconds`, `thoughtgate_upstream_latency_seconds`
 
 **When adding metrics:**
-1. Add to `prom_metrics.rs` (primary system)
-2. Optionally add to `metrics.rs` (legacy) for backward compatibility
-3. Use `record_*` helper methods on `ThoughtGateMetrics`
-4. Wire via `set_metrics()` or `with_metrics()` builder pattern
+1. Add to `prom_metrics.rs`
+2. Use `record_*` helper methods on `ThoughtGateMetrics`
+3. Wire via `set_metrics()` or `with_metrics()` builder pattern
+
+**When adding tracing:**
+- Use `tracing` macros (`info_span!`, `#[instrument]`) for local spans
+- OpenTelemetry exports traces to OTLP endpoints for distributed tracing
 
 ### Requirement Traceability
 Every public function must link to its requirement:

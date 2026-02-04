@@ -3864,7 +3864,6 @@ dependencies = [
  "iso8601-duration",
  "opentelemetry",
  "opentelemetry-otlp",
- "opentelemetry-prometheus",
  "opentelemetry-stdout",
  "opentelemetry_sdk",
  "parking_lot",

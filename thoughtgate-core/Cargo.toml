@@ -64,13 +64,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # HTTP server for governance service handler (localhost API)
 axum = "0.8"
 
-# OpenTelemetry + Prometheus (REQ-OBS-001, REQ-OBS-002)
-opentelemetry = { version = "=0.31.0", features = ["metrics", "trace"] }
+# OpenTelemetry for distributed tracing (REQ-OBS-002 §5, §7, §8)
+# Note: Metrics use prometheus-client below, not OTel metrics
+opentelemetry = { version = "=0.31.0", features = ["trace"] }
 opentelemetry_sdk = { version = "=0.31.0", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "=0.31.0", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
-opentelemetry-prometheus = "=0.31.0"
 
-# Prometheus metrics with prometheus-client (REQ-OBS-002 §6)
+# Prometheus metrics (REQ-OBS-002 §6)
 prometheus-client = "0.24.0"
 
 # Fast, non-poisoning mutex (replaces std::sync::Mutex per CLAUDE.md safety rules)

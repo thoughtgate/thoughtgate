@@ -815,8 +815,14 @@ governance:
         {
             let mut shims = state.shims.lock().await;
             shims.insert("server-1".to_string(), Instant::now());
-            shims.insert("server-2".to_string(), Instant::now() - Duration::from_secs(10));
-            shims.insert("server-3".to_string(), Instant::now() - Duration::from_secs(14));
+            shims.insert(
+                "server-2".to_string(),
+                Instant::now() - Duration::from_secs(10),
+            );
+            shims.insert(
+                "server-3".to_string(),
+                Instant::now() - Duration::from_secs(14),
+            );
         }
 
         // Run cleanup
