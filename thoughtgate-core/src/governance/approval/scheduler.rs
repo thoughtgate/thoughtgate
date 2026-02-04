@@ -412,8 +412,10 @@ impl PollingScheduler {
         self.references.remove(task_id);
 
         // Calculate approval wait duration (REQ-OBS-002 §6.2/MH-004)
-        let wait_duration_secs =
-            (poll_result.decided_at - reference.posted_at).num_seconds() as f64;
+        // Use max(0) to guard against clock skew producing negative durations
+        let wait_duration_secs = (poll_result.decided_at - reference.posted_at)
+            .num_seconds()
+            .max(0) as f64;
         let outcome = match poll_result.decision {
             PollDecision::Approved => "approved",
             PollDecision::Rejected => "rejected",

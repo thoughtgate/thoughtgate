@@ -1447,7 +1447,7 @@ async fn route_request(
                 }
             } else {
                 // Legacy mode (no config): direct Cedar evaluation (Gate 3 only)
-                evaluate_with_cedar(state, request, None).await
+                evaluate_with_cedar(state, request, None, None).await
             }
         }
         RouteTarget::TaskHandler { method, request } => {
@@ -2100,10 +2100,14 @@ async fn route_through_gates(
             // Gate 3: Cedar evaluation with proper context
             debug!(resource = %resource_name, "Gate 2 → Gate 3: Evaluating Cedar policy");
             gate_outcomes.policy_evaluated = true;
-            // Note: evaluate_with_cedar already records gate3 decision and may also
-            // start gate4 (approval flow), so we mark policy_evaluated but don't
-            // duplicate the cedar outcome here - it's recorded in evaluate_with_cedar
-            let result = evaluate_with_cedar(state, request, Some(&match_result)).await;
+            // Pass gate_outcomes to capture cedar decision for the gateway span
+            let result = evaluate_with_cedar(
+                state,
+                request,
+                Some(&match_result),
+                Some(&mut gate_outcomes),
+            )
+            .await;
             finish_span_and_return(&mut decision_span, &gate_outcomes, None, result)
         }
     }
@@ -2229,6 +2233,7 @@ async fn evaluate_with_cedar(
     state: &McpState,
     request: McpRequest,
     match_result: Option<&MatchResult>,
+    gate_outcomes: Option<&mut GateOutcomes>,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
     // List methods bypass Cedar - they don't reference a specific resource
     // Response filtering for list methods is a v0.3+ enhancement
@@ -2336,6 +2341,11 @@ async fn evaluate_with_cedar(
         metrics.record_cedar_eval(decision_str, &policy_id, eval_duration_ms);
         // Record gate 3 decision
         metrics.record_gate_decision("gate3", decision_str);
+    }
+
+    // Populate gate outcome for gateway decision span (REQ-OBS-002 §5.3)
+    if let Some(outcomes) = gate_outcomes {
+        outcomes.cedar = Some(decision_str.to_string());
     }
 
     // Process the Cedar decision
