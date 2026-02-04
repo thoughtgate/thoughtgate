@@ -45,7 +45,7 @@ jobs:
   quick-checks:
     name: Format & Lint
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -58,7 +58,7 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "checks"
+          shared-key: "ci"
           cache-on-failure: true
 
       - name: Install cargo-binstall
@@ -80,12 +80,14 @@ jobs:
       - name: Security audit
         run: cargo audit --deny warnings
 
-  # Stage 1b: Build Binaries
+  # Stage 1b: Build & Pre-compile Test Dependencies
+  # This job compiles everything once, populating the shared cache for all test jobs.
+  # Test jobs then get cache hits instead of recompiling from scratch.
   build:
-    name: Build Binaries
+    name: Build & Compile Tests
     runs-on: ubuntu-latest
     needs: quick-checks
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -96,13 +98,21 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "build"
+          shared-key: "ci"
           cache-on-failure: true
 
       - name: Build release binaries
         run: |
           cargo build --release -p thoughtgate-proxy
           cargo build --release -p thoughtgate-proxy --features mock --bin mock_mcp
+
+      - name: Pre-compile all test binaries (populates cache)
+        run: |
+          # Build all test binaries without running them
+          # This ensures the shared cache has everything tests need
+          cargo test --workspace --no-run
+          cargo test -p thoughtgate-proxy --all-targets --no-run
+          cargo test -p thoughtgate --all-targets --no-run
 
       - name: Upload binaries as artifact
         uses: actions/upload-artifact@v6
@@ -113,45 +123,58 @@ jobs:
             target/release/mock_mcp
           retention-days: 7
 
-  # Stage 1c: Test Suite (parallel execution)
+  # Stage 1c: Test Suite (consolidated parallel execution)
+  #
+  # OPTIMIZATION: Tests are grouped into ~6 jobs instead of 12+ individual jobs.
+  # All jobs share the same cache key ("ci") so they benefit from the pre-compilation
+  # done in the build job. This reduces total CI time significantly.
   test:
     name: Test (${{ matrix.test-name }})
     runs-on: ubuntu-latest
-    needs: quick-checks
-    
+    needs: build  # Wait for build to populate cache
+
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Group 1: All unit tests (library tests for all crates)
           - test-name: "unit"
             test-cmd: "cargo test --workspace --lib -- --nocapture"
-          - test-name: "streaming"
-            test-cmd: "cargo test -p thoughtgate-proxy --test integration_streaming -- --nocapture"
-          - test-name: "peeking"
-            test-cmd: "cargo test -p thoughtgate-proxy --test unit_peeking -- --nocapture"
-          - test-name: "memory"
-            test-cmd: "cargo test -p thoughtgate-proxy --test memory_profile -- --nocapture"
-          # Governance smoke tests - full HTTP stack with YAML config (REQ-GOV-002)
-          - test-name: "governance-smoke"
-            test-cmd: "cargo build -p thoughtgate-proxy && cargo test -p thoughtgate-proxy --test governance_smoke -- --nocapture"
-          # Metrics smoke tests - validate /metrics endpoint (REQ-OBS-002)
-          - test-name: "metrics-smoke"
-            test-cmd: "cargo build -p thoughtgate-proxy && cargo test -p thoughtgate-proxy --test metrics_smoke -- --nocapture"
-          # HIGH PRIORITY - Core governance tests (REQ-GOV-001, REQ-GOV-002)
-          - test-name: "governance-integration"
-            test-cmd: "cargo test -p thoughtgate-proxy --test governance_integration -- --nocapture"
-          - test-name: "e2e-approval"
-            test-cmd: "cargo test -p thoughtgate-proxy --test e2e_approval_flow -- --nocapture"
-          # MEDIUM PRIORITY - Feature coverage
-          - test-name: "trace-context"
-            test-cmd: "cargo test -p thoughtgate-proxy --test trace_context_propagation -- --nocapture"
-          - test-name: "edge-cases"
-            test-cmd: "cargo test -p thoughtgate-proxy --test edge_cases -- --nocapture"
-          - test-name: "amber-edge-cases"
-            test-cmd: "cargo test -p thoughtgate-proxy --test amber_edge_cases -- --nocapture"
-          - test-name: "dashboard"
-            test-cmd: "cargo test -p thoughtgate-proxy --test dashboard_validation -- --nocapture"
-    
+
+          # Group 2: Proxy integration tests (grouped for efficiency)
+          - test-name: "proxy-integration"
+            test-cmd: |
+              cargo test -p thoughtgate-proxy --test integration_streaming -- --nocapture
+              cargo test -p thoughtgate-proxy --test unit_peeking -- --nocapture
+              cargo test -p thoughtgate-proxy --test memory_profile -- --nocapture
+              cargo test -p thoughtgate-proxy --test edge_cases -- --nocapture
+              cargo test -p thoughtgate-proxy --test amber_edge_cases -- --nocapture
+
+          # Group 3: Governance tests (REQ-GOV-001, REQ-GOV-002, REQ-GOV-003)
+          - test-name: "governance"
+            test-cmd: |
+              cargo build -p thoughtgate-proxy
+              cargo test -p thoughtgate-proxy --test governance_smoke -- --nocapture
+              cargo test -p thoughtgate-proxy --test governance_integration -- --nocapture
+              cargo test -p thoughtgate-proxy --test e2e_approval_flow -- --nocapture
+
+          # Group 4: Observability & metrics tests (REQ-OBS-002)
+          - test-name: "observability"
+            test-cmd: |
+              cargo build -p thoughtgate-proxy
+              cargo test -p thoughtgate-proxy --test metrics_smoke -- --nocapture
+              cargo test -p thoughtgate-proxy --test trace_context_propagation -- --nocapture
+              cargo test -p thoughtgate-proxy --test dashboard_validation -- --nocapture
+
+          # Group 5: CLI wrapper tests (REQ-CORE-008) - PREVIOUSLY MISSING!
+          - test-name: "cli"
+            test-cmd: |
+              cargo test -p thoughtgate --lib -- --nocapture
+              cargo test -p thoughtgate --test cli_args -- --nocapture
+              cargo test -p thoughtgate --test integration -- --nocapture
+              cargo test -p thoughtgate --test shim_proxy -- --nocapture
+              cargo test -p thoughtgate --test proptest_ndjson -- --nocapture
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -159,10 +182,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # OPTIMIZATION: All test jobs share the same cache key.
+      # Since the build job already compiled everything, test jobs get cache hits.
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "test-${{ matrix.test-name }}"
+          shared-key: "ci"
           cache-on-failure: true
 
       - name: Run ${{ matrix.test-name }} tests
@@ -187,7 +212,7 @@ jobs:
     needs: quick-checks
     if: github.event_name == 'push'  # Only on main/tags, skip PRs
     continue-on-error: true  # Allow CI to pass while new baselines are established
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -198,7 +223,7 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "bench"
+          shared-key: "ci"
           cache-on-failure: true
 
       - name: Build release binaries
@@ -209,7 +234,7 @@ jobs:
           echo "Running Criterion benchmarks..."
           cargo bench -p thoughtgate-proxy --bench ttfb -- --noplot
           cargo bench -p thoughtgate-core --bench policy_eval -- --noplot || echo "policy_eval benchmark not yet available"
-          
+
           echo ""
           echo "Benchmark complete. Checking output..."
           ls -la target/criterion/ || echo "Warning: target/criterion not created"
@@ -357,27 +382,27 @@ jobs:
       - name: Parse and consolidate benchmark results
         run: |
           echo "Consolidating benchmark results for Bencher..."
-          
+
           python3 << 'PYEOF'
           import json
           from pathlib import Path
-          
+
           # Use dict to deduplicate by name
           # Bencher BMF format: {"benchmark_name": {"measure": {"value": X}}}
           # Three levels: benchmark -> measure -> value object
           metrics = {}
-          
+
           def add_metric(name, value, measure="latency"):
               """Add metric in BMF format with proper measure."""
               metrics[name] = {measure: {"value": value}}
-          
+
           # Parse binary metrics (use "file-size" measure for size metrics)
           binary_file = Path("binary_metrics.json")
           if binary_file.exists():
               with open(binary_file) as f:
                   for m in json.load(f):
                       add_metric(m["name"], m["value"], "file-size")
-          
+
           # Parse startup metrics (use "latency" for timing, "file-size" for memory)
           startup_file = Path("startup_metrics.json")
           if startup_file.exists():
@@ -388,7 +413,7 @@ jobs:
                           add_metric(name, m["value"], "file-size")
                       else:
                           add_metric(name, m["value"], "latency")
-          
+
           # Parse Criterion results
           # Only look in "new" directory to avoid duplicates from base/new
           criterion_dir = Path("target/criterion")
@@ -396,20 +421,20 @@ jobs:
               for estimates_file in criterion_dir.rglob("new/estimates.json"):
                   rel_path = estimates_file.relative_to(criterion_dir)
                   parts = rel_path.parts
-                  
+
                   if len(parts) < 3:
                       continue
-                  
+
                   # Build benchmark name from path (excluding "new" directory)
                   # e.g., policy/eval_simple/new/estimates.json -> policy_eval_simple
                   bench_parts = [p for p in parts[:-2] if p != "new"]
                   bench_name = "_".join(bench_parts).replace(" ", "_")
-                  
+
                   try:
                       with open(estimates_file) as f:
                           data = json.load(f)
                           mean_ns = data["mean"]["point_estimate"]
-                          
+
                           # Convert to appropriate units
                           if "policy" in bench_name.lower():
                               # Policy benchmarks in microseconds
@@ -434,13 +459,13 @@ jobs:
           # Write consolidated results in Bencher BMF format
           with open("bench_metrics.json", "w") as f:
               json.dump(metrics, f, indent=2)
-          
+
           print(f"Consolidated {len(metrics)} metrics:")
           for name, data in sorted(metrics.items()):
               measure = list(data.keys())[0]
               print(f"  - {name} [{measure}]: {data[measure]['value']:.3f}")
           PYEOF
-          
+
           echo ""
           echo "=== Final benchmark results ==="
           cat bench_metrics.json
@@ -509,7 +534,7 @@ jobs:
 
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
-      
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -571,7 +596,7 @@ jobs:
     if: needs.changes.outputs.code == 'true' || github.event_name == 'push'
     permissions:
       pull-requests: write  # Needed for Bencher PR comments
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -579,9 +604,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Use shared cache key for consistency with other jobs
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          shared-key: "ci"
           cache-on-failure: true
 
       - name: Download Docker image artifact
@@ -700,11 +727,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: k8s-tests
     if: startsWith(github.ref, 'refs/tags/v')
-    
+
     permissions:
       contents: read
       packages: write
-      
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -761,22 +788,22 @@ jobs:
         run: |
           IMAGE="ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}"
           echo "Collecting Docker image metrics for $IMAGE..."
-          
+
           # M-BIN-002: Compressed image size (from manifest)
           # Pull manifest and calculate total compressed size
           MANIFEST=$(docker manifest inspect "$IMAGE" -v 2>/dev/null || echo "[]")
-          
+
           if [ "$MANIFEST" != "[]" ]; then
             # Calculate total compressed size across all layers
             COMPRESSED_SIZE=$(echo "$MANIFEST" | jq '[.[] | .OCIManifest.layers[].size // 0] | add // 0')
             echo "compressed_size=$COMPRESSED_SIZE" >> $GITHUB_OUTPUT
             echo "  Compressed size: $COMPRESSED_SIZE bytes ($(echo "scale=2; $COMPRESSED_SIZE / 1048576" | bc) MB)"
-            
+
             # M-BIN-003: Layer count (from first arch)
             LAYER_COUNT=$(echo "$MANIFEST" | jq '.[0].OCIManifest.layers | length // 0')
             echo "layer_count=$LAYER_COUNT" >> $GITHUB_OUTPUT
             echo "  Layer count: $LAYER_COUNT"
-            
+
             # M-BIN-005: Multi-arch verification
             AMD64=$(echo "$MANIFEST" | jq -e '.[] | select(.Descriptor.platform.architecture == "amd64")' > /dev/null && echo "true" || echo "false")
             ARM64=$(echo "$MANIFEST" | jq -e '.[] | select(.Descriptor.platform.architecture == "arm64")' > /dev/null && echo "true" || echo "false")
@@ -821,32 +848,32 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           COMPRESSED_MB=$(echo "scale=2; ${{ steps.docker_metrics.outputs.compressed_size || 0 }} / 1048576" | bc)
-          
+
           cat > release-notes.md << EOF
           ## Container Images
-          
+
           Published to GitHub Container Registry:
-          
+
           \`\`\`bash
           docker pull ghcr.io/${{ github.repository }}:${VERSION}
           docker pull ghcr.io/${{ github.repository }}:latest
           \`\`\`
-          
+
           ## Supported Architectures
           - linux/amd64
           - linux/arm64
-          
+
           ## Performance Metrics
-          
+
           | Metric | Value |
           |--------|-------|
           | Image Size (compressed) | ${COMPRESSED_MB} MB |
           | Layer Count | ${{ steps.docker_metrics.outputs.layer_count }} |
           | Multi-arch | ${{ steps.docker_metrics.outputs.multi_arch }} |
-          
+
           See full performance dashboard: [Bencher.dev](https://bencher.dev/perf/thoughtgate)
           EOF
-          
+
           cat release-notes.md
 
       - name: Upload release notes
