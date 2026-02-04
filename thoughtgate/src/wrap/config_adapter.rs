@@ -194,11 +194,12 @@ pub fn detect_agent_type(command: &str) -> Option<AgentType> {
 // Environment Variable Expansion (F-004)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Expand `${VAR}` references in a string (Claude Code style).
+/// Expand `${VAR}` and `${VAR:-default}` references in a string (Claude Code style).
 ///
 /// Scans for `${...}` patterns and replaces them with the corresponding
-/// environment variable value. Returns `ConfigError::UndefinedEnvVar` if
-/// any referenced variable is not set.
+/// environment variable value. Supports default values with `:-` syntax:
+/// - `${VAR}` - Expands to value of VAR, errors if not set
+/// - `${VAR:-default}` - Expands to VAR if set, otherwise uses "default"
 ///
 /// Implements: REQ-CORE-008/F-004
 pub fn expand_dollar_brace(input: &str) -> Result<String, ConfigError> {
@@ -220,6 +221,8 @@ pub fn expand_env_colon(input: &str) -> Result<String, ConfigError> {
 ///
 /// When `require_env_prefix` is true, only `${env:VAR}` patterns are expanded;
 /// plain `${VAR}` is left unchanged. When false, all `${VAR}` patterns are expanded.
+///
+/// Both modes support the `:-default` syntax for fallback values.
 fn expand_vars(input: &str, require_env_prefix: bool) -> Result<String, ConfigError> {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -245,11 +248,8 @@ fn expand_vars(input: &str, require_env_prefix: bool) -> Result<String, ConfigEr
             }
 
             if require_env_prefix {
-                if let Some(var_name) = var_content.strip_prefix("env:") {
-                    let value =
-                        std::env::var(var_name).map_err(|_| ConfigError::UndefinedEnvVar {
-                            name: var_name.to_string(),
-                        })?;
+                if let Some(var_spec) = var_content.strip_prefix("env:") {
+                    let value = expand_var_with_default(var_spec)?;
                     result.push_str(&value);
                 } else {
                     // Not an env: prefix — pass through unchanged.
@@ -259,10 +259,7 @@ fn expand_vars(input: &str, require_env_prefix: bool) -> Result<String, ConfigEr
                     result.push('}');
                 }
             } else {
-                let value =
-                    std::env::var(&var_content).map_err(|_| ConfigError::UndefinedEnvVar {
-                        name: var_content.clone(),
-                    })?;
+                let value = expand_var_with_default(&var_content)?;
                 result.push_str(&value);
             }
         } else {
@@ -271,6 +268,24 @@ fn expand_vars(input: &str, require_env_prefix: bool) -> Result<String, ConfigEr
     }
 
     Ok(result)
+}
+
+/// Expand a single variable reference, supporting `VAR:-default` syntax.
+///
+/// - `VAR` - Returns value of VAR, errors if not set
+/// - `VAR:-default` - Returns value of VAR if set, otherwise returns "default"
+fn expand_var_with_default(var_spec: &str) -> Result<String, ConfigError> {
+    // Check for `:-` default value syntax.
+    if let Some((var_name, default_value)) = var_spec.split_once(":-") {
+        match std::env::var(var_name) {
+            Ok(value) if !value.is_empty() => Ok(value),
+            _ => Ok(default_value.to_string()),
+        }
+    } else {
+        std::env::var(var_spec).map_err(|_| ConfigError::UndefinedEnvVar {
+            name: var_spec.to_string(),
+        })
+    }
 }
 
 /// Expand environment variables in all string values of a server entry's
@@ -1736,6 +1751,48 @@ mod tests {
             std::env::remove_var("THOUGHTGATE_TEST_A");
             std::env::remove_var("THOUGHTGATE_TEST_B");
         }
+    }
+
+    #[test]
+    fn test_expand_with_default_value_undefined() {
+        // Variable not set, should use default.
+        let result = expand_dollar_brace("${NONEXISTENT_VAR_ABC:-fallback_value}").unwrap();
+        assert_eq!(result, "fallback_value");
+    }
+
+    #[test]
+    fn test_expand_with_default_value_defined() {
+        // SAFETY: Test runs single-threaded.
+        unsafe {
+            std::env::set_var("THOUGHTGATE_TEST_DEFAULT", "actual_value");
+        }
+        let result = expand_dollar_brace("${THOUGHTGATE_TEST_DEFAULT:-fallback}").unwrap();
+        assert_eq!(result, "actual_value");
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_TEST_DEFAULT");
+        }
+    }
+
+    #[test]
+    fn test_expand_with_default_empty_var() {
+        // SAFETY: Test runs single-threaded.
+        unsafe {
+            std::env::set_var("THOUGHTGATE_TEST_EMPTY", "");
+        }
+        // Empty string should trigger default.
+        let result = expand_dollar_brace("${THOUGHTGATE_TEST_EMPTY:-default_for_empty}").unwrap();
+        assert_eq!(result, "default_for_empty");
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_TEST_EMPTY");
+        }
+    }
+
+    #[test]
+    fn test_expand_with_default_in_path() {
+        let result = expand_dollar_brace("/home/${USER:-nobody}/.config/${APP:-myapp}").unwrap();
+        // USER is usually set, APP is not.
+        let user = std::env::var("USER").unwrap_or_else(|_| "nobody".to_string());
+        assert_eq!(result, format!("/home/{user}/.config/myapp"));
     }
 
     // ── Claude Code Adapter Tests ─────────────────────────────────────────
