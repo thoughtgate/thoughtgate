@@ -8,35 +8,36 @@ WORKDIR /app
 
 # Copy only dependency manifests first (for caching)
 COPY Cargo.toml Cargo.lock ./
+COPY thoughtgate-core/Cargo.toml thoughtgate-core/Cargo.toml
+COPY thoughtgate-proxy/Cargo.toml thoughtgate-proxy/Cargo.toml
+COPY thoughtgate/Cargo.toml thoughtgate/Cargo.toml
 
-# Create dummy source files to build dependencies
-# Note: Must match real project module structure to avoid E0761 conflicts
-RUN mkdir -p src/bin src/error && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "pub mod error; pub mod logging_layer; pub mod proxy_service;" > src/lib.rs && \
-    echo "pub struct ProxyService;" > src/proxy_service.rs && \
-    echo "pub enum ProxyError {}" > src/error/mod.rs && \
-    echo "pub struct LoggingLayer;" > src/logging_layer.rs
+# Create workspace-aware dummy sources for dependency caching
+RUN mkdir -p thoughtgate-core/src thoughtgate-proxy/src/bin thoughtgate/src && \
+    echo "fn main() {}" > thoughtgate-proxy/src/main.rs && \
+    echo "" > thoughtgate-core/src/lib.rs && \
+    echo "fn main() {}" > thoughtgate/src/main.rs && \
+    echo "fn main() {}" > thoughtgate-proxy/src/bin/mock_mcp.rs
 
 # Build dependencies (this layer will be cached unless Cargo.toml/Cargo.lock change)
-RUN cargo build --release --locked --bin thoughtgate || true
+RUN cargo build --release -p thoughtgate-proxy --locked || true
 
 # Now copy actual source code
 COPY . .
 
 # Remove dummy binaries to force rebuild with real source
-RUN rm -rf target/release/thoughtgate target/release/deps/thoughtgate*
+RUN rm -rf target/release/thoughtgate-proxy target/release/deps/thoughtgate*
 
 # Build with real source (only this layer rebuilds when source changes)
 # Note: mock_mcp is intentionally NOT built - use Dockerfile.test for tests
-RUN cargo build --release --locked --bin thoughtgate
+RUN cargo build --release -p thoughtgate-proxy --locked
 
 # Production stage - distroless for minimal attack surface
 # Includes: CA certificates, /etc/passwd, timezone data
 FROM gcr.io/distroless/static-debian12:nonroot
 
 # Copy the statically-linked binary
-COPY --from=builder /app/target/release/thoughtgate /thoughtgate
+COPY --from=builder /app/target/release/thoughtgate-proxy /thoughtgate-proxy
 
 # nonroot image already runs as UID 65532
 # NOTE: Set file descriptor limits via container runtime (--ulimit nofile=65535:65535)
@@ -54,4 +55,4 @@ EXPOSE 7467 7468 7469
 #     initialDelaySeconds: 5
 #     periodSeconds: 10
 
-ENTRYPOINT ["/thoughtgate"]
+ENTRYPOINT ["/thoughtgate-proxy"]

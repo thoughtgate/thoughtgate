@@ -18,7 +18,7 @@ use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
 use std::time::Duration;
 
-use thoughtgate::governance::{
+use thoughtgate_core::governance::{
     ApprovalDecision, FailureInfo, FailureStage, Principal, TaskId, TaskStatus, TaskStore,
     TaskStoreConfig, TimeoutAction, ToolCallRequest, ToolCallResult,
 };
@@ -276,7 +276,7 @@ fn build_principal(input: &FuzzPrincipal) -> Principal {
 }
 
 fn build_tool_call(input: &FuzzToolCall) -> ToolCallRequest {
-    use thoughtgate::governance::task::JsonRpcId;
+    use thoughtgate_core::governance::task::JsonRpcId;
 
     let name = sanitize_string(&input.name, 256);
     let arguments = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&input.arguments) {

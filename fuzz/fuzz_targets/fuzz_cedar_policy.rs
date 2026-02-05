@@ -16,8 +16,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use thoughtgate::policy::engine::CedarEngine;
-use thoughtgate::policy::{CedarContext, CedarRequest, CedarResource, Principal, TimeContext};
+use thoughtgate_core::policy::engine::CedarEngine;
+use thoughtgate_core::policy::{CedarContext, CedarRequest, CedarResource, Principal, TimeContext};
 
 /// Fuzz input for Cedar policy evaluation
 #[derive(Arbitrary, Debug)]

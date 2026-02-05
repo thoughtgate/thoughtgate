@@ -1,0 +1,23 @@
+{
+  "numStartups": 5,
+  "projects": {
+    "/tmp/test-project": {
+      "mcpServers": {
+        "filesystem": {
+          "type": "stdio",
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+          "env": {
+            "NODE_ENV": "production"
+          }
+        },
+        "notion": {
+          "type": "http",
+          "url": "https://mcp.notion.com/mcp"
+        }
+      },
+      "enabledMcpjsonServers": [],
+      "disabledMcpjsonServers": []
+    }
+  }
+}

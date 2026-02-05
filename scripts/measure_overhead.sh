@@ -22,9 +22,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-THOUGHTGATE_BIN="${PROJECT_ROOT}/target/release/thoughtgate"
+THOUGHTGATE_BIN="${PROJECT_ROOT}/target/release/thoughtgate-proxy"
 MOCK_MCP_BIN="${PROJECT_ROOT}/target/release/mock_mcp"
-K6_SCRIPT="${PROJECT_ROOT}/tests/benchmark-fast.js"
+K6_SCRIPT="${PROJECT_ROOT}/thoughtgate-proxy/tests/benchmark-fast.js"
 OUTPUT_FILE="${PROJECT_ROOT}/overhead_metrics.json"
 
 MOCK_MCP_PORT=8888
@@ -98,13 +98,13 @@ check_prerequisites() {
     
     if [ ! -f "$THOUGHTGATE_BIN" ]; then
         log_error "ThoughtGate binary not found at $THOUGHTGATE_BIN"
-        log_info "Build with: cargo build --release --bin thoughtgate"
+        log_info "Build with: cargo build --release -p thoughtgate-proxy"
         exit 1
     fi
     
     if [ ! -f "$MOCK_MCP_BIN" ]; then
         log_error "Mock LLM binary not found at $MOCK_MCP_BIN"
-        log_info "Build with: cargo build --release --bin mock_mcp --features mock"
+        log_info "Build with: cargo build --release -p thoughtgate-proxy --features mock --bin mock_mcp"
         exit 1
     fi
     

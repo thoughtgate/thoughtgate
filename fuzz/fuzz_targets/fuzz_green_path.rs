@@ -22,8 +22,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use thoughtgate::proxy_body::{ProxyBody, StreamMetrics};
-use thoughtgate::timeout::{TimeoutBody, TimeoutConfig};
+use thoughtgate_proxy::proxy_body::{ProxyBody, StreamMetrics};
+use thoughtgate_proxy::timeout::{TimeoutBody, TimeoutConfig};
 
 /// Fuzz input for Green Path testing
 #[derive(Arbitrary, Debug)]

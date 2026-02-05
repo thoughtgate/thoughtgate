@@ -16,13 +16,13 @@ This document provides the **top-level architectural view** of ThoughtGate, show
 - Configuration reference
 - v0.2 scope definition
 
-**Target deployment:** Kubernetes sidecar (co-located with AI agent in same pod).
+**Target deployment:** Kubernetes sidecar (co-located with AI agent in same pod). v0.3 adds CLI wrapper for local desktop environments (REQ-CORE-008).
 
 ## 2. System Overview
 
 ### 2.1 What is ThoughtGate?
 
-ThoughtGate is an **MCP (Model Context Protocol) sidecar proxy** that implements **approval workflows** for AI agent tool calls. It intercepts MCP `tools/call` requests, routes them through a 4-gate decision flow (visibility, governance rules, Cedar policies, and approval workflows), and forwards approved operations to upstream MCP servers.
+ThoughtGate is an **MCP (Model Context Protocol) sidecar proxy and CLI wrapper** that implements **approval workflows** for AI agent tool calls. It intercepts MCP `tools/call` requests, routes them through a 4-gate decision flow (visibility, governance rules, Cedar policies, and approval workflows), and forwards approved operations to upstream MCP servers.
 
 ### 2.2 Core Value Proposition
 
@@ -434,7 +434,7 @@ approval:                           # Gate 4: workflow definitions
     destination:
       type: slack
       channel: "#approvals"
-      token_env: SLACK_BOT_TOKEN    # Env var containing bot token
+      token_env: THOUGHTGATE_SLACK_BOT_TOKEN    # Env var containing bot token
       mention:                      # Optional: users/groups to @mention
         - "@oncall"
     timeout: 10m                    # Approval timeout
@@ -507,7 +507,7 @@ Environment variables can override specific settings but cannot define complex s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SLACK_BOT_TOKEN` | (from config) | Slack Bot OAuth token |
+| `THOUGHTGATE_SLACK_BOT_TOKEN` | (from config) | Slack Bot OAuth token |
 | `THOUGHTGATE_APPROVAL_POLL_INTERVAL_SECS` | `5` | Base poll interval |
 | `THOUGHTGATE_APPROVAL_POLL_MAX_INTERVAL_SECS` | `30` | Max poll interval (with backoff) |
 | `THOUGHTGATE_SLACK_RATE_LIMIT_PER_SEC` | `1` | Slack API rate limit |
@@ -533,7 +533,8 @@ Environment variables can override specific settings but cannot define complex s
 |-----------|--------|-------|
 | **YAML Configuration** | Draft | Primary configuration method |
 | **4-Gate Decision Flow** | Draft | Visibility → Governance → Cedar → Approval |
-| **Sidecar Deployment** | Target | K8s pod co-location with agent |
+| **Sidecar Deployment** | Target | K8s pod co-location with agent (`thoughtgate-proxy`) |
+| **CLI Wrapper (v0.3)** | Draft | `thoughtgate wrap -- command` for local dev (REQ-CORE-008) |
 | MCP Transport (JSON-RPC, HTTP+SSE) | Draft | Single upstream |
 | YAML Governance Rules | Draft | First-line routing (forward/deny/approve/policy) |
 | Cedar Policy Engine | Draft | Gate 3 - complex policy decisions |
@@ -553,7 +554,6 @@ Environment variables can override specific settings but cannot define complex s
 | **Buffered Inspection (Amber Path)** | Deferred until request/response inspection needed |
 | **Blocking Mode** | Removed; SEP-1686 is the v0.2 standard |
 | **Gateway Deployment Mode** | Centralized proxy for multiple agents; requires auth |
-| **CLI Wrapper** | `thoughtgate wrap -- command` for local dev |
 | **Agent Authentication** | API keys, mTLS, JWT for gateway mode |
 | Persistent Task Storage | Tasks are in-memory only; lost on restart |
 | Teams Adapter | Slack only in v0.2 |
@@ -636,7 +636,7 @@ spec:
     - containerPort: 7469  # Admin (health, ready, metrics)
       name: admin
     env:
-    - name: SLACK_BOT_TOKEN
+    - name: THOUGHTGATE_SLACK_BOT_TOKEN
       valueFrom:
         secretKeyRef:
           name: thoughtgate-secrets
@@ -687,6 +687,39 @@ In sidecar mode, ThoughtGate infers the Principal from Kubernetes metadata:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### 8.4 CLI Wrapper Mode (v0.3)
+
+v0.3 adds a second deployment mode: **CLI wrapper for local desktop environments** (REQ-CORE-008).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        v0.3 DEPLOYMENT MODEL: CLI WRAPPER                        │
+│                                                                                 │
+│   ┌─────────────────────────────────────────────────────────────────────────┐  │
+│   │     thoughtgate wrap -- claude-code                                     │  │
+│   │     (ThoughtGate parent process)                                        │  │
+│   │                                                                         │  │
+│   │   ┌──────────────┐  ┌───────────────┐  ┌────────────────────┐          │  │
+│   │   │ Agent (child) │  │ shim proxy    │  │ MCP Server (child) │          │  │
+│   │   │ e.g. Claude   │─►│ stdio ↔ stdio │─►│ e.g. npx server    │          │  │
+│   │   │ Code          │◄─│               │◄─│                    │          │  │
+│   │   └──────────────┘  └───────┬───────┘  └────────────────────┘          │  │
+│   │                             │                                           │  │
+│   │                    ┌────────▼────────┐                                  │  │
+│   │                    │ Governance HTTP  │ (127.0.0.1:19090)               │  │
+│   │                    │ Service (local)  │                                  │  │
+│   │                    └─────────────────┘                                  │  │
+│   │                                                                         │  │
+│   │   Identity: Inferred from $USER (local user, no K8s metadata)          │  │
+│   │   Auth: None required (localhost, user-level privileges)               │  │
+│   │                                                                         │  │
+│   └─────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key architectural separation:** The CLI binary (`thoughtgate`, from the `thoughtgate` crate) and the sidecar binary (`thoughtgate-proxy`, from the `thoughtgate-proxy` crate) are entirely separate binaries sharing only `thoughtgate-core`. They never ship together. Docker builds use `cargo build -p thoughtgate-proxy`. Desktop installs use `cargo install thoughtgate`.
+
 ## 9. Security Model
 
 ### 9.1 Trust Model (Sidecar)
@@ -736,6 +769,18 @@ ThoughtGate v0.2's security model is built around the **sidecar trust assumption
 | ThoughtGate → Upstream | TLS | Optional mTLS for zero-trust clusters |
 | ThoughtGate → Slack | Bot Token | OAuth token for API access |
 | Human → Slack | Slack auth | Slack handles user identity |
+
+### 9.3 Trust Model (CLI Wrapper)
+
+In CLI wrapper mode (v0.3), ThoughtGate operates at **user-level privileges** on the developer's machine:
+
+- **No K8s assumptions.** No pod metadata, no downward API, no network policies.
+- **Principal inference:** From `$USER` on Unix (not from pod labels).
+- **Localhost governance service** on `127.0.0.1:19090` — not exposed to the network.
+- **Shim ↔ governance communication** is localhost HTTP (same as sidecar model within a pod).
+- **MCP servers** are child processes spawned by the shim, inheriting the user's full environment and privileges.
+
+**Binary separation security requirement:** The `thoughtgate-proxy` Docker image (K8s sidecar) must NOT contain `nix`, `dirs`, filesystem config-rewriting, or child process spawning code. In regulated industries, security auditors review container contents — desktop development tooling in a production sidecar image is an audit finding. The two binaries are built from separate crates with non-overlapping dependency trees.
 
 ## 10. Observability Standards
 
@@ -989,7 +1034,7 @@ approval:
 
 **Required environment variable:**
 ```
-SLACK_BOT_TOKEN=xoxb-your-bot-token
+THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-bot-token
 ```
 
 ### 14.3 Decision Flow (Quick Reference - v0.2)
@@ -1062,6 +1107,7 @@ Request → Parse JSON-RPC → Route by Method
 | REQ-CORE-005 | Operational Lifecycle | Draft | Core |
 | REQ-CORE-006 | Inspector Framework | **Deferred** | Core |
 | REQ-CORE-007 | SEP-1686 Protocol Compliance | Draft | Core |
+| REQ-CORE-008 | stdio Transport & CLI Wrapper | Draft | Core |
 | REQ-POL-001 | Cedar Policy Engine (Gate 3) | Draft | Policy |
 | REQ-GOV-001 | Task Lifecycle & SEP-1686 | Draft | Governance |
 | REQ-GOV-002 | Approval Execution Pipeline | Draft (simplified) | Governance |

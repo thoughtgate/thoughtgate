@@ -57,51 +57,77 @@ ThoughtGate exposes Prometheus-format metrics on `GET /metrics` (port 7469).
 ### Request Metrics
 
 ```
-# Request counts by action
-thoughtgate_requests_total{action="forward"}
-thoughtgate_requests_total{action="deny"}
-thoughtgate_requests_total{action="approve"}
+# Request counts by method, tool, and status
+thoughtgate_requests_total{method="tools/call", tool_name="delete_user", status="forward"}
+thoughtgate_requests_total{method="tools/call", tool_name="admin_reset", status="deny"}
 
-# Request latency histogram
-thoughtgate_request_duration_seconds{quantile="0.5"}
-thoughtgate_request_duration_seconds{quantile="0.95"}
-thoughtgate_request_duration_seconds{quantile="0.99"}
+# Request latency histogram (milliseconds)
+thoughtgate_request_duration_ms{method="tools/call", tool_name="read_file"}
+```
+
+### Gate Decision Metrics
+
+```
+# Gate evaluation decisions
+thoughtgate_gate_decisions_total{gate="visibility", outcome="allow"}
+thoughtgate_gate_decisions_total{gate="governance", outcome="deny"}
+thoughtgate_gate_decisions_total{gate="policy", outcome="forward"}
 ```
 
 ### Approval Metrics
 
 ```
-# Approval outcomes
-thoughtgate_approval_total{result="approved"}
-thoughtgate_approval_total{result="rejected"}
-thoughtgate_approval_total{result="timeout"}
+# Approval workflow outcomes
+thoughtgate_approval_requests_total{channel="#approvals", outcome="approved"}
+thoughtgate_approval_requests_total{channel="#approvals", outcome="rejected"}
+thoughtgate_approval_requests_total{channel="#approvals", outcome="timeout"}
 
-# Active tasks waiting for approval
-thoughtgate_tasks_active
+# Tasks currently pending
+thoughtgate_tasks_pending{task_type="approval"}
 ```
 
 ### Upstream Metrics
 
 ```
 # Upstream request outcomes
-thoughtgate_upstream_requests_total{status="success"}
-thoughtgate_upstream_requests_total{status="error"}
-thoughtgate_upstream_requests_total{status="timeout"}
+thoughtgate_upstream_requests_total{target="mcp-server:3000", status_code="200"}
+thoughtgate_upstream_requests_total{target="mcp-server:3000", status_code="500"}
+```
+
+### Stdio Transport Metrics (CLI Wrapper)
+
+```
+# Stdio messages by server, direction, and method
+thoughtgate_stdio_messages_total{server_id="filesystem", direction="agent_to_server", method="tools/call"}
+thoughtgate_stdio_messages_total{server_id="filesystem", direction="server_to_agent", method="tools/call"}
+
+# Stdio governance decisions
+thoughtgate_stdio_governance_decisions_total{server_id="filesystem", decision="forward", profile="production"}
+thoughtgate_stdio_governance_decisions_total{server_id="filesystem", decision="deny", profile="production"}
+
+# Stdio framing/parse errors
+thoughtgate_stdio_framing_errors_total{server_id="filesystem", error_type="smuggling_detected"}
+thoughtgate_stdio_framing_errors_total{server_id="filesystem", error_type="invalid_json"}
+
+# Active stdio server connections
+thoughtgate_stdio_active_servers
 ```
 
 ### Traffic Path Metrics
 
 ```
-# Bytes transferred
-green_path_bytes_total{direction="upload"}
-green_path_bytes_total{direction="download"}
+# Green path bytes transferred
+thoughtgate_green_bytes_total{direction="upload"}
+thoughtgate_green_bytes_total{direction="download"}
 
-# Active streams
-green_path_streams_active
+# Active green path streams
+thoughtgate_green_streams_active
 
-# Time to first byte
-green_path_ttfb_seconds
+# Green path time to first byte
+thoughtgate_green_ttfb_ms
 ```
+
+See [Telemetry Reference](/docs/reference/telemetry) for the complete metrics inventory (37 counters, histograms, and gauges).
 
 ## Prometheus Scrape Configuration
 
@@ -135,14 +161,14 @@ scrape_configs:
 
 ### Key Panels
 
-1. **Request Rate by Action**
+1. **Request Rate by Status**
    ```promql
-   sum(rate(thoughtgate_requests_total[5m])) by (action)
+   sum(rate(thoughtgate_requests_total[5m])) by (status)
    ```
 
 2. **Request Latency (p95)**
    ```promql
-   histogram_quantile(0.95, rate(thoughtgate_request_duration_seconds_bucket[5m]))
+   histogram_quantile(0.95, rate(thoughtgate_request_duration_ms_bucket[5m]))
    ```
 
 3. **Approval Wait Time**
@@ -150,15 +176,20 @@ scrape_configs:
    histogram_quantile(0.95, rate(thoughtgate_approval_duration_seconds_bucket[5m]))
    ```
 
-4. **Active Tasks**
+4. **Pending Tasks**
    ```promql
-   thoughtgate_tasks_active
+   thoughtgate_tasks_pending
    ```
 
 5. **Upstream Error Rate**
    ```promql
-   sum(rate(thoughtgate_upstream_requests_total{status="error"}[5m])) /
+   sum(rate(thoughtgate_upstream_requests_total{status_code=~"5.."}[5m])) /
    sum(rate(thoughtgate_upstream_requests_total[5m]))
+   ```
+
+6. **Stdio Governance Decisions (CLI Wrapper)**
+   ```promql
+   sum(rate(thoughtgate_stdio_governance_decisions_total[5m])) by (decision, server_id)
    ```
 
 ### Recommended Alerts
@@ -171,7 +202,7 @@ groups:
       # High denial rate
       - alert: ThoughtGateHighDenialRate
         expr: |
-          sum(rate(thoughtgate_requests_total{action="deny"}[5m])) /
+          sum(rate(thoughtgate_requests_total{status="deny"}[5m])) /
           sum(rate(thoughtgate_requests_total[5m])) > 0.1
         for: 5m
         labels:
@@ -182,7 +213,7 @@ groups:
       # Upstream errors
       - alert: ThoughtGateUpstreamErrors
         expr: |
-          sum(rate(thoughtgate_upstream_requests_total{status="error"}[5m])) > 0
+          sum(rate(thoughtgate_upstream_requests_total{status_code=~"5.."}[5m])) > 0
         for: 2m
         labels:
           severity: critical
@@ -192,7 +223,7 @@ groups:
       # Approval timeouts
       - alert: ThoughtGateApprovalTimeouts
         expr: |
-          sum(rate(thoughtgate_approval_total{result="timeout"}[5m])) > 0
+          sum(rate(thoughtgate_approval_requests_total{outcome="timeout"}[5m])) > 0
         for: 5m
         labels:
           severity: warning
@@ -201,7 +232,7 @@ groups:
 
       # Not ready
       - alert: ThoughtGateNotReady
-        expr: up{job="thoughtgate"} == 1 and thoughtgate_ready == 0
+        expr: up{job="thoughtgate"} == 1 and thoughtgate_config_loaded == 0
         for: 1m
         labels:
           severity: critical
@@ -261,16 +292,31 @@ ThoughtGate **never logs**:
 
 ## Distributed Tracing
 
-ThoughtGate supports OpenTelemetry tracing (v0.3+). Configure the OTLP endpoint:
+ThoughtGate supports OpenTelemetry tracing. Enable it and configure the OTLP endpoint:
 
 ```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+export THOUGHTGATE_TELEMETRY_ENABLED=true
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
 ```
+
+:::note
+Only `http/protobuf` protocol is supported. gRPC endpoints (port 4317) are **not** supported — use the HTTP endpoint (port 4318).
+:::
 
 Each request gets a trace ID that flows through:
 1. Agent → ThoughtGate
 2. ThoughtGate → Upstream
 3. ThoughtGate → Slack (for approvals)
+
+In stdio mode, trace context is propagated via `params._meta.traceparent` fields in JSON-RPC messages. See [Telemetry Reference](/docs/reference/telemetry) for details.
+
+## CLI Wrapper Monitoring
+
+When using `thoughtgate wrap`, the governance service runs on an ephemeral port on localhost. To monitor:
+
+- **Governance logs** — All decisions are logged to stderr with structured JSON
+- **Verbose mode** — Use `--verbose` for debug-level logging
+- **Stdio metrics** — Monitor `thoughtgate_stdio_*` metrics for per-server activity
 
 ## Troubleshooting with Metrics
 
@@ -280,13 +326,13 @@ Check latency breakdown:
 
 ```promql
 # Overall latency
-histogram_quantile(0.95, rate(thoughtgate_request_duration_seconds_bucket[5m]))
+histogram_quantile(0.95, rate(thoughtgate_request_duration_ms_bucket[5m]))
 
 # Is it upstream?
-histogram_quantile(0.95, rate(thoughtgate_upstream_duration_seconds_bucket[5m]))
+histogram_quantile(0.95, rate(thoughtgate_upstream_duration_ms_bucket[5m]))
 
 # Is it policy evaluation?
-histogram_quantile(0.95, rate(thoughtgate_policy_eval_seconds_bucket[5m]))
+histogram_quantile(0.95, rate(thoughtgate_cedar_eval_duration_ms_bucket[5m]))
 ```
 
 ### "Approvals are getting stuck"
@@ -294,11 +340,11 @@ histogram_quantile(0.95, rate(thoughtgate_policy_eval_seconds_bucket[5m]))
 Check task metrics:
 
 ```promql
-# Active tasks (should not grow unbounded)
-thoughtgate_tasks_active
+# Pending tasks (should not grow unbounded)
+thoughtgate_tasks_pending
 
 # Timeout rate
-rate(thoughtgate_approval_total{result="timeout"}[5m])
+rate(thoughtgate_approval_requests_total{outcome="timeout"}[5m])
 ```
 
 ### "High memory usage"
@@ -307,10 +353,10 @@ Check active connections:
 
 ```promql
 # Active streams
-green_path_streams_active
+thoughtgate_green_streams_active
 
-# Buffer usage (for approve path)
-thoughtgate_buffer_bytes_total
+# Active stdio servers
+thoughtgate_stdio_active_servers
 ```
 
 ## Resource Recommendations
@@ -331,4 +377,5 @@ ThoughtGate is designed to be lightweight:
 
 - [Deploy to Kubernetes](/docs/how-to/deploy-kubernetes) — Full deployment guide
 - [Troubleshoot Common Issues](/docs/how-to/troubleshoot) — Problem-solving guide
+- [Telemetry Reference](/docs/reference/telemetry) — Complete metrics inventory
 - [Architecture](/docs/explanation/architecture) — Understand the 4-Gate model

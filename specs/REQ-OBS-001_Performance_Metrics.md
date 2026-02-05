@@ -70,7 +70,7 @@ The system must:
 
 | ID | Metric | Unit | Target | Collection Method | Rationale |
 |----|--------|------|--------|-------------------|-----------|
-| M-BIN-001 | `binary/size` | bytes | < 15 MB | `stat -c%s target/release/thoughtgate` | "Lightweight" claim |
+| M-BIN-001 | `binary/size` | bytes | < 15 MB | `stat -c%s target/release/thoughtgate-proxy` | "Lightweight" claim (sidecar binary) |
 | M-MEM-001 | `memory/idle_rss` | bytes | < 20 MB | `/proc/<pid>/status` VmRSS at idle | "Low footprint" claim |
 | M-LAT-001 | `latency/p50` | ms | < 5 ms | k6 `http_req_duration` | Typical request latency |
 | M-LAT-002 | `latency/p95` | ms | < 15 ms | k6 `http_req_duration` | Tail latency |
@@ -96,10 +96,10 @@ The system must:
 
 | ID | Metric | Unit | Target | Collection Method | Rationale |
 |----|--------|------|--------|-------------------|-----------|
-| M-BIN-002 | `binary/docker_image_compressed` | bytes | < 10 MB | `docker manifest inspect` compressed size | Container pull time |
-| M-BIN-003 | `binary/docker_layers` | count | ≤ 5 | `docker manifest inspect` layer count | Image optimization |
-| M-BIN-004 | `binary/docker_base` | string | scratch | Dockerfile inspection | Minimal attack surface |
-| M-BIN-005 | `binary/multi_arch` | bool | true | Verify amd64 + arm64 manifests | Broad K8s compatibility |
+| M-BIN-002 | `binary/docker_image_compressed` | bytes | < 10 MB | `docker manifest inspect` compressed size | Container pull time (`thoughtgate-proxy` image only) |
+| M-BIN-003 | `binary/docker_layers` | count | ≤ 5 | `docker manifest inspect` layer count | Image optimization (`thoughtgate-proxy` image only) |
+| M-BIN-004 | `binary/docker_base` | string | scratch | Dockerfile inspection | Minimal attack surface (`thoughtgate-proxy` image only) |
+| M-BIN-005 | `binary/multi_arch` | bool | true | Verify amd64 + arm64 manifests | Broad K8s compatibility (`thoughtgate-proxy` image only) |
 | M-MEM-003 | `memory/peak_rss` | bytes | < 150 MB | Peak RSS during test | Worst-case memory |
 | M-START-002 | `startup/policy_load` | ms | < 50 ms | Measure Cedar load time | Config reload speed |
 | M-POL-002 | `policy/eval_p99` | µs | < 500 µs | Criterion micro-benchmark | Policy tail latency |
@@ -182,25 +182,25 @@ The system must:
 Collected after release build, before any tests:
 
 ```bash
-# M-BIN-001: Binary size
-BINARY_SIZE=$(stat -c%s target/release/thoughtgate)
+# M-BIN-001: Binary size (sidecar binary)
+BINARY_SIZE=$(stat -c%s target/release/thoughtgate-proxy)
 
 # M-BIN-002: Docker image compressed size (what users download)
 # Requires image to be pushed to registry first
-DOCKER_COMPRESSED=$(docker manifest inspect thoughtgate:test -v | \
+DOCKER_COMPRESSED=$(docker manifest inspect thoughtgate-proxy:test -v | \
   jq '[.[] | .OCIManifest.layers[].size] | add')
 
 # M-BIN-003: Docker layer count (fewer = faster pulls, better caching)
-DOCKER_LAYERS=$(docker manifest inspect thoughtgate:test -v | \
+DOCKER_LAYERS=$(docker manifest inspect thoughtgate-proxy:test -v | \
   jq '.[0].OCIManifest.layers | length')
 
 # M-BIN-004: Verify base image (scratch = minimal attack surface)
 # Check Dockerfile or inspect image history
-DOCKER_BASE=$(docker history thoughtgate:test --no-trunc | tail -1 | grep -q scratch && echo "scratch" || echo "other")
+DOCKER_BASE=$(docker history thoughtgate-proxy:test --no-trunc | tail -1 | grep -q scratch && echo "scratch" || echo "other")
 
 # M-BIN-005: Multi-arch verification (amd64 + arm64 required for broad K8s compatibility)
-MULTI_ARCH_AMD64=$(docker manifest inspect thoughtgate:test -v | jq -e '.[] | select(.Descriptor.platform.architecture == "amd64")' > /dev/null && echo "true" || echo "false")
-MULTI_ARCH_ARM64=$(docker manifest inspect thoughtgate:test -v | jq -e '.[] | select(.Descriptor.platform.architecture == "arm64")' > /dev/null && echo "true" || echo "false")
+MULTI_ARCH_AMD64=$(docker manifest inspect thoughtgate-proxy:test -v | jq -e '.[] | select(.Descriptor.platform.architecture == "amd64")' > /dev/null && echo "true" || echo "false")
+MULTI_ARCH_ARM64=$(docker manifest inspect thoughtgate-proxy:test -v | jq -e '.[] | select(.Descriptor.platform.architecture == "arm64")' > /dev/null && echo "true" || echo "false")
 MULTI_ARCH=$([[ "$MULTI_ARCH_AMD64" == "true" && "$MULTI_ARCH_ARM64" == "true" ]] && echo "true" || echo "false")
 ```
 
@@ -209,7 +209,7 @@ MULTI_ARCH=$([[ "$MULTI_ARCH_AMD64" == "true" && "$MULTI_ARCH_ARM64" == "true" ]
 ```bash
 # M-START-001: Startup to healthy (/health returns 200)
 START=$(date +%s%N)
-./target/release/thoughtgate &
+./target/release/thoughtgate-proxy &
 PID=$!
 
 # Poll /health until 200 (with timeout)
@@ -287,7 +287,7 @@ Run ThoughtGate under sidecar-like resource limits to validate marketing claims 
 
 ```bash
 # M-TP-002, M-MEM-004: Constrained throughput and memory
-docker run --cpus 0.5 --memory 128m -d --name tg-constrained thoughtgate:test
+docker run --cpus 0.5 --memory 128m -d --name tg-constrained thoughtgate-proxy:test
 CONSTRAINED_PID=$(docker inspect --format '{{.State.Pid}}' tg-constrained)
 
 # Run k6 against constrained container

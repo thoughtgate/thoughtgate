@@ -26,7 +26,7 @@ spec:
 
     # ThoughtGate sidecar
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:v0.2.2
+      image: ghcr.io/thoughtgate/thoughtgate:v0.3.0
       ports:
         - containerPort: 7467
           name: proxy
@@ -35,7 +35,7 @@ spec:
       env:
         - name: THOUGHTGATE_CONFIG
           value: "/etc/thoughtgate/config.yaml"
-        - name: SLACK_BOT_TOKEN
+        - name: THOUGHTGATE_SLACK_BOT_TOKEN
           valueFrom:
             secretKeyRef:
               name: thoughtgate-secrets
@@ -173,7 +173,7 @@ metadata:
 spec:
   containers:
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:v0.2.2
+      image: ghcr.io/thoughtgate/thoughtgate:v0.3.0
       env:
         - name: THOUGHTGATE_CONFIG
           value: "/etc/thoughtgate/config.yaml"

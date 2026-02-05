@@ -1,0 +1,45 @@
+[package]
+name = "thoughtgate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ThoughtGate CLI wrapper for local MCP governance"
+
+[lib]
+name = "thoughtgate"
+path = "src/lib.rs"
+
+[[bin]]
+name = "thoughtgate"
+path = "src/main.rs"
+
+[dependencies]
+thoughtgate-core = { path = "../thoughtgate-core" }
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+which = "7"
+fs2 = "0.4"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# OpenTelemetry for trace context propagation (REQ-OBS-002 §7.3)
+opentelemetry = { version = "=0.31.0" }
+opentelemetry_sdk = { version = "=0.31.0" }
+
+# UUID for correlation IDs (REQ-OBS-002)
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1.0"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal", "process"] }

@@ -16,7 +16,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use thoughtgate::transport::jsonrpc::{parse_jsonrpc, JsonRpcResponse};
+use thoughtgate_core::transport::jsonrpc::{parse_jsonrpc, JsonRpcResponse};
 
 /// Fuzz input for JSON-RPC testing
 #[derive(Arbitrary, Debug)]
@@ -223,7 +223,7 @@ fn test_response_serialization(input: &[u8]) {
     // Try to parse and create a response
     if let Ok(parsed) = parse_jsonrpc(input) {
         match parsed {
-            thoughtgate::transport::jsonrpc::ParsedRequests::Single(req) => {
+            thoughtgate_core::transport::jsonrpc::ParsedRequests::Single(req) => {
                 // Create success response
                 let success = JsonRpcResponse::success(
                     req.id.clone(),
@@ -234,7 +234,7 @@ fn test_response_serialization(input: &[u8]) {
                 // Create error response
                 let error = JsonRpcResponse::error(
                     req.id.clone(),
-                    thoughtgate::error::jsonrpc::JsonRpcError {
+                    thoughtgate_core::error::jsonrpc::JsonRpcError {
                         code: -32600,
                         message: "Test error".to_string(),
                         data: None,
@@ -242,20 +242,20 @@ fn test_response_serialization(input: &[u8]) {
                 );
                 let _ = serde_json::to_string(&error);
             }
-            thoughtgate::transport::jsonrpc::ParsedRequests::Batch(requests) => {
+            thoughtgate_core::transport::jsonrpc::ParsedRequests::Batch(requests) => {
                 for item in requests.iter().take(10) {
                     match item {
-                        thoughtgate::transport::jsonrpc::BatchItem::Valid(req) => {
+                        thoughtgate_core::transport::jsonrpc::BatchItem::Valid(req) => {
                             let response = JsonRpcResponse::success(
                                 req.id.clone(),
                                 serde_json::json!(null),
                             );
                             let _ = serde_json::to_string(&response);
                         }
-                        thoughtgate::transport::jsonrpc::BatchItem::Invalid { id, error: _ } => {
+                        thoughtgate_core::transport::jsonrpc::BatchItem::Invalid { id, error: _ } => {
                             let response = JsonRpcResponse::error(
                                 id.clone(),
-                                thoughtgate::error::jsonrpc::JsonRpcError {
+                                thoughtgate_core::error::jsonrpc::JsonRpcError {
                                     code: -32600,
                                     message: "Invalid request".to_string(),
                                     data: None,

@@ -16,7 +16,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use thoughtgate::config::{Config, Version, substitute_env_vars, validate};
+use thoughtgate_core::config::{Config, Version, substitute_env_vars, validate};
 
 /// Fuzz input for configuration testing
 #[derive(Arbitrary, Debug)]

@@ -1,159 +1,26 @@
-[package]
-name = "thoughtgate"
-version = "0.2.2"
+[workspace]
+members = ["thoughtgate-core", "thoughtgate-proxy", "thoughtgate"]
+resolver = "2"
+
+[workspace.package]
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.87"
 authors = ["Oleg Mukhin <oleg.v.mukhin@gmail.com>"]
-description = "ThoughtGate - High-performance sidecar proxy for governing MCP and A2A agentic AI traffic"
 license = "Apache-2.0"
 
-[dependencies]
-# Async runtime
+[workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-
-# HTTP stack (Hyper v1)
-hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
-hyper-util = { version = "0.1", features = ["full"] }
-http-body = "1"
-http-body-util = "0.1"
-http = "1"
-bytes = "1"
-httparse = "1"
-
-# HTTPS/TLS support for upstream connections
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "log", "logging", "native-tokio", "ring", "rustls-native-certs", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-
-# Stream utilities for zero-copy streaming
-futures-util = "0.3"
-
-# Socket configuration (REQ-CORE-001 Section 3.2)
-socket2 = { version = "0.6.2", features = ["all"] }
-
-# Cancellation and utilities (REQ-CORE-001 F-002)
-tokio-util = { version = "0.7", features = ["rt"] }
-
-# Middleware stack
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
-tower-service = "0.3"
-
-# Observability
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-tracing-appender = "0.2"
-
-# CLI and config
-clap = { version = "4", features = ["derive", "env"] }
-
-# Error handling
 thiserror = "2.0.18"
+bytes = "1.11.1"
 uuid = { version = "1.20", features = ["v4", "serde"] }
-
-# Policy engine (REQ-POL-001)
-cedar-policy = "4.8.0"
-arc-swap = "1.8.0"
-
-# Base64 decoding for K8s JWT tokens (REQ-POL-001/F-006.1)
-base64 = "0.22"
-
-# Task lifecycle (REQ-GOV-001)
-governor = "0.8"
-dashmap = "6"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
-sha2 = "0.10"
-hex = "0.4"
-
-# SEP-1686 Protocol (REQ-CORE-007) - uses uuid for task ID generation
-
-# Async trait support (REQ-CORE-002 Inspector interface)
 async-trait = "0.1"
-
-# Memory allocator (reduces fragmentation under load)
-mimalloc = "0.1"
-
-# OpenTelemetry + Prometheus (REQ-CORE-001 NFR-001)
-opentelemetry = { version = "0.31", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-prometheus = "0.31"
-prometheus = "0.14"
-
-# Serialization (required for transport layer)
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-# serde-saphyr is a panic-free YAML parser built on Saphyr
-# Replaces deprecated serde_yaml and unsound serde_yml
-serde-saphyr = "0.0.17"
-
-# Configuration (REQ-CFG-001)
-glob = "0.3"
-humantime = "2"
-iso8601-duration = "0.2"
-url = "2"
-regex = "1"
-
-# HTTP client for upstream MCP server (REQ-CORE-003)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# HTTP server (REQ-CORE-003)
-axum = "0.8"
-
-[[bin]]
-name = "mock_mcp"
-path = "src/bin/mock_mcp.rs"
-required-features = ["mock"]
-
-[features]
-default = ["metrics"]
-mock = []
-fuzzing = []
-metrics = []
-# Amber Path: Buffered inspection for PII detection, schema validation, etc.
-# Deferred to v0.3+ - enable when response inspection is needed
-amber_path = []
-
-[dev-dependencies]
-# Kubernetes orchestration
-kube = { version = "2.0", features = ["runtime", "derive"] }
-k8s-openapi = { version = "0.26", features = ["v1_30"] }
-
-# TLS support for kube client (must match main dependency)
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-
-# Async utilities
-futures = "0.3"
-anyhow = "1.0"
-
-# Serialization (for test metrics)
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Testing utilities
-rand = "0.9"
-serial_test = "3.0"
-uuid = { version = "1.20", features = ["v4", "serde"] }
-insta = { version = "1.46.1", features = ["json"] }
-wiremock = "0.6"
-
-# Property-based testing (SDD Phase 4 - L2 Verification)
-proptest = "1.0"
-
-# Benchmarking (REQ-CORE-001 Section 5 - TTFB verification)
-criterion = { version = "0.8", features = ["async_tokio"] }
-
-[[bench]]
-name = "ttfb"
-harness = false
-
-# Policy evaluation benchmark (REQ-OBS-001 M-POL-001, M-POL-002)
-[[bench]]
-name = "policy_eval"
-harness = false
-
-# JSON-RPC parsing benchmark (tracks T-001 optimization)
-[[bench]]
-name = "jsonrpc_parse"
-harness = false
+arc-swap = "1.8.0"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [profile.release]
 opt-level = 3

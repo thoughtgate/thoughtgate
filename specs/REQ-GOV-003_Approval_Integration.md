@@ -63,11 +63,13 @@ ThoughtGate runs as a **sidecar** inside a Kubernetes pod. This creates a fundam
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**CLI wrapper mode (v0.3, REQ-CORE-008):** In CLI wrapper mode, shims communicate with a localhost governance service started by `thoughtgate wrap`. The same polling model applies — each shim polls `127.0.0.1:19090` for governance decisions. Shims are not individually addressable from external systems, just like sidecars.
+
 ### 1.3 Design Philosophy
 
 - ThoughtGate posts approval requests to Slack (outbound only)
 - ThoughtGate polls Slack API for decisions (no inbound callbacks)
-- Each sidecar is self-sufficient (no central coordinator needed)
+- Each sidecar/shim is self-sufficient (no central coordinator needed)
 - Adapters encapsulate polling logic for different systems
 - **Workflow configuration loaded from YAML config** (REQ-CFG-001)
 
@@ -212,7 +214,7 @@ Slack bot token is loaded from environment variable specified in config:
 
 | Config Field | Default Env Var | Notes |
 |--------------|-----------------|-------|
-| `token_env` | `SLACK_BOT_TOKEN` | Env var containing bot token |
+| `token_env` | `THOUGHTGATE_SLACK_BOT_TOKEN` | Env var containing bot token |
 | `channel` | (required) | Channel name or ID |
 | `mention` | (optional) | Users/groups to @mention |
 
@@ -223,7 +225,7 @@ approval:
     destination:
       type: slack
       channel: "#approvals"
-      token_env: SLACK_BOT_TOKEN  # Reads from $SLACK_BOT_TOKEN
+      token_env: THOUGHTGATE_SLACK_BOT_TOKEN  # Reads from $THOUGHTGATE_SLACK_BOT_TOKEN
 ```
 
 ### 5.4 Polling Configuration
@@ -346,7 +348,7 @@ pub fn create_adapter(
 ) -> Result<Box<dyn ApprovalAdapter>, ApprovalError> {
     match &workflow.destination {
         ApprovalDestination::Slack { channel, token_env, mention } => {
-            let token_var = token_env.as_deref().unwrap_or("SLACK_BOT_TOKEN");
+            let token_var = token_env.as_deref().unwrap_or("THOUGHTGATE_SLACK_BOT_TOKEN");
             let token = std::env::var(token_var)
                 .map_err(|_| ApprovalError::MissingToken { var: token_var.to_string() })?;
             

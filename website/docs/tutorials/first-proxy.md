@@ -1,8 +1,12 @@
 ---
-sidebar_position: 1
+sidebar_position: 2
 ---
 
 # Your First ThoughtGate Proxy
+
+:::tip CLI Wrapper Alternative
+This tutorial covers the **HTTP sidecar** mode for server deployments. For local development with the CLI wrapper, see [Wrap Your First Agent](/docs/tutorials/wrap-first-agent).
+:::
 
 In this tutorial, you'll set up ThoughtGate to proxy requests between an AI agent and an MCP server, with governance rules that require approval for destructive operations.
 
@@ -15,7 +19,7 @@ In this tutorial, you'll set up ThoughtGate to proxy requests between an AI agen
 
 ## Prerequisites
 
-- Rust 1.75+ installed
+- Rust 1.87+ installed
 - An MCP server running (or use the mock server)
 - A Slack workspace with bot token (for approvals)
 
@@ -26,17 +30,17 @@ Clone the repository and build the release binary:
 ```bash
 git clone https://github.com/thoughtgate/thoughtgate
 cd thoughtgate
-cargo build --release
+cargo build --release -p thoughtgate-proxy
 ```
 
-The binary will be at `target/release/thoughtgate`.
+The binary will be at `target/release/thoughtgate-proxy`.
 
 ## Step 2: Start a Mock MCP Server
 
 For testing, ThoughtGate includes a mock MCP server:
 
 ```bash
-cargo build --release --bin mock_mcp --features mock
+cargo build --release -p thoughtgate-proxy --features mock --bin mock_mcp
 MOCK_MCP_PORT=3000 ./target/release/mock_mcp
 ```
 
@@ -93,9 +97,9 @@ Set environment variables and start the proxy:
 
 ```bash
 export THOUGHTGATE_CONFIG=./thoughtgate.yaml
-export SLACK_BOT_TOKEN=xoxb-your-token
+export THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-token
 
-./target/release/thoughtgate
+./target/release/thoughtgate-proxy
 ```
 
 You should see:

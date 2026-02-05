@@ -43,6 +43,7 @@ This requirement defines the **unified configuration schema** for ThoughtGate. T
 | REQ-GOV-003 | **Provides to** | Slack/approval destination config |
 | REQ-CORE-003 | **Provides to** | Upstream URL configuration |
 | REQ-CORE-004 | **Provides to** | Error handling configuration |
+| REQ-OBS-002 | **Provides to** | Telemetry enable/disable, OTLP endpoints, sampling config |
 
 ## 3. Intent
 
@@ -64,6 +65,7 @@ The system must:
 - Configuration validation at load time
 - Environment variable substitution
 - Hot-reload via file watching
+- Telemetry configuration (OTel export, Prometheus, sampling)
 
 ### 4.2 In Scope (v0.3+)
 - Multi-source MCP
@@ -171,7 +173,7 @@ approval:
   default:
     destination:
       type: slack
-      token_env: SLACK_BOT_TOKEN  # Read at runtime, not substituted
+      token_env: THOUGHTGATE_SLACK_BOT_TOKEN  # Read at runtime, not substituted
 ```
 
 **Substitution rules:**
@@ -220,6 +222,20 @@ pub struct ThoughtGateDefaults {
 
     /// Interval for expired task cleanup (REQ-GOV-001)
     pub task_cleanup_interval: Duration,
+
+    // Telemetry defaults (REQ-OBS-002)
+
+    /// Default OTLP batch export delay
+    pub telemetry_batch_delay: Duration,
+
+    /// Default OTLP export timeout
+    pub telemetry_export_timeout: Duration,
+
+    /// Default sampling rate (1.0 = 100%)
+    pub telemetry_sample_rate: f64,
+
+    /// Default max span queue size
+    pub telemetry_max_queue_size: usize,
 }
 
 impl Default for ThoughtGateDefaults {
@@ -235,6 +251,11 @@ impl Default for ThoughtGateDefaults {
             default_task_ttl: Duration::from_secs(600),          // 10 minutes
             max_task_ttl: Duration::from_secs(86400),            // 24 hours
             task_cleanup_interval: Duration::from_secs(60),
+            // Telemetry defaults
+            telemetry_batch_delay: Duration::from_secs(5),
+            telemetry_export_timeout: Duration::from_secs(30),
+            telemetry_sample_rate: 1.0,
+            telemetry_max_queue_size: 2048,
         }
     }
 }
@@ -254,6 +275,10 @@ impl Default for ThoughtGateDefaults {
 | `default_task_ttl` | 10m | REQ-GOV-001 | Task expiration |
 | `max_task_ttl` | 24h | REQ-GOV-001 | Maximum task lifetime |
 | `task_cleanup_interval` | 60s | REQ-GOV-001 | Expired task pruning |
+| `telemetry_batch_delay` | 5s | REQ-OBS-002 | OTLP batch export interval |
+| `telemetry_export_timeout` | 30s | REQ-OBS-002 | OTLP export timeout |
+| `telemetry_sample_rate` | 1.0 | REQ-OBS-002 | Trace sampling rate (100%) |
+| `telemetry_max_queue_size` | 2048 | REQ-OBS-002 | Max queued spans |
 
 **Invariants:**
 
@@ -367,6 +392,10 @@ pub struct Config {
     /// Cedar policy configuration
     #[serde(default)]
     pub cedar: Option<CedarConfig>,
+    
+    /// Telemetry configuration (tracing, metrics, sampling)
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 ```
 
@@ -602,6 +631,209 @@ pub struct CedarConfig {
 }
 ```
 
+### 7.7 Telemetry Configuration
+
+The `telemetry:` section controls distributed tracing, metrics export, and sampling behavior per REQ-OBS-002.
+
+#### 7.7.1 YAML Schema
+
+```yaml
+telemetry:
+  # Master enable/disable. When false, no spans are created, no OTLP traffic,
+  # but Prometheus /metrics endpoint still works if prometheus.enabled is true.
+  enabled: true  # Default: false
+  
+  otlp:
+    # OTLP exporter endpoint. Overridden by OTEL_EXPORTER_OTLP_ENDPOINT env var.
+    endpoint: "http://otel-collector:4318"  # Default: none (export disabled)
+    
+    # Export protocol. v0.2 supports http/protobuf only.
+    # "grpc" is accepted but falls back to http/protobuf with a warning.
+    protocol: http/protobuf  # Default: http/protobuf
+    
+    # Optional headers for OTLP export (e.g., authentication)
+    headers:
+      Authorization: "Bearer ${OTEL_AUTH_TOKEN:-}"
+  
+  prometheus:
+    # Enable Prometheus /metrics endpoint on admin port
+    enabled: true  # Default: true
+    # Note: Port is admin port (default 7469), path is always /metrics
+  
+  sampling:
+    # Sampling strategy. v0.2 supports "head" only.
+    # "tail" is accepted but falls back to "head" with a warning.
+    strategy: head  # Default: head
+    
+    # Sample rate for successful requests (0.0 to 1.0)
+    # Errors are always sampled at 100% regardless of this setting.
+    success_sample_rate: 0.10  # Default: 1.0 (sample everything)
+  
+  batch:
+    # Maximum spans queued for export before dropping
+    max_queue_size: 2048  # Default: 2048
+    
+    # Maximum spans per export batch
+    max_export_batch_size: 512  # Default: 512
+    
+    # Delay between batch exports (milliseconds)
+    scheduled_delay_ms: 5000  # Default: 5000
+    
+    # Export timeout (milliseconds)
+    export_timeout_ms: 30000  # Default: 30000
+  
+  resource:
+    # OTel resource attributes. These appear on every span.
+    # Standard attributes use dotted keys.
+    service.name: thoughtgate  # Default: "thoughtgate"
+    service.version: ${VERSION:-unknown}
+    deployment.environment: ${DEPLOY_ENV:-development}
+    # Kubernetes attributes auto-populated from downward API if available
+    # k8s.namespace.name, k8s.pod.name, k8s.node.name
+```
+
+#### 7.7.2 Rust Types
+
+```rust
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    /// Master enable/disable for tracing
+    pub enabled: bool,
+    
+    /// OTLP export configuration
+    pub otlp: OtlpConfig,
+    
+    /// Prometheus endpoint configuration
+    pub prometheus: PrometheusConfig,
+    
+    /// Sampling configuration
+    pub sampling: SamplingConfig,
+    
+    /// Batch export configuration
+    pub batch: BatchConfig,
+    
+    /// OTel resource attributes
+    #[serde(default)]
+    pub resource: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct OtlpConfig {
+    /// OTLP endpoint URL (e.g., "http://collector:4318")
+    pub endpoint: Option<String>,
+    
+    /// Export protocol: "http/protobuf" or "grpc"
+    /// v0.2: grpc falls back to http/protobuf
+    #[serde(default = "default_otlp_protocol")]
+    pub protocol: String,
+    
+    /// Optional headers for authentication
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_otlp_protocol() -> String {
+    "http/protobuf".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PrometheusConfig {
+    /// Enable /metrics endpoint
+    pub enabled: bool,
+}
+
+impl Default for PrometheusConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SamplingConfig {
+    /// Sampling strategy: "head" or "tail"
+    /// v0.2: tail falls back to head
+    pub strategy: String,
+    
+    /// Sample rate for successful requests (0.0 to 1.0)
+    pub success_sample_rate: f64,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            strategy: "head".to_string(),
+            success_sample_rate: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BatchConfig {
+    /// Maximum spans queued before dropping
+    pub max_queue_size: usize,
+    
+    /// Maximum spans per export batch
+    pub max_export_batch_size: usize,
+    
+    /// Delay between exports (ms)
+    pub scheduled_delay_ms: u64,
+    
+    /// Export timeout (ms)
+    pub export_timeout_ms: u64,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_size: 2048,
+            max_export_batch_size: 512,
+            scheduled_delay_ms: 5000,
+            export_timeout_ms: 30000,
+        }
+    }
+}
+```
+
+#### 7.7.3 Environment Variable Overrides
+
+Standard OTel environment variables take precedence over YAML config:
+
+| Env Var | Overrides | Notes |
+|---------|-----------|-------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `telemetry.otlp.endpoint` | Standard OTel env var |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `telemetry.otlp.protocol` | Standard OTel env var |
+| `OTEL_TRACES_SAMPLER` | `telemetry.sampling.strategy` | Must be `parentbased_traceidratio` |
+| `OTEL_TRACES_SAMPLER_ARG` | `telemetry.sampling.success_sample_rate` | Float 0.0-1.0 |
+| `OTEL_SERVICE_NAME` | `telemetry.resource.service.name` | Standard OTel env var |
+
+**Precedence:** Environment variable > YAML config > Default
+
+#### 7.7.4 Hot-Reload Behavior
+
+| Field | Hot-Reloadable | Notes |
+|-------|----------------|-------|
+| `enabled` | ⚠️ Partial | Disable takes effect immediately; enable requires restart |
+| `otlp.endpoint` | ❌ No | Requires restart (exporter is initialized once) |
+| `prometheus.enabled` | ❌ No | Requires restart |
+| `sampling.success_sample_rate` | ✅ Yes | New rate applies to new spans |
+| `batch.*` | ❌ No | Requires restart |
+| `resource.*` | ❌ No | Requires restart |
+
+#### 7.7.5 Behavioral Specifications
+
+| ID | Behavior |
+|----|----------|
+| B-CFG-TEL-001 | When `telemetry.enabled: false`, zero OTLP network traffic is generated |
+| B-CFG-TEL-002 | When `telemetry.enabled: false` AND `prometheus.enabled: true`, the `/metrics` endpoint still works |
+| B-CFG-TEL-003 | When `otlp.protocol: grpc`, log warning "gRPC not supported in v0.2, using http/protobuf" and use http/protobuf |
+| B-CFG-TEL-004 | When `sampling.strategy: tail`, log warning "Tail sampling not supported in v0.2, using head" and use head |
+| B-CFG-TEL-005 | Resource attributes from config are merged with auto-detected K8s attributes (K8s takes precedence on conflict) |
+
 ## 8. Validation Rules
 
 ### 8.1 Validation Rules Table
@@ -622,6 +854,12 @@ pub struct CedarConfig {
 | V-012 | v0.2: Source must be `kind: mcp` | `V02McpOnly` | Error |
 | V-013 | Cedar policy files must exist | `PolicyFileNotFound` | Error |
 | V-014 | Env var references must resolve | `MissingEnvVar` | Warning |
+| V-TEL-001 | `sampling.success_sample_rate` must be 0.0 ≤ rate ≤ 1.0 | `InvalidSampleRate` | Error |
+| V-TEL-002 | `otlp.endpoint` must be valid URL if set | `InvalidOtlpEndpoint` | Error |
+| V-TEL-003 | `otlp.protocol` must be "http/protobuf" or "grpc" | `UnknownOtlpProtocol` | Error |
+| V-TEL-004 | `sampling.strategy` must be "head" or "tail" | `UnknownSamplingStrategy` | Error |
+| V-TEL-005 | `batch.max_queue_size` must be > 0 | `InvalidQueueSize` | Error |
+| V-TEL-006 | `batch.scheduled_delay_ms` must be ≥ 100 | `InvalidBatchDelay` | Error |
 
 ### 8.2 Validation Implementation
 
@@ -1155,6 +1393,11 @@ if !expose.is_visible(tool_name) {
 | `test_rule_matching_first_wins` | First match wins behavior |
 | `test_expose_allowlist` | Allowlist filtering |
 | `test_expose_blocklist` | Blocklist filtering |
+| `test_telemetry_config_defaults` | Telemetry defaults applied correctly |
+| `test_telemetry_invalid_sample_rate` | V-TEL-001 validation (rate out of bounds) |
+| `test_telemetry_invalid_otlp_endpoint` | V-TEL-002 validation (malformed URL) |
+| `test_telemetry_unknown_protocol` | V-TEL-003 validation (invalid protocol) |
+| `test_telemetry_env_override` | OTEL_* env vars override YAML |
 
 ### 11.2 Integration Tests
 
@@ -1338,6 +1581,66 @@ when {
     resource.tool == "transfer_funds" &&
     resource.arguments.amount > 10000
 };
+```
+
+### 13.4 With Full Observability
+
+```yaml
+schema: 1
+
+sources:
+  - id: upstream
+    kind: mcp
+    url: ${UPSTREAM_URL}
+
+governance:
+  defaults:
+    action: forward
+
+  rules:
+    - match: "delete_*"
+      action: approve
+      approval: default
+
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+      token_env: THOUGHTGATE_SLACK_BOT_TOKEN
+    timeout: 10m
+    on_timeout: deny
+
+telemetry:
+  enabled: true
+  otlp:
+    endpoint: "http://otel-collector:4318"
+    protocol: http/protobuf
+  prometheus:
+    enabled: true
+  sampling:
+    strategy: head
+    success_sample_rate: 0.10  # Sample 10% of successful requests
+  batch:
+    max_queue_size: 2048
+    scheduled_delay_ms: 5000
+  resource:
+    service.name: thoughtgate
+    deployment.environment: ${DEPLOY_ENV:-production}
+```
+
+**Required environment variables:**
+```bash
+export UPSTREAM_URL=http://mcp-server:3000
+export THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-your-token
+export DEPLOY_ENV=production  # Optional, defaults to "production"
+```
+
+**Optional OTel overrides:**
+```bash
+# These take precedence over YAML config
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://different-collector:4318
+export OTEL_SERVICE_NAME=my-thoughtgate-instance
 ```
 
 ## 14. Migration & Compatibility

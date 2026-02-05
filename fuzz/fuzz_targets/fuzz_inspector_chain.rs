@@ -20,10 +20,10 @@ use libfuzzer_sys::fuzz_target;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use thoughtgate::buffered_forwarder::BufferedForwarder;
-use thoughtgate::error::ProxyError;
-use thoughtgate::proxy_config::ProxyConfig;
-use thoughtgate::inspector::{Decision, InspectionContext, Inspector};
+use thoughtgate_proxy::buffered_forwarder::BufferedForwarder;
+use thoughtgate_proxy::error::ProxyError;
+use thoughtgate_proxy::proxy_config::ProxyConfig;
+use thoughtgate_core::inspector::{Decision, InspectionContext, Inspector};
 
 /// Fuzz input for inspector chain testing
 #[derive(Arbitrary, Debug)]

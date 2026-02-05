@@ -27,7 +27,7 @@ This requirement defines how ThoughtGate manages its operational lifecycle—sta
 
 ### 1.2 Deployment Context
 
-ThoughtGate runs as a sidecar proxy in Kubernetes. It must:
+ThoughtGate runs as a sidecar proxy in Kubernetes (via `thoughtgate-proxy`). For CLI wrapper process lifecycle (v0.3), see REQ-CORE-008 §7.5. The sidecar must:
 - Start quickly and signal readiness
 - Accept traffic only when fully initialized
 - Drain connections gracefully on shutdown
@@ -86,6 +86,7 @@ The system must additionally:
 | Policy validation | In Scope | Against schema |
 | Policy hot-reload | In Scope | Watch for changes |
 | Task failure on shutdown | In Scope | Transition to failed state |
+| stdio process lifecycle | In Scope | REQ-CORE-008: child process mgmt, signal forwarding, config restoration |
 
 ## 5. Constraints
 

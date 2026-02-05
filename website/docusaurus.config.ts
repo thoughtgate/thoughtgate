@@ -72,7 +72,9 @@ const config: Config = {
           title: 'Documentation',
           items: [
             { label: 'Introduction', to: '/docs' },
+            { label: 'Wrap Your First Agent', to: '/docs/tutorials/wrap-first-agent' },
             { label: 'Quickstart', to: '/docs/how-to/quickstart' },
+            { label: 'Supported Agents', to: '/docs/reference/supported-agents' },
             { label: 'Architecture', to: '/docs/explanation/architecture' },
           ],
         },
