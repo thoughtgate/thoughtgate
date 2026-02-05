@@ -35,8 +35,40 @@ struct TestEnv {
 }
 
 impl TestEnv {
+    /// Ensure mock_mcp and thoughtgate-proxy release binaries exist.
+    ///
+    /// If missing, triggers a cargo build. This makes the benchmark
+    /// self-sufficient regardless of CI step ordering or profile mismatches.
+    fn ensure_binaries() {
+        let mock_path = std::path::Path::new("./target/release/mock_mcp");
+        let proxy_path = std::path::Path::new("./target/release/thoughtgate-proxy");
+
+        if mock_path.exists() && proxy_path.exists() {
+            return;
+        }
+
+        eprintln!("Building release binaries (mock_mcp + thoughtgate-proxy)...");
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "thoughtgate-proxy",
+                "--features",
+                "mock",
+            ])
+            .status()
+            .expect("Failed to run cargo build");
+        assert!(
+            status.success(),
+            "Failed to build binaries. Run: cargo build --release -p thoughtgate-proxy --features mock"
+        );
+    }
+
     /// Start the test environment with mock MCP and proxy.
     fn start() -> Self {
+        Self::ensure_binaries();
+
         let mock_port = 19999;
         let proxy_port = 19467;
         let admin_port = 19469;

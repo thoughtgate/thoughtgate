@@ -230,7 +230,7 @@ jobs:
       - name: Run Criterion benchmarks
         run: |
           echo "Running Criterion benchmarks..."
-          cargo bench -p thoughtgate-proxy --bench ttfb -- --noplot
+          cargo bench -p thoughtgate-proxy --features mock --bench ttfb -- --noplot
           cargo bench -p thoughtgate-core --bench policy_eval -- --noplot || echo "policy_eval benchmark not yet available"
 
           echo ""
