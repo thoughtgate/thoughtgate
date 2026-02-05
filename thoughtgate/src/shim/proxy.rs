@@ -982,6 +982,7 @@ async fn agent_to_server(
             message_id: id_from_kind(&msg.kind).map(|id| jsonrpc_id_to_string(&id)),
             correlation_id: &correlation_id,
             tool_name: tool_name.as_deref(),
+            session_id: None, // stdio shim does not track MCP sessions
             parent_context: if trace_ctx.had_trace_context {
                 Some(&trace_ctx.context)
             } else {
