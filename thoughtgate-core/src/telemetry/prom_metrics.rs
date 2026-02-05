@@ -362,12 +362,14 @@ const STDIO_APPROVAL_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.
 /// exceeded, new values are mapped to `"__other__"` to prevent unbounded time
 /// series growth.
 ///
-/// # Gauge Updates
+/// # Gauge Wiring
 ///
-/// The gauges (connections_active, tasks_pending, cedar_policies_loaded, uptime_seconds)
-/// are registered but NOT wired to update in this prompt. They require hooks into
-/// lifecycle, connection tracking, and policy loading that span multiple subsystems.
-/// Updates will be wired in Prompt 5 (Audit logging integration) or later.
+/// Gauges are wired to runtime state in their respective subsystems:
+/// - `connections_active`: proxy main.rs connection accept/drop lifecycle
+/// - `tasks_pending`: task.rs TaskStore create/decrement_pending_counters
+/// - `cedar_policies_loaded`: engine.rs CedarEngine set_metrics/reload
+/// - `uptime_seconds`: proxy main.rs background tick (15s interval)
+/// - `config_reload_timestamp`: proxy main.rs on config load
 ///
 /// Implements: REQ-OBS-002 §6.1-6.5
 pub struct ThoughtGateMetrics {
@@ -727,7 +729,7 @@ impl ThoughtGateMetrics {
         );
 
         // ─────────────────────────────────────────────────────────────────────
-        // Gauges (registered but NOT wired in this prompt - see struct docs)
+        // Gauges (§6.4 — wired in respective subsystems, see struct docs)
         // ─────────────────────────────────────────────────────────────────────
 
         let connections_active = Family::<TransportLabels, Gauge>::default();
@@ -1180,6 +1182,28 @@ impl ThoughtGateMetrics {
                 outcome: Cow::Owned(outcome.to_string()),
             })
             .inc();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Gauge Update Methods (§6.4)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Set the number of loaded Cedar policies.
+    ///
+    /// Call after initial policy load and each reload.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-003
+    pub fn set_cedar_policies_loaded(&self, count: i64) {
+        self.cedar_policies_loaded.set(count);
+    }
+
+    /// Set the process uptime in seconds.
+    ///
+    /// Called periodically or on scrape to update the uptime gauge.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-004
+    pub fn set_uptime_seconds(&self, seconds: i64) {
+        self.uptime_seconds.set(seconds);
     }
 
     /// Record configuration reload timestamp.
