@@ -11,6 +11,14 @@
 //! allocator pressure in hot paths. For dynamic values (like tool names from
 //! cardinality limiting), `Cow::Owned` is used.
 //!
+//! # Exemplars (B-OBS2-006)
+//!
+//! REQ-OBS-002 §12/B-OBS2-006 specifies trace ID exemplars on histogram
+//! metrics. `prometheus-client` v0.24.0 does not expose an exemplar API, so
+//! this is deferred until the crate gains support or a custom encoder is
+//! justified. No histogram data is lost — only the trace ID cross-link is
+//! absent.
+//!
 //! # Traceability
 //! - Implements: REQ-OBS-002 §6.1 (Counters)
 //! - Implements: REQ-OBS-002 §6.2 (Histograms)
