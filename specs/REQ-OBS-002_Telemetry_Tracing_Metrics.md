@@ -188,10 +188,10 @@ Gateway decision spans record ThoughtGate's 4-gate decision flow as a single chi
 | Attribute | Type | Requirement | Description | Example |
 |-----------|------|-------------|-------------|---------|
 | `thoughtgate.request_id` | string | **Required** | Internal correlation ID | `tg-req-abc123` |
-| `thoughtgate.gate.visibility` | string | **Required** | Gate 1 outcome | `exposed`, `hidden` |
+| `thoughtgate.gate.visibility` | string | **Required** | Gate 1 outcome | `pass`, `block` |
 | `thoughtgate.gate.governance` | string | **Required** | Gate 2 outcome (YAML rule) | `forward`, `deny`, `approve`, `policy` |
 | `thoughtgate.gate.cedar` | string | **Conditional** | Gate 3 outcome (only if Gate 2 = `policy`) | `allow`, `deny` |
-| `thoughtgate.gate.approval` | string | **Conditional** | Gate 4 outcome (only if approval required) | `pending`, `approved`, `denied`, `timeout` |
+| `thoughtgate.gate.approval` | string | **Conditional** | Gate 4 outcome (only if approval required) | `started`, `pending`, `approved`, `denied`, `timeout` |
 | `thoughtgate.governance.rule_id` | string | **Recommended** | Matched YAML governance rule | `rule-financial-tools` |
 | `thoughtgate.upstream.target` | string | **Required** | Upstream MCP server identifier | `mcp-server-filesystem` |
 | `thoughtgate.upstream.latency_ms` | double | **Recommended** | Upstream call round-trip latency | `245.3` |
@@ -331,7 +331,7 @@ All metrics use the `thoughtgate.` prefix namespace. Metrics are exposed via a P
 | MG-004 | `thoughtgate.uptime_seconds` | — | Process uptime |
 | MG-005 | `thoughtgate.config.reload.timestamp` | — | Unix timestamp of last config reload |
 | MG-006 | `thoughtgate.audit.buffer.utilization` | — | Audit writer buffer fullness ratio (0.0–1.0). Alert when approaching 1.0 (see REQ-OBS-003 §B-OBS3-005) |
-| MG-007 | `thoughtgate.telemetry.dropped.total` | `signal` | Telemetry items dropped due to full export queue (labels: `spans`, `metrics`, `logs`) |
+| MC-009 | `thoughtgate.telemetry.dropped.total` | `signal` | Telemetry items dropped due to full export queue (labels: `spans`, `metrics`, `logs`). **Type: Counter** (monotonically increasing, not a gauge). |
 
 ### 6.5 Metric Label Cardinality Management
 
