@@ -64,12 +64,10 @@ jobs:
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
 
-      - name: Install cargo-audit
+      - name: Install cargo-deny
         run: |
-          # Force reinstall to handle cached but missing binaries
-          cargo binstall --no-confirm --force cargo-audit || cargo install --force cargo-audit
-          # Verify installation
-          cargo audit --version
+          cargo binstall --no-confirm --force cargo-deny || cargo install --force cargo-deny
+          cargo deny --version
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -77,8 +75,8 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Security audit
-        run: cargo audit --deny warnings
+      - name: Security & license audit
+        run: cargo deny check
 
   # Stage 1b: Build & Pre-compile Test Dependencies
   # This job compiles everything once, populating the shared cache for all test jobs.
