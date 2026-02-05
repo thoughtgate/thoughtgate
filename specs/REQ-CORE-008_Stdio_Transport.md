@@ -610,12 +610,15 @@ pub enum StdioError {
     #[error("Server process exited unexpectedly with code {code}")]
     ServerCrashed { server_id: String, code: i32 },
 
-    #[error("Framing error on {direction} stream: {error}")]
-    FramingError {
+    #[error("Framing error on {direction} stream: {source}")]
+    Framing {
         server_id: String,
         direction: StreamDirection,
-        error: FramingError,
+        source: FramingError,
     },
+
+    #[error("stdio I/O error: {0}")]
+    StdioIo(std::io::Error),
 
     #[error("Governance engine unavailable")]
     GovernanceUnavailable,
@@ -839,6 +842,9 @@ pub enum StdioError {
         pub task_id: Option<String>,
         pub policy_id: Option<String>,
         pub reason: Option<String>,
+        /// Suggested polling interval in milliseconds for PendingApproval decisions.
+        /// The shim should poll GET /governance/task/{task_id} at this interval.
+        pub poll_interval_ms: Option<u64>,
         /// When true, the shim must initiate graceful shutdown (F-018).
         /// Set by the governance service when `wrap` triggers shutdown (F-019).
         pub shutdown: bool,
@@ -907,15 +913,14 @@ pub enum StdioError {
     1. Normal exit path in `main()`
     2. `Drop` implementation on a `ConfigGuard` RAII struct
     3. Signal handler (SIGTERM, SIGINT) registered via `tokio::signal`
-    4. `ctrlc` handler as additional safety net
-    
+    4. Panic hook (`std::panic::set_hook`) as additional safety net
+
     If restoration fails (e.g., backup file missing), log `ERROR` with the backup path and instructions for manual restoration. Never panic during restoration.
 
 > **Implementation Note (v0.3):** Items 1–3 are implemented (normal exit path,
 > `ConfigGuard` RAII with `Drop`, and `tokio::signal` handlers for SIGTERM/SIGINT).
-> Item 4 (`ctrlc` crate handler) is deferred — the tokio signal handler already
-> intercepts SIGINT before the default handler runs, making `ctrlc` redundant in
-> the tokio runtime context. Can be added as defensive depth in v0.4 if needed.
+> Item 4 uses `std::panic::set_hook` (not `ctrlc` crate) — the panic hook ensures
+> config restoration even when a panic unwinds past the normal Drop path.
 
 - **F-021 (Zombie Prevention):** Always call `child.wait()` after termination of any child process. The `kill_on_drop(true)` on `tokio::process::Child` provides a safety net, but explicit waiting is required for clean exit code collection and log messages.
 
@@ -1219,26 +1224,53 @@ tokio::select! {
 ```rust
 struct ConfigGuard {
     config_path: PathBuf,
-    backup_path: PathBuf,
-    lock_path: PathBuf,    // <config_path>.thoughtgate-lock
+    backup_path: Option<PathBuf>,
+    _lock_file: File,             // Advisory lock held for lifetime; released on drop
     restored: AtomicBool,
+    skip: AtomicBool,             // Set by skip_restore() for --no-restore
 }
 
 impl ConfigGuard {
+    /// Two-phase construction: first acquire the lock, then set the backup path.
+    fn lock(config_path: PathBuf, lock_file: File) -> Self {
+        Self {
+            config_path,
+            backup_path: None,
+            _lock_file: lock_file,
+            restored: AtomicBool::new(false),
+            skip: AtomicBool::new(false),
+        }
+    }
+
+    /// Set the backup path after backup has been written successfully.
+    fn set_backup(&mut self, backup_path: PathBuf) {
+        self.backup_path = Some(backup_path);
+    }
+
+    /// Skip restoration on drop (for --no-restore flag).
+    fn skip_restore(&self) {
+        self.skip.store(true, Ordering::SeqCst);
+    }
+
     fn restore(&self) {
+        if self.skip.load(Ordering::SeqCst) {
+            return;
+        }
         if self.restored.swap(true, Ordering::SeqCst) {
             return; // Already restored
         }
-        if let Err(e) = std::fs::copy(&self.backup_path, &self.config_path) {
-            tracing::error!(?e, backup=?self.backup_path,
-                "Failed to restore config. Manual restore: cp {} {}",
-                self.backup_path.display(), self.config_path.display());
-        } else {
-            let _ = std::fs::remove_file(&self.backup_path);
-            tracing::info!("Config restored from backup");
+        if let Some(ref backup) = self.backup_path {
+            if let Err(e) = std::fs::copy(backup, &self.config_path) {
+                tracing::error!(?e, backup=?backup,
+                    "Failed to restore config. Manual restore: cp {} {}",
+                    backup.display(), self.config_path.display());
+            } else {
+                let _ = std::fs::remove_file(backup);
+                tracing::info!("Config restored from backup");
+            }
         }
-        // Clean up lock file (best-effort)
-        let _ = std::fs::remove_file(&self.lock_path);
+        // Note: lock file is NOT deleted on drop (TOCTOU prevention).
+        // The advisory lock is released when _lock_file is dropped.
     }
 }
 
