@@ -486,6 +486,30 @@ pub struct ThoughtGateMetrics {
     pub config_reload_timestamp: Gauge,
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Lifecycle Metrics (REQ-CORE-005 NFR-001)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Startup duration in seconds (set once when service becomes ready).
+    ///
+    /// Wired: main.rs on mark_ready().
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub startup_duration_seconds: Gauge,
+
+    /// Currently active requests being processed.
+    ///
+    /// Wired: main.rs connection accept/complete lifecycle.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub active_requests: Gauge,
+
+    /// Total number of drain timeouts (counter).
+    ///
+    /// Wired: main.rs shutdown sequence on DrainResult::Timeout.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub drain_timeout_total: Counter,
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Green Path Metrics (REQ-CORE-001)
     // ─────────────────────────────────────────────────────────────────────────
     /// Total bytes transferred through green path.
@@ -768,6 +792,31 @@ impl ThoughtGateMetrics {
         );
 
         // ─────────────────────────────────────────────────────────────────────
+        // Lifecycle Metrics (REQ-CORE-005 NFR-001)
+        // ─────────────────────────────────────────────────────────────────────
+
+        let startup_duration_seconds = Gauge::default();
+        registry.register(
+            "thoughtgate_startup_duration_seconds",
+            "Time from process start to ready state in seconds",
+            startup_duration_seconds.clone(),
+        );
+
+        let active_requests = Gauge::default();
+        registry.register(
+            "thoughtgate_active_requests",
+            "Currently active requests being processed",
+            active_requests.clone(),
+        );
+
+        let drain_timeout_total = Counter::default();
+        registry.register(
+            "thoughtgate_drain_timeout_total",
+            "Total drain timeouts during shutdown",
+            drain_timeout_total.clone(),
+        );
+
+        // ─────────────────────────────────────────────────────────────────────
         // Green Path Metrics (REQ-CORE-001)
         // ─────────────────────────────────────────────────────────────────────
 
@@ -935,6 +984,10 @@ impl ThoughtGateMetrics {
             cedar_policies_loaded,
             uptime_seconds,
             config_reload_timestamp,
+            // Lifecycle
+            startup_duration_seconds,
+            active_requests,
+            drain_timeout_total,
             // Green Path
             green_bytes_total,
             green_streams_active,
@@ -1218,6 +1271,35 @@ impl ThoughtGateMetrics {
             .unwrap_or_default()
             .as_secs() as i64;
         self.config_reload_timestamp.set(timestamp);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lifecycle Methods (REQ-CORE-005 NFR-001)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Record startup duration in seconds.
+    ///
+    /// Call once when the service transitions to Ready state.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn record_startup_duration(&self, seconds: f64) {
+        self.startup_duration_seconds.set(seconds as i64);
+    }
+
+    /// Set the active requests gauge.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn set_active_requests(&self, count: i64) {
+        self.active_requests.set(count);
+    }
+
+    /// Increment drain timeout counter.
+    ///
+    /// Call when a shutdown drain exceeds its timeout.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn record_drain_timeout(&self) {
+        self.drain_timeout_total.inc();
     }
 
     // ─────────────────────────────────────────────────────────────────────────

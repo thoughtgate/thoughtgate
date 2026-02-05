@@ -392,6 +392,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     lifecycle.mark_approval_store_initialized(); // Approval store ready
     lifecycle.mark_ready();
 
+    // Record startup duration metric (REQ-CORE-005/NFR-001)
+    tg_metrics.record_startup_duration(startup_instant.elapsed().as_secs_f64());
+
     // Per-request timeout for proxy connections
     // Prevents indefinitely hanging connections from leaking resources
     let request_timeout =
@@ -466,6 +469,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 transport: std::borrow::Cow::Borrowed("http"),
                             })
                             .inc();
+                        // Update active_requests gauge (REQ-CORE-005/NFR-001)
+                        tg_metrics.active_requests.inc();
 
                         let service_stack = service_stack.clone();
                         let conn_shutdown = shutdown.clone();
@@ -503,6 +508,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     transport: std::borrow::Cow::Borrowed("http"),
                                 })
                                 .dec();
+                            // Update active_requests gauge (REQ-CORE-005/NFR-001)
+                            conn_metrics.active_requests.dec();
 
                             // Explicit drops for clarity (both happen automatically at scope end)
                             drop(request_guard); // Decrements lifecycle request counter
@@ -564,6 +571,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         DrainResult::Timeout { remaining } => {
+            // Record drain timeout metric (REQ-CORE-005/NFR-001)
+            tg_metrics.record_drain_timeout();
             // Return error instead of std::process::exit(1) to allow proper cleanup
             // The caller (main) will convert this to an exit code
             Err(format!(
