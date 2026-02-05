@@ -1,0 +1,3 @@
+[package]
+# Only distribute thoughtgate-proxy; exclude mock_mcp (test utility)
+binaries = ["thoughtgate-proxy"]
