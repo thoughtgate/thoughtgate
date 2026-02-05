@@ -130,6 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let prom_registry = Arc::new(prom_registry);
 
+    // Wire metrics to lifecycle manager for upstream health tracking
+    lifecycle.set_metrics(tg_metrics.clone());
+
     // Phase 3: Create unified shutdown token
     // Implements: REQ-CORE-005/F-004 (Unified Shutdown)
     let shutdown = CancellationToken::new();

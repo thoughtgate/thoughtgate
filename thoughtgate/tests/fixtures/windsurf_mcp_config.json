@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"],
+      "env": { "NODE_ENV": "development" }
+    },
+    "database": {
+      "command": "uvx",
+      "args": ["mcp-server-sqlite", "--db-path", "/tmp/app.db"]
+    }
+  }
+}

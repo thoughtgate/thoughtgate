@@ -168,6 +168,15 @@ pub struct TransportLabels {
     pub transport: Cow<'static, str>,
 }
 
+/// Labels for upstream health gauge (info-style enum metric).
+///
+/// Implements: REQ-CORE-005/NFR-001
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UpstreamHealthLabels {
+    /// Health status: "healthy" or "unhealthy"
+    pub status: Cow<'static, str>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Green Path Labels (REQ-CORE-001)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -517,6 +526,13 @@ pub struct ThoughtGateMetrics {
     /// Implements: REQ-CORE-005/NFR-001
     pub startup_duration_seconds: Gauge,
 
+    /// Upstream server health status (info-style enum gauge).
+    ///
+    /// Wired: lifecycle.rs update_upstream_health().
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub upstream_health: Family<UpstreamHealthLabels, Gauge>,
+
     /// Currently active requests being processed.
     ///
     /// Wired: main.rs connection accept/complete lifecycle.
@@ -824,6 +840,13 @@ impl ThoughtGateMetrics {
         // Lifecycle Metrics (REQ-CORE-005 NFR-001)
         // ─────────────────────────────────────────────────────────────────────
 
+        let upstream_health = Family::<UpstreamHealthLabels, Gauge>::default();
+        registry.register(
+            "thoughtgate_upstream_health",
+            "Upstream server health status (1 = active state)",
+            upstream_health.clone(),
+        );
+
         let startup_duration_seconds = Gauge::default();
         registry.register(
             "thoughtgate_startup_duration_seconds",
@@ -1021,6 +1044,7 @@ impl ThoughtGateMetrics {
             uptime_seconds,
             config_reload_timestamp,
             // Lifecycle
+            upstream_health,
             startup_duration_seconds,
             active_requests,
             drain_timeout_total,
@@ -1313,6 +1337,28 @@ impl ThoughtGateMetrics {
     // ─────────────────────────────────────────────────────────────────────────
     // Lifecycle Methods (REQ-CORE-005 NFR-001)
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// Set upstream health status.
+    ///
+    /// Uses the info-style enum pattern: sets the active state to 1, the other to 0.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn set_upstream_health(&self, is_healthy: bool) {
+        let healthy_val = if is_healthy { 1 } else { 0 };
+        let unhealthy_val = if is_healthy { 0 } else { 1 };
+
+        self.upstream_health
+            .get_or_create(&UpstreamHealthLabels {
+                status: Cow::Borrowed("healthy"),
+            })
+            .set(healthy_val);
+
+        self.upstream_health
+            .get_or_create(&UpstreamHealthLabels {
+                status: Cow::Borrowed("unhealthy"),
+            })
+            .set(unhealthy_val);
+    }
 
     /// Record startup duration in seconds.
     ///
