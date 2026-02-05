@@ -505,18 +505,18 @@ In v0.2, pending approvals are tracked as SEP-1686 tasks waiting for Slack respo
 ```rust
 pub async fn cancel_pending_approvals(
     approval_store: &PendingApprovalStore,
-    shutdown_tx: &broadcast::Sender<()>,
+    cancellation_token: &CancellationToken,
 ) {
     let count = approval_store.count();
-    
+
     if count > 0 {
         tracing::info!(
             pending_approvals = count,
             "Cancelling pending approvals due to shutdown"
         );
-        
-        // Signal all waiters to cancel
-        let _ = shutdown_tx.send(());
+
+        // Signal all waiters to cancel via CancellationToken
+        cancellation_token.cancel();
         
         // Each waiter will:
         // 1. Receive shutdown signal

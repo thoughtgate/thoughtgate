@@ -446,18 +446,17 @@ if rule_match.action == Action::Policy {
     
     match cedar_engine.evaluate(&cedar_request) {
         CedarDecision::Permit => {
-            // Continue to Gate 4
-            GateResult::Approve {
-                workflow: rule_match.approval_workflow.unwrap_or("default".into()),
-                timeout: get_workflow_timeout(&rule_match.approval_workflow),
-            }
+            // Continue to Gate 4 — returns GovernanceDecision::PendingApproval
+            let workflow = rule_match.approval_workflow.unwrap_or("default".into());
+            let timeout = get_workflow_timeout(&workflow);
+            execute_approval(&request, &workflow, timeout).await
         }
         CedarDecision::Forbid { reason, .. } => {
-            GateResult::Deny {
-                code: -32003,
-                message: "Policy denied".into(),
-                source: DenySource::CedarPolicy,
-            }
+            // GovernanceDecision::Deny — return -32003
+            return Err(ThoughtGateError::PolicyDenied {
+                tool: tool_name,
+                reason,
+            });
         }
     }
 }
