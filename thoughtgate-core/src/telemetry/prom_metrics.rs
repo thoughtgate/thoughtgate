@@ -263,6 +263,17 @@ pub struct StdioServerLabels {
     pub server_id: Cow<'static, str>,
 }
 
+/// Labels for stdio server state gauge (info-style enum metric).
+///
+/// Implements: REQ-CORE-008 NFR-002
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StdioServerStateLabels {
+    /// Server identifier (cardinality-limited)
+    pub server_id: Cow<'static, str>,
+    /// Server state: "starting", "running", "exited", "signalled", "failed_to_start"
+    pub state: Cow<'static, str>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Governance Pipeline Labels (REQ-GOV-002)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -595,6 +606,13 @@ pub struct ThoughtGateMetrics {
     ///
     /// Implements: REQ-CORE-008 NFR-002
     pub stdio_active_servers: Gauge,
+
+    /// Per-server lifecycle state (info-style enum gauge).
+    ///
+    /// The active state for each server_id has value 1; all others are 0.
+    ///
+    /// Implements: REQ-CORE-008 NFR-002
+    pub stdio_server_state: Family<StdioServerStateLabels, Gauge>,
 
     /// Approval latency for stdio requests in seconds.
     ///
@@ -939,6 +957,13 @@ impl ThoughtGateMetrics {
             stdio_active_servers.clone(),
         );
 
+        let stdio_server_state = Family::<StdioServerStateLabels, Gauge>::default();
+        registry.register(
+            "thoughtgate_stdio_server_state",
+            "Per-server lifecycle state (1 = active state)",
+            stdio_server_state.clone(),
+        );
+
         let stdio_approval_latency_seconds =
             Family::<StdioServerLabels, Histogram>::new_with_constructor(|| {
                 Histogram::new(STDIO_APPROVAL_BUCKETS.iter().copied())
@@ -1009,6 +1034,7 @@ impl ThoughtGateMetrics {
             stdio_governance_decisions_total,
             stdio_framing_errors_total,
             stdio_active_servers,
+            stdio_server_state,
             stdio_approval_latency_seconds,
             // Governance
             governance_pipeline_failures_total,
@@ -1482,6 +1508,32 @@ impl ThoughtGateMetrics {
     /// Implements: REQ-CORE-008 NFR-002
     pub fn decrement_stdio_active_servers(&self) {
         self.stdio_active_servers.dec();
+    }
+
+    /// Set the lifecycle state for a stdio-managed server.
+    ///
+    /// Sets the given state to 1 and all other states to 0 for the given
+    /// server_id (Prometheus info-style enum pattern).
+    ///
+    /// Implements: REQ-CORE-008 NFR-002
+    pub fn set_stdio_server_state(&self, server_id: &str, state: &str) {
+        let limited_id = self.server_id_limiter.resolve(server_id);
+        let all_states = [
+            "starting",
+            "running",
+            "exited",
+            "signalled",
+            "failed_to_start",
+        ];
+        for s in &all_states {
+            let val = if *s == state { 1 } else { 0 };
+            self.stdio_server_state
+                .get_or_create(&StdioServerStateLabels {
+                    server_id: Cow::Owned(limited_id.to_string()),
+                    state: Cow::Borrowed(s),
+                })
+                .set(val);
+        }
     }
 
     /// Record approval latency for stdio transport.

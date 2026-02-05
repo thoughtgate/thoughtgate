@@ -3773,6 +3773,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "similar",
  "thiserror 2.0.18",
  "thoughtgate-core",
  "tokio",

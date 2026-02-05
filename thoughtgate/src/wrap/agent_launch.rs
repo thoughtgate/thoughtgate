@@ -182,15 +182,14 @@ fn run_dry_run(
 
     let rewritten = std::fs::read_to_string(&temp_config).map_err(StdioError::StdioIo)?;
 
-    println!("--- original: {}", config_path.display());
-    for line in original.lines() {
-        println!("  {line}");
-    }
-    println!();
-    println!("+++ rewritten (dry-run):");
-    for line in rewritten.lines() {
-        println!("  {line}");
-    }
+    let diff = similar::TextDiff::from_lines(&original, &rewritten);
+    print!(
+        "{}",
+        diff.unified_diff().context_radius(3).header(
+            &format!("original: {}", config_path.display()),
+            "rewritten (dry-run)",
+        )
+    );
 
     // Clean up temp directory (best-effort).
     let _ = std::fs::remove_dir_all(&temp_dir);

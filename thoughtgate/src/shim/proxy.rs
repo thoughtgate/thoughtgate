@@ -618,13 +618,23 @@ pub async fn run_shim(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let mut child = cmd.spawn().map_err(|e| StdioError::ServerSpawnError {
-        server_id: server_id.clone(),
-        reason: e.to_string(),
+    if let Some(ref m) = metrics {
+        m.set_stdio_server_state(&server_id, "starting");
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if let Some(ref m) = metrics {
+            m.set_stdio_server_state(&server_id, "failed_to_start");
+        }
+        StdioError::ServerSpawnError {
+            server_id: server_id.clone(),
+            reason: e.to_string(),
+        }
     })?;
 
     if let Some(ref m) = metrics {
         m.increment_stdio_active_servers();
+        m.set_stdio_server_state(&server_id, "running");
     }
     tracing::info!(server_id, server_command, "server process spawned");
 
@@ -1635,6 +1645,7 @@ async fn shutdown_server(
             );
             if let Some(m) = metrics {
                 m.decrement_stdio_active_servers();
+                m.set_stdio_server_state(server_id, "exited");
             }
             return Ok(code);
         }
@@ -1669,6 +1680,7 @@ async fn shutdown_server(
             );
             if let Some(m) = metrics {
                 m.decrement_stdio_active_servers();
+                m.set_stdio_server_state(server_id, "signalled");
             }
             return Ok(code);
         }
@@ -1698,6 +1710,7 @@ async fn shutdown_server(
 
     if let Some(m) = metrics {
         m.decrement_stdio_active_servers();
+        m.set_stdio_server_state(server_id, "signalled");
     }
     Ok(code)
 }

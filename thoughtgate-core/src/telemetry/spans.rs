@@ -1255,7 +1255,10 @@ mod tests {
             .attributes
             .iter()
             .find(|kv| kv.key.as_str() == "cedar.violation.reason");
-        assert!(reason_attr.is_some(), "cedar.violation.reason attribute missing");
+        assert!(
+            reason_attr.is_some(),
+            "cedar.violation.reason attribute missing"
+        );
     }
 
     #[test]
