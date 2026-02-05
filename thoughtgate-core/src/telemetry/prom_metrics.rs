@@ -383,6 +383,9 @@ pub struct ThoughtGateMetrics {
 
     /// Decision counts per gate (cedar, governance_rule).
     ///
+    /// Also covers REQ-CORE-004 `gate_denials_total` — filter with
+    /// `outcome="deny"` to get denial counts per gate.
+    ///
     /// Implements: REQ-OBS-002 §6.1/MC-002
     pub decisions_total: Family<DecisionLabels, Counter>,
 

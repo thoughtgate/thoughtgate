@@ -563,6 +563,39 @@ impl ThoughtGateError {
         }
     }
 
+    /// Emit a structured tracing event for this error.
+    ///
+    /// Centralizes error logging with consistent field names for
+    /// log aggregation and correlation.
+    ///
+    /// Implements: REQ-CORE-004/F-004 (Error Observability)
+    pub fn log_error(&self, method: &str, correlation_id: Option<&str>) {
+        let gate = self.gate().unwrap_or("none");
+        let error_type = self.error_type_name();
+        let code = self.to_jsonrpc_code();
+
+        if let Some(cid) = correlation_id {
+            tracing::warn!(
+                error_type = error_type,
+                jsonrpc_code = code,
+                gate = gate,
+                method = method,
+                correlation_id = cid,
+                "Request error: {}",
+                self
+            );
+        } else {
+            tracing::warn!(
+                error_type = error_type,
+                jsonrpc_code = code,
+                gate = gate,
+                method = method,
+                "Request error: {}",
+                self
+            );
+        }
+    }
+
     /// Converts error to JSON-RPC error response.
     ///
     /// Implements: REQ-CORE-004/§6.4 (Error Mapping Implementation)
