@@ -149,8 +149,10 @@ readinessProbe:
 | Upstream URL | (required) | `UPSTREAM_URL` / `THOUGHTGATE_UPSTREAM` |
 | Upstream health interval | 30s | `THOUGHTGATE_UPSTREAM_HEALTH_INTERVAL_SECS` |
 | Environment | `production` | `THOUGHTGATE_ENVIRONMENT` |
-| Log level | info | `THOUGHTGATE_LOG_LEVEL` |
-| Log format | json | `THOUGHTGATE_LOG_FORMAT` |
+| Log level | info | `RUST_LOG` |
+| Log format | json | *(always JSON; not configurable)* |
+
+> **Implementation note:** The implementation uses `RUST_LOG` (standard Rust convention via `tracing-subscriber`'s `EnvFilter`) instead of `THOUGHTGATE_LOG_LEVEL`. The `THOUGHTGATE_LOG_FORMAT` env var is not implemented — the log format is always JSON.
 
 **Note:** Health, ready, and metrics endpoints are served on the admin port (default 7469), separate from the main proxy port (default 7467).
 
@@ -258,14 +260,22 @@ pub enum LifecycleState {
     Stopped,        // Shutdown complete
 }
 
-/// v0.2 Lifecycle Manager
+/// Lifecycle Manager (v0.3 implementation)
+///
+/// Uses ArcSwap for lock-free state reads and CancellationToken for
+/// cooperative shutdown signalling (replaces broadcast::Sender).
 pub struct LifecycleManager {
-    state: AtomicCell<LifecycleState>,
+    state: ArcSwap<LifecycleState>,
     started_at: Instant,
-    shutdown_signal: Option<broadcast::Sender<()>>,
-    drain_complete: Option<broadcast::Sender<()>>,
+    cancellation_token: CancellationToken,
     active_requests: AtomicUsize,
-    pending_approvals: AtomicUsize,  // v0.2: pending approvals, not tasks
+    // Readiness subsystem checks
+    upstream_health: AtomicBool,
+    config_loaded: AtomicBool,
+    approval_store_initialized: AtomicBool,
+    // Metadata
+    version: &'static str,
+    tg_metrics: Option<Arc<ThoughtGateMetrics>>,
 }
 ```
 
@@ -480,7 +490,9 @@ pub async fn drain_requests(
             active_requests = active,
             "Draining requests..."
         );
-        
+
+        // Note: implementation logs progress every 5s (not every iteration)
+        // to reduce log volume during drain
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -629,7 +641,7 @@ thoughtgate_approvals_cancelled_shutdown   # v0.2
 | Config file deleted while running | Keep old config, log error | EC-OPS-017 |
 | Drain timeout = 0 | Immediate force shutdown | EC-OPS-018 |
 | OOM condition | Log error, exit 137 | EC-OPS-019 |
-| Health probe during shutdown | Return 503 | EC-OPS-020 |
+| Health probe during shutdown | Return 200 (process still alive; correct K8s liveness semantic) | EC-OPS-020 |
 
 ### 9.2 v0.2 Assertions
 
@@ -653,58 +665,63 @@ thoughtgate_approvals_cancelled_shutdown   # v0.2
 
 ## 10. Implementation Reference
 
-### Lifecycle Manager (v0.2)
+### Lifecycle Manager (v0.3)
 
 ```rust
 pub struct LifecycleManager {
-    state: Arc<AtomicCell<LifecycleState>>,
-    shutdown_tx: broadcast::Sender<()>,
+    state: ArcSwap<LifecycleState>,
+    cancellation_token: CancellationToken,
+    started_at: Instant,
     active_requests: Arc<AtomicUsize>,
-    pending_approvals: Arc<AtomicUsize>,
+    // Readiness checks
+    upstream_health: AtomicBool,
+    config_loaded: AtomicBool,
+    approval_store_initialized: AtomicBool,
+    // Metadata
+    version: &'static str,
+    tg_metrics: Option<Arc<ThoughtGateMetrics>>,
 }
 
 impl LifecycleManager {
-    pub fn new() -> Self {
-        let (shutdown_tx, _) = broadcast::channel(1);
+    pub fn new(version: &'static str) -> Self {
         Self {
-            state: Arc::new(AtomicCell::new(LifecycleState::Starting)),
-            shutdown_tx,
+            state: ArcSwap::new(Arc::new(LifecycleState::Starting)),
+            cancellation_token: CancellationToken::new(),
+            started_at: Instant::now(),
             active_requests: Arc::new(AtomicUsize::new(0)),
-            pending_approvals: Arc::new(AtomicUsize::new(0)),
+            upstream_health: AtomicBool::new(false),
+            config_loaded: AtomicBool::new(false),
+            approval_store_initialized: AtomicBool::new(false),
+            version,
+            tg_metrics: None,
         }
     }
-    
+
     pub fn is_ready(&self) -> bool {
-        matches!(self.state.load(), LifecycleState::Ready)
+        matches!(**self.state.load(), LifecycleState::Ready)
     }
-    
+
     pub fn is_shutting_down(&self) -> bool {
         matches!(
-            self.state.load(),
+            **self.state.load(),
             LifecycleState::ShuttingDown | LifecycleState::Stopped
         )
     }
-    
+
     pub fn begin_shutdown(&self) {
-        self.state.store(LifecycleState::ShuttingDown);
-        let _ = self.shutdown_tx.send(());
+        self.state.store(Arc::new(LifecycleState::ShuttingDown));
+        self.cancellation_token.cancel();
     }
-    
-    pub fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {
-        self.shutdown_tx.subscribe()
+
+    /// Returns a CancellationToken that components can await for shutdown.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
     }
-    
+
     pub fn track_request(&self) -> RequestGuard {
         self.active_requests.fetch_add(1, Ordering::SeqCst);
         RequestGuard {
             counter: Arc::clone(&self.active_requests),
-        }
-    }
-    
-    pub fn track_approval(&self) -> ApprovalGuard {
-        self.pending_approvals.fetch_add(1, Ordering::SeqCst);
-        ApprovalGuard {
-            counter: Arc::clone(&self.pending_approvals),
         }
     }
 }
@@ -714,16 +731,6 @@ pub struct RequestGuard {
 }
 
 impl Drop for RequestGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-pub struct ApprovalGuard {
-    counter: Arc<AtomicUsize>,
-}
-
-impl Drop for ApprovalGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::SeqCst);
     }
