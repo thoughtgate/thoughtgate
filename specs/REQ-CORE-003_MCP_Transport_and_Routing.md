@@ -108,8 +108,6 @@ The system must:
 - Upstream client (connection, forwarding, response handling)
 - Request/response correlation
 - SEP-1686 `task` parameter detection
-- SSE event streaming for notifications
-
 ### 4.2 Out of Scope
 - Policy evaluation logic (REQ-POL-001)
 - Configuration loading/parsing (REQ-CFG-001)
@@ -118,6 +116,7 @@ The system must:
 - Task state management (REQ-GOV-001)
 - Approval adapter implementation (REQ-GOV-003)
 - stdio transport (deferred to future version)
+- SSE event streaming for notifications (deferred to v0.3+)
 
 ## 5. Constraints
 
@@ -276,7 +275,7 @@ Content-Type: application/json
 pub struct McpRequest {
     pub id: Option<JsonRpcId>,           // None for notifications
     pub method: String,
-    pub params: Option<serde_json::Value>,
+    pub params: Option<Arc<serde_json::Value>>,
     pub task_metadata: Option<TaskMetadata>,  // SEP-1686
     
     // Internal tracking
@@ -291,58 +290,52 @@ pub struct TaskMetadata {
 pub enum JsonRpcId {
     String(String),
     Number(i64),
+    Null,  // Handles `"id": null` per JSON-RPC 2.0
 }
 ```
 
 ### 6.4 Internal: Gate Routing
 
 ```rust
-/// Result of 4-gate evaluation
-pub enum GateResult {
+/// Result of governance evaluation (Gates 1-3).
+/// Used by both stdio (`GovernanceEvaluator`) and HTTP proxy (`route_through_gates()`).
+pub enum GovernanceDecision {
     /// Forward to upstream immediately
     Forward,
-    
     /// Deny with error
-    Deny { 
-        code: i32, 
-        message: String,
-        source: DenySource,
-    },
-    
-    /// Require approval (Gate 4)
-    Approve {
-        workflow: String,
-        timeout: Duration,
-    },
-    
-    /// Request is not visible (404)
-    NotExposed,
+    Deny,
+    /// Require approval (Gate 4) — returns task ID
+    PendingApproval,
 }
 
-pub enum DenySource {
-    GovernanceRule,    // action: deny
-    CedarPolicy,       // Cedar forbid
-    ApprovalRejected,  // Human rejected
-    ApprovalTimeout,   // Timeout reached
+/// Governance rule action from config/schema.rs
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    Forward,
+    Approve,
+    Deny,
+    Policy,
 }
-```
 
-### 6.5 Internal: Governance Engine Interface
-
-```rust
-/// Governance engine evaluates Gates 1-3
-pub trait GovernanceEngine: Send + Sync {
-    /// Evaluate request through gates 1-3
-    /// Returns GateResult indicating next action
-    fn evaluate(
-        &self,
-        tool_name: &str,
-        source_id: &str,
-        arguments: &serde_json::Value,
-        principal: &Principal,
-    ) -> GateResult;
+/// Result of rule matching in the governance layer
+pub struct MatchResult {
+    pub action: Action,
+    pub policy_id: Option<String>,
+    pub approval_workflow: Option<String>,
+    pub matched_rule: Option<String>,
 }
 ```
+
+### 6.5 Internal: Governance Evaluators
+
+ThoughtGate uses two governance evaluator implementations depending on the transport:
+
+1. **`GovernanceEvaluator`** (stdio transport, `thoughtgate` crate): The shim sends `GovernanceEvaluateRequest` via HTTP to the governance service started by `thoughtgate wrap`. The service runs the 4-gate flow and returns `GovernanceEvaluateResponse` containing a `GovernanceDecision`.
+
+2. **`route_through_gates()`** (HTTP proxy, `thoughtgate-proxy` crate): The proxy evaluates gates inline within the Axum request handler, using the same core governance logic from `thoughtgate-core`.
+
+Both paths produce `GovernanceDecision` (Forward/Deny/PendingApproval) and share the same Cedar engine, config types, and profile logic from `thoughtgate-core`.
 
 ## 7. Functional Requirements
 
@@ -364,6 +357,7 @@ The transport layer MUST route methods to appropriate handlers:
 
 | Method Pattern | Route To | Notes |
 |----------------|----------|-------|
+| `initialize` | `InitializeHandler` | Capability injection (REQ-CORE-007) |
 | `tools/call` | Governance Engine (4-gate flow) | Primary interception point |
 | `tools/list` | Governance Engine | Gate 1 visibility filtering |
 | `resources/list` | Governance Engine | Gate 1 visibility filtering |
@@ -714,7 +708,7 @@ thoughtgate_upstream_reconnects_total  # Track upstream connection stability
 
 | Scenario | Expected Behavior | Test ID |
 |----------|-------------------|---------|
-| Unknown JSON-RPC method | Return -32601 | EC-MCP-001 |
+| Unknown JSON-RPC method | Forward to upstream (proxy pass-through) | EC-MCP-001 |
 | Malformed JSON body | Return -32700 | EC-MCP-002 |
 | Valid JSON, invalid JSON-RPC structure | Return -32600 | EC-MCP-003 |
 | Request body exceeds size limit | Return -32600 with size error | EC-MCP-004 |
@@ -731,7 +725,7 @@ thoughtgate_upstream_reconnects_total  # Track upstream connection stability
 
 | Code | Name | Gate | Description |
 |------|------|------|-------------|
-| -32601 | Method not found | 1 | Tool not exposed |
+| -32015 | Tool Not Exposed | 1 | Tool not exposed (ToolNotExposed) |
 | -32003 | Policy Denied | 3 | Cedar forbid |
 | -32007 | Approval Rejected | 4 | Human rejected |
 | -32008 | Approval Timeout | 4 | Timeout reached |
