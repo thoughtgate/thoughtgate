@@ -1,5 +1,6 @@
 [workspace]
 members = ["thoughtgate-core", "thoughtgate-proxy", "thoughtgate"]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
