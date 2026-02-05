@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::ports::admin_port;
-use thoughtgate_core::lifecycle::LifecycleManager;
+use thoughtgate_core::lifecycle::{LifecycleManager, health_router};
 
 /// Admin server configuration.
 #[derive(Debug, Clone)]
@@ -142,18 +142,24 @@ impl AdminServer {
     ///
     /// # Endpoints
     ///
-    /// - `GET /health` - Liveness probe (always returns 200 if server is running)
-    /// - `GET /ready` - Readiness probe (returns 200 if ready, 503 if not)
+    /// - `GET /health` - Liveness probe (JSON, lifecycle-aware)
+    /// - `GET /ready` - Readiness probe (JSON, checks all subsystems)
     /// - `GET /metrics` - Prometheus metrics
     ///
+    /// Health and readiness handlers delegate to the core library's
+    /// lifecycle-aware implementations that return JSON with version,
+    /// uptime, and individual check results.
+    ///
     /// # Traceability
-    /// - Implements: REQ-CORE-005/F-001 (Health Endpoints)
+    /// - Implements: REQ-CORE-005/F-002, F-003
     pub fn router(&self) -> Router {
-        Router::new()
-            .route("/health", get(health_handler))
-            .route("/ready", get(readiness_handler))
+        // Merge core library health/readiness router (JSON, lifecycle-aware)
+        // with our metrics endpoint
+        let metrics_router = Router::new()
             .route("/metrics", get(metrics_handler))
-            .with_state(self.state.clone())
+            .with_state(self.state.clone());
+
+        health_router(self.state.lifecycle.clone()).merge(metrics_router)
     }
 
     /// Run the admin server.
@@ -188,33 +194,6 @@ impl AdminServer {
             .await?;
 
         Ok(())
-    }
-}
-
-/// Health check handler (liveness probe).
-///
-/// This always returns 200 OK if the server is running.
-/// Used by Kubernetes liveness probes.
-///
-/// # Traceability
-/// - Implements: REQ-CORE-005/F-001 (Liveness Probe)
-async fn health_handler() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
-}
-
-/// Readiness check handler.
-///
-/// Returns 200 OK if the proxy is ready to accept traffic.
-/// Returns 503 Service Unavailable if not ready.
-/// Used by Kubernetes readiness probes.
-///
-/// # Traceability
-/// - Implements: REQ-CORE-005/F-001 (Readiness Probe)
-async fn readiness_handler(State(state): State<AdminState>) -> impl IntoResponse {
-    if state.lifecycle.is_ready() {
-        (StatusCode::OK, "Ready")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "Not Ready")
     }
 }
 
@@ -285,8 +264,12 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
+        // Now returns JSON from core library handler
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"OK");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "healthy");
+        assert!(json["version"].is_string());
+        assert!(json["uptime_seconds"].is_number());
     }
 
     #[tokio::test]
@@ -308,11 +291,20 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Now returns JSON with check details
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "not_ready");
+        assert!(json["checks"].is_object());
     }
 
     #[tokio::test]
     async fn test_readiness_endpoint_ready() {
         let state = create_test_state();
+        state.lifecycle.mark_config_loaded();
+        state.lifecycle.mark_approval_store_initialized();
+        state.lifecycle.update_upstream_health(true, None);
         state.lifecycle.mark_ready();
 
         let admin = AdminServer::with_config(
@@ -331,8 +323,13 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
+        // Now returns JSON with check details
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"Ready");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["checks"]["config_loaded"], true);
+        assert_eq!(json["checks"]["upstream_reachable"], true);
+        assert_eq!(json["checks"]["approval_store_initialized"], true);
     }
 
     #[tokio::test]
