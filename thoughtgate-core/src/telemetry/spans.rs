@@ -698,7 +698,7 @@ pub struct CedarSpanData {
 /// };
 /// let mut span = start_cedar_span(&data, &Context::current());
 /// // ... evaluate Cedar policy ...
-/// finish_cedar_span(&mut span, "allow", "policy-1", 0.15);
+/// finish_cedar_span(&mut span, "allow", "policy-1", 0.15, None);
 /// ```
 ///
 /// Implements: REQ-OBS-002 §5.3
@@ -721,6 +721,8 @@ pub fn start_cedar_span(data: &CedarSpanData, parent_cx: &Context) -> BoxedSpan 
 /// Finish a Cedar evaluation span with decision attributes.
 ///
 /// Sets the decision, policy ID, and duration attributes, then ends the span.
+/// When the decision is "deny" and a `denial_reason` is provided, a
+/// `cedar.denial` span event is recorded per REQ-OBS-002 §5.2.
 ///
 /// # Arguments
 ///
@@ -728,12 +730,28 @@ pub fn start_cedar_span(data: &CedarSpanData, parent_cx: &Context) -> BoxedSpan 
 /// * `decision` - Cedar decision ("allow" or "deny")
 /// * `policy_id` - Determining policy ID
 /// * `duration_ms` - Evaluation duration in milliseconds
+/// * `denial_reason` - Human-readable reason when denied; None for allow
 ///
-/// Implements: REQ-OBS-002 §5.3
-pub fn finish_cedar_span(span: &mut impl Span, decision: &str, policy_id: &str, duration_ms: f64) {
+/// Implements: REQ-OBS-002 §5.3, TC-OBS2-003
+pub fn finish_cedar_span(
+    span: &mut impl Span,
+    decision: &str,
+    policy_id: &str,
+    duration_ms: f64,
+    denial_reason: Option<&str>,
+) {
     span.set_attribute(KeyValue::new(CEDAR_DECISION, decision.to_string()));
     span.set_attribute(KeyValue::new(CEDAR_POLICY_ID, policy_id.to_string()));
     span.set_attribute(KeyValue::new(CEDAR_DURATION_MS, duration_ms));
+
+    // Record cedar.denial span event on deny (REQ-OBS-002 §5.2 / TC-OBS2-003)
+    if let Some(reason) = denial_reason {
+        span.add_event(
+            "cedar.denial",
+            vec![KeyValue::new("cedar.violation.reason", reason.to_string())],
+        );
+    }
+
     span.set_status(Status::Ok);
     span.end();
 }
@@ -1191,7 +1209,7 @@ mod tests {
         };
 
         let mut span = start_cedar_span(&data, &Context::current());
-        finish_cedar_span(&mut span, "allow", "policy-1", 0.15);
+        finish_cedar_span(&mut span, "allow", "policy-1", 0.15, None);
 
         provider.force_flush().expect("flush should succeed");
         let spans = exporter.get_finished_spans().expect("should get spans");
@@ -1200,6 +1218,8 @@ mod tests {
         let finished = &spans[0];
         assert_eq!(finished.name.as_ref(), "cedar.evaluate");
         assert_eq!(finished.span_kind, opentelemetry::trace::SpanKind::Internal);
+        // No denial events on allow
+        assert!(finished.events.is_empty());
     }
 
     #[test]
@@ -1213,7 +1233,13 @@ mod tests {
         };
 
         let mut span = start_cedar_span(&data, &Context::current());
-        finish_cedar_span(&mut span, "deny", "admin-policy", 0.08);
+        finish_cedar_span(
+            &mut span,
+            "deny",
+            "admin-policy",
+            0.08,
+            Some("Forbidden by policy: admin-policy"),
+        );
 
         provider.force_flush().expect("flush should succeed");
         let spans = exporter.get_finished_spans().expect("should get spans");
@@ -1221,6 +1247,15 @@ mod tests {
 
         let finished = &spans[0];
         assert_eq!(finished.name.as_ref(), "cedar.evaluate");
+
+        // TC-OBS2-003: Verify cedar.denial span event
+        assert_eq!(finished.events.len(), 1);
+        assert_eq!(finished.events[0].name.as_ref(), "cedar.denial");
+        let reason_attr = finished.events[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "cedar.violation.reason");
+        assert!(reason_attr.is_some(), "cedar.violation.reason attribute missing");
     }
 
     #[test]
@@ -1241,7 +1276,7 @@ mod tests {
             policy_id: None,
         };
         let mut cedar_span = start_cedar_span(&cedar_data, &parent_cx);
-        finish_cedar_span(&mut cedar_span, "allow", "default", 0.05);
+        finish_cedar_span(&mut cedar_span, "allow", "default", 0.05, None);
 
         // End parent span
         drop(parent_cx);
