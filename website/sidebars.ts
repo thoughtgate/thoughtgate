@@ -6,7 +6,10 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Tutorials',
-      items: ['tutorials/first-proxy'],
+      items: [
+        'tutorials/wrap-first-agent',
+        'tutorials/first-proxy',
+      ],
     },
     {
       type: 'category',
@@ -14,7 +17,9 @@ const sidebars: SidebarsConfig = {
       items: [
         'how-to/quickstart',
         'how-to/install',
+        'how-to/wrap-agents',
         'how-to/write-policies',
+        'how-to/use-profiles',
         'how-to/deploy-kubernetes',
         'how-to/monitor',
         'how-to/troubleshoot',
@@ -24,9 +29,12 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Reference',
       items: [
+        'reference/cli',
         'reference/configuration',
+        'reference/supported-agents',
         'reference/policy-syntax',
         'reference/error-codes',
+        'reference/telemetry',
       ],
     },
     {

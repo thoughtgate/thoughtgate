@@ -1,8 +1,78 @@
 ---
-sidebar_position: 5
+sidebar_position: 8
 ---
 
 # Troubleshoot Common Issues
+
+## CLI Wrapper Issues
+
+### Config not restored after crash
+
+**Symptom:** Your agent's MCP config still points to ThoughtGate shims after a crash.
+
+**Check:**
+
+```bash
+# Look for the backup file
+ls ~/.claude.json.thoughtgate-backup
+```
+
+**Fix:**
+- Manually copy the backup over the config: `cp ~/.claude.json.thoughtgate-backup ~/.claude.json`
+- ThoughtGate registers a panic hook and signal handlers to restore on exit, but an `OOM kill` or `SIGKILL` bypasses these
+- Use `--no-restore` if you intentionally want to keep the rewritten config
+
+### Lock file conflicts
+
+**Symptom:** ThoughtGate exits with "Config already locked" error.
+
+**Check:**
+
+```bash
+# Look for stale lock files
+ls ~/.claude.json.thoughtgate-lock
+```
+
+**Fix:**
+- Ensure no other ThoughtGate instance is running
+- Remove the stale lock file: `rm ~/.claude.json.thoughtgate-lock`
+- Lock files are advisory — they're safe to remove when no ThoughtGate process is active
+
+### Agent not detected
+
+**Symptom:** ThoughtGate exits with "Cannot detect agent type" error.
+
+**Fix:**
+- Use `--agent-type` to specify explicitly: `thoughtgate wrap --agent-type cursor -- /path/to/my-cursor`
+- Auto-detection matches the command basename against known patterns (`claude`, `cursor`, `code`, etc.)
+
+### Double-wrap detection
+
+**Symptom:** ThoughtGate exits with "Config already managed by ThoughtGate" error.
+
+**Fix:**
+- This means the agent config already has ThoughtGate shim commands. Either:
+  - Run the agent directly without `thoughtgate wrap`
+  - Restore the original config from the `.thoughtgate-backup` file
+
+### Shim connection failures
+
+**Symptom:** Shim processes log "governance service unreachable" errors.
+
+**Fix:**
+- The governance service may not have started yet — shims use exponential backoff to retry
+- Check for port conflicts: use `--governance-port` to specify a fixed port
+- Check ThoughtGate's stderr for governance service startup errors
+
+### WOULD_BLOCK but nothing actually blocked
+
+**Symptom:** You see `WOULD_BLOCK` in logs but all requests go through.
+
+**Fix:**
+- This is expected in **development mode** (`--profile development`). Switch to production to enforce blocking:
+  ```bash
+  thoughtgate wrap --profile production -- claude-code
+  ```
 
 ## Connection Issues
 
@@ -79,19 +149,21 @@ docker logs thoughtgate 2>&1 | grep -i slack
 
 **Symptom:** ThoughtGate fails to start with config error.
 
-**Check:**
-
+**Fix (HTTP sidecar):**
 ```bash
 # Verify THOUGHTGATE_CONFIG is set
 echo $THOUGHTGATE_CONFIG
-
-# Verify file exists
 ls -la $THOUGHTGATE_CONFIG
 ```
 
-**Fix:**
-- Set the `THOUGHTGATE_CONFIG` environment variable
-- Ensure the file path is absolute or relative to working directory
+**Fix (CLI wrapper):**
+```bash
+# Default: thoughtgate.yaml in working directory
+ls -la thoughtgate.yaml
+
+# Or specify explicitly
+thoughtgate wrap --thoughtgate-config /path/to/config.yaml -- claude-code
+```
 
 ### All requests denied
 
@@ -101,7 +173,7 @@ ls -la $THOUGHTGATE_CONFIG
 
 ```bash
 # Validate YAML syntax
-cat $THOUGHTGATE_CONFIG | python -c "import sys, yaml; yaml.safe_load(sys.stdin)"
+python -c "import sys, yaml; yaml.safe_load(open('thoughtgate.yaml'))"
 
 # Check ThoughtGate logs
 docker logs thoughtgate 2>&1 | grep -i policy
@@ -187,7 +259,7 @@ curl http://localhost:7469/ready
 
 **Fix:**
 - Tasks expire after the configured timeout (default 5 minutes)
-- In-memory state is lost on pod restart (v0.2 limitation)
+- In-memory state is lost on pod restart
 
 ### Task stuck in "working" state
 

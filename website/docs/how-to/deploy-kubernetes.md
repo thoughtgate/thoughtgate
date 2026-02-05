@@ -26,7 +26,7 @@ spec:
 
     # ThoughtGate sidecar
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:v0.2.2
+      image: ghcr.io/thoughtgate/thoughtgate:v0.3.0
       ports:
         - containerPort: 7467
           name: proxy
@@ -173,7 +173,7 @@ metadata:
 spec:
   containers:
     - name: thoughtgate
-      image: ghcr.io/thoughtgate/thoughtgate:v0.2.2
+      image: ghcr.io/thoughtgate/thoughtgate:v0.3.0
       env:
         - name: THOUGHTGATE_CONFIG
           value: "/etc/thoughtgate/config.yaml"

@@ -1,5 +1,5 @@
 ---
-sidebar_position: 1
+sidebar_position: 2
 ---
 
 # Configuration Reference
@@ -8,11 +8,21 @@ ThoughtGate is configured via a YAML configuration file and environment variable
 
 ## Configuration File
 
-Set the path via `THOUGHTGATE_CONFIG` environment variable:
+**HTTP sidecar (Kubernetes):** Set the path via `THOUGHTGATE_CONFIG` environment variable:
 
 ```bash
 export THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml
 ```
+
+**CLI wrapper (local development):** Pass the path via `--thoughtgate-config` flag (defaults to `thoughtgate.yaml` in the working directory):
+
+```bash
+thoughtgate wrap --thoughtgate-config /path/to/config.yaml -- claude-code
+```
+
+:::note
+`THOUGHTGATE_CONFIG` is only used in HTTP sidecar mode. The CLI wrapper uses `--thoughtgate-config` instead.
+:::
 
 ### Minimal Configuration
 
@@ -67,23 +77,54 @@ cedar:
 
 ## Environment Variables
 
+### Core
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `THOUGHTGATE_CONFIG` | Yes | — | Path to YAML configuration file |
-| `THOUGHTGATE_OUTBOUND_PORT` | No | `7467` | Port for proxy traffic |
-| `THOUGHTGATE_ADMIN_PORT` | No | `7469` | Port for health/metrics endpoints |
+| `THOUGHTGATE_CONFIG` | Sidecar only | — | Path to YAML configuration file (sidecar mode) |
+| `THOUGHTGATE_OUTBOUND_PORT` | No | `7467` | Port for proxy traffic (sidecar mode) |
+| `THOUGHTGATE_ADMIN_PORT` | No | `7469` | Port for health/metrics endpoints (sidecar mode) |
+| `THOUGHTGATE_ENVIRONMENT` | No | `production` | Deployment environment label (for telemetry) |
+
+### Slack & Approvals
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
 | `THOUGHTGATE_SLACK_BOT_TOKEN` | For approvals | — | Slack Bot OAuth token (`xoxb-...`) |
-| `SLACK_CHANNEL` | No | `#approvals` | Default channel for approval messages |
+| `THOUGHTGATE_SLACK_CHANNEL` | No | `#approvals` | Default channel for approval messages |
+| `THOUGHTGATE_APPROVAL_TIMEOUT_SECS` | No | `300` | Default approval timeout in seconds |
+| `THOUGHTGATE_REQUEST_TIMEOUT_SECS` | No | `300` | Default upstream request timeout in seconds |
+| `THOUGHTGATE_MAX_BATCH_SIZE` | No | `100` | Maximum Slack batch polling size |
+
+### Telemetry
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `THOUGHTGATE_TELEMETRY_ENABLED` | No | `false` | Enable OTLP trace export |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | OTLP HTTP endpoint (only `http/protobuf` supported) |
+| `OTEL_SERVICE_NAME` | No | `thoughtgate` | Service name for OTLP resource |
+
+See [Telemetry Reference](/docs/reference/telemetry) for the full telemetry configuration.
 
 ## Port Model
+
+### HTTP Sidecar
 
 ThoughtGate uses an Envoy-inspired 3-port architecture:
 
 | Port | Name | Purpose |
 |------|------|---------|
 | 7467 | Outbound | Client requests → upstream (main proxy) |
-| 7468 | Inbound | Reserved for webhooks (v0.3+) |
+| 7468 | Inbound | Reserved for webhooks |
 | 7469 | Admin | Health checks, metrics |
+
+### CLI Wrapper
+
+In CLI wrapper mode, the governance service binds to an **OS-assigned ephemeral port** on `127.0.0.1`. You can override this with `--governance-port`:
+
+```bash
+thoughtgate wrap --governance-port 9090 -- claude-code
+```
 
 ## Governance Actions
 
@@ -152,12 +193,15 @@ Available on admin port (default 7469):
 
 ## Prometheus Metrics
 
+Key metrics (see [Telemetry Reference](/docs/reference/telemetry) for the complete inventory):
+
 ```
-thoughtgate_requests_total{action="forward|approve|deny"}
-thoughtgate_request_duration_seconds{quantile="0.5|0.95|0.99"}
-thoughtgate_approval_total{result="approved|rejected|timeout"}
-thoughtgate_tasks_active
-thoughtgate_upstream_requests_total{status="success|error|timeout"}
+thoughtgate_requests_total{method, tool_name, status}
+thoughtgate_request_duration_ms{method, tool_name}
+thoughtgate_approval_requests_total{channel, outcome}
+thoughtgate_tasks_pending{task_type}
+thoughtgate_upstream_requests_total{target, status_code}
+thoughtgate_gate_decisions_total{gate, outcome}
 ```
 
 ## Example Configurations
