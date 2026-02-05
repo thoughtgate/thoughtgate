@@ -5,6 +5,10 @@
 //!
 //! Uses `start_governance_service(0, ...)` from `thoughtgate-core` to spin up
 //! a real governance HTTP service, and `cat` as a simple echo server.
+//!
+//! These tests spawn Unix commands (`cat`, `sleep`, `false`) and are gated on
+//! `cfg(unix)` — the CLI wrapper depends on Unix signals and process semantics.
+#![cfg(unix)]
 
 use std::sync::Arc;
 
