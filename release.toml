@@ -1,13 +1,16 @@
 # cargo-release configuration for ThoughtGate
 # https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md
 #
-# Usage:
-#   cargo release patch --execute   # 0.3.0 → 0.3.1
-#   cargo release minor --execute   # 0.3.0 → 0.4.0
-#   cargo release major --execute   # 0.3.0 → 1.0.0
+# Releases are triggered via the "Prepare Release" GitHub Actions workflow:
+#   1. Go to Actions → Prepare Release → Run workflow
+#   2. Enter the version (e.g. 0.4.0)
+#   3. Review and merge the resulting PR
+#   4. Tag Release workflow auto-creates the git tag
+#   5. cargo-dist builds binaries and creates the GitHub Release
 #
-# Dry-run (default without --execute):
+# Local dry-run (to preview changes):
 #   cargo release patch
+#   cargo release minor
 
 # All workspace crates share a single version from [workspace.package]
 shared-version = "workspace"
@@ -35,9 +38,10 @@ pre-release-hook = [
 # Single commit for the entire workspace (version bump + changelog)
 consolidate-commits = true
 
-# Push commit and tag to origin after release
-push = true
-push-remote = "origin"
+# CI workflow handles pushing to a release branch and creating a PR.
+# cargo-release only creates the local commit (no push, no tag).
+push = false
+tag = false
 
 # Only allow releases from the main branch
 allow-branch = ["main"]
