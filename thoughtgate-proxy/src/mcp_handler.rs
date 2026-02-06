@@ -4,13 +4,8 @@
 //!
 //! # Overview
 //!
-//! This module provides two ways to handle MCP requests:
-//!
-//! 1. **`McpHandler`** - Direct handler that processes buffered request bodies.
-//!    Used by ProxyService for in-process MCP handling.
-//!
-//! 2. **`McpServer`** - Optional standalone Axum server for testing or
-//!    running MCP handling separately (deprecated in v0.2).
+//! This module provides `McpHandler`, a direct handler that processes buffered
+//! request bodies. Used by ProxyService for in-process MCP handling.
 //!
 //! # Request Flow
 //!
@@ -25,13 +20,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use axum::{
-    Router,
-    extract::{DefaultBodyLimit, State},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::post,
-};
+use axum::http::StatusCode;
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
@@ -67,7 +56,7 @@ use thoughtgate_core::transport::jsonrpc::{
     JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
 };
 use thoughtgate_core::transport::router::{McpRouter, RouteTarget, TaskMethod};
-use thoughtgate_core::transport::upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};
+use thoughtgate_core::transport::upstream::UpstreamForwarder;
 use tokio_util::sync::CancellationToken;
 
 /// RAII guard that decrements the aggregate buffer counter on drop.
@@ -84,87 +73,9 @@ impl<'a> Drop for BufferGuard<'a> {
     }
 }
 
-/// Configuration for the MCP server.
-///
-/// Implements: REQ-CORE-003/§5.3 (Configuration)
-#[derive(Debug, Clone)]
-pub struct McpServerConfig {
-    /// Listen address (e.g., "0.0.0.0:8080")
-    pub listen_addr: String,
-    /// Maximum request body size in bytes
-    pub max_body_size: usize,
-    /// Maximum concurrent requests
-    pub max_concurrent_requests: usize,
-    /// Maximum number of requests in a JSON-RPC batch
-    pub max_batch_size: usize,
-    /// Upstream client configuration
-    pub upstream: UpstreamConfig,
-}
-
-impl Default for McpServerConfig {
-    fn default() -> Self {
-        Self {
-            listen_addr: "0.0.0.0:8080".to_string(),
-            max_body_size: 1024 * 1024, // 1MB
-            max_concurrent_requests: 10000,
-            max_batch_size: 100,
-            upstream: UpstreamConfig::default(),
-        }
-    }
-}
-
-impl McpServerConfig {
-    /// Load configuration from environment variables.
-    ///
-    /// Implements: REQ-CORE-003/§5.3 (Configuration)
-    ///
-    /// # Environment Variables
-    ///
-    /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
-    /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
-    /// - `THOUGHTGATE_MAX_BATCH_SIZE` (default: 100): Max JSON-RPC batch array length
-    ///
-    /// Plus all upstream configuration variables (see `UpstreamConfig::from_env`).
-    ///
-    /// # Note
-    ///
-    /// The `listen_addr` field is not configurable via environment variable.
-    /// Production deployments use `THOUGHTGATE_OUTBOUND_PORT` and `THOUGHTGATE_ADMIN_PORT`
-    /// via `ports.rs` instead. This field is only used by `McpHandler::run()` for testing.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if upstream configuration is invalid.
-    pub fn from_env() -> Result<Self, ThoughtGateError> {
-        let max_body_size: usize = std::env::var("THOUGHTGATE_MAX_REQUEST_BODY_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024 * 1024); // 1MB default
-
-        let max_concurrent_requests: usize = std::env::var("THOUGHTGATE_MAX_CONCURRENT_REQUESTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10000);
-
-        let max_batch_size: usize = std::env::var("THOUGHTGATE_MAX_BATCH_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
-
-        Ok(Self {
-            listen_addr: "0.0.0.0:8080".to_string(), // Not configurable; use ports.rs in production
-            max_body_size,
-            max_concurrent_requests,
-            max_batch_size,
-            upstream: UpstreamConfig::from_env()?,
-        })
-    }
-}
-
 /// Shared MCP handler state.
 ///
-/// This state is shared across all request handlers. Used by both
-/// `McpHandler` (direct invocation) and `McpServer` (Axum server).
+/// This state is shared across all request handlers via `McpHandler`.
 pub struct McpState {
     /// Upstream client for forwarding requests
     pub upstream: Arc<dyn UpstreamForwarder>,
@@ -494,14 +405,6 @@ impl McpHandler {
         handle_mcp_body_bytes(&self.state, body, Some(parent_context)).await
     }
 
-    /// Handle a buffered MCP request body and return a full Response.
-    ///
-    /// This is used by McpServer for backwards compatibility with Axum.
-    pub async fn handle_response(&self, body: Bytes) -> Response {
-        let (status, bytes) = self.handle(body).await;
-        (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
-    }
-
     /// Get a reference to the internal state (for testing).
     #[cfg(test)]
     pub fn state(&self) -> &Arc<McpState> {
@@ -515,44 +418,6 @@ impl Clone for McpHandler {
             state: self.state.clone(),
         }
     }
-}
-
-/// The MCP server (standalone Axum server).
-///
-/// **Note:** In v0.2, prefer using `McpHandler` via `ProxyService` for unified
-/// traffic handling. This standalone server is retained for testing and
-/// backwards compatibility.
-///
-/// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
-pub struct McpServer {
-    config: McpServerConfig,
-    state: Arc<McpState>,
-    /// Cancellation token for graceful shutdown of background tasks.
-    /// Cancelling this token will stop the ApprovalEngine's polling scheduler.
-    shutdown: CancellationToken,
-}
-
-/// Create governance components (TaskHandler + CedarEngine + optional ApprovalEngine).
-///
-/// This is extracted to avoid duplication between `McpServer::new()` and
-/// `McpServer::with_upstream()`.
-///
-/// # Arguments
-///
-/// * `upstream` - Upstream forwarder for approved requests
-/// * `config` - Optional YAML config (enables Gate 1, 2, 4)
-/// * `shutdown` - Cancellation token for graceful shutdown
-///
-/// # Returns
-///
-/// Tuple of (TaskHandler, CedarEngine, optional ApprovalEngine)
-#[allow(clippy::type_complexity)]
-pub async fn create_governance_components(
-    upstream: Arc<dyn UpstreamForwarder>,
-    config: Option<&Config>,
-    shutdown: CancellationToken,
-) -> Result<(TaskHandler, Arc<CedarEngine>, Option<Arc<ApprovalEngine>>), ThoughtGateError> {
-    create_governance_components_with_metrics(upstream, config, shutdown, None).await
 }
 
 /// Create governance components with optional Prometheus metrics for gauge updates.
@@ -665,211 +530,19 @@ pub async fn create_governance_components_with_metrics(
     Ok((task_handler, cedar_engine, approval_engine))
 }
 
-impl McpServer {
-    /// Create a new MCP server.
-    ///
-    /// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Server configuration
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the upstream client cannot be created.
-    pub async fn new(config: McpServerConfig) -> Result<Self, ThoughtGateError> {
-        let upstream = Arc::new(UpstreamClient::new(config.upstream.clone())?);
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
-        let shutdown = CancellationToken::new();
-        let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), None, shutdown.clone()).await?;
+#[cfg(test)]
+use axum::{
+    Router,
+    extract::{DefaultBodyLimit, State},
+    http::header,
+    response::{IntoResponse, Response},
+    routing::post,
+};
 
-        let state = Arc::new(McpState {
-            upstream,
-            router: McpRouter::new(),
-            task_handler,
-            cedar_engine,
-            config: None,
-            approval_engine,
-            semaphore,
-            max_body_size: config.max_body_size,
-            max_batch_size: config.max_batch_size,
-            capability_cache: Arc::new(CapabilityCache::new()),
-            buffered_bytes: AtomicUsize::new(0),
-            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
-            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
-            evaluator: None,
-        });
-
-        Ok(Self {
-            config,
-            state,
-            shutdown,
-        })
-    }
-
-    /// Create a new MCP server with a custom upstream forwarder.
-    ///
-    /// This is useful for testing with mock upstreams.
-    ///
-    /// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Server configuration
-    /// * `upstream` - Custom upstream forwarder implementation
-    pub async fn with_upstream(
-        config: McpServerConfig,
-        upstream: Arc<dyn UpstreamForwarder>,
-    ) -> Result<Self, ThoughtGateError> {
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
-        let shutdown = CancellationToken::new();
-        let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), None, shutdown.clone()).await?;
-
-        let state = Arc::new(McpState {
-            upstream,
-            router: McpRouter::new(),
-            task_handler,
-            cedar_engine,
-            config: None,
-            approval_engine,
-            semaphore,
-            max_body_size: config.max_body_size,
-            max_batch_size: config.max_batch_size,
-            capability_cache: Arc::new(CapabilityCache::new()),
-            buffered_bytes: AtomicUsize::new(0),
-            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
-            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
-            evaluator: None,
-        });
-
-        Ok(Self {
-            config,
-            state,
-            shutdown,
-        })
-    }
-
-    /// Create a new MCP server with full v0.2 4-gate configuration.
-    ///
-    /// This enables the complete 4-gate model:
-    /// - Gate 1: Visibility (ExposeConfig filtering)
-    /// - Gate 2: Governance Rules (YAML rule matching)
-    /// - Gate 3: Cedar Policy (when action: policy)
-    /// - Gate 4: Approval Workflow (when action: approve)
-    ///
-    /// Implements: REQ-CFG-001 (YAML Configuration)
-    /// Implements: REQ-GOV-002 (Approval Execution Pipeline)
-    ///
-    /// # Arguments
-    ///
-    /// * `server_config` - Server configuration
-    /// * `yaml_config` - YAML configuration for gates 1, 2, 4
-    /// * `shutdown` - Cancellation token for graceful shutdown
-    ///
-    /// # Errors
-    ///
-    /// Returns error if upstream client or approval engine cannot be created.
-    pub async fn with_config(
-        server_config: McpServerConfig,
-        yaml_config: Config,
-        shutdown: CancellationToken,
-    ) -> Result<Self, ThoughtGateError> {
-        let upstream = Arc::new(UpstreamClient::new(server_config.upstream.clone())?);
-        let semaphore = Arc::new(Semaphore::new(server_config.max_concurrent_requests));
-        let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), Some(&yaml_config), shutdown.clone())
-                .await?;
-
-        let state = Arc::new(McpState {
-            upstream,
-            router: McpRouter::new(),
-            task_handler,
-            cedar_engine,
-            config: Some(Arc::new(yaml_config)),
-            approval_engine,
-            semaphore,
-            max_body_size: server_config.max_body_size,
-            max_batch_size: server_config.max_batch_size,
-            capability_cache: Arc::new(CapabilityCache::new()),
-            buffered_bytes: AtomicUsize::new(0),
-            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
-            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
-            evaluator: None,
-        });
-
-        Ok(Self {
-            config: server_config,
-            state,
-            shutdown,
-        })
-    }
-
-    /// Create the axum Router.
-    ///
-    /// Implements: REQ-CORE-003/F-002 (Method Routing)
-    ///
-    /// The router includes:
-    /// - `POST /mcp/v1` - Main MCP endpoint
-    /// - Body size limit enforced at HTTP layer (before buffering)
-    pub fn router(&self) -> Router {
-        // Note: We don't use DefaultBodyLimit here because it returns HTTP 413
-        // instead of a JSON-RPC error. We manually check size in handle_mcp_body_bytes
-        // and return a proper JSON-RPC -32600 error per EC-MCP-004.
-        Router::new()
-            .route("/mcp/v1", post(handle_mcp_request))
-            .layer(DefaultBodyLimit::disable())
-            .with_state(self.state.clone())
-    }
-
-    /// Get the shutdown token.
-    ///
-    /// This can be used to coordinate shutdown with external systems.
-    /// Clone the token to share it with other components that need to be
-    /// notified when the server is shutting down.
-    pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown.clone()
-    }
-
-    /// Trigger graceful shutdown of background tasks.
-    ///
-    /// This cancels the shutdown token, which will stop the ApprovalEngine's
-    /// background polling scheduler and any other tasks listening to the token.
-    ///
-    /// Note: This does not stop the HTTP server itself. Use this in conjunction
-    /// with server shutdown to ensure all background tasks are cleaned up.
-    pub fn shutdown(&self) {
-        info!("Triggering graceful shutdown of background tasks");
-        self.shutdown.cancel();
-    }
-
-    /// Run the server.
-    ///
-    /// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
-    ///
-    /// This blocks until the server is shut down.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the server fails to bind or serve.
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listener = tokio::net::TcpListener::bind(&self.config.listen_addr).await?;
-        info!(addr = %self.config.listen_addr, "MCP server listening");
-        axum::serve(listener, self.router()).await?;
-        Ok(())
-    }
-}
-
-/// Handle POST /mcp/v1 requests (Axum handler).
-///
-/// This is the Axum handler that extracts state and body, then delegates
-/// to `handle_mcp_body_bytes` for the actual processing.
-///
-/// Note: This handler does not extract trace context from headers. For
-/// trace propagation, use `McpHandler::handle_with_context()` via ProxyService.
+/// Handle POST /mcp/v1 requests (Axum handler for tests).
 ///
 /// Implements: REQ-CORE-003/§10 (Request Handler Pattern)
+#[cfg(test)]
 async fn handle_mcp_request(State(state): State<Arc<McpState>>, body: Bytes) -> Response {
     let (status, bytes) = handle_mcp_body_bytes(&state, body, None).await;
     (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
@@ -2950,14 +2623,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let body_str = response_body(response).await;
         assert!(body_str.is_empty());
-    }
-
-    #[test]
-    fn test_default_config() {
-        let config = McpServerConfig::default();
-        assert_eq!(config.listen_addr, "0.0.0.0:8080");
-        assert_eq!(config.max_body_size, 1024 * 1024);
-        assert_eq!(config.max_concurrent_requests, 10000);
     }
 
     // ========================================================================

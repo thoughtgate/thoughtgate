@@ -37,17 +37,9 @@ pub enum ProxyError {
     // ─────────────────────────────────────────────────────────────────────────
     // Common Errors
     // ─────────────────────────────────────────────────────────────────────────
-    /// HTTP protocol error
-    #[error("HTTP error: {0}")]
-    Http(#[from] hyper::Error),
-
     /// Invalid URI or target
     #[error("Invalid URI: {0}")]
     InvalidUri(String),
-
-    /// I/O error during connection or streaming
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
 
     // ─────────────────────────────────────────────────────────────────────────
     // Upstream Connection Errors (used in v0.1 for Forward action)
@@ -68,10 +60,6 @@ pub enum ProxyError {
     /// Client disconnected (should close upstream immediately)
     #[error("Client disconnected")]
     ClientDisconnect,
-
-    /// Request timeout (maps to 408 Request Timeout)
-    #[error("Request timeout: {0}")]
-    RequestTimeout(String),
 
     /// Client error from hyper_util
     #[error("Client error: {0}")]
@@ -140,7 +128,6 @@ impl ProxyError {
     /// # Error Mapping (Green Path - REQ-CORE-001)
     /// - `ConnectionRefused` / `Connection` -> 502 Bad Gateway
     /// - `Timeout` -> 504 Gateway Timeout
-    /// - `RequestTimeout` -> 408 Request Timeout
     /// - `InvalidUri` -> 400 Bad Request
     ///
     /// # Error Mapping (Amber Path - REQ-CORE-002)
@@ -163,10 +150,6 @@ impl ProxyError {
             ProxyError::Timeout(_) => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "504 Gateway Timeout\n\nUpstream server did not respond in time.",
-            ),
-            ProxyError::RequestTimeout(_) => (
-                StatusCode::REQUEST_TIMEOUT,
-                "408 Request Timeout\n\nRequest took too long to complete.",
             ),
             ProxyError::InvalidUri(_) => (
                 StatusCode::BAD_REQUEST,
@@ -237,51 +220,6 @@ impl ProxyError {
                 *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                 resp
             })
-    }
-
-    /// Check if this error indicates an upstream connection failure.
-    pub fn is_upstream_error(&self) -> bool {
-        matches!(
-            self,
-            ProxyError::ConnectionRefused(_)
-                | ProxyError::Connection(_)
-                | ProxyError::Timeout(_)
-                | ProxyError::CompressedResponse(_)
-        )
-    }
-
-    /// Check if this error indicates a client-side issue.
-    pub fn is_client_error(&self) -> bool {
-        matches!(
-            self,
-            ProxyError::InvalidUri(_)
-                | ProxyError::ClientDisconnect
-                | ProxyError::RequestTimeout(_)
-                | ProxyError::PayloadTooLarge(_, _)
-                | ProxyError::BufferTimeout(_)
-        )
-    }
-
-    /// Check if this error is an Amber Path error (REQ-CORE-002).
-    pub fn is_amber_path_error(&self) -> bool {
-        matches!(
-            self,
-            ProxyError::PayloadTooLarge(_, _)
-                | ProxyError::BufferTimeout(_)
-                | ProxyError::BufferSemaphoreExhausted
-                | ProxyError::CompressedResponse(_)
-                | ProxyError::Rejected(_, _)
-                | ProxyError::InspectorPanic(_)
-                | ProxyError::InspectorError(_, _)
-        )
-    }
-
-    /// Check if this error is an inspection failure (panic or error).
-    pub fn is_inspection_failure(&self) -> bool {
-        matches!(
-            self,
-            ProxyError::InspectorPanic(_) | ProxyError::InspectorError(_, _)
-        )
     }
 }
 
