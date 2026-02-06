@@ -50,6 +50,7 @@ use crate::jsonrpc::JsonRpcId;
 use crate::policy::engine::CedarEngine;
 use crate::policy::types::{CedarContext, CedarDecision, CedarResource, TimeContext};
 use crate::profile::Profile;
+use crate::telemetry::{CedarSpanData, ThoughtGateMetrics, finish_cedar_span, start_cedar_span};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -119,6 +120,7 @@ pub struct GovernanceEvaluator {
     principal: Principal,
     profile: Profile,
     scheduler: OnceLock<Arc<PollingScheduler>>,
+    tg_metrics: Option<Arc<ThoughtGateMetrics>>,
 }
 
 impl GovernanceEvaluator {
@@ -143,7 +145,17 @@ impl GovernanceEvaluator {
             principal,
             profile,
             scheduler: OnceLock::new(),
+            tg_metrics: None,
         }
+    }
+
+    /// Builder-style method to set Prometheus metrics.
+    ///
+    /// When set, the evaluator records per-gate decisions and Cedar
+    /// evaluation timing as Prometheus counters/histograms.
+    pub fn with_metrics(mut self, metrics: Arc<ThoughtGateMetrics>) -> Self {
+        self.tg_metrics = Some(metrics);
+        self
     }
 
     /// Set the polling scheduler (after construction).
@@ -200,6 +212,9 @@ impl GovernanceEvaluator {
                     "Gate 1: resource not exposed — denying"
                 );
                 trace.gate1 = Some("block".to_string());
+                if let Some(ref m) = self.tg_metrics {
+                    m.record_gate_decision("gate1", "block");
+                }
                 return (
                     self.deny(
                         Some(format!(
@@ -213,6 +228,9 @@ impl GovernanceEvaluator {
                 );
             }
             trace.gate1 = Some("pass".to_string());
+            if let Some(ref m) = self.tg_metrics {
+                m.record_gate_decision("gate1", "pass");
+            }
             debug!(resource = %resource_name, "Gate 1 passed: resource is visible");
         } else {
             // Source not in config — fail closed regardless of profile.
@@ -223,6 +241,9 @@ impl GovernanceEvaluator {
                 "Gate 1: source not found in config — denying"
             );
             trace.gate1 = Some("block".to_string());
+            if let Some(ref m) = self.tg_metrics {
+                m.record_gate_decision("gate1", "block");
+            }
             return (
                 self.deny(
                     Some(format!(
@@ -251,14 +272,23 @@ impl GovernanceEvaluator {
 
         trace.gate2_rule_id = match_result.matched_rule.clone();
 
+        let gate2_outcome = match match_result.action {
+            Action::Forward => "forward",
+            Action::Deny => "deny",
+            Action::Policy => "policy",
+            Action::Approve => "approve",
+        };
+        trace.gate2 = Some(gate2_outcome.to_string());
+        if let Some(ref m) = self.tg_metrics {
+            m.record_gate_decision("gate2", gate2_outcome);
+        }
+
         match match_result.action {
             Action::Forward => {
-                trace.gate2 = Some("forward".to_string());
                 debug!(resource = %resource_name, "Gate 2: forwarding directly");
                 (self.forward(None), trace)
             }
             Action::Deny => {
-                trace.gate2 = Some("deny".to_string());
                 info!(resource = %resource_name, "Gate 2: denied by governance rule");
                 (
                     self.deny(
@@ -270,7 +300,6 @@ impl GovernanceEvaluator {
                 )
             }
             Action::Policy => {
-                trace.gate2 = Some("policy".to_string());
                 // Gate 3: Cedar policy evaluation
                 debug!(resource = %resource_name, "Gate 2 → Gate 3: evaluating Cedar policy");
                 let resp = self
@@ -285,7 +314,6 @@ impl GovernanceEvaluator {
                 (resp, trace)
             }
             Action::Approve => {
-                trace.gate2 = Some("approve".to_string());
                 // Gate 4: Approval workflow
                 debug!(resource = %resource_name, "Gate 2 → Gate 4: starting approval workflow");
                 let resp = self
@@ -357,6 +385,11 @@ impl GovernanceEvaluator {
             }
         };
 
+        let resource_type = match &cedar_resource {
+            CedarResource::ToolCall { .. } => "ThoughtGate::ToolCall",
+            CedarResource::McpMethod { .. } => "ThoughtGate::McpMethod",
+        };
+
         let cedar_request = crate::policy::types::CedarRequest {
             principal: crate::policy::Principal {
                 app_name: self.principal.app_name.clone(),
@@ -372,6 +405,18 @@ impl GovernanceEvaluator {
             },
         };
 
+        // Create Cedar OTel span (REQ-OBS-002 §5.2)
+        let cedar_span_data = CedarSpanData {
+            tool_name: resource_name.to_string(),
+            policy_id: Some(pid.clone()),
+            principal_type: "ThoughtGate::App".to_string(),
+            principal_id: self.principal.app_name.clone(),
+            action: req.method.clone(),
+            resource_type: resource_type.to_string(),
+            resource_id: resource_name.to_string(),
+        };
+        let mut cedar_span = start_cedar_span(&cedar_span_data, &opentelemetry::Context::current());
+
         let eval_start = std::time::Instant::now();
         let cedar_result = engine.evaluate_v2(&cedar_request);
         let eval_duration_ms = eval_start.elapsed().as_secs_f64() * 1000.0;
@@ -380,6 +425,14 @@ impl GovernanceEvaluator {
         match cedar_result {
             CedarDecision::Permit { .. } => {
                 trace.gate3 = Some("allow".to_string());
+
+                // Finish Cedar span + record metrics
+                finish_cedar_span(&mut cedar_span, "allow", &pid, eval_duration_ms, None);
+                if let Some(ref m) = self.tg_metrics {
+                    m.record_cedar_eval("allow", &pid, eval_duration_ms);
+                    m.record_gate_decision("gate3", "allow");
+                }
+
                 // Cedar permit → Gate 4 (approval workflow)
                 debug!(
                     resource = %resource_name,
@@ -391,6 +444,20 @@ impl GovernanceEvaluator {
             }
             CedarDecision::Forbid { reason, .. } => {
                 trace.gate3 = Some("deny".to_string());
+
+                // Finish Cedar span + record metrics
+                finish_cedar_span(
+                    &mut cedar_span,
+                    "deny",
+                    &pid,
+                    eval_duration_ms,
+                    Some(&reason),
+                );
+                if let Some(ref m) = self.tg_metrics {
+                    m.record_cedar_eval("deny", &pid, eval_duration_ms);
+                    m.record_gate_decision("gate3", "deny");
+                }
+
                 if self.profile == Profile::Development {
                     info!(
                         resource = %resource_name,
@@ -539,6 +606,10 @@ impl GovernanceEvaluator {
             .as_millis() as u64;
 
         trace.gate4 = Some("started".to_string());
+        if let Some(ref m) = self.tg_metrics {
+            m.record_gate_decision("gate4", "started");
+            m.record_approval_request("slack", "pending");
+        }
 
         GovernanceEvaluateResponse {
             decision: GovernanceDecision::PendingApproval,
@@ -1110,5 +1181,159 @@ governance:
         assert_eq!(trace.gate1.as_deref(), Some("pass"));
         assert_eq!(trace.gate2.as_deref(), Some("approve"));
         assert_eq!(trace.gate4.as_deref(), Some("started"));
+    }
+
+    // ── Metrics recording tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_evaluate_records_gate1_pass_metric() {
+        use crate::telemetry::prom_metrics::DecisionLabels;
+        use std::borrow::Cow;
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(ThoughtGateMetrics::new(&mut registry));
+
+        let eval = GovernanceEvaluator::new(
+            default_config(),
+            None,
+            Arc::new(TaskStore::with_defaults()),
+            test_principal(),
+            Profile::Production,
+        )
+        .with_metrics(metrics.clone());
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "safe_read"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Forward);
+
+        // Verify gate1 "pass" counter was incremented
+        let count = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate1"),
+                outcome: Cow::Borrowed("pass"),
+            })
+            .get();
+        assert_eq!(count, 1, "gate1 pass counter should be 1");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_records_gate1_block_metric() {
+        use crate::telemetry::prom_metrics::DecisionLabels;
+        use std::borrow::Cow;
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(ThoughtGateMetrics::new(&mut registry));
+
+        let eval = GovernanceEvaluator::new(
+            blocklist_config(),
+            None,
+            Arc::new(TaskStore::with_defaults()),
+            test_principal(),
+            Profile::Production,
+        )
+        .with_metrics(metrics.clone());
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "hidden_admin"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+
+        // Verify gate1 "block" counter was incremented
+        let count = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate1"),
+                outcome: Cow::Borrowed("block"),
+            })
+            .get();
+        assert_eq!(count, 1, "gate1 block counter should be 1");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_records_gate2_deny_metric() {
+        use crate::telemetry::prom_metrics::DecisionLabels;
+        use std::borrow::Cow;
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(ThoughtGateMetrics::new(&mut registry));
+
+        let eval = GovernanceEvaluator::new(
+            deny_config(),
+            None,
+            Arc::new(TaskStore::with_defaults()),
+            test_principal(),
+            Profile::Production,
+        )
+        .with_metrics(metrics.clone());
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "dangerous_delete"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+
+        // Gate 1 should pass, Gate 2 should deny
+        let gate1 = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate1"),
+                outcome: Cow::Borrowed("pass"),
+            })
+            .get();
+        assert_eq!(gate1, 1, "gate1 should have recorded pass");
+
+        let gate2 = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate2"),
+                outcome: Cow::Borrowed("deny"),
+            })
+            .get();
+        assert_eq!(gate2, 1, "gate2 should have recorded deny");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_records_gate4_metric() {
+        use crate::telemetry::prom_metrics::DecisionLabels;
+        use std::borrow::Cow;
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(ThoughtGateMetrics::new(&mut registry));
+
+        let eval = GovernanceEvaluator::new(
+            deny_config(),
+            None,
+            Arc::new(TaskStore::with_defaults()),
+            test_principal(),
+            Profile::Production,
+        )
+        .with_metrics(metrics.clone());
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "needs_approval_deploy"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::PendingApproval);
+
+        let gate4 = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate4"),
+                outcome: Cow::Borrowed("started"),
+            })
+            .get();
+        assert_eq!(gate4, 1, "gate4 should have recorded started");
     }
 }
