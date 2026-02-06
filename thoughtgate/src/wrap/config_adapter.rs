@@ -1366,13 +1366,15 @@ impl ConfigAdapter for ZedAdapter {
                     }),
                 );
 
-                if let Some(env_obj) = entry_obj.get_mut("env") {
-                    if let Some(env_map) = env_obj.as_object_mut() {
-                        env_map.insert(
-                            "THOUGHTGATE_SERVER_ID".to_string(),
-                            server.id.clone().into(),
-                        );
-                    }
+                // Add THOUGHTGATE_SERVER_ID to env (create env if absent).
+                let env_obj = entry_obj
+                    .entry("env")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(env_map) = env_obj.as_object_mut() {
+                    env_map.insert(
+                        "THOUGHTGATE_SERVER_ID".to_string(),
+                        server.id.clone().into(),
+                    );
                 }
             }
         }
@@ -1709,6 +1711,63 @@ mod tests {
                 "@modelcontextprotocol/server-filesystem",
                 "/tmp",
             ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_zed_rewrite_injects_env_without_existing_env() {
+        let dir = temp_config_dir();
+        let config_path = dir.join("settings.json");
+        let fixture = std::fs::read_to_string(fixture_path("zed_settings.json")).unwrap();
+        std::fs::write(&config_path, &fixture).unwrap();
+
+        let adapter = ZedAdapter;
+        let servers = adapter.parse_servers(&config_path).unwrap();
+        let shim_binary = PathBuf::from("/usr/local/bin/thoughtgate");
+        let options = ShimOptions {
+            server_id: String::new(),
+            governance_endpoint: "http://127.0.0.1:19090".to_string(),
+            profile: Profile::Production,
+            config_path: PathBuf::from("thoughtgate.yaml"),
+        };
+
+        adapter
+            .rewrite_config(&config_path, &servers, &shim_binary, &options)
+            .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        // `simple-server` has no env key in the fixture — verify it was created.
+        let simple_env = rewritten["context_servers"]["simple-server"]["env"]
+            .as_object()
+            .expect("env should be created for servers without existing env");
+        assert_eq!(
+            simple_env
+                .get("THOUGHTGATE_SERVER_ID")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "simple-server"
+        );
+
+        // `filesystem` has an existing env — verify it was preserved.
+        let fs_env = rewritten["context_servers"]["filesystem"]["env"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            fs_env.get("NODE_ENV").unwrap().as_str().unwrap(),
+            "production"
+        );
+        assert_eq!(
+            fs_env
+                .get("THOUGHTGATE_SERVER_ID")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "filesystem"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
