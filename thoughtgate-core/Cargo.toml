@@ -43,7 +43,7 @@ cedar-policy = "4.8.0"
 base64 = "0.22"
 
 # Task lifecycle (REQ-GOV-001)
-governor = "0.8"
+governor = "0.10"
 dashmap = "6"
 sha2 = "0.10"
 hex = "0.4"
