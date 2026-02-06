@@ -39,7 +39,6 @@ pub use spans::{
     McpMessageType,
     McpSpanData,
     // Span Functions (stable API)
-    current_span_context,
     finish_approval_callback_span,
     finish_cedar_span,
     finish_gateway_decision_span,
@@ -64,7 +63,6 @@ pub use propagation::{
     extract_context_from_headers,
     extract_context_from_meta,
     inject_context_into_headers,
-    inject_context_into_meta,
 };
 
 // Re-export prometheus-client metrics

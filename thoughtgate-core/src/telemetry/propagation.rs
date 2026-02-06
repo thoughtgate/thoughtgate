@@ -255,19 +255,6 @@ impl Extractor for MetaExtractor<'_> {
     }
 }
 
-/// Injector for JSON-RPC result `_meta` fields (stdio transport).
-///
-/// Implements the OTel `Injector` trait for W3C trace context injection
-/// into JSON-RPC response _meta fields.
-struct MetaInjector<'a>(&'a mut serde_json::Map<String, serde_json::Value>);
-
-impl Injector for MetaInjector<'_> {
-    fn set(&mut self, key: &str, value: String) {
-        self.0
-            .insert(key.to_string(), serde_json::Value::String(value));
-    }
-}
-
 /// Result of extracting trace context from stdio `_meta` field.
 ///
 /// Includes the extracted OpenTelemetry context and the modified params
@@ -395,79 +382,6 @@ pub fn extract_context_from_meta(
         context,
         stripped_params,
         had_trace_context,
-    }
-}
-
-/// Inject trace context and baggage into JSON-RPC response `result._meta` field.
-///
-/// Per REQ-OBS-002 §7.3.2, when returning a response over stdio, ThoughtGate
-/// injects trace context and baggage into the response's `result._meta` field:
-/// - `_meta.traceparent` and `_meta.tracestate` (W3C Trace Context)
-/// - `_meta.baggage` (W3C Baggage for business context)
-///
-/// # Arguments
-///
-/// * `cx` - The OpenTelemetry context containing the current span and baggage
-/// * `result` - Mutable JSON-RPC result value to inject into
-/// * `session_id` - Optional session identifier to add to tracestate
-///
-/// # Example
-///
-/// ```ignore
-/// let mut result = json!({ "content": [...] });
-/// inject_context_into_meta(&Context::current(), &mut result, Some("session-123"));
-/// // result now has _meta.traceparent, _meta.tracestate, and _meta.baggage
-/// ```
-///
-/// Implements: REQ-OBS-002 §7.3.2, §7.4.3
-pub fn inject_context_into_meta(
-    cx: &Context,
-    result: &mut serde_json::Value,
-    session_id: Option<&str>,
-) {
-    let propagator = composite_propagator();
-
-    // Ensure result is an object
-    let obj = match result.as_object_mut() {
-        Some(o) => o,
-        None => return,
-    };
-
-    // Get or create _meta
-    let meta = obj
-        .entry("_meta")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    let meta_obj = match meta.as_object_mut() {
-        Some(o) => o,
-        None => return,
-    };
-
-    // Inject trace context
-    propagator.inject_context(cx, &mut MetaInjector(meta_obj));
-
-    // Augment tracestate with thoughtgate session identifier
-    if let Some(sid) = session_id {
-        if let Some(existing_ts) = meta_obj.get("tracestate").and_then(|v| v.as_str()) {
-            // Parse existing entries, remove any old thoughtgate entry, prepend new
-            let entries: Vec<&str> = existing_ts
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty() && !s.starts_with("thoughtgate="))
-                .collect();
-            let tg_entry = format!("thoughtgate={}", sid);
-            let mut all_entries = vec![tg_entry.as_str()];
-            all_entries.extend(entries.into_iter().take(31));
-            meta_obj.insert(
-                "tracestate".to_string(),
-                serde_json::Value::String(all_entries.join(",")),
-            );
-        } else {
-            meta_obj.insert(
-                "tracestate".to_string(),
-                serde_json::Value::String(format!("thoughtgate={}", sid)),
-            );
-        }
     }
 }
 
@@ -861,73 +775,5 @@ mod tests {
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
         );
         assert_eq!(stripped["_meta"]["tracestate"], "vendor=value");
-    }
-
-    #[test]
-    fn test_inject_into_meta_basic() {
-        use opentelemetry::trace::Tracer;
-        use opentelemetry_sdk::trace::SdkTracerProvider;
-        use serde_json::json;
-
-        let provider = SdkTracerProvider::builder().build();
-        let tracer = provider.tracer("test");
-        let span = tracer.start("test-span");
-        let cx = Context::current_with_span(span);
-
-        let mut result = json!({
-            "content": [{ "type": "text", "text": "hello" }]
-        });
-
-        inject_context_into_meta(&cx, &mut result, None);
-
-        // Should have _meta.traceparent
-        assert!(result.get("_meta").is_some());
-        let traceparent = result["_meta"]["traceparent"].as_str().unwrap();
-        assert!(traceparent.starts_with("00-"));
-        assert_eq!(traceparent.len(), 55);
-    }
-
-    #[test]
-    fn test_inject_into_meta_with_session_id() {
-        use opentelemetry::trace::Tracer;
-        use opentelemetry_sdk::trace::SdkTracerProvider;
-        use serde_json::json;
-
-        let provider = SdkTracerProvider::builder().build();
-        let tracer = provider.tracer("test");
-        let span = tracer.start("test-span");
-        let cx = Context::current_with_span(span);
-
-        let mut result = json!({ "content": [] });
-
-        inject_context_into_meta(&cx, &mut result, Some("session-xyz"));
-
-        // Should have tracestate with thoughtgate entry
-        let tracestate = result["_meta"]["tracestate"].as_str().unwrap();
-        assert!(tracestate.contains("thoughtgate=session-xyz"));
-    }
-
-    #[test]
-    fn test_inject_into_meta_preserves_existing_meta() {
-        use opentelemetry::trace::Tracer;
-        use opentelemetry_sdk::trace::SdkTracerProvider;
-        use serde_json::json;
-
-        let provider = SdkTracerProvider::builder().build();
-        let tracer = provider.tracer("test");
-        let span = tracer.start("test-span");
-        let cx = Context::current_with_span(span);
-
-        let mut result = json!({
-            "_meta": { "existing": "value" },
-            "content": []
-        });
-
-        inject_context_into_meta(&cx, &mut result, None);
-
-        // Existing _meta field preserved
-        assert_eq!(result["_meta"]["existing"], "value");
-        // traceparent added
-        assert!(result["_meta"]["traceparent"].is_string());
     }
 }

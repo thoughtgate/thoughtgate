@@ -11,7 +11,7 @@
 use opentelemetry::{
     Context, KeyValue,
     global::{self, BoxedSpan},
-    trace::{Link, Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer},
+    trace::{Link, Span, SpanContext, SpanKind, Status, Tracer},
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -527,17 +527,6 @@ pub fn finish_approval_callback_span(
 
     // Set span status based on decision (approved = ok, denied = still ok but noted)
     span.set_status(Status::Ok);
-}
-
-/// Get the current span context from the active span.
-///
-/// Useful for extracting the span context to serialize for async boundaries.
-///
-/// # Returns
-///
-/// The `SpanContext` of the currently active span.
-pub fn current_span_context() -> SpanContext {
-    Context::current().span().span_context().clone()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1151,7 +1140,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_mcp_span_with_parent_context() {
-        use opentelemetry::trace::{SpanId, TraceFlags, TraceId, TraceState};
+        use opentelemetry::trace::{SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 
         let (provider, exporter) = setup_test_provider();
 
