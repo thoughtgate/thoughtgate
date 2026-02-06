@@ -44,7 +44,7 @@ use crate::governance::api::{
     GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse, MessageType,
 };
 use crate::governance::approval::{ApprovalRequest, PollingScheduler};
-use crate::governance::engine::TimeoutAction;
+use crate::governance::engine::{ApprovalEngine, TimeoutAction};
 use crate::governance::task::{Principal, TaskStatus, TaskStore, ToolCallRequest};
 use crate::jsonrpc::JsonRpcId;
 use crate::policy::engine::CedarEngine;
@@ -119,8 +119,12 @@ pub struct GovernanceEvaluator {
     task_store: Arc<TaskStore>,
     principal: Principal,
     profile: Profile,
+    /// Legacy scheduler (used when no ApprovalEngine is configured).
     scheduler: OnceLock<Arc<PollingScheduler>>,
     tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+    /// When set, Gate 4 delegates to the engine (preferred path).
+    /// When None, falls back to direct TaskStore + scheduler manipulation.
+    approval_engine: Option<Arc<ApprovalEngine>>,
 }
 
 impl GovernanceEvaluator {
@@ -146,6 +150,7 @@ impl GovernanceEvaluator {
             profile,
             scheduler: OnceLock::new(),
             tg_metrics: None,
+            approval_engine: None,
         }
     }
 
@@ -155,6 +160,16 @@ impl GovernanceEvaluator {
     /// evaluation timing as Prometheus counters/histograms.
     pub fn with_metrics(mut self, metrics: Arc<ThoughtGateMetrics>) -> Self {
         self.tg_metrics = Some(metrics);
+        self
+    }
+
+    /// Builder-style method to set the approval engine.
+    ///
+    /// When set, Gate 4 delegates to the engine (which handles
+    /// pre-approval pipeline, task creation, Slack posting, and polling).
+    /// When unset, Gate 4 falls back to direct TaskStore + scheduler.
+    pub fn with_approval_engine(mut self, engine: Arc<ApprovalEngine>) -> Self {
+        self.approval_engine = Some(engine);
         self
     }
 
@@ -484,8 +499,8 @@ impl GovernanceEvaluator {
     /// Start an approval workflow (Gate 4).
     ///
     /// In development mode, logs the would-be approval and returns Forward.
-    /// In production, creates a task, transitions to InputRequired, submits
-    /// to the polling scheduler, and returns PendingApproval.
+    /// In production, delegates to `ApprovalEngine` when available (preferred),
+    /// falling back to direct TaskStore + scheduler manipulation (legacy).
     ///
     /// Implements: REQ-CORE-008/F-016, REQ-GOV-001
     async fn start_approval(
@@ -508,7 +523,6 @@ impl GovernanceEvaluator {
             )));
         }
 
-        // ── Production: create task + submit to scheduler ───────────────
         let mcp_request_id = req.id.clone().unwrap_or(JsonRpcId::Null);
 
         let tool_request = ToolCallRequest {
@@ -517,6 +531,44 @@ impl GovernanceEvaluator {
             arguments: extract_arguments(&req.params),
             mcp_request_id,
         };
+
+        // ── Preferred path: delegate to ApprovalEngine ──────────────────
+        if let Some(ref engine) = self.approval_engine {
+            match engine
+                .start_approval(tool_request, self.principal.clone(), None)
+                .await
+            {
+                Ok(result) => {
+                    let poll_interval_ms = result.poll_interval.as_millis() as u64;
+
+                    trace.gate4 = Some("started".to_string());
+                    if let Some(ref m) = self.tg_metrics {
+                        m.record_gate_decision("gate4", "started");
+                        m.record_approval_request("slack", "pending");
+                    }
+
+                    return GovernanceEvaluateResponse {
+                        decision: GovernanceDecision::PendingApproval,
+                        task_id: Some(result.task_id.to_string()),
+                        policy_id: policy_id.map(String::from),
+                        reason: None,
+                        poll_interval_ms: Some(poll_interval_ms),
+                        shutdown: false,
+                        deny_source: None,
+                    };
+                }
+                Err(e) => {
+                    warn!(error = %e, "Gate 4: ApprovalEngine failed — denying");
+                    return self.deny(
+                        Some(format!("Approval workflow failed: {e}")),
+                        policy_id,
+                        DenySource::GovernanceRule,
+                    );
+                }
+            }
+        }
+
+        // ── Legacy path: direct TaskStore + scheduler ───────────────────
 
         // Create task in TaskStore.
         let task = match self.task_store.create(
@@ -566,7 +618,7 @@ impl GovernanceEvaluator {
                 expires_at: task.expires_at,
                 created_at: Utc::now(),
                 correlation_id: task_id.to_string(),
-                request_span_context: None, // TODO: Wire span context from request handler
+                request_span_context: None,
             };
 
             if let Err(e) = scheduler.submit(approval_req).await {
@@ -575,7 +627,6 @@ impl GovernanceEvaluator {
                     error = %e,
                     "Gate 4: failed to submit to scheduler — denying"
                 );
-                // Best-effort: cancel the task we just created.
                 let _ = self.task_store.transition(
                     &task_id,
                     TaskStatus::Failed,

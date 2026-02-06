@@ -18,4 +18,4 @@ pub use jsonrpc::{
     BatchItem, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpRequest, ParsedRequests, TaskMetadata,
 };
 pub use router::{McpRouter, RouteTarget, TaskMethod};
-pub use upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};
+pub use upstream::{NoopUpstreamForwarder, UpstreamClient, UpstreamConfig, UpstreamForwarder};

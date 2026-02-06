@@ -739,6 +739,34 @@ impl UpstreamForwarder for UpstreamClient {
     }
 }
 
+/// No-op upstream forwarder for CLI mode.
+///
+/// `ApprovalEngine` requires an `UpstreamForwarder` but the CLI wrapper
+/// (stdio transport) never executes approved requests through HTTP — it only
+/// creates tasks and returns `PendingApproval`. The agent polls `tasks/result`
+/// via the governance HTTP service, which handles execution separately.
+///
+/// Implements: REQ-CORE-008 (stdio transport)
+pub struct NoopUpstreamForwarder;
+
+#[async_trait::async_trait]
+impl UpstreamForwarder for NoopUpstreamForwarder {
+    async fn forward(&self, _request: &McpRequest) -> Result<JsonRpcResponse, ThoughtGateError> {
+        Err(ThoughtGateError::ServiceUnavailable {
+            reason: "Upstream forwarding not available in CLI mode".into(),
+        })
+    }
+
+    async fn forward_batch(
+        &self,
+        _requests: &[McpRequest],
+    ) -> Result<Vec<JsonRpcResponse>, ThoughtGateError> {
+        Err(ThoughtGateError::ServiceUnavailable {
+            reason: "Upstream forwarding not available in CLI mode".into(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
