@@ -183,6 +183,9 @@ impl GovernanceEvaluator {
 
     /// Evaluate a governance request through Gates 1–4.
     ///
+    /// Uses the evaluator's default principal (set at construction).
+    /// For per-request principal override, use [`evaluate_with_principal`].
+    ///
     /// Returns a [`GovernanceEvaluateResponse`] with the governance decision
     /// and an [`EvalTrace`] carrying per-gate outcome data for telemetry.
     /// The `shutdown` field is NOT set here — the caller (service.rs) sets it.
@@ -192,6 +195,22 @@ impl GovernanceEvaluator {
         &self,
         req: &GovernanceEvaluateRequest,
     ) -> (GovernanceEvaluateResponse, EvalTrace) {
+        self.evaluate_with_principal(req, None).await
+    }
+
+    /// Evaluate with a request-specific principal (overrides default).
+    ///
+    /// Used by the proxy where principal is inferred per-request (e.g.,
+    /// K8s service account detection). Falls back to `self.principal`
+    /// when `principal_override` is `None`.
+    ///
+    /// Implements: REQ-CORE-008/F-016
+    pub async fn evaluate_with_principal(
+        &self,
+        req: &GovernanceEvaluateRequest,
+        principal_override: Option<&Principal>,
+    ) -> (GovernanceEvaluateResponse, EvalTrace) {
+        let effective_principal = principal_override.unwrap_or(&self.principal);
         let mut trace = EvalTrace::default();
 
         // ── Fast-path: only evaluate agent→server requests ───────────────
@@ -323,6 +342,7 @@ impl GovernanceEvaluator {
                         &resource_name,
                         &match_result.policy_id,
                         &match_result.approval_workflow,
+                        effective_principal,
                         &mut trace,
                     )
                     .await;
@@ -336,6 +356,7 @@ impl GovernanceEvaluator {
                         req,
                         &resource_name,
                         match_result.policy_id.as_deref(),
+                        effective_principal,
                         &mut trace,
                     )
                     .await;
@@ -357,6 +378,7 @@ impl GovernanceEvaluator {
         resource_name: &str,
         policy_id: &Option<String>,
         approval_workflow: &Option<String>,
+        principal: &Principal,
         trace: &mut EvalTrace,
     ) -> GovernanceEvaluateResponse {
         let engine = match &self.cedar_engine {
@@ -407,10 +429,10 @@ impl GovernanceEvaluator {
 
         let cedar_request = crate::policy::types::CedarRequest {
             principal: crate::policy::Principal {
-                app_name: self.principal.app_name.clone(),
-                namespace: self.principal.namespace.clone(),
-                service_account: self.principal.service_account.clone(),
-                roles: self.principal.roles.clone(),
+                app_name: principal.app_name.clone(),
+                namespace: principal.namespace.clone(),
+                service_account: principal.service_account.clone(),
+                roles: principal.roles.clone(),
             },
             resource: cedar_resource,
             context: CedarContext {
@@ -425,7 +447,7 @@ impl GovernanceEvaluator {
             tool_name: resource_name.to_string(),
             policy_id: Some(pid.clone()),
             principal_type: "ThoughtGate::App".to_string(),
-            principal_id: self.principal.app_name.clone(),
+            principal_id: principal.app_name.clone(),
             action: req.method.clone(),
             resource_type: resource_type.to_string(),
             resource_id: resource_name.to_string(),
@@ -454,7 +476,7 @@ impl GovernanceEvaluator {
                     policy_id = %pid,
                     "Gate 3: Cedar permit → Gate 4 approval"
                 );
-                self.start_approval(req, resource_name, Some(&pid), trace)
+                self.start_approval(req, resource_name, Some(&pid), principal, trace)
                     .await
             }
             CedarDecision::Forbid { reason, .. } => {
@@ -508,6 +530,7 @@ impl GovernanceEvaluator {
         req: &GovernanceEvaluateRequest,
         resource_name: &str,
         policy_id: Option<&str>,
+        principal: &Principal,
         trace: &mut EvalTrace,
     ) -> GovernanceEvaluateResponse {
         // ── Development mode: skip approval, auto-forward ───────────────
@@ -535,7 +558,7 @@ impl GovernanceEvaluator {
         // ── Preferred path: delegate to ApprovalEngine ──────────────────
         if let Some(ref engine) = self.approval_engine {
             match engine
-                .start_approval(tool_request, self.principal.clone(), None)
+                .start_approval(tool_request, principal.clone(), None)
                 .await
             {
                 Ok(result) => {
@@ -574,7 +597,7 @@ impl GovernanceEvaluator {
         let task = match self.task_store.create(
             tool_request.clone(),
             tool_request,
-            self.principal.clone(),
+            principal.clone(),
             Some(Duration::from_secs(DEFAULT_APPROVAL_TTL_SECS)),
             TimeoutAction::Deny,
         ) {
@@ -614,7 +637,7 @@ impl GovernanceEvaluator {
                 task_id: task_id.clone(),
                 tool_name: resource_name.to_string(),
                 tool_arguments: extract_arguments(&req.params),
-                principal: self.principal.clone(),
+                principal: principal.clone(),
                 expires_at: task.expires_at,
                 created_at: Utc::now(),
                 correlation_id: task_id.to_string(),
@@ -1386,5 +1409,61 @@ governance:
             })
             .get();
         assert_eq!(gate4, 1, "gate4 should have recorded started");
+    }
+
+    // ── Per-request principal tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_evaluate_with_override_principal() {
+        let config = deny_config();
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let eval = GovernanceEvaluator::new(
+            config,
+            None,
+            task_store.clone(),
+            test_principal(), // default: "test-app"
+            Profile::Production,
+        );
+
+        // Override principal
+        let override_principal = Principal::new("k8s-service-account");
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "needs_approval_deploy"})),
+        );
+        let (resp, trace) = eval
+            .evaluate_with_principal(&req, Some(&override_principal))
+            .await;
+
+        // Should still get PendingApproval (principal doesn't change the gate routing)
+        assert_eq!(resp.decision, GovernanceDecision::PendingApproval);
+        assert_eq!(trace.gate4.as_deref(), Some("started"));
+
+        // Verify the task was created with the override principal
+        let task_id_str = resp.task_id.as_deref().expect("should have task_id");
+        let task_id: crate::governance::TaskId = task_id_str.parse().unwrap();
+        let task = task_store.get(&task_id).expect("task should exist");
+        assert_eq!(
+            task.principal.app_name.as_str(),
+            "k8s-service-account",
+            "task should use override principal, not default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_with_principal_none_uses_default() {
+        let eval = test_evaluator(default_config(), Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "safe_read"})),
+        );
+
+        // None principal should behave identically to evaluate()
+        let (resp1, _) = eval.evaluate(&req).await;
+        let (resp2, _) = eval.evaluate_with_principal(&req, None).await;
+        assert_eq!(resp1.decision, resp2.decision);
     }
 }
