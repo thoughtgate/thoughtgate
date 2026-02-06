@@ -7,35 +7,6 @@
 
 use std::time::Duration;
 
-/// State of a managed MCP server process.
-///
-/// Tracks the lifecycle from spawn attempt through running to termination.
-/// Used for metrics reporting (`server_state` gauge) and shutdown coordination.
-///
-/// Implements: REQ-CORE-008 §6.6
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerProcessState {
-    /// Process is starting up (spawn called, not yet confirmed running).
-    Starting,
-    /// Process is running and the stdio proxy is active.
-    Running,
-    /// Process exited normally with an exit code.
-    Exited {
-        /// The process exit code.
-        code: i32,
-    },
-    /// Process was killed by a signal (Unix only).
-    Signalled {
-        /// The signal number that terminated the process.
-        signal: i32,
-    },
-    /// Process failed to start (e.g., command not found).
-    FailedToStart {
-        /// Human-readable description of the failure.
-        reason: String,
-    },
-}
-
 /// Shutdown request with configurable grace periods.
 ///
 /// Controls the escalation sequence in F-018:
@@ -72,28 +43,5 @@ mod tests {
         let req = ShutdownRequest::default();
         assert_eq!(req.stdin_close_grace, Duration::from_secs(5));
         assert_eq!(req.sigterm_grace, Duration::from_secs(2));
-    }
-
-    #[test]
-    fn test_server_process_state_variants() {
-        let starting = ServerProcessState::Starting;
-        let running = ServerProcessState::Running;
-        let exited = ServerProcessState::Exited { code: 0 };
-        let signalled = ServerProcessState::Signalled { signal: 15 };
-        let failed = ServerProcessState::FailedToStart {
-            reason: "command not found".to_string(),
-        };
-
-        assert_eq!(starting, ServerProcessState::Starting);
-        assert_eq!(running, ServerProcessState::Running);
-        assert_eq!(exited, ServerProcessState::Exited { code: 0 });
-        assert_ne!(exited, ServerProcessState::Exited { code: 1 });
-        assert_eq!(signalled, ServerProcessState::Signalled { signal: 15 });
-        assert_eq!(
-            failed,
-            ServerProcessState::FailedToStart {
-                reason: "command not found".to_string()
-            }
-        );
     }
 }
