@@ -223,20 +223,12 @@ pub struct ThoughtGateDefaults {
     /// Interval for expired task cleanup (REQ-GOV-001)
     pub task_cleanup_interval: Duration,
 
-    // Telemetry defaults (REQ-OBS-002)
-
-    /// Default OTLP batch export delay
-    pub telemetry_batch_delay: Duration,
-
-    /// Default OTLP export timeout
-    pub telemetry_export_timeout: Duration,
-
-    /// Default sampling rate (1.0 = 100%)
-    pub telemetry_sample_rate: f64,
-
-    /// Default max span queue size
-    pub telemetry_max_queue_size: usize,
 }
+
+// Note: Telemetry defaults (batch_delay, export_timeout, sample_rate,
+// max_queue_size) are no longer centralized here. They are defined as
+// serde default functions in schema.rs (e.g., `#[serde(default = "default_batch_delay")]`)
+// co-located with their respective config structs (BatchConfig, SamplingConfig).
 
 impl Default for ThoughtGateDefaults {
     fn default() -> Self {
@@ -252,10 +244,6 @@ impl Default for ThoughtGateDefaults {
             max_task_ttl: Duration::from_secs(86400),            // 24 hours
             task_cleanup_interval: Duration::from_secs(60),
             // Telemetry defaults
-            telemetry_batch_delay: Duration::from_secs(5),
-            telemetry_export_timeout: Duration::from_secs(30),
-            telemetry_sample_rate: 1.0,
-            telemetry_max_queue_size: 2048,
         }
     }
 }
@@ -275,10 +263,8 @@ impl Default for ThoughtGateDefaults {
 | `default_task_ttl` | 10m | REQ-GOV-001 | Task expiration |
 | `max_task_ttl` | 24h | REQ-GOV-001 | Maximum task lifetime |
 | `task_cleanup_interval` | 60s | REQ-GOV-001 | Expired task pruning |
-| `telemetry_batch_delay` | 5s | REQ-OBS-002 | OTLP batch export interval |
-| `telemetry_export_timeout` | 30s | REQ-OBS-002 | OTLP export timeout |
-| `telemetry_sample_rate` | 1.0 | REQ-OBS-002 | Trace sampling rate (100%) |
-| `telemetry_max_queue_size` | 2048 | REQ-OBS-002 | Max queued spans |
+
+> **Note:** Telemetry defaults (`telemetry_batch_delay`, `telemetry_export_timeout`, `telemetry_sample_rate`, `telemetry_max_queue_size`) are defined as serde default functions co-located with their config structs in `schema.rs`, not in `ThoughtGateDefaults`.
 
 **Invariants:**
 
@@ -356,17 +342,22 @@ pub struct Config {
 
 ### 6.3 Configuration Loading Interface
 
+> **Implementation note:** The `ConfigLoader` trait described below is not used in the
+> implementation. Instead, configuration loading uses free functions:
+>
+> - `load_config(path: &Path) -> Result<Config, ConfigError>` — load and parse
+> - `validate(config: &Config) -> Result<Vec<ValidationWarning>, ConfigError>` — validate
+> - `load_and_validate(path: &Path) -> Result<(Config, Vec<ValidationWarning>), ConfigError>` — combined
+
 ```rust
-pub trait ConfigLoader: Send + Sync {
-    /// Load configuration from file path
-    fn load(&self, path: &Path) -> Result<Config, ConfigError>;
-    
-    /// Validate configuration
-    fn validate(&self, config: &Config) -> Result<Vec<ValidationWarning>, ConfigError>;
-    
-    /// Watch for changes and notify
-    fn watch(&self, path: &Path, callback: impl Fn(Config) + Send + 'static) -> Result<(), ConfigError>;
-}
+/// Load configuration from file path
+pub fn load_config(path: &Path) -> Result<Config, ConfigError>;
+
+/// Validate configuration
+pub fn validate(config: &Config) -> Result<Vec<ValidationWarning>, ConfigError>;
+
+/// Load and validate in one step
+pub fn load_and_validate(path: &Path) -> Result<(Config, Vec<ValidationWarning>), ConfigError>;
 ```
 
 ## 7. Data Structures
@@ -393,9 +384,10 @@ pub struct Config {
     #[serde(default)]
     pub cedar: Option<CedarConfig>,
     
-    /// Telemetry configuration (tracing, metrics, sampling)
+    /// Telemetry configuration (tracing, metrics, sampling).
+    /// Optional — when absent, telemetry is disabled.
     #[serde(default)]
-    pub telemetry: TelemetryConfig,
+    pub telemetry: Option<TelemetryYamlConfig>,
 }
 ```
 
@@ -548,7 +540,9 @@ pub enum SourceFilter {
 ### 7.5 Approval Configuration (v0.2: Human Only)
 
 ```rust
-/// Map of workflow name to configuration
+/// Map of workflow name to configuration.
+/// Note: this type alias is not used in the implementation — the approval
+/// field is typed inline as `HashMap<String, HumanWorkflow>`.
 pub type ApprovalWorkflows = HashMap<String, HumanWorkflow>;
 
 #[derive(Debug, Deserialize)]
@@ -721,15 +715,17 @@ pub struct TelemetryConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct OtlpConfig {
-    /// OTLP endpoint URL (e.g., "http://collector:4318")
-    pub endpoint: Option<String>,
-    
+    /// OTLP endpoint URL (e.g., "http://collector:4318").
+    /// Required when telemetry is enabled — export will fail without it.
+    pub endpoint: String,
+
     /// Export protocol: "http/protobuf" or "grpc"
     /// v0.2: grpc falls back to http/protobuf
     #[serde(default = "default_otlp_protocol")]
     pub protocol: String,
-    
-    /// Optional headers for authentication
+
+    /// Optional headers for authentication (e.g., Authorization: "Bearer ...")
+    /// Now implemented — headers are passed to the OTLP exporter.
     #[serde(default)]
     pub headers: HashMap<String, String>,
 }
@@ -922,9 +918,11 @@ impl Config {
             }
             
             // V-006: approval workflow must exist
+            // Note: all workflow names must be explicitly defined — there is
+            // no special "default" name that bypasses this check.
             if rule.action == Action::Approve {
                 if let Some(ref workflow) = rule.approval {
-                    if !workflow_names.contains(workflow.as_str()) && workflow != "default" {
+                    if !workflow_names.contains(workflow.as_str()) {
                         return Err(ConfigError::UndefinedWorkflow {
                             workflow: workflow.clone(),
                             pattern: rule.pattern.clone(),
@@ -1000,7 +998,7 @@ pub enum ConfigError {
     PolicyFileNotFound { path: PathBuf },
     
     #[error("YAML parse error: {0}")]
-    ParseError(#[from] serde_yaml::Error),
+    ParseError(#[from] serde_saphyr::Error),
     
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),

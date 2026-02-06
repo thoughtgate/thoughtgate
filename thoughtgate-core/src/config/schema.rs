@@ -702,6 +702,8 @@ pub struct StdioTelemetryConfig {
 }
 
 /// OTLP exporter configuration.
+///
+/// Implements: REQ-CFG-001 §8.2
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OtlpConfig {
     /// OTLP HTTP endpoint (e.g., "http://otel-collector:4318").
@@ -710,6 +712,13 @@ pub struct OtlpConfig {
     /// Protocol: only "http/protobuf" supported in v0.2.
     #[serde(default = "default_otlp_protocol")]
     pub protocol: String,
+
+    /// Custom HTTP headers for OTLP export (e.g., Authorization tokens).
+    ///
+    /// Values may contain `${ENV_VAR:-default}` references resolved at config
+    /// load time.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 fn default_otlp_protocol() -> String {

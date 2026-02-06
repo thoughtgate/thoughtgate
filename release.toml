@@ -1,0 +1,46 @@
+# cargo-release configuration for ThoughtGate
+# https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md
+#
+# Usage:
+#   cargo release patch --execute   # 0.3.0 → 0.3.1
+#   cargo release minor --execute   # 0.3.0 → 0.4.0
+#   cargo release major --execute   # 0.3.0 → 1.0.0
+#
+# Dry-run (default without --execute):
+#   cargo release patch
+
+# All workspace crates share a single version from [workspace.package]
+shared-version = "workspace"
+
+# No crates.io publishing — ThoughtGate distributes via cargo-dist binaries
+publish = false
+
+# Tag format: v0.3.1 (matches cargo-dist release.yml trigger pattern)
+tag-name = "v{{version}}"
+tag-message = "chore(release): v{{version}}"
+
+# Commit message follows conventional commits format
+pre-release-commit-message = "chore(release): prepare v{{version}}"
+
+# Run git-cliff to regenerate CHANGELOG.md before the release commit.
+# cargo-release runs this hook from each crate's subdirectory, but we need
+# git-cliff to cover the entire workspace and write to the workspace root.
+# Using bash -c lets us expand $WORKSPACE_ROOT (set by cargo-release).
+pre-release-hook = [
+    "bash", "-c",
+    "git-cliff --repository \"$WORKSPACE_ROOT\" --tag \"$1\" --output \"$WORKSPACE_ROOT/CHANGELOG.md\"",
+    "--", "v{{version}}",
+]
+
+# Single commit for the entire workspace (version bump + changelog)
+consolidate-commits = true
+
+# Push commit and tag to origin after release
+push = true
+push-remote = "origin"
+
+# Only allow releases from the main branch
+allow-branch = ["main"]
+
+# When bumping workspace version, upgrade dependent crate versions too
+dependent-version = "upgrade"

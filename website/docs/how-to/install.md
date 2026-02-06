@@ -6,6 +6,29 @@ sidebar_position: 2
 
 ThoughtGate has two binaries: the **CLI wrapper** (`thoughtgate`) for local development, and the **HTTP sidecar** (`thoughtgate-proxy`) for Kubernetes deployments.
 
+## Shell Installer (Recommended)
+
+The fastest way to install ThoughtGate:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/thoughtgate/thoughtgate/releases/latest/download/thoughtgate-installer.sh | sh
+```
+
+## Homebrew
+
+```bash
+brew install thoughtgate/thoughtgate
+```
+
+## cargo-binstall
+
+If you have [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+
+```bash
+cargo binstall thoughtgate
+```
+
 ## From Source
 
 ### Prerequisites

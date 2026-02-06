@@ -11,6 +11,14 @@
 //! allocator pressure in hot paths. For dynamic values (like tool names from
 //! cardinality limiting), `Cow::Owned` is used.
 //!
+//! # Exemplars (B-OBS2-006)
+//!
+//! REQ-OBS-002 §12/B-OBS2-006 specifies trace ID exemplars on histogram
+//! metrics. `prometheus-client` v0.24.0 does not expose an exemplar API, so
+//! this is deferred until the crate gains support or a custom encoder is
+//! justified. No histogram data is lost — only the trace ID cross-link is
+//! absent.
+//!
 //! # Traceability
 //! - Implements: REQ-OBS-002 §6.1 (Counters)
 //! - Implements: REQ-OBS-002 §6.2 (Histograms)
@@ -160,6 +168,15 @@ pub struct TransportLabels {
     pub transport: Cow<'static, str>,
 }
 
+/// Labels for upstream health gauge (info-style enum metric).
+///
+/// Implements: REQ-CORE-005/NFR-001
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UpstreamHealthLabels {
+    /// Health status: "healthy" or "unhealthy"
+    pub status: Cow<'static, str>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Green Path Labels (REQ-CORE-001)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,6 +280,17 @@ pub struct StdioServerLabels {
     pub server_id: Cow<'static, str>,
 }
 
+/// Labels for stdio server state gauge (info-style enum metric).
+///
+/// Implements: REQ-CORE-008 NFR-002
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StdioServerStateLabels {
+    /// Server identifier (cardinality-limited)
+    pub server_id: Cow<'static, str>,
+    /// Server state: "starting", "running", "exited", "signalled", "failed_to_start"
+    pub state: Cow<'static, str>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Governance Pipeline Labels (REQ-GOV-002)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -362,12 +390,14 @@ const STDIO_APPROVAL_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.
 /// exceeded, new values are mapped to `"__other__"` to prevent unbounded time
 /// series growth.
 ///
-/// # Gauge Updates
+/// # Gauge Wiring
 ///
-/// The gauges (connections_active, tasks_pending, cedar_policies_loaded, uptime_seconds)
-/// are registered but NOT wired to update in this prompt. They require hooks into
-/// lifecycle, connection tracking, and policy loading that span multiple subsystems.
-/// Updates will be wired in Prompt 5 (Audit logging integration) or later.
+/// Gauges are wired to runtime state in their respective subsystems:
+/// - `connections_active`: proxy main.rs connection accept/drop lifecycle
+/// - `tasks_pending`: task.rs TaskStore create/decrement_pending_counters
+/// - `cedar_policies_loaded`: engine.rs CedarEngine set_metrics/reload
+/// - `uptime_seconds`: proxy main.rs background tick (15s interval)
+/// - `config_reload_timestamp`: proxy main.rs on config load
 ///
 /// Implements: REQ-OBS-002 §6.1-6.5
 pub struct ThoughtGateMetrics {
@@ -380,6 +410,9 @@ pub struct ThoughtGateMetrics {
     pub requests_total: Family<RequestLabels, Counter>,
 
     /// Decision counts per gate (cedar, governance_rule).
+    ///
+    /// Also covers REQ-CORE-004 `gate_denials_total` — filter with
+    /// `outcome="deny"` to get denial counts per gate.
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-002
     pub decisions_total: Family<DecisionLabels, Counter>,
@@ -484,6 +517,37 @@ pub struct ThoughtGateMetrics {
     pub config_reload_timestamp: Gauge,
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Lifecycle Metrics (REQ-CORE-005 NFR-001)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Startup duration in seconds (set once when service becomes ready).
+    ///
+    /// Wired: main.rs on mark_ready().
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub startup_duration_seconds: Gauge,
+
+    /// Upstream server health status (info-style enum gauge).
+    ///
+    /// Wired: lifecycle.rs update_upstream_health().
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub upstream_health: Family<UpstreamHealthLabels, Gauge>,
+
+    /// Currently active requests being processed.
+    ///
+    /// Wired: main.rs connection accept/complete lifecycle.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub active_requests: Gauge,
+
+    /// Total number of drain timeouts (counter).
+    ///
+    /// Wired: main.rs shutdown sequence on DrainResult::Timeout.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub drain_timeout_total: Counter,
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Green Path Metrics (REQ-CORE-001)
     // ─────────────────────────────────────────────────────────────────────────
     /// Total bytes transferred through green path.
@@ -566,6 +630,13 @@ pub struct ThoughtGateMetrics {
     ///
     /// Implements: REQ-CORE-008 NFR-002
     pub stdio_active_servers: Gauge,
+
+    /// Per-server lifecycle state (info-style enum gauge).
+    ///
+    /// The active state for each server_id has value 1; all others are 0.
+    ///
+    /// Implements: REQ-CORE-008 NFR-002
+    pub stdio_server_state: Family<StdioServerStateLabels, Gauge>,
 
     /// Approval latency for stdio requests in seconds.
     ///
@@ -727,7 +798,7 @@ impl ThoughtGateMetrics {
         );
 
         // ─────────────────────────────────────────────────────────────────────
-        // Gauges (registered but NOT wired in this prompt - see struct docs)
+        // Gauges (§6.4 — wired in respective subsystems, see struct docs)
         // ─────────────────────────────────────────────────────────────────────
 
         let connections_active = Family::<TransportLabels, Gauge>::default();
@@ -763,6 +834,38 @@ impl ThoughtGateMetrics {
             "thoughtgate_config_reload_timestamp",
             "Unix timestamp of last configuration reload",
             config_reload_timestamp.clone(),
+        );
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Lifecycle Metrics (REQ-CORE-005 NFR-001)
+        // ─────────────────────────────────────────────────────────────────────
+
+        let upstream_health = Family::<UpstreamHealthLabels, Gauge>::default();
+        registry.register(
+            "thoughtgate_upstream_health",
+            "Upstream server health status (1 = active state)",
+            upstream_health.clone(),
+        );
+
+        let startup_duration_seconds = Gauge::default();
+        registry.register(
+            "thoughtgate_startup_duration_seconds",
+            "Time from process start to ready state in seconds",
+            startup_duration_seconds.clone(),
+        );
+
+        let active_requests = Gauge::default();
+        registry.register(
+            "thoughtgate_active_requests",
+            "Currently active requests being processed",
+            active_requests.clone(),
+        );
+
+        let drain_timeout_total = Counter::default();
+        registry.register(
+            "thoughtgate_drain_timeout_total",
+            "Total drain timeouts during shutdown",
+            drain_timeout_total.clone(),
         );
 
         // ─────────────────────────────────────────────────────────────────────
@@ -885,6 +988,13 @@ impl ThoughtGateMetrics {
             stdio_active_servers.clone(),
         );
 
+        let stdio_server_state = Family::<StdioServerStateLabels, Gauge>::default();
+        registry.register(
+            "thoughtgate_stdio_server_state",
+            "Per-server lifecycle state (1 = active state)",
+            stdio_server_state.clone(),
+        );
+
         let stdio_approval_latency_seconds =
             Family::<StdioServerLabels, Histogram>::new_with_constructor(|| {
                 Histogram::new(STDIO_APPROVAL_BUCKETS.iter().copied())
@@ -933,6 +1043,11 @@ impl ThoughtGateMetrics {
             cedar_policies_loaded,
             uptime_seconds,
             config_reload_timestamp,
+            // Lifecycle
+            upstream_health,
+            startup_duration_seconds,
+            active_requests,
+            drain_timeout_total,
             // Green Path
             green_bytes_total,
             green_streams_active,
@@ -951,6 +1066,7 @@ impl ThoughtGateMetrics {
             stdio_governance_decisions_total,
             stdio_framing_errors_total,
             stdio_active_servers,
+            stdio_server_state,
             stdio_approval_latency_seconds,
             // Governance
             governance_pipeline_failures_total,
@@ -1182,6 +1298,28 @@ impl ThoughtGateMetrics {
             .inc();
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Gauge Update Methods (§6.4)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Set the number of loaded Cedar policies.
+    ///
+    /// Call after initial policy load and each reload.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-003
+    pub fn set_cedar_policies_loaded(&self, count: i64) {
+        self.cedar_policies_loaded.set(count);
+    }
+
+    /// Set the process uptime in seconds.
+    ///
+    /// Called periodically or on scrape to update the uptime gauge.
+    ///
+    /// Implements: REQ-OBS-002 §6.4/MG-004
+    pub fn set_uptime_seconds(&self, seconds: i64) {
+        self.uptime_seconds.set(seconds);
+    }
+
     /// Record configuration reload timestamp.
     ///
     /// Updates the config_reload_timestamp gauge to the current Unix timestamp.
@@ -1194,6 +1332,57 @@ impl ThoughtGateMetrics {
             .unwrap_or_default()
             .as_secs() as i64;
         self.config_reload_timestamp.set(timestamp);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lifecycle Methods (REQ-CORE-005 NFR-001)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Set upstream health status.
+    ///
+    /// Uses the info-style enum pattern: sets the active state to 1, the other to 0.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn set_upstream_health(&self, is_healthy: bool) {
+        let healthy_val = if is_healthy { 1 } else { 0 };
+        let unhealthy_val = if is_healthy { 0 } else { 1 };
+
+        self.upstream_health
+            .get_or_create(&UpstreamHealthLabels {
+                status: Cow::Borrowed("healthy"),
+            })
+            .set(healthy_val);
+
+        self.upstream_health
+            .get_or_create(&UpstreamHealthLabels {
+                status: Cow::Borrowed("unhealthy"),
+            })
+            .set(unhealthy_val);
+    }
+
+    /// Record startup duration in seconds.
+    ///
+    /// Call once when the service transitions to Ready state.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn record_startup_duration(&self, seconds: f64) {
+        self.startup_duration_seconds.set(seconds as i64);
+    }
+
+    /// Set the active requests gauge.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn set_active_requests(&self, count: i64) {
+        self.active_requests.set(count);
+    }
+
+    /// Increment drain timeout counter.
+    ///
+    /// Call when a shutdown drain exceeds its timeout.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn record_drain_timeout(&self) {
+        self.drain_timeout_total.inc();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1373,6 +1562,32 @@ impl ThoughtGateMetrics {
     /// Implements: REQ-CORE-008 NFR-002
     pub fn decrement_stdio_active_servers(&self) {
         self.stdio_active_servers.dec();
+    }
+
+    /// Set the lifecycle state for a stdio-managed server.
+    ///
+    /// Sets the given state to 1 and all other states to 0 for the given
+    /// server_id (Prometheus info-style enum pattern).
+    ///
+    /// Implements: REQ-CORE-008 NFR-002
+    pub fn set_stdio_server_state(&self, server_id: &str, state: &str) {
+        let limited_id = self.server_id_limiter.resolve(server_id);
+        let all_states = [
+            "starting",
+            "running",
+            "exited",
+            "signalled",
+            "failed_to_start",
+        ];
+        for s in &all_states {
+            let val = if *s == state { 1 } else { 0 };
+            self.stdio_server_state
+                .get_or_create(&StdioServerStateLabels {
+                    server_id: Cow::Owned(limited_id.to_string()),
+                    state: Cow::Borrowed(s),
+                })
+                .set(val);
+        }
     }
 
     /// Record approval latency for stdio transport.

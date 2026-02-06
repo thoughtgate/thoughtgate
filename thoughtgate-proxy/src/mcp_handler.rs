@@ -1489,6 +1489,7 @@ async fn handle_single_request_bytes(
         message_id: id.as_ref().map(jsonrpc_id_to_string),
         correlation_id: &correlation_id,
         tool_name: tool_name.as_deref(),
+        session_id: None, // TODO: extract from MCP handshake when available
         parent_context,
     };
     let mut mcp_span: BoxedSpan = start_mcp_span(&span_data);
@@ -2310,10 +2311,21 @@ async fn evaluate_with_cedar(
     // Cedar Policy Evaluation with Telemetry (REQ-OBS-002 §5.3, §6.1/MC-004)
     // ========================================================================
 
+    // Derive Cedar entity metadata for span attributes
+    let (cedar_action, cedar_resource_type) = match &cedar_request.resource {
+        CedarResource::ToolCall { .. } => ("tools/call", "ThoughtGate::ToolCall"),
+        CedarResource::McpMethod { .. } => ("mcp/method", "ThoughtGate::McpMethod"),
+    };
+
     // Create Cedar span data
     let cedar_span_data = CedarSpanData {
         tool_name: resource_name.clone(),
         policy_id: Some(policy_id.clone()),
+        principal_type: "ThoughtGate::App".to_string(),
+        principal_id: cedar_request.principal.app_name.clone(),
+        action: cedar_action.to_string(),
+        resource_type: cedar_resource_type.to_string(),
+        resource_id: cedar_request.resource.name().to_string(),
     };
 
     // Start Cedar span as child of current context
@@ -2324,14 +2336,20 @@ async fn evaluate_with_cedar(
     let cedar_result = state.cedar_engine.evaluate_v2(&cedar_request);
     let eval_duration_ms = eval_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Determine decision string for telemetry
-    let decision_str = match &cedar_result {
-        CedarDecision::Permit { .. } => "allow",
-        CedarDecision::Forbid { .. } => "deny",
+    // Determine decision string and denial reason for telemetry
+    let (decision_str, denial_reason) = match &cedar_result {
+        CedarDecision::Permit { .. } => ("allow", None),
+        CedarDecision::Forbid { reason, .. } => ("deny", Some(reason.as_str())),
     };
 
-    // Finish Cedar span with attributes
-    finish_cedar_span(&mut cedar_span, decision_str, &policy_id, eval_duration_ms);
+    // Finish Cedar span with attributes (records cedar.denial event on deny)
+    finish_cedar_span(
+        &mut cedar_span,
+        decision_str,
+        &policy_id,
+        eval_duration_ms,
+        denial_reason,
+    );
 
     // Record Cedar metrics (REQ-OBS-002 §6.1/MC-004, §6.2/MH-002)
     if let Some(ref metrics) = state.tg_metrics {

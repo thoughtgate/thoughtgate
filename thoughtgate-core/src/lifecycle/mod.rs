@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -277,6 +277,9 @@ pub struct LifecycleManager {
 
     /// Version string (from Cargo.toml)
     version: &'static str,
+
+    /// Optional Prometheus metrics (wired post-construction via set_metrics)
+    tg_metrics: ArcSwapOption<crate::telemetry::ThoughtGateMetrics>,
 }
 
 impl LifecycleManager {
@@ -297,7 +300,17 @@ impl LifecycleManager {
             approval_store_initialized: AtomicBool::new(false),
             config,
             version: env!("CARGO_PKG_VERSION"),
+            tg_metrics: ArcSwapOption::empty(),
         }
+    }
+
+    /// Wire Prometheus metrics for upstream health tracking.
+    ///
+    /// Call after construction since LifecycleManager is typically wrapped in Arc.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn set_metrics(&self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) {
+        self.tg_metrics.store(Some(metrics));
     }
 
     /// Returns the current lifecycle state.
@@ -359,6 +372,11 @@ impl LifecycleManager {
             last_check: Instant::now(),
             last_error: error,
         }));
+
+        // Update Prometheus gauge if metrics are wired
+        if let Some(metrics) = self.tg_metrics.load().as_ref() {
+            metrics.set_upstream_health(is_healthy);
+        }
     }
 
     /// Returns a clone of the shutdown token.

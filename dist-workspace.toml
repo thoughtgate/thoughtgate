@@ -1,0 +1,37 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# Version lock — CI fetches this exact cargo-dist version
+cargo-dist-version = "0.30.3"
+
+# CI backend
+ci = "github"
+
+# Target platforms (Unix-only — CLI depends on nix crate)
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# Installers
+installers = ["shell"]
+
+# Supply chain security
+cargo-auditable = true
+cargo-cyclonedx = true
+github-attestations = true
+
+# Artifact integrity
+checksum = "sha256"
+
+# Release behavior
+publish-prereleases = false
+source-tarball = true
+auto-includes = true
+
+# CI behavior
+pr-run-mode = "plan"
+fail-fast = false

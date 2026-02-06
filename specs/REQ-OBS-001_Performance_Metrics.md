@@ -365,36 +365,62 @@ Criterion benchmark (`benches/ttfb.rs`) tests actual proxy with real HTTP:
 
 ### 8.1 Bencher JSON Schema
 
-All metrics consolidated into single JSON file:
+**CI output format:** Bencher Metric Format (BMF). Each metric is a named object containing a measure with a numeric value:
 
 ```json
-[
-  {"name": "binary/size", "value": 8432640, "unit": "bytes"},
-  {"name": "binary/docker_image_compressed", "value": 9437184, "unit": "bytes"},
-  {"name": "binary/docker_layers", "value": 3, "unit": "count"},
-  {"name": "binary/docker_base", "value": "scratch", "unit": "string"},
-  {"name": "binary/multi_arch", "value": true, "unit": "bool"},
-  {"name": "startup/to_healthy", "value": 45.2, "unit": "ms"},
-  {"name": "startup/to_ready", "value": 82.5, "unit": "ms"},
-  {"name": "startup/policy_load", "value": 12.1, "unit": "ms"},
-  {"name": "memory/idle_rss", "value": 15728640, "unit": "bytes"},
-  {"name": "memory/under_load_rss", "value": 52428800, "unit": "bytes"},
-  {"name": "memory/peak_rss", "value": 67108864, "unit": "bytes"},
-  {"name": "memory/constrained_rss", "value": 98566144, "unit": "bytes"},
-  {"name": "cpu/idle_percent", "value": 0.3, "unit": "%"},
-  {"name": "cpu/under_load_percent", "value": 42.5, "unit": "%"},
-  {"name": "latency/p50", "value": 2.3, "unit": "ms"},
-  {"name": "latency/p95", "value": 5.1, "unit": "ms"},
-  {"name": "latency/p99", "value": 12.4, "unit": "ms"},
-  {"name": "ttfb/p95", "value": 2.8, "unit": "ms"},
-  {"name": "overhead/latency_p50", "value": 0.8, "unit": "ms"},
-  {"name": "overhead/percent_p50", "value": 3.2, "unit": "%"},
-  {"name": "throughput/rps_10vu", "value": 15420, "unit": "req/s"},
-  {"name": "throughput/rps_constrained", "value": 6850, "unit": "req/s"},
-  {"name": "policy/eval_p50", "value": 0.045, "unit": "µs"},
-  {"name": "policy/eval_p99", "value": 0.12, "unit": "µs"}
-]
+{
+  "binary/size": {
+    "bytes": { "value": 8432640 }
+  },
+  "startup/to_healthy": {
+    "ms": { "value": 45.2 }
+  },
+  "startup/to_ready": {
+    "ms": { "value": 82.5 }
+  },
+  "memory/idle_rss": {
+    "bytes": { "value": 15728640 }
+  },
+  "memory/under_load_rss": {
+    "bytes": { "value": 52428800 }
+  },
+  "memory/constrained_rss": {
+    "bytes": { "value": 98566144 }
+  },
+  "latency/p50": {
+    "ms": { "value": 2.3 }
+  },
+  "latency/p95": {
+    "ms": { "value": 5.1 }
+  },
+  "latency/p99": {
+    "ms": { "value": 12.4 }
+  },
+  "throughput/rps_10vu": {
+    "req/s": { "value": 15420 }
+  },
+  "throughput/rps_constrained": {
+    "req/s": { "value": 6850 }
+  },
+  "overhead/latency_p50": {
+    "ms": { "value": 0.8 }
+  },
+  "overhead/percent_p50": {
+    "%": { "value": 3.2 }
+  },
+  "policy/eval_p50": {
+    "µs": { "value": 0.045 }
+  },
+  "policy/eval_p99": {
+    "µs": { "value": 0.12 }
+  }
+}
 ```
+
+> **Note:** The flat array format (`[{"name": ..., "value": ..., "unit": ...}]`)
+> is used as an intermediate representation within collection scripts. The final
+> CI output uses the Bencher BMF format shown above, which is what Bencher.dev
+> consumes via `adapter: json`.
 
 ### 8.2 Metric Naming Convention
 

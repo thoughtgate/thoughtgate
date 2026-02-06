@@ -8,9 +8,6 @@ on:
       - 'website/**'
       - '.github/workflows/docs.yml'
   pull_request:
-    types: [opened, synchronize, reopened, closed]
-    branches:
-      - '**'
     paths:
       - 'website/**'
       - '.github/workflows/docs.yml'
@@ -23,23 +20,10 @@ jobs:
   build:
     name: Build Documentation
     runs-on: ubuntu-latest
-    outputs:
-      pr_number: ${{ steps.pr_info.outputs.pr_number }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-
-      - name: Get PR info
-        id: pr_info
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
-            echo "base_url=/pr-preview/${{ github.event.pull_request.number }}/" >> $GITHUB_OUTPUT
-          else
-            echo "pr_number=" >> $GITHUB_OUTPUT
-            echo "base_url=/" >> $GITHUB_OUTPUT
-          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -57,15 +41,6 @@ jobs:
         run: npm run build
         env:
           NODE_OPTIONS: '--max-old-space-size=4096'
-          # Override baseUrl for PR previews
-          DOCUSAURUS_BASE_URL: ${{ steps.pr_info.outputs.base_url }}
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docs-build-${{ github.run_id }}
-          path: website/build
-          retention-days: 7
 
       - name: Upload pages artifact (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -91,95 +66,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
-  deploy-preview:
-    name: Deploy PR Preview
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'pull_request'
-
-    permissions:
-      contents: write
-      pull-requests: write
-
-    steps:
-      - name: Checkout gh-pages branch
-        uses: actions/checkout@v6
-        with:
-          ref: gh-pages
-          fetch-depth: 0
-
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: docs-build-${{ github.run_id }}
-          path: pr-preview/${{ needs.build.outputs.pr_number }}
-
-      - name: Commit and push preview
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pr-preview/${{ needs.build.outputs.pr_number }}
-          git commit -m "Deploy PR #${{ needs.build.outputs.pr_number }} preview" || echo "No changes to commit"
-          git push
-
-      - name: Comment preview URL on PR
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const prNumber = ${{ needs.build.outputs.pr_number }};
-            const previewUrl = `https://thoughtgate.io/pr-preview/${prNumber}/`;
-            const body = `## 📚 Documentation Preview\n\nPreview deployed to: ${previewUrl}\n\n_This preview will be removed when the PR is merged or closed._`;
-
-            // Check if we already commented
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-            });
-
-            const botComment = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes('Documentation Preview')
-            );
-
-            if (botComment) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: botComment.id,
-                body: body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                body: body,
-              });
-            }
-
-  cleanup-preview:
-    name: Cleanup PR Preview
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
-
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout gh-pages branch
-        uses: actions/checkout@v6
-        with:
-          ref: gh-pages
-          fetch-depth: 0
-
-      - name: Remove preview directory
-        run: |
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          if [ -d "pr-preview/$PR_NUMBER" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git rm -rf pr-preview/$PR_NUMBER
-            git commit -m "Remove PR #$PR_NUMBER preview"
-            git push
-          fi

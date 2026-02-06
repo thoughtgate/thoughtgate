@@ -64,12 +64,10 @@ jobs:
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
 
-      - name: Install cargo-audit
+      - name: Install cargo-deny
         run: |
-          # Force reinstall to handle cached but missing binaries
-          cargo binstall --no-confirm --force cargo-audit || cargo install --force cargo-audit
-          # Verify installation
-          cargo audit --version
+          cargo binstall --no-confirm --force cargo-deny || cargo install --force cargo-deny
+          cargo deny --version
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -77,8 +75,8 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Security audit
-        run: cargo audit --deny warnings
+      - name: Security & license audit
+        run: cargo deny check
 
   # Stage 1b: Build & Pre-compile Test Dependencies
   # This job compiles everything once, populating the shared cache for all test jobs.
@@ -232,7 +230,7 @@ jobs:
       - name: Run Criterion benchmarks
         run: |
           echo "Running Criterion benchmarks..."
-          cargo bench -p thoughtgate-proxy --bench ttfb -- --noplot
+          cargo bench -p thoughtgate-proxy --features mock --bench ttfb -- --noplot
           cargo bench -p thoughtgate-core --bench policy_eval -- --noplot || echo "policy_eval benchmark not yet available"
 
           echo ""
@@ -532,6 +530,9 @@ jobs:
     needs: [changes, build, test]
     if: needs.changes.outputs.code == 'true' || github.event_name == 'push'
 
+    permissions:
+      security-events: write
+
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
 
@@ -571,12 +572,20 @@ jobs:
           outputs: type=docker,dest=/tmp/thoughtgate-image.tar
 
       - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           input: /tmp/thoughtgate-image.tar
           severity: 'CRITICAL,HIGH'
           exit-code: '1'
           ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
 
       - name: Upload Docker image as artifact
         uses: actions/upload-artifact@v6

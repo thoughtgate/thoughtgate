@@ -28,8 +28,12 @@ pub(crate) const MCP_METHOD_NAME: &str = "mcp.method.name";
 
 /// MCP session identifier for correlation
 /// Requirement: Recommended
-#[allow(dead_code)] // Reserved for future use
 pub(crate) const MCP_SESSION_ID: &str = "mcp.session.id";
+
+/// MCP protocol version from handshake
+/// Requirement: Recommended
+#[allow(dead_code)] // No protocol version extraction yet
+pub(crate) const MCP_PROTOCOL_VERSION: &str = "mcp.protocol.version";
 
 /// JSON-RPC message type discriminator
 /// Values: "request", "response", "notification"
@@ -184,6 +188,8 @@ pub struct McpSpanData<'a> {
     pub correlation_id: &'a str,
     /// Tool name for tools/call requests
     pub tool_name: Option<&'a str>,
+    /// MCP session identifier for cross-request correlation
+    pub session_id: Option<&'a str>,
     /// Optional parent context for W3C trace propagation.
     /// When provided, the MCP span becomes a child of the caller's span.
     /// When None, ThoughtGate becomes the trace root.
@@ -281,6 +287,7 @@ pub struct GateOutcomes {
 ///     message_id: Some("42".to_string()),
 ///     correlation_id: "req-abc123",
 ///     tool_name: Some("web_search"),
+///     session_id: None,
 ///     parent_context: Some(&parent_ctx),
 /// };
 /// let mut span = start_mcp_span(&data);
@@ -306,6 +313,10 @@ pub fn start_mcp_span(data: &McpSpanData<'_>) -> BoxedSpan {
 
     if let Some(tool) = data.tool_name {
         attributes.push(KeyValue::new(GENAI_TOOL_NAME, tool.to_string()));
+    }
+
+    if let Some(session_id) = data.session_id {
+        attributes.push(KeyValue::new(MCP_SESSION_ID, session_id.to_string()));
     }
 
     let builder = tracer
@@ -665,6 +676,21 @@ pub(crate) const CEDAR_POLICY_ID: &str = "cedar.policy_id";
 /// Cedar policy evaluation span attribute: evaluation duration in milliseconds.
 pub(crate) const CEDAR_DURATION_MS: &str = "cedar.duration_ms";
 
+/// Cedar principal entity type (e.g., "ThoughtGate::App").
+pub(crate) const CEDAR_PRINCIPAL_TYPE: &str = "cedar.principal.type";
+
+/// Cedar principal entity identifier (e.g., app_name).
+pub(crate) const CEDAR_PRINCIPAL_ID: &str = "cedar.principal.id";
+
+/// Cedar action being evaluated (e.g., "tools/call", "mcp/method").
+pub(crate) const CEDAR_ACTION: &str = "cedar.action";
+
+/// Cedar resource entity type (e.g., "ThoughtGate::ToolCall").
+pub(crate) const CEDAR_RESOURCE_TYPE: &str = "cedar.resource.type";
+
+/// Cedar resource entity identifier (tool or method name).
+pub(crate) const CEDAR_RESOURCE_ID: &str = "cedar.resource.id";
+
 /// Data needed to start a Cedar evaluation span.
 ///
 /// Implements: REQ-OBS-002 §5.3 (Cedar Evaluation Spans)
@@ -673,6 +699,16 @@ pub struct CedarSpanData {
     pub tool_name: String,
     /// Policy ID from governance rules, if any.
     pub policy_id: Option<String>,
+    /// Cedar principal entity type (e.g., "ThoughtGate::App").
+    pub principal_type: String,
+    /// Cedar principal identifier (e.g., app_name).
+    pub principal_id: String,
+    /// Cedar action (e.g., "tools/call", "mcp/method").
+    pub action: String,
+    /// Cedar resource entity type (e.g., "ThoughtGate::ToolCall").
+    pub resource_type: String,
+    /// Cedar resource identifier (tool or method name).
+    pub resource_id: String,
 }
 
 /// Start a Cedar policy evaluation span as a child of the current context.
@@ -695,17 +731,29 @@ pub struct CedarSpanData {
 /// let data = CedarSpanData {
 ///     tool_name: "web_search".to_string(),
 ///     policy_id: Some("sensitive-tools".to_string()),
+///     principal_type: "ThoughtGate::App".to_string(),
+///     principal_id: "my-agent".to_string(),
+///     action: "tools/call".to_string(),
+///     resource_type: "ThoughtGate::ToolCall".to_string(),
+///     resource_id: "web_search".to_string(),
 /// };
 /// let mut span = start_cedar_span(&data, &Context::current());
 /// // ... evaluate Cedar policy ...
-/// finish_cedar_span(&mut span, "allow", "policy-1", 0.15);
+/// finish_cedar_span(&mut span, "allow", "policy-1", 0.15, None);
 /// ```
 ///
 /// Implements: REQ-OBS-002 §5.3
 pub fn start_cedar_span(data: &CedarSpanData, parent_cx: &Context) -> BoxedSpan {
     let tracer = global::tracer("thoughtgate");
 
-    let mut attributes = vec![KeyValue::new(CEDAR_TOOL_NAME, data.tool_name.clone())];
+    let mut attributes = vec![
+        KeyValue::new(CEDAR_TOOL_NAME, data.tool_name.clone()),
+        KeyValue::new(CEDAR_PRINCIPAL_TYPE, data.principal_type.clone()),
+        KeyValue::new(CEDAR_PRINCIPAL_ID, data.principal_id.clone()),
+        KeyValue::new(CEDAR_ACTION, data.action.clone()),
+        KeyValue::new(CEDAR_RESOURCE_TYPE, data.resource_type.clone()),
+        KeyValue::new(CEDAR_RESOURCE_ID, data.resource_id.clone()),
+    ];
 
     if let Some(ref policy_id) = data.policy_id {
         attributes.push(KeyValue::new(CEDAR_POLICY_ID, policy_id.clone()));
@@ -721,6 +769,8 @@ pub fn start_cedar_span(data: &CedarSpanData, parent_cx: &Context) -> BoxedSpan 
 /// Finish a Cedar evaluation span with decision attributes.
 ///
 /// Sets the decision, policy ID, and duration attributes, then ends the span.
+/// When the decision is "deny" and a `denial_reason` is provided, a
+/// `cedar.denial` span event is recorded per REQ-OBS-002 §5.2.
 ///
 /// # Arguments
 ///
@@ -728,12 +778,28 @@ pub fn start_cedar_span(data: &CedarSpanData, parent_cx: &Context) -> BoxedSpan 
 /// * `decision` - Cedar decision ("allow" or "deny")
 /// * `policy_id` - Determining policy ID
 /// * `duration_ms` - Evaluation duration in milliseconds
+/// * `denial_reason` - Human-readable reason when denied; None for allow
 ///
-/// Implements: REQ-OBS-002 §5.3
-pub fn finish_cedar_span(span: &mut impl Span, decision: &str, policy_id: &str, duration_ms: f64) {
+/// Implements: REQ-OBS-002 §5.3, TC-OBS2-003
+pub fn finish_cedar_span(
+    span: &mut impl Span,
+    decision: &str,
+    policy_id: &str,
+    duration_ms: f64,
+    denial_reason: Option<&str>,
+) {
     span.set_attribute(KeyValue::new(CEDAR_DECISION, decision.to_string()));
     span.set_attribute(KeyValue::new(CEDAR_POLICY_ID, policy_id.to_string()));
     span.set_attribute(KeyValue::new(CEDAR_DURATION_MS, duration_ms));
+
+    // Record cedar.denial span event on deny (REQ-OBS-002 §5.2 / TC-OBS2-003)
+    if let Some(reason) = denial_reason {
+        span.add_event(
+            "cedar.denial",
+            vec![KeyValue::new("cedar.violation.reason", reason.to_string())],
+        );
+    }
+
     span.set_status(Status::Ok);
     span.end();
 }
@@ -790,6 +856,7 @@ mod tests {
             message_id: Some("42".to_string()),
             correlation_id: "test-corr-123",
             tool_name: Some("web_search"),
+            session_id: None,
             parent_context: None,
         };
 
@@ -816,6 +883,7 @@ mod tests {
             message_id: Some("99".to_string()),
             correlation_id: "test-err-456",
             tool_name: None,
+            session_id: None,
             parent_context: None,
         };
 
@@ -858,6 +926,7 @@ mod tests {
             message_id: None,
             correlation_id: "test-notif-789",
             tool_name: None,
+            session_id: None,
             parent_context: None,
         };
 
@@ -1106,6 +1175,7 @@ mod tests {
             message_id: Some("123".to_string()),
             correlation_id: "test-parent-ctx",
             tool_name: Some("test_tool"),
+            session_id: None,
             parent_context: Some(&parent_context),
         };
 
@@ -1150,6 +1220,7 @@ mod tests {
             message_id: Some("456".to_string()),
             correlation_id: "test-no-parent",
             tool_name: None,
+            session_id: None,
             parent_context: None,
         };
 
@@ -1188,10 +1259,15 @@ mod tests {
         let data = CedarSpanData {
             tool_name: "web_search".to_string(),
             policy_id: Some("sensitive-tools".to_string()),
+            principal_type: "ThoughtGate::App".to_string(),
+            principal_id: "test-app".to_string(),
+            action: "tools/call".to_string(),
+            resource_type: "ThoughtGate::ToolCall".to_string(),
+            resource_id: "web_search".to_string(),
         };
 
         let mut span = start_cedar_span(&data, &Context::current());
-        finish_cedar_span(&mut span, "allow", "policy-1", 0.15);
+        finish_cedar_span(&mut span, "allow", "policy-1", 0.15, None);
 
         provider.force_flush().expect("flush should succeed");
         let spans = exporter.get_finished_spans().expect("should get spans");
@@ -1200,6 +1276,8 @@ mod tests {
         let finished = &spans[0];
         assert_eq!(finished.name.as_ref(), "cedar.evaluate");
         assert_eq!(finished.span_kind, opentelemetry::trace::SpanKind::Internal);
+        // No denial events on allow
+        assert!(finished.events.is_empty());
     }
 
     #[test]
@@ -1210,10 +1288,21 @@ mod tests {
         let data = CedarSpanData {
             tool_name: "delete_database".to_string(),
             policy_id: Some("admin-only".to_string()),
+            principal_type: "ThoughtGate::App".to_string(),
+            principal_id: "test-app".to_string(),
+            action: "tools/call".to_string(),
+            resource_type: "ThoughtGate::ToolCall".to_string(),
+            resource_id: "delete_database".to_string(),
         };
 
         let mut span = start_cedar_span(&data, &Context::current());
-        finish_cedar_span(&mut span, "deny", "admin-policy", 0.08);
+        finish_cedar_span(
+            &mut span,
+            "deny",
+            "admin-policy",
+            0.08,
+            Some("Forbidden by policy: admin-policy"),
+        );
 
         provider.force_flush().expect("flush should succeed");
         let spans = exporter.get_finished_spans().expect("should get spans");
@@ -1221,6 +1310,18 @@ mod tests {
 
         let finished = &spans[0];
         assert_eq!(finished.name.as_ref(), "cedar.evaluate");
+
+        // TC-OBS2-003: Verify cedar.denial span event
+        assert_eq!(finished.events.len(), 1);
+        assert_eq!(finished.events[0].name.as_ref(), "cedar.denial");
+        let reason_attr = finished.events[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "cedar.violation.reason");
+        assert!(
+            reason_attr.is_some(),
+            "cedar.violation.reason attribute missing"
+        );
     }
 
     #[test]
@@ -1239,9 +1340,14 @@ mod tests {
         let cedar_data = CedarSpanData {
             tool_name: "test_tool".to_string(),
             policy_id: None,
+            principal_type: "ThoughtGate::App".to_string(),
+            principal_id: "test-app".to_string(),
+            action: "tools/call".to_string(),
+            resource_type: "ThoughtGate::ToolCall".to_string(),
+            resource_id: "test_tool".to_string(),
         };
         let mut cedar_span = start_cedar_span(&cedar_data, &parent_cx);
-        finish_cedar_span(&mut cedar_span, "allow", "default", 0.05);
+        finish_cedar_span(&mut cedar_span, "allow", "default", 0.05, None);
 
         // End parent span
         drop(parent_cx);

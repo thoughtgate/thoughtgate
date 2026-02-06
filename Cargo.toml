@@ -1,5 +1,6 @@
 [workspace]
 members = ["thoughtgate-core", "thoughtgate-proxy", "thoughtgate"]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
@@ -8,6 +9,8 @@ edition = "2024"
 rust-version = "1.87"
 authors = ["Oleg Mukhin <oleg.v.mukhin@gmail.com>"]
 license = "Apache-2.0"
+homepage = "https://thoughtgate.dev"
+repository = "https://github.com/thoughtgate/thoughtgate"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -318,6 +318,7 @@ async fn test_mcp_span_inherits_parent_trace_id() {
         message_id: Some("123".to_string()),
         correlation_id: "test-inherit",
         tool_name: Some("test_tool"),
+        session_id: None,
         parent_context: Some(&parent_context),
     };
 
@@ -365,6 +366,7 @@ async fn test_new_trace_when_no_parent() {
         message_id: Some("456".to_string()),
         correlation_id: "test-no-parent",
         tool_name: None,
+        session_id: None,
         parent_context: None,
     };
 

@@ -343,6 +343,60 @@ pub fn validate(config: &Config, version: Version) -> Result<ValidationResult, C
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Telemetry validation (V-TEL-001 through V-TEL-006)
+    // ─────────────────────────────────────────────────────────────────────
+    if let Some(ref telemetry) = config.telemetry {
+        // V-TEL-001: Sample rate in [0.0, 1.0]
+        if let Some(ref sampling) = telemetry.sampling {
+            if !(0.0..=1.0).contains(&sampling.success_sample_rate) {
+                return Err(ConfigError::InvalidSampleRate {
+                    rate: sampling.success_sample_rate,
+                });
+            }
+
+            // V-TEL-004: Strategy must be "head" or "tail"
+            if sampling.strategy != "head" && sampling.strategy != "tail" {
+                return Err(ConfigError::UnknownSamplingStrategy {
+                    strategy: sampling.strategy.clone(),
+                });
+            }
+        }
+
+        // V-TEL-002: OTLP endpoint must be valid URL if set
+        if let Some(ref otlp) = telemetry.otlp {
+            if url::Url::parse(&otlp.endpoint).is_err() {
+                return Err(ConfigError::InvalidOtlpEndpoint {
+                    endpoint: otlp.endpoint.clone(),
+                    message: "invalid URL format".to_string(),
+                });
+            }
+
+            // V-TEL-003: Protocol must be "http/protobuf" or "grpc"
+            if otlp.protocol != "http/protobuf" && otlp.protocol != "grpc" {
+                return Err(ConfigError::UnknownOtlpProtocol {
+                    protocol: otlp.protocol.clone(),
+                });
+            }
+        }
+
+        // V-TEL-005: max_queue_size > 0
+        if let Some(ref batch) = telemetry.batch {
+            if batch.max_queue_size == 0 {
+                return Err(ConfigError::InvalidQueueSize {
+                    size: batch.max_queue_size,
+                });
+            }
+
+            // V-TEL-006: scheduled_delay_ms >= 100
+            if batch.scheduled_delay_ms < 100 {
+                return Err(ConfigError::InvalidBatchDelay {
+                    delay_ms: batch.scheduled_delay_ms,
+                });
+            }
+        }
+    }
+
     Ok(ValidationResult::with_warnings(warnings))
 }
 
@@ -710,5 +764,162 @@ cedar:
         assert!(approval.contains_key("finance"));
 
         assert!(config.cedar.is_some());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Telemetry Validation Tests (V-TEL-001 through V-TEL-006)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn config_with_telemetry(telemetry_yaml: &str) -> String {
+        format!(
+            r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+telemetry:
+{telemetry_yaml}
+"#
+        )
+    }
+
+    #[test]
+    fn test_telemetry_invalid_sample_rate_too_high() {
+        let yaml = config_with_telemetry(
+            r#"  sampling:
+    success_sample_rate: 1.5"#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(matches!(result, Err(ConfigError::InvalidSampleRate { .. })));
+    }
+
+    #[test]
+    fn test_telemetry_invalid_sample_rate_negative() {
+        let yaml = config_with_telemetry(
+            r#"  sampling:
+    success_sample_rate: -0.1"#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(matches!(result, Err(ConfigError::InvalidSampleRate { .. })));
+    }
+
+    #[test]
+    fn test_telemetry_valid_sample_rate_boundaries() {
+        for rate in &["0.0", "0.5", "1.0"] {
+            let yaml = config_with_telemetry(&format!(
+                r#"  sampling:
+    success_sample_rate: {rate}"#
+            ));
+            let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+            let result = validate(&config, Version::V0_2);
+            assert!(result.is_ok(), "rate {rate} should be valid");
+        }
+    }
+
+    #[test]
+    fn test_telemetry_invalid_otlp_endpoint() {
+        let yaml = config_with_telemetry(
+            r#"  otlp:
+    endpoint: "not a url""#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidOtlpEndpoint { .. })
+        ));
+    }
+
+    #[test]
+    fn test_telemetry_valid_otlp_endpoint() {
+        let yaml = config_with_telemetry(
+            r#"  otlp:
+    endpoint: "http://otel-collector:4318""#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_telemetry_unknown_protocol() {
+        let yaml = config_with_telemetry(
+            r#"  otlp:
+    endpoint: "http://otel-collector:4318"
+    protocol: "thrift""#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(matches!(
+            result,
+            Err(ConfigError::UnknownOtlpProtocol { .. })
+        ));
+    }
+
+    #[test]
+    fn test_telemetry_valid_protocols() {
+        for protocol in &["http/protobuf", "grpc"] {
+            let yaml = config_with_telemetry(&format!(
+                r#"  otlp:
+    endpoint: "http://otel-collector:4318"
+    protocol: "{protocol}""#
+            ));
+            let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+            let result = validate(&config, Version::V0_2);
+            assert!(result.is_ok(), "protocol {protocol} should be valid");
+        }
+    }
+
+    #[test]
+    fn test_telemetry_unknown_sampling_strategy() {
+        let yaml = config_with_telemetry(
+            r#"  sampling:
+    strategy: "random""#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(matches!(
+            result,
+            Err(ConfigError::UnknownSamplingStrategy { .. })
+        ));
+    }
+
+    #[test]
+    fn test_telemetry_invalid_queue_size() {
+        let yaml = config_with_telemetry(
+            r#"  batch:
+    max_queue_size: 0"#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(matches!(result, Err(ConfigError::InvalidQueueSize { .. })));
+    }
+
+    #[test]
+    fn test_telemetry_invalid_batch_delay() {
+        let yaml = config_with_telemetry(
+            r#"  batch:
+    scheduled_delay_ms: 50"#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(matches!(result, Err(ConfigError::InvalidBatchDelay { .. })));
+    }
+
+    #[test]
+    fn test_telemetry_valid_batch_delay_boundary() {
+        let yaml = config_with_telemetry(
+            r#"  batch:
+    scheduled_delay_ms: 100"#,
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_ok());
     }
 }

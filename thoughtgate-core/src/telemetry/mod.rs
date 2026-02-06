@@ -78,7 +78,7 @@ pub use timers::{AmberPathTimer, InspectorTimer};
 pub use opentelemetry::global::BoxedSpan;
 
 use opentelemetry::global;
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -107,6 +107,9 @@ pub struct TelemetryConfig {
 
     /// Additional resource attributes.
     pub resource_attributes: std::collections::HashMap<String, String>,
+
+    /// Custom HTTP headers for OTLP export (e.g., Authorization tokens).
+    pub otlp_headers: std::collections::HashMap<String, String>,
 
     /// Head sampling rate (0.0 to 1.0).
     pub sample_rate: f64,
@@ -151,6 +154,7 @@ impl Default for TelemetryConfig {
             otlp_endpoint: None,
             service_name: "thoughtgate".to_string(),
             resource_attributes: std::collections::HashMap::new(),
+            otlp_headers: std::collections::HashMap::new(),
             sample_rate: 1.0,
             batch: BatchSettings::default(),
         }
@@ -182,6 +186,7 @@ impl TelemetryConfig {
             otlp_endpoint,
             service_name,
             resource_attributes: std::collections::HashMap::new(),
+            otlp_headers: std::collections::HashMap::new(),
             sample_rate: 1.0,
             batch: BatchSettings::default(),
         }
@@ -242,6 +247,13 @@ impl TelemetryConfig {
             .or_else(|| std::env::var("OTEL_SERVICE_NAME").ok())
             .unwrap_or_else(|| "thoughtgate".to_string());
 
+        // OTLP headers from config (e.g., Authorization tokens)
+        let otlp_headers = yaml
+            .otlp
+            .as_ref()
+            .map(|o| o.headers.clone())
+            .unwrap_or_default();
+
         // Batch settings
         let batch = yaml
             .batch
@@ -259,6 +271,7 @@ impl TelemetryConfig {
             otlp_endpoint,
             service_name,
             resource_attributes,
+            otlp_headers,
             sample_rate,
             batch,
         }
@@ -373,10 +386,16 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
 
     let provider = if config.enabled {
         // Build OTLP HTTP/protobuf exporter
+        // Note: gRPC is not supported in v0.2 — B-CFG-TEL-003 logs a warning
+        // and falls back to HTTP/protobuf in from_yaml_config().
         let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder().with_http();
 
         if let Some(ref endpoint) = config.otlp_endpoint {
             exporter_builder = exporter_builder.with_endpoint(endpoint);
+        }
+
+        if !config.otlp_headers.is_empty() {
+            exporter_builder = exporter_builder.with_headers(config.otlp_headers.clone());
         }
 
         let exporter = exporter_builder
@@ -447,6 +466,7 @@ mod tests {
             otlp_endpoint: None,
             service_name: "test-noop".to_string(),
             resource_attributes: std::collections::HashMap::new(),
+            otlp_headers: std::collections::HashMap::new(),
             sample_rate: 1.0,
             batch: BatchSettings::default(),
         };
@@ -498,6 +518,7 @@ mod tests {
             otlp_endpoint: Some("http://should-not-be-called:4318".to_string()),
             service_name: "test".to_string(),
             resource_attributes: std::collections::HashMap::new(),
+            otlp_headers: std::collections::HashMap::new(),
             sample_rate: 1.0,
             batch: BatchSettings::default(),
         };
@@ -543,6 +564,7 @@ mod tests {
             otlp: Some(OtlpConfig {
                 endpoint: "http://test-collector:4318".to_string(),
                 protocol: "http/protobuf".to_string(),
+                headers: std::collections::HashMap::new(),
             }),
             prometheus: None,
             sampling: Some(SamplingConfig {

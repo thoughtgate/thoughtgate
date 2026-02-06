@@ -95,7 +95,7 @@ The system must:
 | -32001 | Upstream Timeout | - | MCP server didn't respond in time |
 | -32002 | Upstream Error | - | MCP server returned error |
 | -32003 | Policy Denied | 3 | Cedar policy forbid |
-| -32004 | Task Not Found | - | Invalid task ID |
+| -32602 | Task Not Found | - | Invalid task ID (per MCP Tasks spec, task ID not found is Invalid Params) |
 | -32005 | Task Expired | - | Task TTL exceeded |
 | -32006 | Task Cancelled | - | Task was cancelled |
 | -32007 | Approval Rejected | 4 | Human rejected the request |
@@ -144,9 +144,9 @@ pub enum ThoughtGateError {
     // ═══════════════════════════════════════════════════════════
     // Gate 1: Visibility errors (from REQ-CFG-001)
     // ═══════════════════════════════════════════════════════════
-    ToolNotExposed { 
+    ToolNotExposed {
         tool: String,
-        source: String,
+        source_id: String,
     },
     
     // ═══════════════════════════════════════════════════════════
@@ -210,6 +210,13 @@ pub enum ThoughtGateError {
     ConfigurationError { details: String },
     
     // ═══════════════════════════════════════════════════════════
+    // Task lifecycle errors (from REQ-GOV-001, MCP Tasks spec)
+    // ═══════════════════════════════════════════════════════════
+    TaskResultNotReady { task_id: String },    // -32020: Result not yet available
+    TaskRequired { details: String },           // -32600: Per MCP spec, task required
+    TaskForbidden { details: String },          // -32601: Per MCP spec, task forbidden
+
+    // ═══════════════════════════════════════════════════════════
     // Operational errors
     // ═══════════════════════════════════════════════════════════
     RateLimited { retry_after_secs: Option<u64> },
@@ -229,9 +236,11 @@ pub struct JsonRpcError {
 
 pub struct ErrorData {
     pub correlation_id: String,
+    pub error_type: String,         // Error classification (e.g., "policy_denied", "tool_not_exposed")
     pub gate: Option<String>,      // Which gate rejected: "visibility", "governance", "policy", "approval"
     pub tool: Option<String>,      // Tool that was being called
     pub details: Option<String>,   // Safe details for debugging
+    pub retry_after: Option<u64>,  // Seconds until retry is appropriate (for rate limiting)
 }
 ```
 
@@ -242,7 +251,7 @@ The following table specifies when each `ErrorData` field should be populated:
 | Error Type | `gate` | `tool` | `details` |
 |------------|--------|--------|-----------|
 | `ToolNotExposed` | `"visibility"` | Yes | No |
-| `GovernanceRuleDenied` | `"governance"` | Yes | Rule pattern (if safe to expose) |
+| `GovernanceRuleDenied` | `"governance"` | Yes | No (security: don't expose rule patterns) |
 | `PolicyDenied` | `"policy"` | Yes | No (security: don't expose policy internals) |
 | `ApprovalRejected` | `"approval"` | Yes | Rejector identity (if approved by user) |
 | `ApprovalTimeout` | `"approval"` | Yes | Timeout duration |
@@ -280,88 +289,53 @@ The following table specifies when each `ErrorData` field should be populated:
 ### 6.4 Error Mapping Implementation
 
 ```rust
-impl From<ThoughtGateError> for JsonRpcError {
-    fn from(err: ThoughtGateError) -> Self {
-        match err {
+/// Converts the error to a JSON-RPC error response.
+///
+/// Note: This is a method (not a From impl) because it requires a
+/// `correlation_id` parameter that the From trait cannot accept.
+///
+/// Implements: REQ-CORE-004/F-002
+impl ThoughtGateError {
+    pub fn to_jsonrpc_error(&self, correlation_id: &str) -> JsonRpcError {
+        match self {
             // Gate 1: Visibility
             ThoughtGateError::ToolNotExposed { tool, .. } => JsonRpcError {
                 code: -32015,
                 message: format!("Tool '{}' is not available", tool),
                 data: Some(ErrorData {
+                    correlation_id: correlation_id.to_string(),
+                    error_type: "tool_not_exposed".into(),
                     gate: Some("visibility".into()),
-                    tool: Some(tool),
+                    tool: Some(tool.clone()),
                     ..Default::default()
                 }),
             },
-            
+
             // Gate 2: Governance
-            ThoughtGateError::GovernanceRuleDenied { tool, rule } => JsonRpcError {
+            ThoughtGateError::GovernanceRuleDenied { tool, .. } => JsonRpcError {
                 code: -32014,
                 message: format!("Tool '{}' is denied by governance rules", tool),
                 data: Some(ErrorData {
+                    correlation_id: correlation_id.to_string(),
+                    error_type: "governance_rule_denied".into(),
                     gate: Some("governance".into()),
-                    tool: Some(tool),
-                    details: rule.map(|r| format!("Matched rule: {}", r)),
+                    tool: Some(tool.clone()),
+                    // Security: don't expose rule patterns
+                    details: None,
                     ..Default::default()
                 }),
             },
-            
-            // Gate 3: Cedar Policy
-            ThoughtGateError::PolicyDenied { tool, policy_id, .. } => JsonRpcError {
-                code: -32003,
-                message: format!("Policy denied access to tool '{}'", tool),
+
+            // ... other error mappings follow same pattern
+            _ => JsonRpcError {
+                code: -32603,
+                message: "Internal error".into(),
                 data: Some(ErrorData {
-                    gate: Some("policy".into()),
-                    tool: Some(tool),
-                    // Don't include policy_id or reason in response (security)
+                    correlation_id: correlation_id.to_string(),
+                    error_type: "internal_error".into(),
                     ..Default::default()
                 }),
             },
-            
-            // Gate 4: Approval
-            ThoughtGateError::ApprovalRejected { tool, rejected_by, .. } => JsonRpcError {
-                code: -32007,
-                message: format!("Approval rejected for tool '{}'", tool),
-                data: Some(ErrorData {
-                    gate: Some("approval".into()),
-                    tool: Some(tool),
-                    details: rejected_by.map(|by| format!("Rejected by: {}", by)),
-                    ..Default::default()
-                }),
-            },
-            
-            ThoughtGateError::ApprovalTimeout { tool, timeout_secs, .. } => JsonRpcError {
-                code: -32008,
-                message: format!("Approval timeout for tool '{}' after {}s", tool, timeout_secs),
-                data: Some(ErrorData {
-                    gate: Some("approval".into()),
-                    tool: Some(tool),
-                    ..Default::default()
-                }),
-            },
-            
-            ThoughtGateError::WorkflowNotFound { workflow } => JsonRpcError {
-                code: -32017,
-                message: format!("Approval workflow '{}' not found", workflow),
-                data: Some(ErrorData {
-                    gate: Some("approval".into()),
-                    details: Some(format!("Check approval.{} in config", workflow)),
-                    ..Default::default()
-                }),
-            },
-            
-            // Configuration errors
-            ThoughtGateError::ConfigurationError { details } => JsonRpcError {
-                code: -32016,
-                message: "Configuration error".into(),
-                data: Some(ErrorData {
-                    details: Some(details),
-                    ..Default::default()
-                }),
-            },
-            
-            // ... other error mappings unchanged
-            _ => todo!("Map remaining errors"),
         }
     }
 }
@@ -388,12 +362,12 @@ impl From<ThoughtGateError> for JsonRpcError {
 ```rust
 fn log_error(err: &ThoughtGateError, correlation_id: &str) {
     match err {
-        ThoughtGateError::ToolNotExposed { tool, source } => {
+        ThoughtGateError::ToolNotExposed { tool, source_id } => {
             warn!(
                 correlation_id = %correlation_id,
                 gate = "visibility",
                 tool = %tool,
-                source = %source,
+                source_id = %source_id,
                 "Tool not exposed"
             );
         }

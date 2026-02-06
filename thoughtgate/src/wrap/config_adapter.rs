@@ -1531,6 +1531,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_windsurf_config() {
+        let adapter = WindsurfAdapter;
+        let path = fixture_path("windsurf_mcp_config.json");
+        let servers = adapter.parse_servers(&path).unwrap();
+
+        assert_eq!(servers.len(), 2);
+
+        let fs_server = servers.iter().find(|s| s.id == "filesystem").unwrap();
+        assert_eq!(fs_server.command, "npx");
+        assert_eq!(
+            fs_server.args,
+            vec![
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+                "/home/user"
+            ]
+        );
+        assert!(fs_server.enabled);
+
+        let db_server = servers.iter().find(|s| s.id == "database").unwrap();
+        assert_eq!(db_server.command, "uvx");
+    }
+
+    #[test]
+    fn test_parse_zed_config() {
+        let adapter = ZedAdapter;
+        let path = fixture_path("zed_settings.json");
+        let servers = adapter.parse_servers(&path).unwrap();
+
+        assert_eq!(servers.len(), 2);
+
+        // Structured command with path + args.
+        let fs_server = servers.iter().find(|s| s.id == "filesystem").unwrap();
+        assert_eq!(fs_server.command, "npx");
+        assert_eq!(
+            fs_server.args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+        );
+
+        // Simple string command with no args.
+        let simple = servers.iter().find(|s| s.id == "simple-server").unwrap();
+        assert_eq!(simple.command, "mcp-server-simple");
+        assert!(simple.args.is_empty());
+    }
+
     // ── Config Rewrite Tests ─────────────────────────────────────────────
 
     #[test]

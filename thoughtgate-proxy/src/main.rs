@@ -130,6 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let prom_registry = Arc::new(prom_registry);
 
+    // Wire metrics to lifecycle manager for upstream health tracking
+    lifecycle.set_metrics(tg_metrics.clone());
+
     // Phase 3: Create unified shutdown token
     // Implements: REQ-CORE-005/F-004 (Unified Shutdown)
     let shutdown = CancellationToken::new();
@@ -249,6 +252,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create MCP handler with governance if config exists
+    // Keep a reference to the task store for shutdown cleanup (REQ-CORE-005/F-004.2)
+    let mut shutdown_task_store: Option<Arc<thoughtgate_core::governance::TaskStore>> = None;
     let mcp_handler: Option<Arc<McpHandler>> = if let Some(ref config) = yaml_config {
         // Create upstream client for MCP handler (with metrics for REQ-OBS-002 §6.1/MC-006)
         let upstream_config = UpstreamConfig::from_env().map_err(|e| {
@@ -268,6 +273,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(tg_metrics.clone()),
             )
             .await?;
+
+        // Save task store reference for shutdown cleanup (REQ-CORE-005/F-004.2)
+        shutdown_task_store = Some(task_handler.shared_store());
 
         // Create MCP handler with full governance
         // Use the same TaskStore that ApprovalEngine uses for task coordination
@@ -387,6 +395,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     lifecycle.mark_approval_store_initialized(); // Approval store ready
     lifecycle.mark_ready();
 
+    // Record startup duration metric (REQ-CORE-005/NFR-001)
+    tg_metrics.record_startup_duration(startup_instant.elapsed().as_secs_f64());
+
     // Per-request timeout for proxy connections
     // Prevents indefinitely hanging connections from leaking resources
     let request_timeout =
@@ -461,6 +472,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 transport: std::borrow::Cow::Borrowed("http"),
                             })
                             .inc();
+                        // Update active_requests gauge (REQ-CORE-005/NFR-001)
+                        tg_metrics.active_requests.inc();
 
                         let service_stack = service_stack.clone();
                         let conn_shutdown = shutdown.clone();
@@ -498,6 +511,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     transport: std::borrow::Cow::Borrowed("http"),
                                 })
                                 .dec();
+                            // Update active_requests gauge (REQ-CORE-005/NFR-001)
+                            conn_metrics.active_requests.dec();
 
                             // Explicit drops for clarity (both happen automatically at scope end)
                             drop(request_guard); // Decrements lifecycle request counter
@@ -520,6 +535,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Graceful shutdown sequence
     // Implements: REQ-CORE-005/F-004, F-005
     // Note: admin_shutdown is the same token as shutdown, already cancelled by signal handler
+
+    // Fail all pending tasks before draining
+    // Implements: REQ-CORE-005/F-004.2, F-006
+    if let Some(ref task_store) = shutdown_task_store {
+        let failed_count = task_store.fail_all_pending("service_shutdown");
+        if failed_count > 0 {
+            info!(
+                failed_tasks = failed_count,
+                "Transitioned pending tasks to Failed for shutdown"
+            );
+        }
+    }
 
     info!(
         active_requests = lifecycle.active_request_count(),
@@ -547,6 +574,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         DrainResult::Timeout { remaining } => {
+            // Record drain timeout metric (REQ-CORE-005/NFR-001)
+            tg_metrics.record_drain_timeout();
             // Return error instead of std::process::exit(1) to allow proper cleanup
             // The caller (main) will convert this to an exit code
             Err(format!(

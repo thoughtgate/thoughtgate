@@ -3,7 +3,7 @@
 //! Implements: REQ-CFG-001 Section 8.3 (Error Types)
 //!
 //! # Traceability
-//! - Implements: REQ-CFG-001/V-001 through V-014
+//! - Implements: REQ-CFG-001/V-001 through V-014, V-TEL-001 through V-TEL-006
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -74,6 +74,33 @@ pub enum ConfigError {
     /// V-014: Required environment variable not set.
     #[error("environment variable '{var}' not set (required for field '{field}')")]
     MissingEnvVar { var: String, field: String },
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Telemetry validation errors (V-TEL-001 through V-TEL-006)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// V-TEL-001: Sample rate out of bounds.
+    #[error("invalid sample rate {rate}: must be between 0.0 and 1.0")]
+    InvalidSampleRate { rate: f64 },
+
+    /// V-TEL-002: OTLP endpoint is not a valid URL.
+    #[error("invalid OTLP endpoint '{endpoint}': {message}")]
+    InvalidOtlpEndpoint { endpoint: String, message: String },
+
+    /// V-TEL-003: Unknown OTLP protocol.
+    #[error("unknown OTLP protocol '{protocol}': must be \"http/protobuf\" or \"grpc\"")]
+    UnknownOtlpProtocol { protocol: String },
+
+    /// V-TEL-004: Unknown sampling strategy.
+    #[error("unknown sampling strategy '{strategy}': must be \"head\" or \"tail\"")]
+    UnknownSamplingStrategy { strategy: String },
+
+    /// V-TEL-005: Invalid queue size.
+    #[error("invalid max_queue_size {size}: must be > 0")]
+    InvalidQueueSize { size: usize },
+
+    /// V-TEL-006: Batch delay too small.
+    #[error("invalid scheduled_delay_ms {delay_ms}: must be >= 100")]
+    InvalidBatchDelay { delay_ms: u64 },
 
     // ─────────────────────────────────────────────────────────────────────────
     // Schema validation errors

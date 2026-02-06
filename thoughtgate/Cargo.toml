@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 description = "ThoughtGate CLI wrapper for local MCP governance"
 
 [lib]
@@ -28,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 which = "7"
 fs2 = "0.4"
+similar = "2"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # OpenTelemetry for trace context propagation (REQ-OBS-002 §7.3)

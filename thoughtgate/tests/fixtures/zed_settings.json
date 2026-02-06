@@ -1,0 +1,14 @@
+{
+  "context_servers": {
+    "filesystem": {
+      "command": {
+        "path": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      },
+      "env": { "NODE_ENV": "production" }
+    },
+    "simple-server": {
+      "command": "mcp-server-simple"
+    }
+  }
+}
