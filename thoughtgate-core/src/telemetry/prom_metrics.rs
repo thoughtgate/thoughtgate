@@ -1088,10 +1088,10 @@ impl ThoughtGateMetrics {
     ///
     /// * `method` - JSON-RPC method name (e.g., "tools/call")
     /// * `tool_name` - Tool name for tools/call requests, None otherwise
-    /// * `status` - Request outcome: "success" or "error"
+    /// * `status` - Request outcome: "success" or "error" (must be a static string)
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-001, §6.5
-    pub fn record_request(&self, method: &str, tool_name: Option<&str>, status: &str) {
+    pub fn record_request(&self, method: &str, tool_name: Option<&str>, status: &'static str) {
         let tool = tool_name
             .map(|t| self.tool_name_limiter.resolve(t))
             .unwrap_or("none");
@@ -1100,7 +1100,7 @@ impl ThoughtGateMetrics {
             .get_or_create(&RequestLabels {
                 method: Cow::Owned(method.to_string()),
                 tool_name: Cow::Owned(tool.to_string()),
-                status: Cow::Owned(status.to_string()),
+                status: Cow::Borrowed(status),
             })
             .inc();
     }
@@ -1131,22 +1131,22 @@ impl ThoughtGateMetrics {
     ///
     /// # Arguments
     ///
-    /// * `decision` - Cedar decision (e.g., "allow", "deny")
+    /// * `decision` - Cedar decision: "allow" or "deny" (must be a static string)
     /// * `policy_id` - Determining policy ID
     /// * `duration_ms` - Evaluation duration in milliseconds
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-004, §6.2/MH-002
-    pub fn record_cedar_eval(&self, decision: &str, policy_id: &str, duration_ms: f64) {
+    pub fn record_cedar_eval(&self, decision: &'static str, policy_id: &str, duration_ms: f64) {
         self.cedar_evaluations_total
             .get_or_create(&CedarEvalLabels {
-                decision: Cow::Owned(decision.to_string()),
+                decision: Cow::Borrowed(decision),
                 policy_id: Cow::Owned(policy_id.to_string()),
             })
             .inc();
 
         self.cedar_evaluation_duration_ms
             .get_or_create(&CedarDurationLabels {
-                decision: Cow::Owned(decision.to_string()),
+                decision: Cow::Borrowed(decision),
             })
             .observe(duration_ms);
     }
@@ -1155,15 +1155,15 @@ impl ThoughtGateMetrics {
     ///
     /// # Arguments
     ///
-    /// * `gate` - Gate type (e.g., "cedar", "governance_rule")
-    /// * `outcome` - Decision outcome (e.g., "allow", "deny", "approve")
+    /// * `gate` - Gate type (e.g., "cedar", "governance_rule") (must be a static string)
+    /// * `outcome` - Decision outcome (e.g., "allow", "deny", "approve") (must be a static string)
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-002
-    pub fn record_gate_decision(&self, gate: &str, outcome: &str) {
+    pub fn record_gate_decision(&self, gate: &'static str, outcome: &'static str) {
         self.decisions_total
             .get_or_create(&DecisionLabels {
-                gate: Cow::Owned(gate.to_string()),
-                outcome: Cow::Owned(outcome.to_string()),
+                gate: Cow::Borrowed(gate),
+                outcome: Cow::Borrowed(outcome),
             })
             .inc();
     }
@@ -1173,13 +1173,14 @@ impl ThoughtGateMetrics {
     /// # Arguments
     ///
     /// * `error_type` - Error classification (e.g., "policy_denied", "upstream_timeout")
+    ///   (must be a static string — see `ThoughtGateError::error_type_name()`)
     /// * `method` - JSON-RPC method that caused the error
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-003
-    pub fn record_error(&self, error_type: &str, method: &str) {
+    pub fn record_error(&self, error_type: &'static str, method: &str) {
         self.errors_total
             .get_or_create(&ErrorLabels {
-                error_type: Cow::Owned(error_type.to_string()),
+                error_type: Cow::Borrowed(error_type),
                 method: Cow::Owned(method.to_string()),
             })
             .inc();

@@ -28,6 +28,7 @@ use cedar_policy::{
     Authorizer, Context, Decision, Entities, EntityId, EntityTypeName, EntityUid, PolicySet,
     Request, Schema,
 };
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -258,7 +259,7 @@ impl CedarEngine {
                 self.stats_v2.forbid_count.fetch_add(1, Ordering::Relaxed);
                 return CedarDecision::Forbid {
                     reason: format!("Failed to build request: {}", e),
-                    policy_ids: vec![],
+                    policy_ids: SmallVec::new(),
                 };
             }
         };
@@ -271,7 +272,7 @@ impl CedarEngine {
                 self.stats_v2.forbid_count.fetch_add(1, Ordering::Relaxed);
                 return CedarDecision::Forbid {
                     reason: format!("Failed to build entities: {}", e),
-                    policy_ids: vec![],
+                    policy_ids: SmallVec::new(),
                 };
             }
         };
@@ -292,7 +293,7 @@ impl CedarEngine {
                 self.stats_v2.permit_count.fetch_add(1, Ordering::Relaxed);
 
                 // Extract determining policy IDs
-                let determining_policies: Vec<String> = response
+                let determining_policies: SmallVec<[String; 1]> = response
                     .diagnostics()
                     .reason()
                     .map(|id| id.to_string())
@@ -315,14 +316,14 @@ impl CedarEngine {
                 self.stats_v2.forbid_count.fetch_add(1, Ordering::Relaxed);
 
                 // Extract forbidding policy IDs
-                let policy_ids: Vec<String> = response
+                let policy_ids: SmallVec<[String; 2]> = response
                     .diagnostics()
                     .reason()
                     .map(|id| id.to_string())
                     .collect();
 
                 // Build reason from errors if any
-                let errors: Vec<String> = response
+                let errors: SmallVec<[String; 1]> = response
                     .diagnostics()
                     .errors()
                     .map(|e| e.to_string())

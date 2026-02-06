@@ -1475,7 +1475,8 @@ async fn handle_single_request_bytes(
     let request_start = std::time::Instant::now();
 
     // Extract tool name for tools/call requests (REQ-OBS-002 §5.1.1)
-    let tool_name = extract_tool_name(&request);
+    // Borrows from request.params (Arc<Value>) — must convert to owned before request is moved
+    let tool_name: Option<String> = extract_tool_name(&request).map(String::from);
 
     // Start MCP span with optional parent context (REQ-OBS-002 §5.1, §7.1)
     // When parent_context is provided, the span becomes a child of the caller's trace.
@@ -1565,16 +1566,11 @@ async fn handle_single_request_bytes(
 /// Extract tool name from tools/call request params.
 ///
 /// Implements: REQ-OBS-002 §5.1.1 (gen_ai.tool.name attribute)
-fn extract_tool_name(request: &McpRequest) -> Option<String> {
+fn extract_tool_name(request: &McpRequest) -> Option<&str> {
     if request.method != "tools/call" {
         return None;
     }
-    request
-        .params
-        .as_ref()?
-        .get("name")?
-        .as_str()
-        .map(|s| s.to_string())
+    request.params.as_ref()?.get("name")?.as_str()
 }
 
 /// Convert JsonRpcId to string for span attributes.
