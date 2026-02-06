@@ -36,8 +36,13 @@ use bytes::Bytes;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use thoughtgate_core::config::{Action, Config, MatchResult};
+use thoughtgate_core::StreamDirection;
+use thoughtgate_core::config::{Config, MatchResult};
 use thoughtgate_core::error::ThoughtGateError;
+use thoughtgate_core::governance::api::{
+    GovernanceDecision, GovernanceEvaluateRequest, MessageType,
+};
+use thoughtgate_core::governance::evaluator::{DenySource, GovernanceEvaluator};
 use thoughtgate_core::governance::{
     ApprovalAdapter, ApprovalEngine, ApprovalEngineConfig, Principal, SlackAdapter, TaskHandler,
     TaskStore, ToolCallRequest,
@@ -47,6 +52,7 @@ use thoughtgate_core::policy::principal::infer_principal;
 use thoughtgate_core::policy::{
     CedarContext, CedarDecision, CedarRequest, CedarResource, TimeContext,
 };
+use thoughtgate_core::profile::Profile;
 use thoughtgate_core::protocol::{
     CapabilityCache, TasksCancelRequest, TasksGetRequest, TasksListRequest, TasksResultRequest,
     extract_upstream_sse_support, extract_upstream_task_support, inject_task_capability,
@@ -186,6 +192,10 @@ pub struct McpState {
     pub max_aggregate_buffer: usize,
     /// Prometheus metrics for request counting and latency (REQ-OBS-002 §6).
     pub tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+    /// Unified governance evaluator (Gates 1-4).
+    /// When present, `route_through_gates()` delegates to this instead of
+    /// reimplementing gate logic. None in legacy mode (no YAML config).
+    pub evaluator: Option<Arc<GovernanceEvaluator>>,
 }
 
 /// Configuration for the MCP handler.
@@ -317,6 +327,7 @@ impl McpHandler {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: config.max_aggregate_buffer,
             tg_metrics: None,
+            evaluator: None,
         });
 
         Self { state }
@@ -347,6 +358,7 @@ impl McpHandler {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: config.max_aggregate_buffer,
             tg_metrics: None,
+            evaluator: None,
         });
 
         Self { state }
@@ -384,8 +396,29 @@ impl McpHandler {
         approval_engine: Option<Arc<ApprovalEngine>>,
         tg_metrics: Option<Arc<ThoughtGateMetrics>>,
     ) -> Self {
-        let task_handler = TaskHandler::new(task_store);
+        let task_handler = TaskHandler::new(task_store.clone());
         let semaphore = Arc::new(Semaphore::new(handler_config.max_concurrent_requests));
+
+        // Construct the unified evaluator when YAML config is present.
+        // In legacy mode (no config), route_request() falls back to
+        // evaluate_with_cedar() directly, so no evaluator is needed.
+        let evaluator = yaml_config.as_ref().map(|config| {
+            let principal = Principal::new("proxy");
+            let mut eval = GovernanceEvaluator::new(
+                config.clone(),
+                Some(cedar_engine.clone()),
+                task_store,
+                principal,
+                Profile::Production,
+            );
+            if let Some(ref metrics) = tg_metrics {
+                eval = eval.with_metrics(metrics.clone());
+            }
+            if let Some(ref engine) = approval_engine {
+                eval = eval.with_approval_engine(engine.clone());
+            }
+            Arc::new(eval)
+        });
 
         let state = Arc::new(McpState {
             upstream,
@@ -401,6 +434,7 @@ impl McpHandler {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: handler_config.max_aggregate_buffer,
             tg_metrics,
+            evaluator,
         });
 
         Self { state }
@@ -664,6 +698,7 @@ impl McpServer {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
             tg_metrics: None, // McpServer doesn't use prometheus-client metrics
+            evaluator: None,
         });
 
         Ok(Self {
@@ -706,6 +741,7 @@ impl McpServer {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
             tg_metrics: None, // McpServer doesn't use prometheus-client metrics
+            evaluator: None,
         });
 
         Ok(Self {
@@ -760,6 +796,7 @@ impl McpServer {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
             tg_metrics: None, // McpServer doesn't use prometheus-client metrics
+            evaluator: None,
         });
 
         Ok(Self {
@@ -1871,6 +1908,14 @@ async fn route_through_gates(
     state: &McpState,
     mut request: McpRequest,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
+    let evaluator =
+        state
+            .evaluator
+            .as_ref()
+            .ok_or_else(|| ThoughtGateError::ServiceUnavailable {
+                reason: "Evaluator not configured".to_string(),
+            })?;
+
     let config = state
         .config
         .as_ref()
@@ -1878,12 +1923,10 @@ async fn route_through_gates(
             reason: "Configuration not loaded".to_string(),
         })?;
 
-    // Extract the governable resource name (tool name, resource URI, or prompt name)
-    // Implements: REQ-CORE-003/F-002 (Method Routing)
+    // Extract resource name for SEP-1686 validation and logging
     let resource_name = match extract_governable_name(&request) {
         Some(name) => name,
         None => {
-            // Request without required identifier is invalid params
             let field = match request.method.as_str() {
                 "tools/call" | "prompts/get" => "name",
                 "resources/read" | "resources/subscribe" => "uri",
@@ -1903,13 +1946,25 @@ async fn route_through_gates(
         resource = %resource_name,
         method = %request.method,
         source = %source_id,
-        "Routing through 4-gate model"
+        "Routing through 4-gate model (via evaluator)"
     );
+
+    // ========================================================================
+    // SEP-1686: Task Metadata Validation (proxy-specific)
+    // ========================================================================
+    // Pre-check Gate 2 result to validate task metadata before the evaluator
+    // runs all gates. This is cheap (config lookup only) and HTTP-specific.
+    let match_result = config.governance.evaluate(&resource_name, source_id);
+    validate_task_metadata(
+        &mut request,
+        &match_result.action,
+        &resource_name,
+        state.capability_cache.upstream_supports_tasks(),
+    )?;
 
     // ========================================================================
     // Start Gateway Decision Span (REQ-OBS-002 §5.3)
     // ========================================================================
-    // Tracks the overall decision-making process across all 4 gates.
     let correlation_id_str = request.correlation_id.to_string();
     let decision_span_data = GatewayDecisionSpanData {
         request_id: &correlation_id_str,
@@ -1917,194 +1972,101 @@ async fn route_through_gates(
     };
     let mut decision_span =
         start_gateway_decision_span(&decision_span_data, &opentelemetry::Context::current());
-    let mut gate_outcomes = GateOutcomes::default();
 
-    // Helper to finish span and return result
-    let finish_span_and_return = |span: &mut BoxedSpan,
-                                  outcomes: &GateOutcomes,
-                                  upstream_latency_ms: Option<f64>,
-                                  result: Result<JsonRpcResponse, ThoughtGateError>|
-     -> Result<JsonRpcResponse, ThoughtGateError> {
-        finish_gateway_decision_span(span, outcomes, upstream_latency_ms);
-        result
+    // ========================================================================
+    // Infer per-request principal (K8s service account detection)
+    // ========================================================================
+    let principal = match tokio::task::spawn_blocking(infer_principal).await {
+        Ok(Ok(policy_principal)) => Some(Principal::from_policy(
+            &policy_principal.app_name,
+            &policy_principal.namespace,
+            &policy_principal.service_account,
+            policy_principal.roles.clone(),
+        )),
+        Ok(Err(e)) => {
+            warn!(error = %e, "Principal inference failed, using evaluator default");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "Principal inference task panicked, using evaluator default");
+            None
+        }
     };
 
     // ========================================================================
-    // Gate 1: Visibility Check
+    // Build GovernanceEvaluateRequest and delegate to evaluator
     // ========================================================================
-    // Check if the tool is visible based on ExposeConfig
-    // Implements: REQ-CFG-001 Section 9.3 (Exposure Filtering)
-    //
-    // Note: If the source is not found in config, we fail closed (block the
-    // request). A missing source indicates a misconfiguration — the hardcoded
-    // "upstream" source_id doesn't match any configured source. Config
-    // validation should catch this at load time, but we enforce here as defense
-    // in depth.
-
-    if let Some(source) = config.get_source(source_id) {
-        let expose: thoughtgate_core::config::ExposeConfig = source.expose();
-        if !expose.is_visible(&resource_name) {
-            // Record gate 1 block metric (REQ-OBS-002 §6.1/MC-002)
-            if let Some(ref metrics) = state.tg_metrics {
-                metrics.record_gate_decision("gate1", "block");
-            }
-            gate_outcomes.visibility = Some("block".to_string());
-            warn!(
-                resource = %resource_name,
-                method = %request.method,
-                source = %source_id,
-                "Gate 1: Resource not exposed"
-            );
-            return finish_span_and_return(
-                &mut decision_span,
-                &gate_outcomes,
-                None,
-                Err(ThoughtGateError::ToolNotExposed {
-                    tool: resource_name,
-                    source_id: source_id.to_string(),
-                }),
-            );
-        }
-        // Record gate 1 pass metric (REQ-OBS-002 §6.1/MC-002)
-        if let Some(ref metrics) = state.tg_metrics {
-            metrics.record_gate_decision("gate1", "pass");
-        }
-        gate_outcomes.visibility = Some("pass".to_string());
-        debug!(resource = %resource_name, method = %request.method, "Gate 1 passed: resource is visible");
-    } else {
-        // Source not found in config — fail closed
-        // This indicates a misconfiguration (get_source_id returns a name
-        // that doesn't match any configured source). Allowing traffic through
-        // would bypass visibility checks entirely.
-        // Record gate 1 block metric (REQ-OBS-002 §6.1/MC-002)
-        if let Some(ref metrics) = state.tg_metrics {
-            metrics.record_gate_decision("gate1", "block");
-        }
-        gate_outcomes.visibility = Some("block".to_string());
-        warn!(
-            resource = %resource_name,
-            source = %source_id,
-            "Gate 1 blocked: source not found in config"
-        );
-        return finish_span_and_return(
-            &mut decision_span,
-            &gate_outcomes,
-            None,
-            Err(ThoughtGateError::ServiceUnavailable {
-                reason: format!("Source '{}' not found in configuration", source_id),
-            }),
-        );
-    }
-
-    // ========================================================================
-    // Gate 2: Governance Rules Evaluation
-    // ========================================================================
-    // Match against YAML governance rules to determine action
-    // Implements: REQ-CFG-001 Section 9.2 (Rule Matching)
-
-    let match_result = config.governance.evaluate(&resource_name, source_id);
-
-    info!(
-        resource = %resource_name,
-        method = %request.method,
-        action = %match_result.action,
-        matched_rule = ?match_result.matched_rule,
-        policy_id = ?match_result.policy_id,
-        "Gate 2: Governance rule matched"
-    );
-
-    // ========================================================================
-    // SEP-1686: Task Metadata Validation
-    // ========================================================================
-    // Validate that client sent params.task for actions that require it
-    // This is checked AFTER Gate 2 because we need to know the action first
-    if let Err(e) = validate_task_metadata(
-        &mut request,
-        &match_result.action,
-        &resource_name,
-        state.capability_cache.upstream_supports_tasks(),
-    ) {
-        // Record gate 2 outcome before returning
-        let outcome = match match_result.action {
-            Action::Forward => "forward",
-            Action::Deny => "deny",
-            Action::Approve => "approve",
-            Action::Policy => "policy",
-        };
-        gate_outcomes.governance = Some(outcome.to_string());
-        gate_outcomes.governance_rule_id = match_result.matched_rule.clone();
-        return finish_span_and_return(&mut decision_span, &gate_outcomes, None, Err(e));
-    }
-
-    // ========================================================================
-    // Route by Gate 2 Action
-    // ========================================================================
-
-    // Record gate 2 decision metric (REQ-OBS-002 §6.1/MC-002)
-    let gate2_outcome = match match_result.action {
-        Action::Forward => "forward",
-        Action::Deny => "deny",
-        Action::Approve => "approve",
-        Action::Policy => "policy",
+    let gov_req = GovernanceEvaluateRequest {
+        server_id: source_id.to_string(),
+        direction: StreamDirection::AgentToServer,
+        method: request.method.clone(),
+        id: request.id.clone(),
+        params: request.params.as_deref().cloned(),
+        message_type: MessageType::Request,
+        profile: Profile::Production,
     };
-    if let Some(ref metrics) = state.tg_metrics {
-        metrics.record_gate_decision("gate2", gate2_outcome);
-    }
-    gate_outcomes.governance = Some(gate2_outcome.to_string());
-    gate_outcomes.governance_rule_id = match_result.matched_rule.clone();
 
-    match match_result.action {
-        Action::Forward => {
-            // Skip all policy checks, forward directly
-            debug!(resource = %resource_name, "Gate 2: Forwarding directly to upstream");
+    let (resp, trace) = evaluator
+        .evaluate_with_principal(&gov_req, principal.as_ref())
+        .await;
+
+    // ========================================================================
+    // Map EvalTrace → GateOutcomes for the gateway decision span
+    // ========================================================================
+    let gate_outcomes = GateOutcomes {
+        visibility: trace.gate1,
+        governance: trace.gate2,
+        cedar: trace.gate3,
+        approval: trace.gate4,
+        governance_rule_id: trace.gate2_rule_id,
+        policy_evaluated: trace.gate3_policy_id.is_some(),
+    };
+
+    // ========================================================================
+    // Map GovernanceDecision to proxy actions
+    // ========================================================================
+    let result = match resp.decision {
+        GovernanceDecision::Forward => {
             let upstream_start = std::time::Instant::now();
             let result = state.upstream.forward(&request).await;
             let upstream_latency_ms = Some(upstream_start.elapsed().as_secs_f64() * 1000.0);
-            finish_span_and_return(
-                &mut decision_span,
-                &gate_outcomes,
-                upstream_latency_ms,
-                result,
-            )
+            finish_gateway_decision_span(&mut decision_span, &gate_outcomes, upstream_latency_ms);
+            return result;
         }
+        GovernanceDecision::Deny => Err(match resp.deny_source {
+            Some(DenySource::Visibility) => ThoughtGateError::ToolNotExposed {
+                tool: resource_name,
+                source_id: source_id.to_string(),
+            },
+            Some(DenySource::GovernanceRule) => ThoughtGateError::GovernanceRuleDenied {
+                tool: resource_name,
+                rule: resp.reason.clone(),
+            },
+            Some(DenySource::CedarPolicy) => ThoughtGateError::PolicyDenied {
+                tool: resource_name,
+                policy_id: resp.policy_id.clone(),
+                reason: resp.reason.clone(),
+            },
+            None => ThoughtGateError::PolicyDenied {
+                tool: resource_name,
+                policy_id: resp.policy_id.clone(),
+                reason: resp.reason.clone(),
+            },
+        }),
+        GovernanceDecision::PendingApproval => {
+            let task_id = resp.task_id.clone().unwrap_or_default();
+            let poll_interval_ms = resp.poll_interval_ms.unwrap_or(1000);
+            Ok(JsonRpcResponse::task_created(
+                request.id.clone(),
+                task_id,
+                "working".to_string(),
+                std::time::Duration::from_millis(poll_interval_ms),
+            ))
+        }
+    };
 
-        Action::Deny => {
-            // Immediate rejection
-            warn!(resource = %resource_name, "Gate 2: Request denied by governance rule");
-            finish_span_and_return(
-                &mut decision_span,
-                &gate_outcomes,
-                None,
-                Err(ThoughtGateError::GovernanceRuleDenied {
-                    tool: resource_name,
-                    rule: match_result.matched_rule,
-                }),
-            )
-        }
-
-        Action::Approve => {
-            // Gate 4: Create approval task
-            debug!(resource = %resource_name, "Gate 2 → Gate 4: Starting approval workflow");
-            gate_outcomes.approval = Some("started".to_string());
-            let result = start_approval_flow(state, request, &resource_name, &match_result).await;
-            finish_span_and_return(&mut decision_span, &gate_outcomes, None, result)
-        }
-
-        Action::Policy => {
-            // Gate 3: Cedar evaluation with proper context
-            debug!(resource = %resource_name, "Gate 2 → Gate 3: Evaluating Cedar policy");
-            gate_outcomes.policy_evaluated = true;
-            // Pass gate_outcomes to capture cedar decision for the gateway span
-            let result = evaluate_with_cedar(
-                state,
-                request,
-                Some(&match_result),
-                Some(&mut gate_outcomes),
-            )
-            .await;
-            finish_span_and_return(&mut decision_span, &gate_outcomes, None, result)
-        }
-    }
+    finish_gateway_decision_span(&mut decision_span, &gate_outcomes, None);
+    result
 }
 
 /// Start an approval workflow (Gate 4).
@@ -2639,6 +2601,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         })
     }
 
@@ -2814,6 +2777,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         });
 
         let router = Router::new()
@@ -2862,6 +2826,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         });
 
         // Router with DefaultBodyLimit disabled - we check size manually and return JSON-RPC error
@@ -3203,6 +3168,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         })
     }
 
@@ -3460,6 +3426,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         })
     }
 
