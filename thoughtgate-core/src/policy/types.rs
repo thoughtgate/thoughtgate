@@ -323,46 +323,6 @@ impl PolicyAnnotations {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Engine Statistics (REQ-POL-001 §6.3)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// v0.2 Cedar engine statistics.
-///
-/// Implements: REQ-POL-001/§6.3 (CedarStats)
-#[derive(Debug, Clone, Default)]
-pub struct CedarStats {
-    /// Total number of evaluations.
-    pub evaluation_count: u64,
-
-    /// Number of Permit decisions.
-    pub permit_count: u64,
-
-    /// Number of Forbid decisions.
-    pub forbid_count: u64,
-
-    /// Average evaluation time in microseconds.
-    pub avg_eval_time_us: u64,
-}
-
-/// Policy information for debugging/observability.
-///
-/// Implements: REQ-POL-001/§6.3 (PolicyInfo)
-#[derive(Debug, Clone, Default)]
-pub struct PolicyInfo {
-    /// Paths from which policies were loaded.
-    pub paths: Vec<std::path::PathBuf>,
-
-    /// Number of policies loaded.
-    pub policy_count: usize,
-
-    /// When policies were last reloaded.
-    pub last_reload: Option<std::time::SystemTime>,
-
-    /// Number of policies with `@thoughtgate_approval` annotations.
-    pub annotated_policy_count: usize,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
