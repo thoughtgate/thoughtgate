@@ -28,6 +28,7 @@ github-attestations = true
 checksum = "sha256"
 
 # Release behavior
+dispatch-releases = true
 publish-prereleases = false
 source-tarball = true
 auto-includes = true

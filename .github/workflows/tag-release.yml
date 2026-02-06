@@ -1,19 +1,15 @@
 # Tag Release
 #
-# Automatically creates a git tag when a release PR merges to main.
-# The tag push triggers the Release workflow (release.yml) which builds
-# binaries via cargo-dist and creates the GitHub Release.
+# Automatically creates a git tag and dispatches the Release workflow
+# when a release PR merges to main.
 #
-# IMPORTANT: Set the RELEASE_TOKEN repository secret to a fine-grained PAT
-# with "Contents: Read and write" permission. Without it, the tag push
-# uses GITHUB_TOKEN which does NOT trigger downstream workflows.
+# Flow:
+#   1. Release PR (from prepare-release.yml) merges to main
+#   2. This workflow creates an annotated git tag
+#   3. Dispatches release.yml via workflow_dispatch (no PAT needed)
+#   4. cargo-dist builds binaries and creates the GitHub Release
 #
-# Setup:
-#   1. Create a fine-grained PAT at https://github.com/settings/tokens
-#      - Repository access: this repo only
-#      - Permissions: Contents → Read and write
-#   2. Save as repository secret named RELEASE_TOKEN
-#      Settings → Secrets and variables → Actions → New repository secret
+# No extra secrets required — GITHUB_TOKEN can trigger workflow_dispatch.
 
 name: Tag Release
 
@@ -24,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -36,15 +33,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          # PAT ensures the tag push triggers release.yml (cargo-dist).
-          # GITHUB_TOKEN-triggered events do not create new workflow runs.
-          token: ${{ secrets.RELEASE_TOKEN || github.token }}
 
       - name: Create and push tag
         run: |
           VERSION="${{ github.event.pull_request.head.ref }}"
           VERSION="${VERSION#release/}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Creating tag: $VERSION"
           git tag -a "$VERSION" -m "chore(release): $VERSION"
           git push origin "$VERSION"
+        id: tag
+
+      - name: Dispatch release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ github.event.pull_request.head.ref }}"
+          VERSION="${VERSION#release/}"
+          echo "Dispatching release.yml with tag=$VERSION"
+          gh workflow run release.yml -f "tag=$VERSION"
