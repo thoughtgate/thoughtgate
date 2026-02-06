@@ -2435,17 +2435,30 @@ async fn evaluate_with_cedar(
 async fn handle_batch_request_bytes(
     state: &McpState,
     items: Vec<thoughtgate_core::transport::jsonrpc::BatchItem>,
-    _parent_context: Option<&opentelemetry::Context>,
+    parent_context: Option<&opentelemetry::Context>,
 ) -> (StatusCode, Bytes) {
     use futures_util::stream::{self, StreamExt};
+    use opentelemetry::trace::{Span, SpanKind, Tracer};
     use thoughtgate_core::transport::jsonrpc::BatchItem;
 
-    // Note: For batch requests, trace context propagation is limited.
-    // ContextGuard is !Send, so we cannot attach it across async boundaries.
-    // Individual batch items don't get individual MCP spans in this implementation.
-    // The trace context from the parent will be visible via Context::current()
-    // if the caller attached it before calling this function.
-    // TODO: Consider creating a batch-level span that wraps all items.
+    // Create batch-level span for observability (REQ-OBS-002 §5.1).
+    // ContextGuard is !Send so we cannot attach the span across async
+    // boundaries, but the span itself tracks batch-level metadata.
+    let tracer = opentelemetry::global::tracer("thoughtgate");
+    let batch_size = items.len();
+    let mut batch_span = {
+        let builder = tracer
+            .span_builder(format!("jsonrpc.batch[{batch_size}]"))
+            .with_kind(SpanKind::Server)
+            .with_attributes(vec![opentelemetry::KeyValue::new(
+                "mcp.batch.size",
+                batch_size as i64,
+            )]);
+        match parent_context {
+            Some(ctx) => builder.start_with_context(&tracer, ctx),
+            None => builder.start(&tracer),
+        }
+    };
 
     // Process batch items concurrently using buffer_unordered.
     // JSON-RPC batch spec allows responses in any order (matched by id).
@@ -2498,6 +2511,16 @@ async fn handle_batch_request_bytes(
 
     // Filter out None entries (notifications)
     let responses: Vec<JsonRpcResponse> = responses.into_iter().flatten().collect();
+
+    // Record error count on the batch span.
+    let error_count = responses.iter().filter(|r| r.error.is_some()).count();
+    if error_count > 0 {
+        batch_span.set_attribute(opentelemetry::KeyValue::new(
+            "mcp.batch.error_count",
+            error_count as i64,
+        ));
+    }
+    batch_span.end();
 
     // Return batch response
     if responses.is_empty() {
