@@ -5,7 +5,7 @@ All notable changes to ThoughtGate will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-02-05
+## [0.3.0] - 2026-02-06
 
 ### Features
 
@@ -60,6 +60,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(governance)* Document soft limit and add stale shim cleanup
 - *(wrap)* Update ClaudeCodeAdapter for new per-project config format
 - *(shim)* Gate integration tests on cfg(unix)
+- *(lifecycle)* Wire admin server to core health/readiness and fail pending tasks on shutdown
+- *(telemetry)* Add gauge helper methods and update wiring documentation
+- *(telemetry)* Add cedar.denial span event on policy denial
+- *(config)* Add telemetry validation rules V-TEL-001 through V-TEL-006
+- *(telemetry)* Add lifecycle metrics for startup, active requests, and drain
+- *(error)* Add centralized log_error method and document gate denial metrics
+- *(shim)* Implement unified diff for dry-run and add stdio server state gauge
+- *(telemetry)* Add cedar principal/action/resource and mcp.session.id span attributes
+- *(telemetry)* Add OTLP headers field and document exemplar limitation
+- *(telemetry)* Add upstream health gauge and adapter config tests
+- *(specs)* Remove remaining stale GateResult/broadcast references
+- *(fuzz)* Exclude fuzz crate from workspace to fix nightly CI
+- *(bench)* Ensure mock_mcp binary exists before ttfb benchmark
+- *(ci)* Remove broken PR preview deployment from docs workflow
+- *(ci)* Restore cargo-dist expected comments in release.yml announce job
 
 ### Refactoring
 
@@ -76,6 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(specs)* Add REQ-OBS-002 telemetry spec and update REQ-CFG-001
 - *(website)* Add v0.3 CLI wrapper documentation
 - Rewrite README for v0.3 CLI wrapper era
+- *(specs)* Update REQ-CORE-003 to match v0.3 transport implementation
+- *(specs)* Update REQ-CORE-004 to match error handling evolution
+- *(specs)* Update REQ-CORE-005 to match lifecycle implementation
+- *(specs)* Update REQ-CORE-008 to match stdio transport implementation
+- *(specs)* Update REQ-OBS-001 to match BMF output format
+- *(specs)* Update REQ-OBS-002 gate values and MG-007 metric type
+- *(specs)* Update REQ-CFG-001 to match config implementation
 
 ### Styling
 
@@ -95,11 +117,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(deps)* Remove unused opentelemetry-prometheus and metrics feature
 - *(deps)* Update dependencies and fix flaky test
 - *(deps)* Remove unused opentelemetry-prometheus from proxy
+- *(deps)* Bump governor from 0.8.1 to 0.10.4
 
 ### Miscellaneous
 
 - *(thoughtgate)* Add proptest dev-dep, fix config_guard doc comments
 - Configure cargo-dist for binary distribution
+- *(ci)* Replace cargo-audit with cargo-deny
+- Add release config and changelog
+- *(ci)* Bump trivy-action to 0.33.1 and upload SARIF to GitHub Security
+- *(dist)* Remove homebrew installer until tap repo is created
 
 ### CI/CD
 
