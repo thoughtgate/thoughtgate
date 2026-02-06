@@ -5,7 +5,7 @@
 #
 # Flow:
 #   1. Release PR (from prepare-release.yml) merges to main
-#   2. This workflow creates an annotated git tag
+#   2. This workflow creates an annotated git tag (format: v0.4.0)
 #   3. Dispatches release.yml via workflow_dispatch (no PAT needed)
 #   4. cargo-dist builds binaries and creates the GitHub Release
 #
@@ -35,20 +35,19 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Create and push tag
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          VERSION="${{ github.event.pull_request.head.ref }}"
-          VERSION="${VERSION#release/}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          VERSION="${HEAD_REF#release/}"
           echo "Creating tag: $VERSION"
           git tag -a "$VERSION" -m "chore(release): $VERSION"
           git push origin "$VERSION"
-        id: tag
 
       - name: Dispatch release workflow
         env:
           GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          VERSION="${{ github.event.pull_request.head.ref }}"
-          VERSION="${VERSION#release/}"
+          VERSION="${HEAD_REF#release/}"
           echo "Dispatching release.yml with tag=$VERSION"
           gh workflow run release.yml -f "tag=$VERSION"

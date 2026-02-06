@@ -18,10 +18,6 @@ shared-version = "workspace"
 # No crates.io publishing — ThoughtGate distributes via cargo-dist binaries
 publish = false
 
-# Tag format: v0.3.1 (matches cargo-dist release.yml trigger pattern)
-tag-name = "v{{version}}"
-tag-message = "chore(release): v{{version}}"
-
 # Commit message follows conventional commits format
 pre-release-commit-message = "chore(release): prepare v{{version}}"
 
