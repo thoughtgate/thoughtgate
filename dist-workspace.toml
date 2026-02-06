@@ -17,11 +17,7 @@ targets = [
 ]
 
 # Installers
-installers = ["shell", "homebrew"]
-
-# Homebrew tap (repo must exist: github.com/thoughtgate/homebrew-thoughtgate)
-tap = "thoughtgate/homebrew-thoughtgate"
-publish-jobs = ["homebrew"]
+installers = ["shell"]
 
 # Supply chain security
 cargo-auditable = true
