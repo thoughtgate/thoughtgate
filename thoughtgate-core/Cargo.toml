@@ -82,11 +82,6 @@ smallvec = "1"
 # Cryptographically secure random number generation (trace/span ID generation)
 rand = "0.9"
 
-[features]
-default = ["metrics"]
-metrics = []
-fuzzing = []
-
 [dev-dependencies]
 proptest = "1.0"
 insta = { version = "1.46.1", features = ["json"] }
