@@ -2422,20 +2422,16 @@ async fn evaluate_with_cedar(
 ///
 /// # Design Note: Batch Concurrency
 ///
-/// Requests are processed sequentially (single-permit-per-batch) rather than
-/// in parallel. This design choice is intentional:
+/// Batch items are processed concurrently via `buffer_unordered` with a cap
+/// of 16 in-flight items. This is safe because:
 ///
-/// 1. **Approval coupling** (F-007.5): If ANY request needs approval, the
-///    entire batch becomes task-augmented — requests are not independent.
-/// 2. **Bounded resource usage**: With `max_batch_size` limiting array length,
-///    sequential processing bounds total work per request to O(max_batch_size).
-///    Parallel processing would require additional concurrency limits to
-///    prevent a single batch from monopolizing the connection pool.
-/// 3. **Deadlock prevention**: Parallel batch items competing for the same
-///    upstream connection pool under load could deadlock if the pool is
-///    exhausted by one batch while another waits.
-/// 4. **Response ordering**: Sequential processing trivially preserves
-///    response ordering without additional synchronization.
+/// - **Independent routing**: Each item routes through `route_request()`
+///   independently. Approval decisions are per-request, not per-batch.
+/// - **Bounded concurrency**: The `.min(16)` cap prevents a single batch
+///   from monopolizing the upstream connection pool, even when
+///   `max_batch_size` allows up to 100 items.
+/// - **Response ordering**: JSON-RPC 2.0 §6 specifies batch responses may
+///   be returned in any order — clients match by `id`.
 async fn handle_batch_request_bytes(
     state: &McpState,
     items: Vec<thoughtgate_core::transport::jsonrpc::BatchItem>,
