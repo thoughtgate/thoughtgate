@@ -496,8 +496,21 @@ fn detect_double_wrap(config: &serde_json::Value, key: &str, shim_binary: &Path)
     };
 
     for (_id, server) in servers_obj {
+        // Standard format: "command": "thoughtgate"
         if let Some(cmd) = server.get("command").and_then(|v| v.as_str()) {
             if cmd == shim_str || Path::new(cmd).file_name() == Path::new("thoughtgate").file_name()
+            {
+                return true;
+            }
+        }
+        // Zed object format: "command": { "path": "thoughtgate", ... }
+        if let Some(cmd_path) = server
+            .get("command")
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+        {
+            if cmd_path == shim_str
+                || Path::new(cmd_path).file_name() == Path::new("thoughtgate").file_name()
             {
                 return true;
             }
@@ -1796,6 +1809,35 @@ mod tests {
             .unwrap();
 
         // Second rewrite detects double-wrap.
+        let result = adapter.rewrite_config(&config_path, &servers, &shim_binary, &options);
+        assert!(matches!(result, Err(ConfigError::AlreadyManaged)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_double_wrap_zed_object_format() {
+        let dir = temp_config_dir();
+        let config_path = dir.join("settings.json");
+        let fixture = std::fs::read_to_string(fixture_path("zed_settings.json")).unwrap();
+        std::fs::write(&config_path, &fixture).unwrap();
+
+        let adapter = ZedAdapter;
+        let servers = adapter.parse_servers(&config_path).unwrap();
+        let shim_binary = PathBuf::from("/usr/local/bin/thoughtgate");
+        let options = ShimOptions {
+            server_id: String::new(),
+            governance_endpoint: "http://127.0.0.1:19090".to_string(),
+            profile: Profile::Production,
+            config_path: PathBuf::from("thoughtgate.yaml"),
+        };
+
+        // First rewrite succeeds.
+        adapter
+            .rewrite_config(&config_path, &servers, &shim_binary, &options)
+            .unwrap();
+
+        // Second rewrite detects double-wrap via object command format.
         let result = adapter.rewrite_config(&config_path, &servers, &shim_binary, &options);
         assert!(matches!(result, Err(ConfigError::AlreadyManaged)));
 
