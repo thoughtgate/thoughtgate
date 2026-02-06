@@ -1069,6 +1069,7 @@ async fn agent_to_server(
                         reason: None,
                         poll_interval_ms: None,
                         shutdown: false,
+                        deny_source: None,
                     }
                 }
             },
@@ -1110,6 +1111,7 @@ async fn agent_to_server(
                     reason: None,
                     poll_interval_ms: None,
                     shutdown: false,
+                    deny_source: None,
                 }
             }
         };

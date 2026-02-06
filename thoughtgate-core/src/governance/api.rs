@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::StreamDirection;
 use crate::governance::TaskStatus;
+use crate::governance::evaluator::DenySource;
 use crate::jsonrpc::JsonRpcId;
 use crate::profile::Profile;
 
@@ -82,6 +83,10 @@ pub struct GovernanceEvaluateResponse {
     /// When true, the shim must initiate graceful shutdown (F-018).
     /// Set by the governance service when `wrap` triggers shutdown (F-019).
     pub shutdown: bool,
+    /// Which gate produced a Deny decision (for error code mapping).
+    /// Not serialized over the wire — only used in-process by the proxy.
+    #[serde(skip)]
+    pub deny_source: Option<DenySource>,
 }
 
 /// Governance decision for a single message.
@@ -172,6 +177,7 @@ mod tests {
             reason: None,
             poll_interval_ms: None,
             shutdown: false,
+            deny_source: None,
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -191,6 +197,7 @@ mod tests {
             reason: Some("service shutting down".to_string()),
             poll_interval_ms: None,
             shutdown: true,
+            deny_source: None,
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -209,6 +216,7 @@ mod tests {
             reason: None,
             poll_interval_ms: Some(5000),
             shutdown: false,
+            deny_source: None,
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -259,6 +267,7 @@ mod tests {
             reason: None,
             poll_interval_ms: None,
             shutdown: false,
+            deny_source: None,
         };
 
         let json = serde_json::to_string(&resp).unwrap();
