@@ -188,10 +188,6 @@ pub enum Source {
         /// Whether this source is enabled.
         #[serde(default = "default_true")]
         enabled: bool,
-
-        /// Human-readable description.
-        #[serde(default)]
-        description: Option<String>,
     },
     // v0.3+: A2a
     // v0.4+: McpDiscovery, OpenApi, A2aDiscovery
@@ -421,17 +417,6 @@ pub struct Rule {
     #[serde(default)]
     pub description: Option<String>,
 
-    // ───────────────────────────────────────────────────────────────────────
-    // Future slots (v0.3+) - Parsed but ignored in v0.2
-    // ───────────────────────────────────────────────────────────────────────
-    /// Rate limiting configuration (v0.3+).
-    #[serde(default)]
-    pub limits: Option<serde_json::Value>,
-
-    /// Inspector chain for this rule (v0.3+).
-    #[serde(default)]
-    pub inspectors: Option<Vec<String>>,
-
     /// Pre-compiled glob pattern (populated by `Config::compile_patterns()`).
     /// Avoids re-parsing the glob on every request evaluation.
     #[serde(skip)]
@@ -571,36 +556,6 @@ pub enum ApprovalDestination {
         #[serde(default)]
         mention: Option<Vec<String>>,
     },
-
-    /// Send to webhook.
-    #[serde(rename = "webhook")]
-    Webhook {
-        /// Webhook URL.
-        url: String,
-        /// Authentication configuration.
-        #[serde(default)]
-        auth: Option<WebhookAuth>,
-    },
-
-    /// Interactive CLI prompt.
-    #[serde(rename = "cli")]
-    Cli,
-
-    /// External approval service (EXPERIMENTAL).
-    ///
-    /// # Traceability
-    /// - Implements: REQ-CFG-001 Section 8.8 (External Approval Service)
-    #[serde(rename = "approval_service")]
-    ApprovalService {
-        /// URL of the approval service endpoint.
-        url: String,
-        /// Authentication configuration.
-        #[serde(default)]
-        auth: Option<WebhookAuth>,
-        /// Custom headers to include in requests.
-        #[serde(default)]
-        headers: Option<HashMap<String, String>>,
-    },
 }
 
 /// Action to take when approval times out.
@@ -611,18 +566,6 @@ pub enum TimeoutAction {
     #[default]
     Deny,
     // v0.3+: Escalate, AutoApprove
-}
-
-/// Webhook authentication configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WebhookAuth {
-    /// Authentication type ("bearer" or "basic").
-    #[serde(rename = "type")]
-    pub auth_type: String,
-
-    /// Environment variable containing the token.
-    #[serde(default)]
-    pub token_env: Option<String>,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -662,10 +605,6 @@ pub struct TelemetryYamlConfig {
     /// OTLP export configuration.
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
-
-    /// Prometheus metrics configuration.
-    #[serde(default)]
-    pub prometheus: Option<PrometheusYamlConfig>,
 
     /// Sampling configuration.
     #[serde(default)]
@@ -723,22 +662,6 @@ pub struct OtlpConfig {
 
 fn default_otlp_protocol() -> String {
     "http/protobuf".to_string()
-}
-
-/// Prometheus metrics configuration.
-///
-/// Note: default_true() is already defined at line 196 in schema.rs
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PrometheusYamlConfig {
-    /// Enable Prometheus /metrics endpoint. Default: true
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-impl Default for PrometheusYamlConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 /// Sampling configuration.
@@ -826,7 +749,6 @@ mod tests {
             prefix: Some("test_".to_string()),
             expose: None,
             enabled: true,
-            description: Some("Test source".to_string()),
         };
 
         assert_eq!(source.id(), "test");
@@ -894,8 +816,6 @@ mod tests {
                     policy_id: None,
                     approval: Some("default".to_string()),
                     description: None,
-                    limits: None,
-                    inspectors: None,
                     compiled_pattern: None,
                 },
                 Rule {
@@ -905,8 +825,6 @@ mod tests {
                     policy_id: None,
                     approval: None,
                     description: None,
-                    limits: None,
-                    inspectors: None,
                     compiled_pattern: None,
                 },
             ],
@@ -930,8 +848,6 @@ mod tests {
                 policy_id: None,
                 approval: None,
                 description: None,
-                limits: None,
-                inspectors: None,
                 compiled_pattern: None,
             }],
         };
@@ -954,8 +870,6 @@ mod tests {
                 policy_id: None,
                 approval: None,
                 description: None,
-                limits: None,
-                inspectors: None,
                 compiled_pattern: None,
             }],
         };

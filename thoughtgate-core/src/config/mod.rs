@@ -48,8 +48,8 @@ pub use loader::{
 };
 pub use schema::{
     Action, ApprovalDestination, BatchConfig, CedarConfig, Config, ExposeConfig, Governance,
-    GovernanceDefaults, HumanWorkflow, MatchResult, OtlpConfig, PrometheusYamlConfig, Rule,
-    SamplingConfig, Source, SourceFilter, TelemetryYamlConfig, TimeoutAction, WebhookAuth,
+    GovernanceDefaults, HumanWorkflow, MatchResult, OtlpConfig, Rule, SamplingConfig, Source,
+    SourceFilter, TelemetryYamlConfig, TimeoutAction,
 };
 
 #[cfg(test)]

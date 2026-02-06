@@ -59,10 +59,6 @@ pub enum ConfigError {
     // ─────────────────────────────────────────────────────────────────────────
     // Value validation errors (V-007, V-008, V-013, V-014)
     // ─────────────────────────────────────────────────────────────────────────
-    /// V-007: Invalid duration format.
-    #[error("invalid duration '{value}': {message}")]
-    InvalidDuration { value: String, message: String },
-
     /// V-008: Invalid URL format.
     #[error("invalid URL '{url}': {message}")]
     InvalidUrl { url: String, message: String },
@@ -109,10 +105,6 @@ pub enum ConfigError {
     #[error("unsupported schema version {version}, expected 1")]
     UnsupportedSchemaVersion { version: u32 },
 
-    /// Schema field missing.
-    #[error("missing required field 'schema'")]
-    MissingSchemaVersion,
-
     // ─────────────────────────────────────────────────────────────────────────
     // I/O and parsing errors
     // ─────────────────────────────────────────────────────────────────────────
@@ -142,17 +134,8 @@ pub enum ValidationWarning {
     /// V-004: policy_id specified but action is not policy.
     PolicyIdWithoutPolicyAction { pattern: String },
 
-    /// V-014: Environment variable not set, using default.
-    MissingEnvVar { var: String, field: String },
-
     /// Glob pattern matches zero tools (informational).
     PatternMatchesNothing { pattern: String },
-
-    /// Feature not supported in current version.
-    UnsupportedFeature {
-        feature: String,
-        min_version: String,
-    },
 }
 
 impl std::fmt::Display for ValidationWarning {
@@ -164,20 +147,8 @@ impl std::fmt::Display for ValidationWarning {
                     "rule '{pattern}' has policy_id but action is not 'policy'"
                 )
             }
-            Self::MissingEnvVar { var, field } => {
-                write!(f, "environment variable '{var}' not set for '{field}'")
-            }
             Self::PatternMatchesNothing { pattern } => {
                 write!(f, "glob pattern '{pattern}' may match no tools")
-            }
-            Self::UnsupportedFeature {
-                feature,
-                min_version,
-            } => {
-                write!(
-                    f,
-                    "feature '{feature}' requires version {min_version} or later"
-                )
             }
         }
     }

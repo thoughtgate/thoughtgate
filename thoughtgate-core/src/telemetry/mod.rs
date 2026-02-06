@@ -566,7 +566,6 @@ mod tests {
                 protocol: "http/protobuf".to_string(),
                 headers: std::collections::HashMap::new(),
             }),
-            prometheus: None,
             sampling: Some(SamplingConfig {
                 strategy: "head".to_string(),
                 success_sample_rate: 0.5,
