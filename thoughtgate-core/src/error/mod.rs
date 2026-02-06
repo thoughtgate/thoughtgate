@@ -54,15 +54,6 @@ pub enum ThoughtGateError {
         details: String,
     },
 
-    /// The requested method does not exist.
-    ///
-    /// Implements: REQ-CORE-004/EC-ERR-003
-    #[error("Method '{method}' not found")]
-    MethodNotFound {
-        /// The method name that was not found
-        method: String,
-    },
-
     /// The method parameters are invalid.
     ///
     /// Implements: REQ-CORE-004/EC-ERR-004
@@ -216,54 +207,6 @@ pub enum ThoughtGateError {
         workflow: Option<String>,
     },
 
-    /// Approval workflow not found in configuration.
-    ///
-    /// Implements: REQ-CORE-004/§5.2 (-32017)
-    #[error("Approval workflow '{workflow}' not found")]
-    WorkflowNotFound {
-        /// The workflow name that was not found
-        workflow: String,
-    },
-
-    // Pipeline errors (from REQ-GOV-002) - v0.2+
-    /// An inspector rejected the request.
-    ///
-    /// **Note:** Inspection is deferred to v0.2+. This error is retained for
-    /// future use when Amber Path inspection is enabled.
-    ///
-    /// Implements: REQ-CORE-004/EC-ERR-015
-    #[error("Request validation failed: {reason}")]
-    InspectionFailed {
-        /// The inspector that failed
-        inspector: String,
-        /// Reason for the failure
-        reason: String,
-    },
-
-    /// Policy changed between approval and execution.
-    ///
-    /// **Note:** Policy drift detection is deferred to v0.2+. In v0.1 blocking mode,
-    /// approved requests are forwarded immediately without re-evaluation.
-    ///
-    /// Implements: REQ-CORE-004/EC-ERR-016
-    #[error("Policy changed. Request no longer permitted")]
-    PolicyDrift {
-        /// The task ID affected by policy drift
-        task_id: String,
-    },
-
-    /// Request context changed during approval.
-    ///
-    /// **Note:** Transform drift detection is deferred to v0.2+. In v0.1, requests
-    /// are not inspected or transformed.
-    ///
-    /// Implements: REQ-CORE-004/EC-ERR-017
-    #[error("Request context changed during approval")]
-    TransformDrift {
-        /// The task ID affected by transform drift
-        task_id: String,
-    },
-
     // ═══════════════════════════════════════════════════════════
     // MCP Tasks Protocol Errors (Protocol Revision 2025-11-25)
     // ═══════════════════════════════════════════════════════════
@@ -280,32 +223,6 @@ pub enum ThoughtGateError {
         tool: String,
         /// Hint for the client on how to fix this
         hint: String,
-    },
-
-    /// Client sent `params.task` for a tool that forbids it.
-    ///
-    /// Implements: MCP Tasks Specification - Tool-Level Negotiation
-    /// Uses: -32601 (Method not found) per MCP spec
-    ///
-    /// Tools advertised with `execution.taskSupport: "forbidden"` (or not present)
-    /// MUST NOT receive `params.task`. This error is returned when the client
-    /// includes task metadata for such tools.
-    #[error("Task metadata forbidden for tool '{tool}'")]
-    TaskForbidden {
-        /// The tool that forbids task metadata
-        tool: String,
-    },
-
-    // ═══════════════════════════════════════════════════════════
-    // Configuration errors (from REQ-CFG-001)
-    // ═══════════════════════════════════════════════════════════
-    /// Configuration is invalid or cannot be loaded.
-    ///
-    /// Implements: REQ-CORE-004/§5.2 (-32016)
-    #[error("Configuration error: {details}")]
-    ConfigurationError {
-        /// Description of the configuration error (sanitized)
-        details: String,
     },
 
     // ═══════════════════════════════════════════════════════════
@@ -351,7 +268,6 @@ impl ThoughtGateError {
             // Standard JSON-RPC codes
             Self::ParseError { .. } => -32700,
             Self::InvalidRequest { .. } => -32600,
-            Self::MethodNotFound { .. } => -32601,
             Self::InvalidParams { .. } => -32602,
             Self::InternalError { .. } => -32603,
 
@@ -370,18 +286,12 @@ impl ThoughtGateError {
             Self::TaskCancelled { .. } => -32006,
             Self::TaskResultNotReady { .. } => -32020,
 
-            // ThoughtGate custom codes: Gate 4 - Approval (-32007, -32008, -32017)
+            // ThoughtGate custom codes: Gate 4 - Approval (-32007, -32008)
             Self::ApprovalRejected { .. } => -32007,
             Self::ApprovalTimeout { .. } => -32008,
-            Self::WorkflowNotFound { .. } => -32017,
 
             // ThoughtGate custom codes: Rate limiting (-32009)
             Self::RateLimited { .. } => -32009,
-
-            // ThoughtGate custom codes: Pipeline errors (-32010 to -32012)
-            Self::InspectionFailed { .. } => -32010,
-            Self::PolicyDrift { .. } => -32011,
-            Self::TransformDrift { .. } => -32012,
 
             // ThoughtGate custom codes: Operational (-32013)
             Self::ServiceUnavailable { .. } => -32013,
@@ -392,14 +302,9 @@ impl ThoughtGateError {
             // ThoughtGate custom codes: Gate 1 - Visibility (-32015)
             Self::ToolNotExposed { .. } => -32015,
 
-            // ThoughtGate custom codes: Configuration (-32016)
-            Self::ConfigurationError { .. } => -32016,
-
             // MCP Tasks Protocol errors (standard JSON-RPC codes per MCP spec)
             // TaskRequired: -32600 (Invalid request) - task augmentation required
-            // TaskForbidden: -32601 (Method not found) - task mode not supported
             Self::TaskRequired { .. } => -32600,
-            Self::TaskForbidden { .. } => -32601,
         }
     }
 
@@ -410,7 +315,6 @@ impl ThoughtGateError {
         match self {
             Self::ParseError { .. } => "parse_error",
             Self::InvalidRequest { .. } => "invalid_request",
-            Self::MethodNotFound { .. } => "method_not_found",
             Self::InvalidParams { .. } => "invalid_params",
             Self::UpstreamConnectionFailed { .. } => "upstream_connection_failed",
             Self::UpstreamTimeout { .. } => "upstream_timeout",
@@ -424,16 +328,10 @@ impl ThoughtGateError {
             Self::TaskResultNotReady { .. } => "task_result_not_ready",
             Self::ApprovalRejected { .. } => "approval_rejected",
             Self::ApprovalTimeout { .. } => "approval_timeout",
-            Self::WorkflowNotFound { .. } => "workflow_not_found",
             Self::RateLimited { .. } => "rate_limited",
-            Self::InspectionFailed { .. } => "inspection_failed",
-            Self::PolicyDrift { .. } => "policy_drift",
-            Self::TransformDrift { .. } => "transform_drift",
-            Self::ConfigurationError { .. } => "configuration_error",
             Self::ServiceUnavailable { .. } => "service_unavailable",
             Self::InternalError { .. } => "internal_error",
             Self::TaskRequired { .. } => "task_required",
-            Self::TaskForbidden { .. } => "task_forbidden",
         }
     }
 
@@ -462,9 +360,7 @@ impl ThoughtGateError {
             Self::PolicyDenied { .. } => Some("policy"),
 
             // Gate 4: Approval
-            Self::ApprovalRejected { .. }
-            | Self::ApprovalTimeout { .. }
-            | Self::WorkflowNotFound { .. } => Some("approval"),
+            Self::ApprovalRejected { .. } | Self::ApprovalTimeout { .. } => Some("approval"),
 
             // Non-gate errors
             _ => None,
@@ -481,8 +377,7 @@ impl ThoughtGateError {
             | Self::PolicyDenied { tool, .. }
             | Self::ApprovalRejected { tool, .. }
             | Self::ApprovalTimeout { tool, .. }
-            | Self::TaskRequired { tool, .. }
-            | Self::TaskForbidden { tool, .. } => Some(tool),
+            | Self::TaskRequired { tool, .. } => Some(tool),
             _ => None,
         }
     }
@@ -509,9 +404,6 @@ impl ThoughtGateError {
             Self::ApprovalTimeout { timeout_secs, .. } => {
                 Some(format!("Timeout after {}s", timeout_secs))
             }
-            Self::WorkflowNotFound { workflow } => {
-                Some(format!("Check approval.{} in config", workflow))
-            }
 
             // Upstream errors
             Self::UpstreamConnectionFailed { .. } => None, // Don't expose internal URLs
@@ -531,17 +423,6 @@ impl ThoughtGateError {
                 Some(format!("Task {} result pending", task_id))
             }
 
-            // Pipeline errors - No details (security)
-            Self::InspectionFailed { inspector, .. } => {
-                // Only expose inspector name, not reason
-                Some(format!("Inspector: {}", inspector))
-            }
-            Self::PolicyDrift { .. } => None,
-            Self::TransformDrift { .. } => None,
-
-            // Configuration errors
-            Self::ConfigurationError { details } => Some(details.clone()),
-
             // Operational errors
             Self::RateLimited { retry_after_secs } => {
                 retry_after_secs.map(|s| format!("Retry after {}s", s))
@@ -551,48 +432,13 @@ impl ThoughtGateError {
             // Protocol errors
             Self::ParseError { details } => Some(details.clone()),
             Self::InvalidRequest { details } => Some(details.clone()),
-            Self::MethodNotFound { method } => Some(format!("Method: {}", method)),
             Self::InvalidParams { details } => Some(details.clone()),
 
             // SEP-1686 Protocol errors
             Self::TaskRequired { hint, .. } => Some(hint.clone()),
-            Self::TaskForbidden { .. } => Some("Tool does not support task mode".to_string()),
 
             // Internal error - correlation ID only (log lookup)
             Self::InternalError { .. } => None,
-        }
-    }
-
-    /// Emit a structured tracing event for this error.
-    ///
-    /// Centralizes error logging with consistent field names for
-    /// log aggregation and correlation.
-    ///
-    /// Implements: REQ-CORE-004/F-004 (Error Observability)
-    pub fn log_error(&self, method: &str, correlation_id: Option<&str>) {
-        let gate = self.gate().unwrap_or("none");
-        let error_type = self.error_type_name();
-        let code = self.to_jsonrpc_code();
-
-        if let Some(cid) = correlation_id {
-            tracing::warn!(
-                error_type = error_type,
-                jsonrpc_code = code,
-                gate = gate,
-                method = method,
-                correlation_id = cid,
-                "Request error: {}",
-                self
-            );
-        } else {
-            tracing::warn!(
-                error_type = error_type,
-                jsonrpc_code = code,
-                gate = gate,
-                method = method,
-                "Request error: {}",
-                self
-            );
         }
     }
 
@@ -639,13 +485,6 @@ mod tests {
             }
             .to_jsonrpc_code(),
             -32600
-        );
-        assert_eq!(
-            ThoughtGateError::MethodNotFound {
-                method: "test".to_string()
-            }
-            .to_jsonrpc_code(),
-            -32601
         );
         assert_eq!(
             ThoughtGateError::InvalidParams {
@@ -743,28 +582,6 @@ mod tests {
             -32009
         );
         assert_eq!(
-            ThoughtGateError::InspectionFailed {
-                inspector: "test".to_string(),
-                reason: "test".to_string()
-            }
-            .to_jsonrpc_code(),
-            -32010
-        );
-        assert_eq!(
-            ThoughtGateError::PolicyDrift {
-                task_id: "test".to_string()
-            }
-            .to_jsonrpc_code(),
-            -32011
-        );
-        assert_eq!(
-            ThoughtGateError::TransformDrift {
-                task_id: "test".to_string()
-            }
-            .to_jsonrpc_code(),
-            -32012
-        );
-        assert_eq!(
             ThoughtGateError::ServiceUnavailable {
                 reason: "test".to_string()
             }
@@ -846,17 +663,6 @@ mod tests {
         let details_str = details.unwrap();
         assert!(!details_str.contains("sensitive data"));
         assert!(details_str.contains("-1")); // Only code exposed
-
-        // Inspection failures should not expose full reason
-        let err = ThoughtGateError::InspectionFailed {
-            inspector: "test".to_string(),
-            reason: "Sensitive validation details".to_string(),
-        };
-        let details = err.safe_details();
-        assert!(details.is_some());
-        let details_str = details.unwrap();
-        assert!(!details_str.contains("Sensitive"));
-        assert!(details_str.contains("test")); // Inspector name exposed
 
         // Connection failures should not expose internal URLs
         let err = ThoughtGateError::UpstreamConnectionFailed {
@@ -1061,50 +867,6 @@ mod tests {
         assert_eq!(data.details, Some("Timeout after 300s".to_string()));
     }
 
-    /// Tests workflow not found error format.
-    ///
-    /// Verifies: REQ-CORE-004/§9.1 test_workflow_not_found_format
-    #[test]
-    fn test_workflow_not_found_format() {
-        let err = ThoughtGateError::WorkflowNotFound {
-            workflow: "missing_workflow".to_string(),
-        };
-
-        assert_eq!(err.to_jsonrpc_code(), -32017);
-        assert_eq!(err.gate(), Some("approval"));
-        assert!(err.tool().is_none());
-        assert_eq!(err.error_type_name(), "workflow_not_found");
-
-        let jsonrpc = err.to_jsonrpc_error("test-id");
-        let data = jsonrpc.data.unwrap();
-        assert_eq!(data.gate, Some("approval".to_string()));
-        assert!(data.tool.is_none());
-        assert_eq!(
-            data.details,
-            Some("Check approval.missing_workflow in config".to_string())
-        );
-    }
-
-    /// Tests configuration error format.
-    ///
-    /// Verifies: REQ-CORE-004/§9.1 test_configuration_error_format
-    #[test]
-    fn test_configuration_error_format() {
-        let err = ThoughtGateError::ConfigurationError {
-            details: "Invalid schema version".to_string(),
-        };
-
-        assert_eq!(err.to_jsonrpc_code(), -32016);
-        assert!(err.gate().is_none());
-        assert!(err.tool().is_none());
-        assert_eq!(err.error_type_name(), "configuration_error");
-
-        let jsonrpc = err.to_jsonrpc_error("test-id");
-        let data = jsonrpc.data.unwrap();
-        assert!(data.gate.is_none());
-        assert_eq!(data.details, Some("Invalid schema version".to_string()));
-    }
-
     /// Tests that correlation ID is always included.
     ///
     /// Verifies: REQ-CORE-004/§9.1 test_error_data_includes_correlation
@@ -1223,29 +985,6 @@ mod tests {
         assert!(err.safe_details().unwrap().contains("params.task"));
     }
 
-    /// Tests TaskForbidden error code and formatting.
-    ///
-    /// Verifies: MCP Tasks Specification - Tool-Level Negotiation
-    #[test]
-    fn test_task_forbidden_error() {
-        let err = ThoughtGateError::TaskForbidden {
-            tool: "read_file".to_string(),
-        };
-
-        // Verify error code: -32601 (Method not found) per MCP spec
-        assert_eq!(err.to_jsonrpc_code(), -32601);
-
-        // Verify error type name
-        assert_eq!(err.error_type_name(), "task_forbidden");
-
-        // Verify tool extraction
-        assert_eq!(err.tool(), Some("read_file"));
-
-        // Verify safe_details provides useful message
-        assert!(err.safe_details().is_some());
-        assert!(err.safe_details().unwrap().contains("task mode"));
-    }
-
     /// Tests TaskRequired error produces valid JSON-RPC error.
     #[test]
     fn test_task_required_jsonrpc_error() {
@@ -1265,19 +1004,5 @@ mod tests {
         assert_eq!(data.error_type, "task_required");
         assert!(data.details.is_some());
         assert_eq!(data.tool, Some("admin_action".to_string()));
-    }
-
-    /// Tests TaskForbidden error produces valid JSON-RPC error.
-    #[test]
-    fn test_task_forbidden_jsonrpc_error() {
-        let err = ThoughtGateError::TaskForbidden {
-            tool: "simple_tool".to_string(),
-        };
-
-        let jsonrpc_err = err.to_jsonrpc_error("test-correlation-id");
-
-        // -32601 (Method not found) per MCP spec
-        assert_eq!(jsonrpc_err.code, -32601);
-        assert!(jsonrpc_err.message.contains("simple_tool"));
     }
 }

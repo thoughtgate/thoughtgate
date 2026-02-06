@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -699,39 +698,6 @@ pub enum DrainResult {
     Timeout {
         /// Number of requests still active
         remaining: usize,
-    },
-}
-
-// ============================================================================
-// Errors
-// ============================================================================
-
-/// Errors during lifecycle operations.
-///
-/// Implements: REQ-CORE-005
-#[derive(Debug, Error)]
-pub enum LifecycleError {
-    /// Startup timeout exceeded
-    #[error("Startup timeout after {timeout_secs}s at phase: {phase}")]
-    StartupTimeout {
-        /// Timeout in seconds
-        timeout_secs: u64,
-        /// Phase where timeout occurred
-        phase: String,
-    },
-
-    /// Required component unavailable
-    #[error("Required component unavailable: {component}")]
-    ComponentUnavailable {
-        /// Component name
-        component: String,
-    },
-
-    /// Configuration error
-    #[error("Configuration error: {details}")]
-    ConfigError {
-        /// Error details
-        details: String,
     },
 }
 
