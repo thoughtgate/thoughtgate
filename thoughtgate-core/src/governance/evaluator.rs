@@ -142,6 +142,11 @@ impl GovernanceEvaluator {
         principal: Principal,
         profile: Profile,
     ) -> Self {
+        if profile == Profile::Development {
+            warn!(
+                "SECURITY: Development mode active — Cedar denials and approval workflows will be bypassed"
+            );
+        }
         Self {
             config,
             cedar_engine,
@@ -248,6 +253,26 @@ impl GovernanceEvaluator {
 
         // ── Gate 1: Visibility check ────────────────────────────────────
         if let Some(source) = self.config.get_source(&req.server_id) {
+            // Check if source is enabled before visibility
+            if !source.is_enabled() {
+                info!(
+                    server_id = %req.server_id,
+                    "Gate 1: source disabled — denying"
+                );
+                trace.gate1 = Some("block".to_string());
+                if let Some(ref m) = self.tg_metrics {
+                    m.record_gate_decision("gate1", "block");
+                }
+                return (
+                    self.deny(
+                        Some(format!("Source '{}' is disabled", req.server_id)),
+                        None,
+                        DenySource::Visibility,
+                    ),
+                    trace,
+                );
+            }
+
             let expose = source.expose();
             if !expose.is_visible(&resource_name) {
                 info!(
@@ -366,6 +391,7 @@ impl GovernanceEvaluator {
                         req,
                         &resource_name,
                         match_result.policy_id.as_deref(),
+                        match_result.approval_workflow.as_deref(),
                         effective_principal,
                         &mut trace,
                     )
@@ -396,7 +422,7 @@ impl GovernanceEvaluator {
             None => {
                 // No Cedar engine — profile-dependent fallback.
                 if self.profile == Profile::Development {
-                    info!(
+                    warn!(
                         resource = %resource_name,
                         "Gate 3: no Cedar engine, auto-forwarding in dev mode"
                     );
@@ -486,8 +512,15 @@ impl GovernanceEvaluator {
                     policy_id = %pid,
                     "Gate 3: Cedar permit → Gate 4 approval"
                 );
-                self.start_approval(req, resource_name, Some(&pid), principal, trace)
-                    .await
+                self.start_approval(
+                    req,
+                    resource_name,
+                    Some(&pid),
+                    approval_workflow.as_deref(),
+                    principal,
+                    trace,
+                )
+                .await
             }
             CedarDecision::Forbid { reason, .. } => {
                 trace.gate3 = Some("deny".to_string());
@@ -506,7 +539,7 @@ impl GovernanceEvaluator {
                 }
 
                 if self.profile == Profile::Development {
-                    info!(
+                    warn!(
                         resource = %resource_name,
                         reason = %reason,
                         "Gate 3: WOULD_DENY (Cedar forbid) — auto-forwarding in dev mode"
@@ -518,7 +551,6 @@ impl GovernanceEvaluator {
                     reason = %reason,
                     "Gate 3: Cedar forbid — denying"
                 );
-                let _ = approval_workflow; // used in future for workflow selection
                 self.deny(Some(reason), Some(&pid), DenySource::CedarPolicy)
             }
         }
@@ -540,12 +572,13 @@ impl GovernanceEvaluator {
         req: &GovernanceEvaluateRequest,
         resource_name: &str,
         policy_id: Option<&str>,
+        approval_workflow: Option<&str>,
         principal: &Principal,
         trace: &mut EvalTrace,
     ) -> GovernanceEvaluateResponse {
         // ── Development mode: skip approval, auto-forward ───────────────
         if self.profile == Profile::Development {
-            info!(
+            warn!(
                 method = %req.method,
                 resource = %resource_name,
                 "WOULD_REQUIRE_APPROVAL — auto-forwarding in dev mode"
@@ -565,10 +598,15 @@ impl GovernanceEvaluator {
             mcp_request_id,
         };
 
+        // ── Resolve workflow-specific settings ────────────────────────────
+        let wf = approval_workflow.and_then(|name| self.config.get_workflow(name));
+        let wf_timeout = wf.map(|w| w.timeout_or_default());
+        let wf_on_timeout = wf.map(|w| w.on_timeout_or_default());
+
         // ── Preferred path: delegate to ApprovalEngine ──────────────────
         if let Some(ref engine) = self.approval_engine {
             match engine
-                .start_approval(tool_request, principal.clone(), None)
+                .start_approval(tool_request, principal.clone(), wf_timeout, wf_on_timeout)
                 .await
             {
                 Ok(result) => {
@@ -1003,6 +1041,62 @@ governance:
     #[tokio::test]
     async fn test_forward_visible_tool_gate1() {
         let eval = test_evaluator(blocklist_config(), Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "read_file"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Forward);
+    }
+
+    #[tokio::test]
+    async fn test_deny_disabled_source_gate1() {
+        let config = test_config(
+            r#"
+schema: 1
+sources:
+  - id: test-server
+    kind: mcp
+    url: http://localhost:3000
+    enabled: false
+governance:
+  defaults:
+    action: forward
+"#,
+        );
+        let eval = test_evaluator(config, Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "read_file"})),
+        );
+        let (resp, trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+        assert!(
+            resp.reason.as_deref().unwrap_or("").contains("disabled"),
+            "reason should mention source disabled, got: {:?}",
+            resp.reason
+        );
+        assert_eq!(trace.gate1.as_deref(), Some("block"));
+    }
+
+    #[tokio::test]
+    async fn test_allow_enabled_source_gate1() {
+        let config = test_config(
+            r#"
+schema: 1
+sources:
+  - id: test-server
+    kind: mcp
+    url: http://localhost:3000
+    enabled: true
+governance:
+  defaults:
+    action: forward
+"#,
+        );
+        let eval = test_evaluator(config, Profile::Production);
         let req = make_request(
             "tools/call",
             "test-server",
