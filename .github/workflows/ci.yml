@@ -62,7 +62,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@v1.17.4
 
       - name: Install cargo-deny
         run: |
@@ -306,10 +306,15 @@ jobs:
           EOF
           cat startup_metrics.json
 
-      - name: Install k6
+      - name: Install k6 (with checksum verification)
         run: |
-          curl -sL https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz | tar xz
-          sudo mv k6-v0.54.0-linux-amd64/k6 /usr/local/bin/
+          K6_VERSION="v0.54.0"
+          K6_SHA256="c7f03434854f837b6790ee81572e4b0f955241974c79a43cbb9f8d0fef069589"
+          curl -sL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" -o k6.tar.gz
+          echo "${K6_SHA256}  k6.tar.gz" | sha256sum -c -
+          tar xzf k6.tar.gz
+          sudo mv k6-${K6_VERSION}-linux-amd64/k6 /usr/local/bin/
+          rm -rf k6.tar.gz k6-${K6_VERSION}-linux-amd64
           k6 version
 
       - name: Run k6 latency benchmark
@@ -468,7 +473,7 @@ jobs:
           cat bench_metrics.json
 
       - name: Install Bencher CLI
-        uses: bencherdev/bencher@main
+        uses: bencherdev/bencher@v0.5.10
 
       - name: Report benchmarks to Bencher (main branch)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -574,7 +579,7 @@ jobs:
         uses: aquasecurity/trivy-action@0.33.1
         with:
           input: /tmp/thoughtgate-image.tar
-          severity: 'CRITICAL,HIGH'
+          severity: 'CRITICAL,HIGH,MEDIUM'
           exit-code: '1'
           ignore-unfixed: true
           format: 'sarif'
@@ -658,7 +663,7 @@ jobs:
 
       - name: Install Bencher CLI
         if: always()
-        uses: bencherdev/bencher@main
+        uses: bencherdev/bencher@v0.5.10
 
       - name: Report K8s metrics to Bencher (main branch)
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -789,6 +794,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
 
       # REQ-OBS-001: Collect Docker image metrics (M-BIN-002 to M-BIN-005)
       - name: Collect Docker image metrics
@@ -837,7 +844,7 @@ jobs:
           cat docker_metrics.json
 
       - name: Install Bencher CLI
-        uses: bencherdev/bencher@main
+        uses: bencherdev/bencher@v0.5.10
 
       - name: Report Docker metrics to Bencher
         run: |
