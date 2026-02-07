@@ -331,9 +331,26 @@ pub(crate) async fn start_approval_flow(
                 .map(|w| w.timeout_or_default())
         });
 
-    // Start the approval workflow with workflow-specific timeout
+    // Resolve workflow-specific on_timeout action
+    let workflow_on_timeout = match_result
+        .approval_workflow
+        .as_ref()
+        .and_then(|workflow_name| {
+            state
+                .config
+                .as_ref()
+                .and_then(|c| c.get_workflow(workflow_name))
+                .map(|w| w.on_timeout_or_default())
+        });
+
+    // Start the approval workflow with workflow-specific timeout and on_timeout
     let result = approval_engine
-        .start_approval(tool_request, principal, workflow_timeout)
+        .start_approval(
+            tool_request,
+            principal,
+            workflow_timeout,
+            workflow_on_timeout,
+        )
         .await
         .map_err(|e| ThoughtGateError::ServiceUnavailable {
             reason: format!("Failed to start approval: {}", e),

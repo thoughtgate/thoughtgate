@@ -124,18 +124,10 @@ impl ApprovalEngineConfig {
     }
 }
 
-/// Action to take when approval times out.
+/// Re-export TimeoutAction from config to avoid duplication.
 ///
 /// Implements: REQ-GOV-002/F-006.4
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TimeoutAction {
-    /// Deny the request on timeout (return -32008)
-    #[default]
-    Deny,
-    /// Auto-approve on timeout (dangerous, use with caution)
-    Approve,
-}
+pub use crate::config::TimeoutAction;
 
 // ============================================================================
 // Approval Engine Errors
@@ -402,6 +394,7 @@ impl ApprovalEngine {
         request: ToolCallRequest,
         principal: Principal,
         workflow_timeout: Option<Duration>,
+        on_timeout_override: Option<TimeoutAction>,
     ) -> Result<ApprovalStartResult, ApprovalEngineError> {
         let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
 
@@ -431,7 +424,7 @@ impl ApprovalEngine {
                 pre_result.transformed_request,
                 principal.clone(),
                 Some(timeout),
-                self.config.on_timeout,
+                on_timeout_override.unwrap_or(self.config.on_timeout),
             )
             .map_err(|e| ApprovalEngineError::TaskCreation {
                 details: e.to_string(),
@@ -1148,7 +1141,7 @@ mod tests {
         );
 
         let result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await;
 
         assert!(result.is_ok(), "start_approval should succeed");
@@ -1216,7 +1209,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1255,7 +1248,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1311,7 +1304,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1354,7 +1347,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1395,7 +1388,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1450,7 +1443,7 @@ mod tests {
         );
 
         let result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1516,7 +1509,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1568,7 +1561,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1626,7 +1619,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1685,7 +1678,7 @@ mod tests {
 
         // Start approval but never approve
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1742,7 +1735,7 @@ mod tests {
 
         // Start approval but never approve
         let _start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 

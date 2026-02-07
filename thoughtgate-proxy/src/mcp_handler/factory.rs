@@ -52,8 +52,11 @@ pub async fn create_governance_components_with_metrics(
 
     // Create Cedar policy engine (Gate 3) with optional metrics wiring (REQ-OBS-002 §6.4/MG-003)
     let cedar_engine = {
-        let engine = CedarEngine::new().map_err(|e| ThoughtGateError::ServiceUnavailable {
-            reason: format!("Failed to create Cedar engine: {}", e),
+        let cedar_config = config.and_then(|c| c.cedar.as_ref());
+        let engine = CedarEngine::new_with_config(cedar_config).map_err(|e| {
+            ThoughtGateError::ServiceUnavailable {
+                reason: format!("Failed to create Cedar engine: {}", e),
+            }
         })?;
         if let Some(ref metrics) = tg_metrics {
             Arc::new(engine.with_metrics(metrics.clone()))

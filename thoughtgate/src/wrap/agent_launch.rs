@@ -561,7 +561,7 @@ async fn setup_governance(
         }
     };
 
-    let cedar_engine = match CedarEngine::new() {
+    let cedar_engine = match CedarEngine::new_with_config(config.cedar.as_ref()) {
         Ok(engine) => {
             tracing::info!("Cedar policy engine initialized");
             Some(Arc::new(engine))

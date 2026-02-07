@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::error::{ConfigError, ValidationResult, ValidationWarning};
-use super::schema::{Action, Config, Source};
+use super::schema::{Action, ApprovalDestination, Config, Source, SourceFilter};
 
 /// Semantic version for feature gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +250,32 @@ pub fn validate(config: &Config, version: Version) -> Result<ValidationResult, C
         }
     }
 
+    // V-016: Source ID format validation
+    for source in &config.sources {
+        let id = source.id();
+        if id.is_empty() {
+            return Err(ConfigError::InvalidSourceId {
+                id: id.to_string(),
+                reason: "source ID must not be empty".to_string(),
+            });
+        }
+        if id.trim() != id {
+            return Err(ConfigError::InvalidSourceId {
+                id: id.to_string(),
+                reason: "source ID must not have leading or trailing whitespace".to_string(),
+            });
+        }
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        {
+            return Err(ConfigError::InvalidSourceId {
+                id: id.to_string(),
+                reason: "source ID must contain only [a-zA-Z0-9._-]".to_string(),
+            });
+        }
+    }
+
     // V-003: Unique prefixes
     let mut seen_prefixes = HashSet::new();
     for source in &config.sources {
@@ -305,6 +331,13 @@ pub fn validate(config: &Config, version: Version) -> Result<ValidationResult, C
                         pattern: rule.pattern.clone(),
                     });
                 }
+            } else if workflow_names.len() != 1 {
+                // V-006b: no explicit approval field — implicit selection only
+                // works when exactly one workflow is defined
+                return Err(ConfigError::MissingApprovalWorkflow {
+                    pattern: rule.pattern.clone(),
+                    workflow_count: workflow_names.len(),
+                });
             }
         }
 
@@ -314,6 +347,27 @@ pub fn validate(config: &Config, version: Version) -> Result<ValidationResult, C
                 pattern: rule.pattern.clone(),
                 message: e.to_string(),
             });
+        }
+
+        // V-007: Source references in rules must exist
+        if let Some(ref source_filter) = rule.source {
+            let check_source = |id: &str| -> Result<(), ConfigError> {
+                if !seen_ids.contains(id) {
+                    return Err(ConfigError::UndefinedSourceInRule {
+                        source_id: id.to_string(),
+                        pattern: rule.pattern.clone(),
+                    });
+                }
+                Ok(())
+            };
+            match source_filter {
+                SourceFilter::Single(id) => check_source(id)?,
+                SourceFilter::Multiple(ids) => {
+                    for id in ids {
+                        check_source(id)?;
+                    }
+                }
+            }
         }
     }
 
@@ -335,11 +389,56 @@ pub fn validate(config: &Config, version: Version) -> Result<ValidationResult, C
         }
     }
 
+    // Per-workflow Slack settings warning (not yet supported)
+    // V-015: Workflow timeout validation
+    if let Some(ref approval) = config.approval {
+        for (name, workflow) in approval {
+            let ApprovalDestination::Slack {
+                ref token_env,
+                ref mention,
+                ref channel,
+            } = workflow.destination;
+            if token_env.is_some() || mention.is_some() || channel != "#approvals" {
+                warnings.push(ValidationWarning::PerWorkflowSlackNotSupported {
+                    workflow: name.clone(),
+                });
+            }
+
+            // V-015: Minimum timeout durations
+            if let Some(timeout) = workflow.timeout {
+                if timeout.as_secs() < 5 {
+                    return Err(ConfigError::InvalidWorkflowTimeout {
+                        workflow: name.clone(),
+                        field: "timeout".to_string(),
+                        duration_secs: timeout.as_secs(),
+                    });
+                }
+            }
+            if let Some(bt) = workflow.blocking_timeout {
+                if bt.as_secs() < 5 {
+                    return Err(ConfigError::InvalidWorkflowTimeout {
+                        workflow: name.clone(),
+                        field: "blocking_timeout".to_string(),
+                        duration_secs: bt.as_secs(),
+                    });
+                }
+            }
+        }
+    }
+
     // V-013: Cedar policy files exist
     if let Some(ref cedar) = config.cedar {
         for path in &cedar.policies {
             if !path.exists() {
                 return Err(ConfigError::PolicyFileNotFound { path: path.clone() });
+            }
+        }
+        // V-013 extension: Cedar schema path exists
+        if let Some(ref schema_path) = cedar.schema {
+            if !schema_path.exists() {
+                return Err(ConfigError::PolicyFileNotFound {
+                    path: schema_path.clone(),
+                });
             }
         }
     }
@@ -393,6 +492,23 @@ pub fn validate(config: &Config, version: Version) -> Result<ValidationResult, C
             if batch.scheduled_delay_ms < 100 {
                 return Err(ConfigError::InvalidBatchDelay {
                     delay_ms: batch.scheduled_delay_ms,
+                });
+            }
+
+            // V-TEL-007: max_export_batch_size in (0, max_queue_size]
+            if batch.max_export_batch_size == 0
+                || batch.max_export_batch_size > batch.max_queue_size
+            {
+                return Err(ConfigError::InvalidExportBatchSize {
+                    batch_size: batch.max_export_batch_size,
+                    queue_size: batch.max_queue_size,
+                });
+            }
+
+            // V-TEL-008: export_timeout_ms >= 100
+            if batch.export_timeout_ms < 100 {
+                return Err(ConfigError::InvalidExportTimeout {
+                    timeout_ms: batch.export_timeout_ms,
                 });
             }
         }
@@ -922,5 +1038,525 @@ telemetry:
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
         let result = validate(&config, Version::V0_2);
         assert!(result.is_ok());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Per-workflow Slack warning tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_per_workflow_slack_warning() {
+        let yaml = r##"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: approve
+      approval: custom
+approval:
+  custom:
+    destination:
+      type: slack
+      channel: "#custom-channel"
+      token_env: CUSTOM_TOKEN
+      mention:
+        - "@oncall"
+    timeout: 5m
+"##;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2).unwrap();
+        assert!(!result.is_clean());
+        assert!(result.warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::PerWorkflowSlackNotSupported { workflow } if workflow == "custom"
+        )));
+    }
+
+    #[test]
+    fn test_per_workflow_slack_no_warning_default() {
+        let yaml = r##"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: approve
+      approval: default
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 5m
+"##;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2).unwrap();
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, ValidationWarning::PerWorkflowSlackNotSupported { .. })),
+            "No per-workflow Slack warning expected for default channel"
+        );
+    }
+
+    #[test]
+    fn test_unknown_field_rejected() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+unknown_top_level_field: oops
+"#;
+        let result: Result<Config, _> = serde_saphyr::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "Unknown top-level field should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown_top_level_field"),
+            "Error should mention the unknown field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_rule_field_rejected() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: deny
+      typo_field: oops
+"#;
+        let result: Result<Config, _> = serde_saphyr::from_str(yaml);
+        assert!(result.is_err(), "Unknown rule field should be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("typo_field"),
+            "Error should mention the unknown field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_approve_no_workflow_zero_defined() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: approve
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("0 workflows"),
+            "Should mention 0 workflows, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_approve_no_workflow_multi_defined() {
+        let yaml = r##"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: approve
+approval:
+  fast:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 1m
+  slow:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 30m
+"##;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("2 workflows"),
+            "Should mention 2 workflows, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_approve_no_workflow_single_defined() {
+        let yaml = r##"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: approve
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 5m
+"##;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(
+            result.is_ok(),
+            "Single workflow should allow implicit selection, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    // ── V-015: Workflow timeout validation ────────────────────────────────
+
+    #[test]
+    fn test_zero_timeout_rejected() {
+        let yaml = r##"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 0s
+"##;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("0s"), "Should mention 0s timeout, got: {err}");
+    }
+
+    #[test]
+    fn test_small_timeout_rejected() {
+        let yaml = r##"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 3s
+"##;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("3s"), "Should mention 3s timeout, got: {err}");
+    }
+
+    #[test]
+    fn test_minimum_timeout_accepted() {
+        let yaml = r##"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 5s
+"##;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(
+            result.is_ok(),
+            "5s timeout should be accepted, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    // ── V-007: Source references in rules ─────────────────────────────────
+
+    #[test]
+    fn test_undefined_source_in_rule_rejected() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: deny
+      source: nonexistent-server
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nonexistent-server"),
+            "Should mention undefined source, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_valid_source_in_rule_accepted() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+  rules:
+    - match: "delete_*"
+      action: deny
+      source: upstream
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(
+            result.is_ok(),
+            "Valid source reference should be accepted, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    // ── V-013 extension: Cedar schema path ───────────────────────────────
+
+    #[test]
+    fn test_cedar_schema_path_validated() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+cedar:
+  policies: []
+  schema: /nonexistent/path/to/schema.cedarschema
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found"),
+            "Should mention file not found, got: {err}"
+        );
+    }
+
+    // ── V-016: Source ID format validation ────────────────────────────────
+
+    #[test]
+    fn test_empty_source_id() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: ""
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty"),
+            "Should mention empty source ID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_special_char_source_id() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: "up stream!"
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("[a-zA-Z0-9._-]"),
+            "Should mention valid characters, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_valid_source_id_with_dots() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: my.mcp-server_01
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(
+            result.is_ok(),
+            "Dotted source ID should be valid, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    // ── V-TEL-007/008: OTEL batch config range checks ───────────────────
+
+    #[test]
+    fn test_batch_export_size_zero() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+telemetry:
+  enabled: true
+  batch:
+    max_queue_size: 2048
+    max_export_batch_size: 0
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("max_export_batch_size"),
+            "Should mention batch size, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_batch_export_size_exceeds_queue() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+telemetry:
+  enabled: true
+  batch:
+    max_queue_size: 100
+    max_export_batch_size: 200
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("max_export_batch_size"),
+            "Should mention batch exceeds queue, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_batch_export_timeout_small() {
+        let yaml = r#"
+schema: 1
+sources:
+  - id: upstream
+    kind: mcp
+    url: http://mcp-server:8080
+governance:
+  defaults:
+    action: forward
+telemetry:
+  enabled: true
+  batch:
+    export_timeout_ms: 50
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let result = validate(&config, Version::V0_2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("export_timeout_ms"),
+            "Should mention timeout, got: {err}"
+        );
     }
 }

@@ -102,6 +102,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         });
 
+    // Port conflict detection
+    if let Err(e) = thoughtgate_proxy::ports::validate_ports() {
+        error!(reason = %e, "Port configuration error — refusing to start");
+        std::process::exit(1);
+    }
+
     // Phase 1b: Validate environment safety
     // Implements: REQ-CORE-005/F-001 (Startup Safety)
     if let Err(msg) = thoughtgate_core::lifecycle::validate_environment() {

@@ -36,6 +36,7 @@ use super::duration_format;
 ///     action: forward
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Schema version (must be 1).
     pub schema: u32,
@@ -178,6 +179,7 @@ pub enum Source {
         url: String,
 
         /// Optional prefix for tool names from this source.
+        /// Reserved for v0.4+ multi-source prefix routing. Parsed but not used at runtime.
         #[serde(default)]
         prefix: Option<String>,
 
@@ -190,6 +192,7 @@ pub enum Source {
         enabled: bool,
 
         /// Human-readable description of this source.
+        /// Reserved for admin UI. Not used at runtime.
         #[serde(default)]
         description: Option<String>,
     },
@@ -348,6 +351,7 @@ impl ExposeConfig {
 /// # Traceability
 /// - Implements: REQ-CFG-001 Section 7.4 (Governance Configuration)
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Governance {
     /// Default action when no rule matches.
     pub defaults: GovernanceDefaults,
@@ -359,6 +363,7 @@ pub struct Governance {
 
 /// Default governance settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GovernanceDefaults {
     /// Default action to take when no rule matches.
     pub action: Action,
@@ -397,6 +402,7 @@ impl std::fmt::Display for Action {
 /// # Traceability
 /// - Implements: REQ-CFG-001 Section 7.4 (Rule)
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rule {
     /// Glob pattern for tool name matching.
     #[serde(rename = "match")]
@@ -418,6 +424,7 @@ pub struct Rule {
     pub approval: Option<String>,
 
     /// Human-readable description.
+    /// Reserved for admin UI. Not used at runtime.
     #[serde(default)]
     pub description: Option<String>,
 
@@ -511,6 +518,7 @@ impl Governance {
 /// # Traceability
 /// - Implements: REQ-CFG-001 Section 7.5 (Approval Configuration)
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanWorkflow {
     /// Destination for approval requests.
     pub destination: ApprovalDestination,
@@ -546,7 +554,7 @@ impl HumanWorkflow {
 
     /// Get the timeout action, using default if not specified.
     pub fn on_timeout_or_default(&self) -> TimeoutAction {
-        self.on_timeout.clone().unwrap_or_default()
+        self.on_timeout.unwrap_or_default()
     }
 
     /// Get the blocking timeout for holding HTTP connections during approval.
@@ -580,13 +588,14 @@ pub enum ApprovalDestination {
 }
 
 /// Action to take when approval times out.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeoutAction {
     /// Deny the request on timeout.
     #[default]
     Deny,
-    // v0.3+: Escalate, AutoApprove
+    /// Auto-approve on timeout (use with caution).
+    Approve,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -598,6 +607,7 @@ pub enum TimeoutAction {
 /// # Traceability
 /// - Implements: REQ-CFG-001 Section 7.6 (Cedar Configuration)
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CedarConfig {
     /// List of Cedar policy file paths.
     pub policies: Vec<PathBuf>,
@@ -617,6 +627,7 @@ pub struct CedarConfig {
 /// - Implements: REQ-OBS-002 §8.2 (OTLP Export Configuration)
 /// - Implements: REQ-OBS-002 §8.5 (Sampling Strategies)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryYamlConfig {
     /// Master enable/disable switch for OTLP trace export.
     /// Default: false (B-OBS2-001: disabled by default)
@@ -649,6 +660,7 @@ pub struct TelemetryYamlConfig {
 /// # Traceability
 /// - Implements: REQ-OBS-002 §7.3.1 (Stdio Transport Propagation)
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StdioTelemetryConfig {
     /// If true, preserve `_meta.traceparent` and `_meta.tracestate` when
     /// forwarding to upstream MCP servers.
@@ -665,6 +677,7 @@ pub struct StdioTelemetryConfig {
 ///
 /// Implements: REQ-CFG-001 §8.2
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OtlpConfig {
     /// OTLP HTTP endpoint (e.g., "http://otel-collector:4318").
     pub endpoint: String,
@@ -687,6 +700,7 @@ fn default_otlp_protocol() -> String {
 
 /// Sampling configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamplingConfig {
     /// Sampling strategy: "head" only in v0.2.
     #[serde(default = "default_sampling_strategy")]
@@ -716,6 +730,7 @@ impl Default for SamplingConfig {
 
 /// Batch span processor configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchConfig {
     /// Maximum spans in the export queue.
     #[serde(default = "default_max_queue_size")]
