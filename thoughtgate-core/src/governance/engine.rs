@@ -154,8 +154,6 @@ pub enum ApprovalEngineError {
     TaskNotFound { task_id: TaskId },
     /// Task in unexpected state
     InvalidState { task_id: TaskId, status: TaskStatus },
-    /// Upstream execution failed
-    ExecutionFailed { details: String },
     /// Internal error
     Internal { details: String },
 }
@@ -169,7 +167,6 @@ impl std::fmt::Display for ApprovalEngineError {
             Self::InvalidState { task_id, status } => {
                 write!(f, "Task {task_id} in invalid state: {status}")
             }
-            Self::ExecutionFailed { details } => write!(f, "Execution failed: {details}"),
             Self::Internal { details } => write!(f, "Internal error: {details}"),
         }
     }

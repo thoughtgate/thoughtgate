@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 
+use smallvec::SmallVec;
+
 use super::Principal;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -207,7 +209,8 @@ pub enum CedarDecision {
     Permit {
         /// Policy IDs that contributed to the permit decision.
         /// Used to look up `@thoughtgate_approval` annotations.
-        determining_policies: Vec<String>,
+        /// SmallVec avoids heap allocation for the common 0-1 policy case.
+        determining_policies: SmallVec<[String; 1]>,
     },
 
     /// Policy forbids the request.
@@ -217,7 +220,8 @@ pub enum CedarDecision {
         /// Reason for denial (safe for logging).
         reason: String,
         /// Policy IDs that caused the denial.
-        policy_ids: Vec<String>,
+        /// SmallVec avoids heap allocation for the common 1-2 policy case.
+        policy_ids: SmallVec<[String; 2]>,
     },
 }
 
@@ -246,7 +250,7 @@ impl CedarDecision {
     pub fn default_forbid() -> Self {
         CedarDecision::Forbid {
             reason: "No policy permits this action (default-deny)".to_string(),
-            policy_ids: vec![],
+            policy_ids: SmallVec::new(),
         }
     }
 }
@@ -317,46 +321,6 @@ impl PolicyAnnotations {
     pub fn len(&self) -> usize {
         self.workflow_mapping.len()
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Engine Statistics (REQ-POL-001 §6.3)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// v0.2 Cedar engine statistics.
-///
-/// Implements: REQ-POL-001/§6.3 (CedarStats)
-#[derive(Debug, Clone, Default)]
-pub struct CedarStats {
-    /// Total number of evaluations.
-    pub evaluation_count: u64,
-
-    /// Number of Permit decisions.
-    pub permit_count: u64,
-
-    /// Number of Forbid decisions.
-    pub forbid_count: u64,
-
-    /// Average evaluation time in microseconds.
-    pub avg_eval_time_us: u64,
-}
-
-/// Policy information for debugging/observability.
-///
-/// Implements: REQ-POL-001/§6.3 (PolicyInfo)
-#[derive(Debug, Clone, Default)]
-pub struct PolicyInfo {
-    /// Paths from which policies were loaded.
-    pub paths: Vec<std::path::PathBuf>,
-
-    /// Number of policies loaded.
-    pub policy_count: usize,
-
-    /// When policies were last reloaded.
-    pub last_reload: Option<std::time::SystemTime>,
-
-    /// Number of policies with `@thoughtgate_approval` annotations.
-    pub annotated_policy_count: usize,
 }
 
 #[cfg(test)]
@@ -434,7 +398,7 @@ mod tests {
     #[test]
     fn test_cedar_decision_permit() {
         let decision = CedarDecision::Permit {
-            determining_policies: vec!["policy1".to_string(), "policy2".to_string()],
+            determining_policies: smallvec::smallvec!["policy1".to_string(), "policy2".to_string()],
         };
 
         assert!(decision.is_permit());
@@ -446,7 +410,7 @@ mod tests {
     fn test_cedar_decision_forbid() {
         let decision = CedarDecision::Forbid {
             reason: "Amount exceeds limit".to_string(),
-            policy_ids: vec!["high_value_block".to_string()],
+            policy_ids: smallvec::smallvec!["high_value_block".to_string()],
         };
 
         assert!(!decision.is_permit());

@@ -22,6 +22,8 @@
 //! - Content-Type contains "application/json"
 //! - Path is "/mcp/v1" or "/" (root path for simple deployments)
 
+use std::borrow::Cow;
+
 use hyper::{Method, Request, header};
 
 /// Type of traffic for routing decisions.
@@ -119,10 +121,8 @@ pub fn discriminate_traffic<B>(req: &Request<B>) -> TrafficType {
         .unwrap_or("");
 
     // Case-insensitive check per RFC 7231 Section 3.1.1.1
-    if !content_type
-        .to_ascii_lowercase()
-        .contains("application/json")
-    {
+    // Uses zero-allocation byte-window scan instead of to_ascii_lowercase()
+    if !contains_ignore_ascii_case(content_type, "application/json") {
         return TrafficType::Http;
     }
 
@@ -132,7 +132,6 @@ pub fn discriminate_traffic<B>(req: &Request<B>) -> TrafficType {
     // Normalize: collapse consecutive slashes, trim trailing slash
     let path = req.uri().path();
     let normalized = normalize_path(path);
-    let normalized = normalized.as_str();
     if normalized == "/mcp/v1" || normalized == "/" {
         return TrafficType::Mcp;
     }
@@ -165,11 +164,33 @@ pub fn is_mcp_request<B>(req: &Request<B>) -> bool {
     discriminate_traffic(req) == TrafficType::Mcp
 }
 
+/// Case-insensitive substring search without heap allocation.
+///
+/// Scans `haystack` for a contiguous window matching `needle` using
+/// ASCII case-insensitive comparison. `needle` must be lowercase.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Normalize a URL path by collapsing consecutive slashes and trimming trailing slash.
+///
+/// Returns `Cow::Borrowed` when the path is already normalized (common case),
+/// avoiding a heap allocation on every request.
 ///
 /// Prevents path confusion bypasses where `//mcp/v1` or `/mcp/v1/` would evade
 /// exact-match detection.
-fn normalize_path(path: &str) -> String {
+fn normalize_path(path: &str) -> Cow<'_, str> {
+    // Fast path: check if normalization is actually needed
+    let has_double_slash = path.as_bytes().windows(2).any(|w| w == b"//");
+    let has_trailing_slash = path.len() > 1 && path.ends_with('/');
+    if !has_double_slash && !has_trailing_slash {
+        return Cow::Borrowed(path);
+    }
+
+    // Slow path: allocate and normalize
     let mut result = String::with_capacity(path.len());
     let mut prev_slash = false;
     for ch in path.chars() {
@@ -187,7 +208,7 @@ fn normalize_path(path: &str) -> String {
     if result.len() > 1 && result.ends_with('/') {
         result.pop();
     }
-    result
+    Cow::Owned(result)
 }
 
 #[cfg(test)]

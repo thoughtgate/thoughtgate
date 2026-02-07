@@ -88,13 +88,8 @@ opentelemetry = "0.31"
 prometheus-client = "0.24.0"
 
 [features]
-default = ["metrics"]
 mock = []
 fuzzing = []
-metrics = []
-# Amber Path: Buffered inspection for PII detection, schema validation, etc.
-# Deferred to v0.3+ - enable when response inspection is needed
-amber_path = []
 
 [dev-dependencies]
 # Kubernetes orchestration

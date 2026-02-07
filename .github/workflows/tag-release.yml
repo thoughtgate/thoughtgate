@@ -1,0 +1,53 @@
+# Tag Release
+#
+# Automatically creates a git tag and dispatches the Release workflow
+# when a release PR merges to main.
+#
+# Flow:
+#   1. Release PR (from prepare-release.yml) merges to main
+#   2. This workflow creates an annotated git tag (format: v0.4.0)
+#   3. Dispatches release.yml via workflow_dispatch (no PAT needed)
+#   4. cargo-dist builds binaries and creates the GitHub Release
+#
+# No extra secrets required — GITHUB_TOKEN can trigger workflow_dispatch.
+
+name: Tag Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag:
+    name: Create release tag
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release/v')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Create and push tag
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          VERSION="${HEAD_REF#release/}"
+          echo "Creating tag: $VERSION"
+          git tag -a "$VERSION" -m "chore(release): $VERSION"
+          git push origin "$VERSION"
+
+      - name: Dispatch release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          VERSION="${HEAD_REF#release/}"
+          echo "Dispatching release.yml with tag=$VERSION"
+          gh workflow run release.yml -f "tag=$VERSION"

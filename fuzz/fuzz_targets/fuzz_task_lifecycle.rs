@@ -19,9 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use thoughtgate_core::governance::{
-    ApprovalDecision, FailureInfo, FailureStage, Principal, TaskId, TaskStatus, TaskStore,
-    TaskStoreConfig, TimeoutAction, ToolCallRequest, ToolCallResult,
+    ApprovalDecision, Principal, TaskId, TaskStatus, TaskStore, TaskStoreConfig, TimeoutAction,
+    ToolCallRequest, ToolCallResult,
 };
+use thoughtgate_core::governance::task::{FailureInfo, FailureStage};
 
 /// Fuzz input for task lifecycle testing
 #[derive(Arbitrary, Debug)]

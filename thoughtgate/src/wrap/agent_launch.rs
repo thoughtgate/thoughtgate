@@ -18,11 +18,13 @@ use tokio_util::sync::CancellationToken;
 use thoughtgate_core::governance::approval::{
     ApprovalAdapter, MockAdapter, PollingConfig, PollingScheduler, SlackAdapter, SlackConfig,
 };
+use thoughtgate_core::governance::engine::{ApprovalEngine, ApprovalEngineConfig};
 use thoughtgate_core::governance::evaluator::GovernanceEvaluator;
 use thoughtgate_core::governance::service::{GovernanceServiceState, start_governance_service};
 use thoughtgate_core::governance::task::{Principal, TaskStore};
 use thoughtgate_core::policy::engine::CedarEngine;
 use thoughtgate_core::profile::Profile;
+use thoughtgate_core::transport::NoopUpstreamForwarder;
 
 use crate::cli::WrapArgs;
 use crate::error::StdioError;
@@ -173,7 +175,6 @@ fn run_dry_run(
         server_id: String::new(),
         governance_endpoint: "http://127.0.0.1:0".to_string(),
         profile,
-        config_path: PathBuf::from("/dev/null"),
     };
 
     let _backup = adapter
@@ -403,15 +404,15 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         let task_store = Arc::new(TaskStore::with_defaults());
 
         // Create evaluator.
-        let evaluator = Arc::new(GovernanceEvaluator::new(
+        let mut evaluator = GovernanceEvaluator::new(
             config.clone(),
-            cedar_engine,
+            cedar_engine.clone(),
             task_store.clone(),
             principal,
             profile,
-        ));
+        );
 
-        // Conditionally create polling scheduler (if config uses approval workflows).
+        // Conditionally create ApprovalEngine (if config uses approval workflows).
         let scheduler_state = if config.requires_approval_engine() {
             let cancel_token = CancellationToken::new();
 
@@ -439,28 +440,45 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
                 }
             };
 
-            let scheduler = Arc::new(PollingScheduler::new(
-                adapter,
-                task_store.clone(),
-                PollingConfig::default(),
-                cancel_token.clone(),
-            ));
+            // Use ApprovalEngine when Cedar is available (handles pipeline + scheduling).
+            // Fall back to direct PollingScheduler when no Cedar engine.
+            if let Some(ref cedar) = cedar_engine {
+                let noop_upstream = Arc::new(NoopUpstreamForwarder);
+                let engine = ApprovalEngine::new(
+                    task_store.clone(),
+                    adapter,
+                    noop_upstream,
+                    cedar.clone(),
+                    ApprovalEngineConfig::from_env(),
+                    cancel_token.clone(),
+                );
+                engine.spawn_background_tasks().await;
+                evaluator = evaluator.with_approval_engine(Arc::new(engine));
+                tracing::info!("approval engine started (with Cedar pipeline)");
+            } else {
+                let scheduler = Arc::new(PollingScheduler::new(
+                    adapter,
+                    task_store.clone(),
+                    PollingConfig::default(),
+                    cancel_token.clone(),
+                ));
+                evaluator.set_scheduler(scheduler.clone());
+                tokio::spawn({
+                    let scheduler = scheduler.clone();
+                    async move {
+                        scheduler.run().await;
+                    }
+                });
+                tracing::info!("approval polling scheduler started (legacy, no Cedar)");
+            }
 
-            evaluator.set_scheduler(scheduler.clone());
-
-            let scheduler_handle = tokio::spawn({
-                let scheduler = scheduler.clone();
-                async move {
-                    scheduler.run().await;
-                }
-            });
-
-            tracing::info!("approval polling scheduler started");
-            Some((cancel_token, scheduler_handle))
+            Some(cancel_token)
         } else {
             tracing::debug!("no approval workflows configured — scheduler not started");
             None
         };
+
+        let evaluator = Arc::new(evaluator);
 
         let state = Arc::new(GovernanceServiceState::with_evaluator(
             evaluator, task_store,
@@ -502,7 +520,6 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         server_id: String::new(), // per-server; rewrite sets each server_id
         governance_endpoint: governance_endpoint.clone(),
         profile,
-        config_path: args.thoughtgate_config.clone(),
     };
 
     let backup_path = adapter
@@ -539,7 +556,12 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
                 }
             }
         }
-        eprintln!("thoughtgate panicked: {info}");
+        // Use write! instead of eprintln! to avoid double-panic if stderr
+        // is closed (eprintln! panics on write failure).
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("thoughtgate panicked: {info}\n"),
+        );
         prev_hook(info);
     }));
 
@@ -609,9 +631,10 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
     // ── F-010: Cleanup ─────────────────────────────────────────────────────
 
     // Stop the approval polling scheduler (if running).
-    if let Some((cancel_token, scheduler_handle)) = scheduler_state {
+    if let Some(cancel_token) = scheduler_state {
         cancel_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), scheduler_handle).await;
+        // Allow up to 5s for scheduler shutdown (engine manages its own handle).
+        tokio::time::sleep(Duration::from_millis(100)).await;
         tracing::debug!("approval scheduler stopped");
     }
 

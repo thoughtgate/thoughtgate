@@ -110,15 +110,6 @@ pub struct UpstreamLabels {
     pub status_code: Cow<'static, str>,
 }
 
-/// Labels for telemetry dropped counters.
-///
-/// Implements: REQ-OBS-002 §6.1/MC-009
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct SignalLabels {
-    /// Signal type (e.g., "span", "metric", "log")
-    pub signal: Cow<'static, str>,
-}
-
 /// Labels for request duration histograms.
 ///
 /// Implements: REQ-OBS-002 §6.2/MH-001
@@ -175,59 +166,6 @@ pub struct TransportLabels {
 pub struct UpstreamHealthLabels {
     /// Health status: "healthy" or "unhealthy"
     pub status: Cow<'static, str>,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Green Path Labels (REQ-CORE-001)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Labels for green path byte counters.
-///
-/// Implements: REQ-CORE-001 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct GreenPathLabels {
-    /// Direction: "upload" or "download"
-    pub direction: Cow<'static, str>,
-}
-
-/// Labels for green path stream outcome counters.
-///
-/// Implements: REQ-CORE-001 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct StreamOutcomeLabels {
-    /// Outcome: "success", "error", or "upgrade"
-    pub outcome: Cow<'static, str>,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Amber Path Labels (REQ-CORE-002)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Labels for per-inspector duration histograms.
-///
-/// Implements: REQ-CORE-002 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct InspectorLabels {
-    /// Inspector name (cardinality-limited)
-    pub inspector_name: Cow<'static, str>,
-}
-
-/// Labels for amber path inspection decision counters.
-///
-/// Implements: REQ-CORE-002 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct AmberDecisionLabels {
-    /// Decision: "approve", "modify", or "reject"
-    pub decision: Cow<'static, str>,
-}
-
-/// Labels for amber path error counters.
-///
-/// Implements: REQ-CORE-002 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct AmberErrorLabels {
-    /// Error type: "timeout", "limit", "semaphore", "panic", "compressed", "dropped"
-    pub error_type: Cow<'static, str>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -295,15 +233,6 @@ pub struct StdioServerStateLabels {
 // Governance Pipeline Labels (REQ-GOV-002)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Labels for governance pipeline failure counters.
-///
-/// Implements: REQ-GOV-002 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct PipelineStageLabels {
-    /// Pipeline stage that failed
-    pub stage: Cow<'static, str>,
-}
-
 /// Labels for pending task gauges.
 ///
 /// Implements: REQ-OBS-002 §6.4/MG-002
@@ -357,20 +286,6 @@ const APPROVAL_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 180
 const PAYLOAD_BUCKETS: &[f64] = &[
     128.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0,
 ];
-
-/// Green path TTFB buckets in seconds (sub-millisecond to 1 second).
-const GREEN_TTFB_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
-
-/// Green path chunk size buckets in bytes.
-const GREEN_CHUNK_BUCKETS: &[f64] = &[64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0];
-
-/// Amber path buffer size buckets in bytes (same as payload buckets).
-const AMBER_BUFFER_BUCKETS: &[f64] = &[
-    128.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0,
-];
-
-/// Amber path duration buckets in seconds (sub-millisecond to 5 seconds).
-const AMBER_DURATION_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0];
 
 /// Stdio approval latency buckets in seconds (1 second to 1 hour).
 const STDIO_APPROVAL_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0];
@@ -436,11 +351,6 @@ pub struct ThoughtGateMetrics {
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-006
     pub upstream_requests_total: Family<UpstreamLabels, Counter>,
-
-    /// Telemetry items dropped due to full export queue.
-    ///
-    /// Implements: REQ-OBS-002 §6.1/MC-009
-    pub telemetry_dropped_total: Family<SignalLabels, Counter>,
 
     /// SEP-1686 tasks created by type.
     ///
@@ -548,67 +458,6 @@ pub struct ThoughtGateMetrics {
     pub drain_timeout_total: Counter,
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Green Path Metrics (REQ-CORE-001)
-    // ─────────────────────────────────────────────────────────────────────────
-    /// Total bytes transferred through green path.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub green_bytes_total: Family<GreenPathLabels, Counter>,
-
-    /// Active green path streams.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub green_streams_active: Gauge,
-
-    /// Total green path streams by outcome.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub green_streams_total: Family<StreamOutcomeLabels, Counter>,
-
-    /// Time-to-first-byte for green path streams in seconds.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub green_ttfb_seconds: Histogram,
-
-    /// Chunk sizes for green path streams in bytes.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub green_chunk_size_bytes: Histogram,
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Amber Path Metrics (REQ-CORE-002)
-    // ─────────────────────────────────────────────────────────────────────────
-    /// Buffered payload sizes in bytes.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_buffer_size_bytes: Histogram,
-
-    /// Total amber path operation duration in seconds.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_duration_seconds: Histogram,
-
-    /// Per-inspector execution duration in seconds.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_inspector_duration_seconds: Family<InspectorLabels, Histogram>,
-
-    /// Inspection decisions by decision type.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_inspections_total: Family<AmberDecisionLabels, Counter>,
-
-    /// Amber path errors by error type.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_errors_total: Family<AmberErrorLabels, Counter>,
-
-    /// Currently active amber path buffers.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_buffers_active: Gauge,
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Stdio Transport Metrics (REQ-CORE-008)
     // ─────────────────────────────────────────────────────────────────────────
     /// Total stdio messages processed.
@@ -644,19 +493,6 @@ pub struct ThoughtGateMetrics {
     pub stdio_approval_latency_seconds: Family<StdioServerLabels, Histogram>,
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Governance Pipeline Metrics (REQ-GOV-002)
-    // ─────────────────────────────────────────────────────────────────────────
-    /// Pipeline execution failures by stage.
-    ///
-    /// Implements: REQ-GOV-002 NFR-001
-    pub governance_pipeline_failures_total: Family<PipelineStageLabels, Counter>,
-
-    /// Total scheduler poll operations.
-    ///
-    /// Implements: REQ-GOV-002 NFR-001
-    pub governance_scheduler_polls_total: Counter,
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Internal State
     // ─────────────────────────────────────────────────────────────────────────
     /// Cardinality limiter for tool_name label (max 200 distinct values).
@@ -664,9 +500,6 @@ pub struct ThoughtGateMetrics {
 
     /// Cardinality limiter for server_id labels (max 50 distinct values).
     server_id_limiter: CardinalityLimiter,
-
-    /// Cardinality limiter for inspector_name labels (max 50 distinct values).
-    inspector_name_limiter: CardinalityLimiter,
 }
 
 impl ThoughtGateMetrics {
@@ -722,13 +555,6 @@ impl ThoughtGateMetrics {
             "thoughtgate_upstream_requests_total",
             "Upstream MCP server call counts",
             upstream_requests_total.clone(),
-        );
-
-        let telemetry_dropped_total = Family::<SignalLabels, Counter>::default();
-        registry.register(
-            "thoughtgate_telemetry_dropped_total",
-            "Telemetry items dropped due to full export queue",
-            telemetry_dropped_total.clone(),
         );
 
         let tasks_created_total = Family::<TaskCreatedLabels, Counter>::default();
@@ -869,94 +695,6 @@ impl ThoughtGateMetrics {
         );
 
         // ─────────────────────────────────────────────────────────────────────
-        // Green Path Metrics (REQ-CORE-001)
-        // ─────────────────────────────────────────────────────────────────────
-
-        let green_bytes_total = Family::<GreenPathLabels, Counter>::default();
-        registry.register(
-            "thoughtgate_green_bytes_total",
-            "Total bytes transferred through green path",
-            green_bytes_total.clone(),
-        );
-
-        let green_streams_active = Gauge::default();
-        registry.register(
-            "thoughtgate_green_streams_active",
-            "Active green path streams",
-            green_streams_active.clone(),
-        );
-
-        let green_streams_total = Family::<StreamOutcomeLabels, Counter>::default();
-        registry.register(
-            "thoughtgate_green_streams_total",
-            "Total green path streams by outcome",
-            green_streams_total.clone(),
-        );
-
-        let green_ttfb_seconds = Histogram::new(GREEN_TTFB_BUCKETS.iter().copied());
-        registry.register(
-            "thoughtgate_green_ttfb_seconds",
-            "Time-to-first-byte for green path streams",
-            green_ttfb_seconds.clone(),
-        );
-
-        let green_chunk_size_bytes = Histogram::new(GREEN_CHUNK_BUCKETS.iter().copied());
-        registry.register(
-            "thoughtgate_green_chunk_size_bytes",
-            "Chunk sizes for green path streams",
-            green_chunk_size_bytes.clone(),
-        );
-
-        // ─────────────────────────────────────────────────────────────────────
-        // Amber Path Metrics (REQ-CORE-002)
-        // ─────────────────────────────────────────────────────────────────────
-
-        let amber_buffer_size_bytes = Histogram::new(AMBER_BUFFER_BUCKETS.iter().copied());
-        registry.register(
-            "thoughtgate_amber_buffer_size_bytes",
-            "Buffered payload sizes in bytes",
-            amber_buffer_size_bytes.clone(),
-        );
-
-        let amber_duration_seconds = Histogram::new(AMBER_DURATION_BUCKETS.iter().copied());
-        registry.register(
-            "thoughtgate_amber_duration_seconds",
-            "Total amber path operation duration",
-            amber_duration_seconds.clone(),
-        );
-
-        let amber_inspector_duration_seconds =
-            Family::<InspectorLabels, Histogram>::new_with_constructor(|| {
-                Histogram::new(AMBER_DURATION_BUCKETS.iter().copied())
-            });
-        registry.register(
-            "thoughtgate_amber_inspector_duration_seconds",
-            "Per-inspector execution duration",
-            amber_inspector_duration_seconds.clone(),
-        );
-
-        let amber_inspections_total = Family::<AmberDecisionLabels, Counter>::default();
-        registry.register(
-            "thoughtgate_amber_inspections_total",
-            "Inspection decisions by decision type",
-            amber_inspections_total.clone(),
-        );
-
-        let amber_errors_total = Family::<AmberErrorLabels, Counter>::default();
-        registry.register(
-            "thoughtgate_amber_errors_total",
-            "Amber path errors by error type",
-            amber_errors_total.clone(),
-        );
-
-        let amber_buffers_active = Gauge::default();
-        registry.register(
-            "thoughtgate_amber_buffers_active",
-            "Currently active amber path buffers",
-            amber_buffers_active.clone(),
-        );
-
-        // ─────────────────────────────────────────────────────────────────────
         // Stdio Transport Metrics (REQ-CORE-008)
         // ─────────────────────────────────────────────────────────────────────
 
@@ -1005,24 +743,6 @@ impl ThoughtGateMetrics {
             stdio_approval_latency_seconds.clone(),
         );
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Governance Pipeline Metrics (REQ-GOV-002)
-        // ─────────────────────────────────────────────────────────────────────
-
-        let governance_pipeline_failures_total = Family::<PipelineStageLabels, Counter>::default();
-        registry.register(
-            "thoughtgate_governance_pipeline_failures_total",
-            "Pipeline execution failures by stage",
-            governance_pipeline_failures_total.clone(),
-        );
-
-        let governance_scheduler_polls_total = Counter::default();
-        registry.register(
-            "thoughtgate_governance_scheduler_polls_total",
-            "Total scheduler poll operations",
-            governance_scheduler_polls_total.clone(),
-        );
-
         Self {
             requests_total,
             decisions_total,
@@ -1030,7 +750,6 @@ impl ThoughtGateMetrics {
             cedar_evaluations_total,
             approval_requests_total,
             upstream_requests_total,
-            telemetry_dropped_total,
             tasks_created_total,
             tasks_completed_total,
             request_duration_ms,
@@ -1048,19 +767,6 @@ impl ThoughtGateMetrics {
             startup_duration_seconds,
             active_requests,
             drain_timeout_total,
-            // Green Path
-            green_bytes_total,
-            green_streams_active,
-            green_streams_total,
-            green_ttfb_seconds,
-            green_chunk_size_bytes,
-            // Amber Path
-            amber_buffer_size_bytes,
-            amber_duration_seconds,
-            amber_inspector_duration_seconds,
-            amber_inspections_total,
-            amber_errors_total,
-            amber_buffers_active,
             // Stdio
             stdio_messages_total,
             stdio_governance_decisions_total,
@@ -1068,13 +774,9 @@ impl ThoughtGateMetrics {
             stdio_active_servers,
             stdio_server_state,
             stdio_approval_latency_seconds,
-            // Governance
-            governance_pipeline_failures_total,
-            governance_scheduler_polls_total,
             // Cardinality limiters
             tool_name_limiter: CardinalityLimiter::new(200),
             server_id_limiter: CardinalityLimiter::new(50),
-            inspector_name_limiter: CardinalityLimiter::new(50),
         }
     }
 
@@ -1088,10 +790,10 @@ impl ThoughtGateMetrics {
     ///
     /// * `method` - JSON-RPC method name (e.g., "tools/call")
     /// * `tool_name` - Tool name for tools/call requests, None otherwise
-    /// * `status` - Request outcome: "success" or "error"
+    /// * `status` - Request outcome: "success" or "error" (must be a static string)
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-001, §6.5
-    pub fn record_request(&self, method: &str, tool_name: Option<&str>, status: &str) {
+    pub fn record_request(&self, method: &str, tool_name: Option<&str>, status: &'static str) {
         let tool = tool_name
             .map(|t| self.tool_name_limiter.resolve(t))
             .unwrap_or("none");
@@ -1100,7 +802,7 @@ impl ThoughtGateMetrics {
             .get_or_create(&RequestLabels {
                 method: Cow::Owned(method.to_string()),
                 tool_name: Cow::Owned(tool.to_string()),
-                status: Cow::Owned(status.to_string()),
+                status: Cow::Borrowed(status),
             })
             .inc();
     }
@@ -1131,22 +833,22 @@ impl ThoughtGateMetrics {
     ///
     /// # Arguments
     ///
-    /// * `decision` - Cedar decision (e.g., "allow", "deny")
+    /// * `decision` - Cedar decision: "allow" or "deny" (must be a static string)
     /// * `policy_id` - Determining policy ID
     /// * `duration_ms` - Evaluation duration in milliseconds
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-004, §6.2/MH-002
-    pub fn record_cedar_eval(&self, decision: &str, policy_id: &str, duration_ms: f64) {
+    pub fn record_cedar_eval(&self, decision: &'static str, policy_id: &str, duration_ms: f64) {
         self.cedar_evaluations_total
             .get_or_create(&CedarEvalLabels {
-                decision: Cow::Owned(decision.to_string()),
+                decision: Cow::Borrowed(decision),
                 policy_id: Cow::Owned(policy_id.to_string()),
             })
             .inc();
 
         self.cedar_evaluation_duration_ms
             .get_or_create(&CedarDurationLabels {
-                decision: Cow::Owned(decision.to_string()),
+                decision: Cow::Borrowed(decision),
             })
             .observe(duration_ms);
     }
@@ -1155,15 +857,15 @@ impl ThoughtGateMetrics {
     ///
     /// # Arguments
     ///
-    /// * `gate` - Gate type (e.g., "cedar", "governance_rule")
-    /// * `outcome` - Decision outcome (e.g., "allow", "deny", "approve")
+    /// * `gate` - Gate type (e.g., "cedar", "governance_rule") (must be a static string)
+    /// * `outcome` - Decision outcome (e.g., "allow", "deny", "approve") (must be a static string)
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-002
-    pub fn record_gate_decision(&self, gate: &str, outcome: &str) {
+    pub fn record_gate_decision(&self, gate: &'static str, outcome: &'static str) {
         self.decisions_total
             .get_or_create(&DecisionLabels {
-                gate: Cow::Owned(gate.to_string()),
-                outcome: Cow::Owned(outcome.to_string()),
+                gate: Cow::Borrowed(gate),
+                outcome: Cow::Borrowed(outcome),
             })
             .inc();
     }
@@ -1173,13 +875,14 @@ impl ThoughtGateMetrics {
     /// # Arguments
     ///
     /// * `error_type` - Error classification (e.g., "policy_denied", "upstream_timeout")
+    ///   (must be a static string — see `ThoughtGateError::error_type_name()`)
     /// * `method` - JSON-RPC method that caused the error
     ///
     /// Implements: REQ-OBS-002 §6.1/MC-003
-    pub fn record_error(&self, error_type: &str, method: &str) {
+    pub fn record_error(&self, error_type: &'static str, method: &str) {
         self.errors_total
             .get_or_create(&ErrorLabels {
-                error_type: Cow::Owned(error_type.to_string()),
+                error_type: Cow::Borrowed(error_type),
                 method: Cow::Owned(method.to_string()),
             })
             .inc();
@@ -1311,15 +1014,6 @@ impl ThoughtGateMetrics {
         self.cedar_policies_loaded.set(count);
     }
 
-    /// Set the process uptime in seconds.
-    ///
-    /// Called periodically or on scrape to update the uptime gauge.
-    ///
-    /// Implements: REQ-OBS-002 §6.4/MG-004
-    pub fn set_uptime_seconds(&self, seconds: i64) {
-        self.uptime_seconds.set(seconds);
-    }
-
     /// Record configuration reload timestamp.
     ///
     /// Updates the config_reload_timestamp gauge to the current Unix timestamp.
@@ -1369,13 +1063,6 @@ impl ThoughtGateMetrics {
         self.startup_duration_seconds.set(seconds as i64);
     }
 
-    /// Set the active requests gauge.
-    ///
-    /// Implements: REQ-CORE-005/NFR-001
-    pub fn set_active_requests(&self, count: i64) {
-        self.active_requests.set(count);
-    }
-
     /// Increment drain timeout counter.
     ///
     /// Call when a shutdown drain exceeds its timeout.
@@ -1383,126 +1070,6 @@ impl ThoughtGateMetrics {
     /// Implements: REQ-CORE-005/NFR-001
     pub fn record_drain_timeout(&self) {
         self.drain_timeout_total.inc();
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Green Path Methods (REQ-CORE-001)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Record bytes transferred through green path.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub fn record_green_bytes(&self, direction: &str, bytes: u64) {
-        self.green_bytes_total
-            .get_or_create(&GreenPathLabels {
-                direction: Cow::Owned(direction.to_string()),
-            })
-            .inc_by(bytes);
-    }
-
-    /// Increment active green path streams.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub fn increment_green_streams_active(&self) {
-        self.green_streams_active.inc();
-    }
-
-    /// Decrement active green path streams.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub fn decrement_green_streams_active(&self) {
-        self.green_streams_active.dec();
-    }
-
-    /// Record a green path stream completion.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub fn record_green_stream(&self, outcome: &str) {
-        self.green_streams_total
-            .get_or_create(&StreamOutcomeLabels {
-                outcome: Cow::Owned(outcome.to_string()),
-            })
-            .inc();
-    }
-
-    /// Record time-to-first-byte for green path stream.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub fn record_green_ttfb(&self, seconds: f64) {
-        self.green_ttfb_seconds.observe(seconds);
-    }
-
-    /// Record chunk size for green path stream.
-    ///
-    /// Implements: REQ-CORE-001 NFR-001
-    pub fn record_green_chunk_size(&self, bytes: u64) {
-        self.green_chunk_size_bytes.observe(bytes as f64);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Amber Path Methods (REQ-CORE-002)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Record amber path buffer size.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_buffer_size(&self, bytes: u64) {
-        self.amber_buffer_size_bytes.observe(bytes as f64);
-    }
-
-    /// Record amber path operation duration.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_duration(&self, seconds: f64) {
-        self.amber_duration_seconds.observe(seconds);
-    }
-
-    /// Record per-inspector execution duration.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_inspector_duration(&self, inspector_name: &str, seconds: f64) {
-        let limited_name = self.inspector_name_limiter.resolve(inspector_name);
-        self.amber_inspector_duration_seconds
-            .get_or_create(&InspectorLabels {
-                inspector_name: Cow::Owned(limited_name.to_string()),
-            })
-            .observe(seconds);
-    }
-
-    /// Record an inspection decision.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_inspection(&self, decision: &str) {
-        self.amber_inspections_total
-            .get_or_create(&AmberDecisionLabels {
-                decision: Cow::Owned(decision.to_string()),
-            })
-            .inc();
-    }
-
-    /// Record an amber path error.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_error(&self, error_type: &str) {
-        self.amber_errors_total
-            .get_or_create(&AmberErrorLabels {
-                error_type: Cow::Owned(error_type.to_string()),
-            })
-            .inc();
-    }
-
-    /// Increment active amber path buffers.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn increment_amber_buffers_active(&self) {
-        self.amber_buffers_active.inc();
-    }
-
-    /// Decrement active amber path buffers.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn decrement_amber_buffers_active(&self) {
-        self.amber_buffers_active.dec();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1600,28 +1167,6 @@ impl ThoughtGateMetrics {
                 server_id: Cow::Owned(limited_id.to_string()),
             })
             .observe(duration.as_secs_f64());
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Governance Pipeline Methods (REQ-GOV-002)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Record a governance pipeline failure.
-    ///
-    /// Implements: REQ-GOV-002 NFR-001
-    pub fn record_pipeline_failure(&self, stage: &str) {
-        self.governance_pipeline_failures_total
-            .get_or_create(&PipelineStageLabels {
-                stage: Cow::Owned(stage.to_string()),
-            })
-            .inc();
-    }
-
-    /// Record a scheduler poll operation.
-    ///
-    /// Implements: REQ-GOV-002 NFR-001
-    pub fn record_scheduler_poll(&self) {
-        self.governance_scheduler_polls_total.inc();
     }
 }
 

@@ -16,6 +16,3 @@ pub mod proxy_config;
 pub mod proxy_service;
 pub mod timeout;
 pub mod traffic;
-
-#[cfg(feature = "amber_path")]
-pub mod buffered_forwarder;

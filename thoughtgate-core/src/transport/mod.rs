@@ -3,7 +3,7 @@
 //! This module handles JSON-RPC 2.0 message parsing, method routing, and
 //! upstream forwarding for MCP (Model Context Protocol) traffic.
 //!
-//! The HTTP-specific handler (`McpHandler`, `McpServer`) lives in
+//! The HTTP-specific handler (`McpHandler`) lives in
 //! `thoughtgate-proxy`. This module provides the building blocks.
 //!
 //! # Traceability
@@ -18,4 +18,4 @@ pub use jsonrpc::{
     BatchItem, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpRequest, ParsedRequests, TaskMetadata,
 };
 pub use router::{McpRouter, RouteTarget, TaskMethod};
-pub use upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};
+pub use upstream::{NoopUpstreamForwarder, UpstreamClient, UpstreamConfig, UpstreamForwarder};

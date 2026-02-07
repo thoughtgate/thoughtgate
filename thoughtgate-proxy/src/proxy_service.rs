@@ -46,10 +46,7 @@ use hyper::{Request, Response, StatusCode, header};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
-use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tower::Service;
 use tracing::{debug, error, info, warn};
 
@@ -178,11 +175,6 @@ impl ProxyService {
         self
     }
 
-    /// Check if this proxy service has MCP handling enabled.
-    pub fn has_mcp_handler(&self) -> bool {
-        self.mcp_handler.is_some()
-    }
-
     /// Get a reference to the proxy configuration.
     pub fn config(&self) -> &ProxyConfig {
         &self.config
@@ -261,8 +253,10 @@ impl ProxyService {
                     r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32600,"message":"Request body exceeds maximum size of {} bytes"}}}}"#,
                     max_body_size
                 )));
+                // MCP Streamable HTTP transport requires HTTP 200 for all
+                // JSON-RPC responses, including errors (the error is in the body).
                 return Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
                     // Full<Bytes> has Infallible error - convert using absurd pattern
                     .body(body.map_err(|e| match e {}).boxed())
@@ -573,82 +567,6 @@ pub fn get_upgrade_protocol<B>(req: &Request<B>) -> Option<String> {
 /// - Implements: REQ-CORE-001 F-004 (Protocol Upgrade Handling)
 pub fn is_upgrade_response<B>(res: &Response<B>) -> bool {
     res.status() == hyper::StatusCode::SWITCHING_PROTOCOLS
-}
-
-/// Extract host from URI.
-#[allow(dead_code)]
-fn extract_host(uri: &Uri) -> ProxyResult<String> {
-    uri.host()
-        .ok_or_else(|| ProxyError::InvalidUri("URI missing host".to_string()))
-        .map(|s| s.to_string())
-}
-
-/// Extract port from URI, defaulting to 80 for HTTP or 443 for HTTPS.
-#[allow(dead_code)]
-fn extract_port(uri: &Uri) -> ProxyResult<u16> {
-    if let Some(port) = uri.port_u16() {
-        Ok(port)
-    } else {
-        match uri.scheme_str() {
-            Some("https") => Ok(443),
-            Some("http") => Ok(80),
-            _ => Err(ProxyError::InvalidUri(
-                "Cannot determine port from URI".to_string(),
-            )),
-        }
-    }
-}
-
-/// Configure socket with optimized options for zero-copy streaming.
-///
-/// # Traceability
-/// - Implements: REQ-CORE-001 Section 3.2 (Network Optimization)
-///
-/// # Socket Options
-/// - TCP_NODELAY: Disable Nagle's algorithm for low-latency
-/// - SO_KEEPALIVE: Keep connections alive during idle periods
-/// - SO_RCVBUF / SO_SNDBUF: Set buffer sizes for throughput
-pub fn configure_socket(socket: &Socket, config: &ProxyConfig) -> ProxyResult<()> {
-    // Set TCP_NODELAY (disable Nagle's algorithm)
-    socket
-        .set_tcp_nodelay(config.tcp_nodelay)
-        .map_err(|e| ProxyError::Connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
-
-    // Set TCP keepalive
-    let keepalive = TcpKeepalive::new().with_time(Duration::from_secs(config.tcp_keepalive_secs));
-    socket
-        .set_tcp_keepalive(&keepalive)
-        .map_err(|e| ProxyError::Connection(format!("Failed to set SO_KEEPALIVE: {}", e)))?;
-
-    // Set socket buffer sizes
-    socket
-        .set_recv_buffer_size(config.socket_buffer_size)
-        .map_err(|e| ProxyError::Connection(format!("Failed to set SO_RCVBUF: {}", e)))?;
-
-    socket
-        .set_send_buffer_size(config.socket_buffer_size)
-        .map_err(|e| ProxyError::Connection(format!("Failed to set SO_SNDBUF: {}", e)))?;
-
-    Ok(())
-}
-
-/// Create a configured TCP socket for the given address.
-///
-/// # Traceability
-/// - Implements: REQ-CORE-001 Section 3.2 (Network Optimization)
-pub fn create_configured_socket(addr: &SocketAddr, config: &ProxyConfig) -> ProxyResult<Socket> {
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .map_err(|e| ProxyError::Connection(format!("Failed to create socket: {}", e)))?;
-
-    configure_socket(&socket, config)?;
-
-    Ok(socket)
 }
 
 /// Map hyper_util client errors to appropriate ProxyError variants.
@@ -1019,17 +937,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(discriminate_traffic(&req), TrafficType::Http);
-    }
-
-    /// Test MCP handler configuration.
-    #[test]
-    fn test_mcp_handler_configuration() {
-        let service =
-            ProxyService::new_with_upstream(Some("https://upstream.example.com".to_string()))
-                .expect("Failed to create proxy service");
-
-        // By default, no MCP handler
-        assert!(!service.has_mcp_handler());
     }
 
     /// Test MCP traffic with content-type charset is still detected.

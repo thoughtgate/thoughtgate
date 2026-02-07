@@ -32,7 +32,6 @@ fn test_opts(server_id: &str, port: u16) -> ShimOptions {
         server_id: server_id.to_string(),
         governance_endpoint: format!("http://127.0.0.1:{port}"),
         profile: Profile::Production,
-        config_path: std::path::PathBuf::from("/dev/null"),
     }
 }
 
@@ -67,7 +66,6 @@ async fn test_governance_unavailable_returns_error() {
         server_id: "test-server".to_string(),
         governance_endpoint: "http://127.0.0.1:1".to_string(), // Port 1 — nothing listening
         profile: Profile::Production,
-        config_path: std::path::PathBuf::from("/dev/null"),
     };
     let metrics = None;
 

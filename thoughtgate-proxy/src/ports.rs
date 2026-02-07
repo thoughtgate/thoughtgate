@@ -23,14 +23,6 @@
 /// Configurable via `THOUGHTGATE_OUTBOUND_PORT` environment variable.
 pub const DEFAULT_OUTBOUND_PORT: u16 = 7467;
 
-/// Default inbound port reserved for future callbacks/webhooks.
-///
-/// In v0.2, this port is bound but not wired to any handlers.
-/// It will be used in future versions for:
-/// - Webhook callbacks from approval systems
-/// - Push notifications from upstream servers
-pub const DEFAULT_INBOUND_PORT: u16 = 7468;
-
 /// Default admin port for health checks and metrics.
 ///
 /// Configurable via `THOUGHTGATE_ADMIN_PORT` environment variable.
@@ -83,33 +75,15 @@ pub fn admin_port() -> u16 {
         .unwrap_or(DEFAULT_ADMIN_PORT)
 }
 
-/// Get the inbound port (reserved, not configurable in v0.2).
-///
-/// This port is bound but not wired to handlers. It reserves the port
-/// for future use with callback/webhook functionality.
-///
-/// # Note
-///
-/// In v0.2, this always returns the default value. Configuration will
-/// be added when the inbound functionality is implemented.
-pub fn inbound_port() -> u16 {
-    DEFAULT_INBOUND_PORT
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_default_ports() {
-        // Verify default values match Envoy-style 3-port model
+        // Verify default values match Envoy-style port model
         assert_eq!(DEFAULT_OUTBOUND_PORT, 7467);
-        assert_eq!(DEFAULT_INBOUND_PORT, 7468);
         assert_eq!(DEFAULT_ADMIN_PORT, 7469);
-
-        // Ports should be sequential
-        assert_eq!(DEFAULT_INBOUND_PORT, DEFAULT_OUTBOUND_PORT + 1);
-        assert_eq!(DEFAULT_ADMIN_PORT, DEFAULT_INBOUND_PORT + 1);
     }
 
     #[test]
@@ -126,12 +100,6 @@ mod tests {
         // When env var not set, should return default
         let port = admin_port();
         assert!(port > 0);
-    }
-
-    #[test]
-    fn test_inbound_port_reserved() {
-        // Inbound port should always return default (not configurable in v0.2)
-        assert_eq!(inbound_port(), DEFAULT_INBOUND_PORT);
     }
 
     #[test]

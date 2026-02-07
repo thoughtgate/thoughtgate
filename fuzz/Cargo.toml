@@ -24,11 +24,10 @@ serde-saphyr = "0.0"
 
 [dependencies.thoughtgate-core]
 path = "../thoughtgate-core"
-features = ["fuzzing"]
 
 [dependencies.thoughtgate-proxy]
 path = "../thoughtgate-proxy"
-features = ["fuzzing", "amber_path"]
+features = ["fuzzing"]
 
 [dependencies.thoughtgate]
 path = "../thoughtgate"
@@ -58,13 +57,6 @@ doc = false
 [[bin]]
 name = "fuzz_green_path"
 path = "fuzz_targets/fuzz_green_path.rs"
-test = false
-doc = false
-
-# REQ-CORE-002: Inspector chain semantics
-[[bin]]
-name = "fuzz_inspector_chain"
-path = "fuzz_targets/fuzz_inspector_chain.rs"
 test = false
 doc = false
 

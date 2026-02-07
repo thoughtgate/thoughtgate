@@ -4,13 +4,8 @@
 //!
 //! # Overview
 //!
-//! This module provides two ways to handle MCP requests:
-//!
-//! 1. **`McpHandler`** - Direct handler that processes buffered request bodies.
-//!    Used by ProxyService for in-process MCP handling.
-//!
-//! 2. **`McpServer`** - Optional standalone Axum server for testing or
-//!    running MCP handling separately (deprecated in v0.2).
+//! This module provides `McpHandler`, a direct handler that processes buffered
+//! request bodies. Used by ProxyService for in-process MCP handling.
 //!
 //! # Request Flow
 //!
@@ -25,19 +20,18 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use axum::{
-    Router,
-    extract::{DefaultBodyLimit, State},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::post,
-};
+use axum::http::StatusCode;
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use thoughtgate_core::config::{Action, Config, MatchResult};
+use thoughtgate_core::StreamDirection;
+use thoughtgate_core::config::{Config, MatchResult};
 use thoughtgate_core::error::ThoughtGateError;
+use thoughtgate_core::governance::api::{
+    GovernanceDecision, GovernanceEvaluateRequest, MessageType,
+};
+use thoughtgate_core::governance::evaluator::{DenySource, GovernanceEvaluator};
 use thoughtgate_core::governance::{
     ApprovalAdapter, ApprovalEngine, ApprovalEngineConfig, Principal, SlackAdapter, TaskHandler,
     TaskStore, ToolCallRequest,
@@ -47,6 +41,7 @@ use thoughtgate_core::policy::principal::infer_principal;
 use thoughtgate_core::policy::{
     CedarContext, CedarDecision, CedarRequest, CedarResource, TimeContext,
 };
+use thoughtgate_core::profile::Profile;
 use thoughtgate_core::protocol::{
     CapabilityCache, TasksCancelRequest, TasksGetRequest, TasksListRequest, TasksResultRequest,
     extract_upstream_sse_support, extract_upstream_task_support, inject_task_capability,
@@ -61,7 +56,7 @@ use thoughtgate_core::transport::jsonrpc::{
     JsonRpcId, JsonRpcResponse, McpRequest, ParsedRequests, parse_jsonrpc,
 };
 use thoughtgate_core::transport::router::{McpRouter, RouteTarget, TaskMethod};
-use thoughtgate_core::transport::upstream::{UpstreamClient, UpstreamConfig, UpstreamForwarder};
+use thoughtgate_core::transport::upstream::UpstreamForwarder;
 use tokio_util::sync::CancellationToken;
 
 /// RAII guard that decrements the aggregate buffer counter on drop.
@@ -78,87 +73,9 @@ impl<'a> Drop for BufferGuard<'a> {
     }
 }
 
-/// Configuration for the MCP server.
-///
-/// Implements: REQ-CORE-003/§5.3 (Configuration)
-#[derive(Debug, Clone)]
-pub struct McpServerConfig {
-    /// Listen address (e.g., "0.0.0.0:8080")
-    pub listen_addr: String,
-    /// Maximum request body size in bytes
-    pub max_body_size: usize,
-    /// Maximum concurrent requests
-    pub max_concurrent_requests: usize,
-    /// Maximum number of requests in a JSON-RPC batch
-    pub max_batch_size: usize,
-    /// Upstream client configuration
-    pub upstream: UpstreamConfig,
-}
-
-impl Default for McpServerConfig {
-    fn default() -> Self {
-        Self {
-            listen_addr: "0.0.0.0:8080".to_string(),
-            max_body_size: 1024 * 1024, // 1MB
-            max_concurrent_requests: 10000,
-            max_batch_size: 100,
-            upstream: UpstreamConfig::default(),
-        }
-    }
-}
-
-impl McpServerConfig {
-    /// Load configuration from environment variables.
-    ///
-    /// Implements: REQ-CORE-003/§5.3 (Configuration)
-    ///
-    /// # Environment Variables
-    ///
-    /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
-    /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
-    /// - `THOUGHTGATE_MAX_BATCH_SIZE` (default: 100): Max JSON-RPC batch array length
-    ///
-    /// Plus all upstream configuration variables (see `UpstreamConfig::from_env`).
-    ///
-    /// # Note
-    ///
-    /// The `listen_addr` field is not configurable via environment variable.
-    /// Production deployments use `THOUGHTGATE_OUTBOUND_PORT` and `THOUGHTGATE_ADMIN_PORT`
-    /// via `ports.rs` instead. This field is only used by `McpHandler::run()` for testing.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if upstream configuration is invalid.
-    pub fn from_env() -> Result<Self, ThoughtGateError> {
-        let max_body_size: usize = std::env::var("THOUGHTGATE_MAX_REQUEST_BODY_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024 * 1024); // 1MB default
-
-        let max_concurrent_requests: usize = std::env::var("THOUGHTGATE_MAX_CONCURRENT_REQUESTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10000);
-
-        let max_batch_size: usize = std::env::var("THOUGHTGATE_MAX_BATCH_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
-
-        Ok(Self {
-            listen_addr: "0.0.0.0:8080".to_string(), // Not configurable; use ports.rs in production
-            max_body_size,
-            max_concurrent_requests,
-            max_batch_size,
-            upstream: UpstreamConfig::from_env()?,
-        })
-    }
-}
-
 /// Shared MCP handler state.
 ///
-/// This state is shared across all request handlers. Used by both
-/// `McpHandler` (direct invocation) and `McpServer` (Axum server).
+/// This state is shared across all request handlers via `McpHandler`.
 pub struct McpState {
     /// Upstream client for forwarding requests
     pub upstream: Arc<dyn UpstreamForwarder>,
@@ -186,6 +103,10 @@ pub struct McpState {
     pub max_aggregate_buffer: usize,
     /// Prometheus metrics for request counting and latency (REQ-OBS-002 §6).
     pub tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+    /// Unified governance evaluator (Gates 1-4).
+    /// When present, `route_through_gates()` delegates to this instead of
+    /// reimplementing gate logic. None in legacy mode (no YAML config).
+    pub evaluator: Option<Arc<GovernanceEvaluator>>,
 }
 
 /// Configuration for the MCP handler.
@@ -317,36 +238,7 @@ impl McpHandler {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: config.max_aggregate_buffer,
             tg_metrics: None,
-        });
-
-        Self { state }
-    }
-
-    /// Create a new MCP handler with custom task handler.
-    ///
-    /// This is useful for testing with mock components.
-    pub fn with_task_handler(
-        upstream: Arc<dyn UpstreamForwarder>,
-        cedar_engine: Arc<CedarEngine>,
-        task_handler: TaskHandler,
-        config: McpHandlerConfig,
-    ) -> Self {
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
-
-        let state = Arc::new(McpState {
-            upstream,
-            router: McpRouter::new(),
-            task_handler,
-            cedar_engine,
-            config: None,
-            approval_engine: None,
-            semaphore,
-            max_body_size: config.max_body_size,
-            max_batch_size: config.max_batch_size,
-            capability_cache: Arc::new(CapabilityCache::new()),
-            buffered_bytes: AtomicUsize::new(0),
-            max_aggregate_buffer: config.max_aggregate_buffer,
-            tg_metrics: None,
+            evaluator: None,
         });
 
         Self { state }
@@ -384,8 +276,29 @@ impl McpHandler {
         approval_engine: Option<Arc<ApprovalEngine>>,
         tg_metrics: Option<Arc<ThoughtGateMetrics>>,
     ) -> Self {
-        let task_handler = TaskHandler::new(task_store);
+        let task_handler = TaskHandler::new(task_store.clone());
         let semaphore = Arc::new(Semaphore::new(handler_config.max_concurrent_requests));
+
+        // Construct the unified evaluator when YAML config is present.
+        // In legacy mode (no config), route_request() falls back to
+        // evaluate_with_cedar() directly, so no evaluator is needed.
+        let evaluator = yaml_config.as_ref().map(|config| {
+            let principal = Principal::new("proxy");
+            let mut eval = GovernanceEvaluator::new(
+                config.clone(),
+                Some(cedar_engine.clone()),
+                task_store,
+                principal,
+                Profile::Production,
+            );
+            if let Some(ref metrics) = tg_metrics {
+                eval = eval.with_metrics(metrics.clone());
+            }
+            if let Some(ref engine) = approval_engine {
+                eval = eval.with_approval_engine(engine.clone());
+            }
+            Arc::new(eval)
+        });
 
         let state = Arc::new(McpState {
             upstream,
@@ -401,6 +314,7 @@ impl McpHandler {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: handler_config.max_aggregate_buffer,
             tg_metrics,
+            evaluator,
         });
 
         Self { state }
@@ -460,14 +374,6 @@ impl McpHandler {
         handle_mcp_body_bytes(&self.state, body, Some(parent_context)).await
     }
 
-    /// Handle a buffered MCP request body and return a full Response.
-    ///
-    /// This is used by McpServer for backwards compatibility with Axum.
-    pub async fn handle_response(&self, body: Bytes) -> Response {
-        let (status, bytes) = self.handle(body).await;
-        (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
-    }
-
     /// Get a reference to the internal state (for testing).
     #[cfg(test)]
     pub fn state(&self) -> &Arc<McpState> {
@@ -481,44 +387,6 @@ impl Clone for McpHandler {
             state: self.state.clone(),
         }
     }
-}
-
-/// The MCP server (standalone Axum server).
-///
-/// **Note:** In v0.2, prefer using `McpHandler` via `ProxyService` for unified
-/// traffic handling. This standalone server is retained for testing and
-/// backwards compatibility.
-///
-/// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
-pub struct McpServer {
-    config: McpServerConfig,
-    state: Arc<McpState>,
-    /// Cancellation token for graceful shutdown of background tasks.
-    /// Cancelling this token will stop the ApprovalEngine's polling scheduler.
-    shutdown: CancellationToken,
-}
-
-/// Create governance components (TaskHandler + CedarEngine + optional ApprovalEngine).
-///
-/// This is extracted to avoid duplication between `McpServer::new()` and
-/// `McpServer::with_upstream()`.
-///
-/// # Arguments
-///
-/// * `upstream` - Upstream forwarder for approved requests
-/// * `config` - Optional YAML config (enables Gate 1, 2, 4)
-/// * `shutdown` - Cancellation token for graceful shutdown
-///
-/// # Returns
-///
-/// Tuple of (TaskHandler, CedarEngine, optional ApprovalEngine)
-#[allow(clippy::type_complexity)]
-pub async fn create_governance_components(
-    upstream: Arc<dyn UpstreamForwarder>,
-    config: Option<&Config>,
-    shutdown: CancellationToken,
-) -> Result<(TaskHandler, Arc<CedarEngine>, Option<Arc<ApprovalEngine>>), ThoughtGateError> {
-    create_governance_components_with_metrics(upstream, config, shutdown, None).await
 }
 
 /// Create governance components with optional Prometheus metrics for gauge updates.
@@ -631,208 +499,19 @@ pub async fn create_governance_components_with_metrics(
     Ok((task_handler, cedar_engine, approval_engine))
 }
 
-impl McpServer {
-    /// Create a new MCP server.
-    ///
-    /// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Server configuration
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the upstream client cannot be created.
-    pub async fn new(config: McpServerConfig) -> Result<Self, ThoughtGateError> {
-        let upstream = Arc::new(UpstreamClient::new(config.upstream.clone())?);
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
-        let shutdown = CancellationToken::new();
-        let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), None, shutdown.clone()).await?;
+#[cfg(test)]
+use axum::{
+    Router,
+    extract::{DefaultBodyLimit, State},
+    http::header,
+    response::{IntoResponse, Response},
+    routing::post,
+};
 
-        let state = Arc::new(McpState {
-            upstream,
-            router: McpRouter::new(),
-            task_handler,
-            cedar_engine,
-            config: None,
-            approval_engine,
-            semaphore,
-            max_body_size: config.max_body_size,
-            max_batch_size: config.max_batch_size,
-            capability_cache: Arc::new(CapabilityCache::new()),
-            buffered_bytes: AtomicUsize::new(0),
-            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
-            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
-        });
-
-        Ok(Self {
-            config,
-            state,
-            shutdown,
-        })
-    }
-
-    /// Create a new MCP server with a custom upstream forwarder.
-    ///
-    /// This is useful for testing with mock upstreams.
-    ///
-    /// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Server configuration
-    /// * `upstream` - Custom upstream forwarder implementation
-    pub async fn with_upstream(
-        config: McpServerConfig,
-        upstream: Arc<dyn UpstreamForwarder>,
-    ) -> Result<Self, ThoughtGateError> {
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
-        let shutdown = CancellationToken::new();
-        let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), None, shutdown.clone()).await?;
-
-        let state = Arc::new(McpState {
-            upstream,
-            router: McpRouter::new(),
-            task_handler,
-            cedar_engine,
-            config: None,
-            approval_engine,
-            semaphore,
-            max_body_size: config.max_body_size,
-            max_batch_size: config.max_batch_size,
-            capability_cache: Arc::new(CapabilityCache::new()),
-            buffered_bytes: AtomicUsize::new(0),
-            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
-            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
-        });
-
-        Ok(Self {
-            config,
-            state,
-            shutdown,
-        })
-    }
-
-    /// Create a new MCP server with full v0.2 4-gate configuration.
-    ///
-    /// This enables the complete 4-gate model:
-    /// - Gate 1: Visibility (ExposeConfig filtering)
-    /// - Gate 2: Governance Rules (YAML rule matching)
-    /// - Gate 3: Cedar Policy (when action: policy)
-    /// - Gate 4: Approval Workflow (when action: approve)
-    ///
-    /// Implements: REQ-CFG-001 (YAML Configuration)
-    /// Implements: REQ-GOV-002 (Approval Execution Pipeline)
-    ///
-    /// # Arguments
-    ///
-    /// * `server_config` - Server configuration
-    /// * `yaml_config` - YAML configuration for gates 1, 2, 4
-    /// * `shutdown` - Cancellation token for graceful shutdown
-    ///
-    /// # Errors
-    ///
-    /// Returns error if upstream client or approval engine cannot be created.
-    pub async fn with_config(
-        server_config: McpServerConfig,
-        yaml_config: Config,
-        shutdown: CancellationToken,
-    ) -> Result<Self, ThoughtGateError> {
-        let upstream = Arc::new(UpstreamClient::new(server_config.upstream.clone())?);
-        let semaphore = Arc::new(Semaphore::new(server_config.max_concurrent_requests));
-        let (task_handler, cedar_engine, approval_engine) =
-            create_governance_components(upstream.clone(), Some(&yaml_config), shutdown.clone())
-                .await?;
-
-        let state = Arc::new(McpState {
-            upstream,
-            router: McpRouter::new(),
-            task_handler,
-            cedar_engine,
-            config: Some(Arc::new(yaml_config)),
-            approval_engine,
-            semaphore,
-            max_body_size: server_config.max_body_size,
-            max_batch_size: server_config.max_batch_size,
-            capability_cache: Arc::new(CapabilityCache::new()),
-            buffered_bytes: AtomicUsize::new(0),
-            max_aggregate_buffer: 512 * 1024 * 1024, // 512MB default for McpServer
-            tg_metrics: None, // McpServer doesn't use prometheus-client metrics
-        });
-
-        Ok(Self {
-            config: server_config,
-            state,
-            shutdown,
-        })
-    }
-
-    /// Create the axum Router.
-    ///
-    /// Implements: REQ-CORE-003/F-002 (Method Routing)
-    ///
-    /// The router includes:
-    /// - `POST /mcp/v1` - Main MCP endpoint
-    /// - Body size limit enforced at HTTP layer (before buffering)
-    pub fn router(&self) -> Router {
-        // Note: We don't use DefaultBodyLimit here because it returns HTTP 413
-        // instead of a JSON-RPC error. We manually check size in handle_mcp_body_bytes
-        // and return a proper JSON-RPC -32600 error per EC-MCP-004.
-        Router::new()
-            .route("/mcp/v1", post(handle_mcp_request))
-            .layer(DefaultBodyLimit::disable())
-            .with_state(self.state.clone())
-    }
-
-    /// Get the shutdown token.
-    ///
-    /// This can be used to coordinate shutdown with external systems.
-    /// Clone the token to share it with other components that need to be
-    /// notified when the server is shutting down.
-    pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown.clone()
-    }
-
-    /// Trigger graceful shutdown of background tasks.
-    ///
-    /// This cancels the shutdown token, which will stop the ApprovalEngine's
-    /// background polling scheduler and any other tasks listening to the token.
-    ///
-    /// Note: This does not stop the HTTP server itself. Use this in conjunction
-    /// with server shutdown to ensure all background tasks are cleaned up.
-    pub fn shutdown(&self) {
-        info!("Triggering graceful shutdown of background tasks");
-        self.shutdown.cancel();
-    }
-
-    /// Run the server.
-    ///
-    /// Implements: REQ-CORE-003/§5.2 (MCP Streamable HTTP Transport)
-    ///
-    /// This blocks until the server is shut down.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the server fails to bind or serve.
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listener = tokio::net::TcpListener::bind(&self.config.listen_addr).await?;
-        info!(addr = %self.config.listen_addr, "MCP server listening");
-        axum::serve(listener, self.router()).await?;
-        Ok(())
-    }
-}
-
-/// Handle POST /mcp/v1 requests (Axum handler).
-///
-/// This is the Axum handler that extracts state and body, then delegates
-/// to `handle_mcp_body_bytes` for the actual processing.
-///
-/// Note: This handler does not extract trace context from headers. For
-/// trace propagation, use `McpHandler::handle_with_context()` via ProxyService.
+/// Handle POST /mcp/v1 requests (Axum handler for tests).
 ///
 /// Implements: REQ-CORE-003/§10 (Request Handler Pattern)
+#[cfg(test)]
 async fn handle_mcp_request(State(state): State<Arc<McpState>>, body: Bytes) -> Response {
     let (status, bytes) = handle_mcp_body_bytes(&state, body, None).await;
     (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
@@ -880,13 +559,13 @@ async fn handle_mcp_body_bytes(
     // Increment before processing; decrement when this request completes.
     let body_size = body.len();
     let prev = state.buffered_bytes.fetch_add(body_size, Ordering::AcqRel);
-    if prev + body_size > state.max_aggregate_buffer {
+    if prev.saturating_add(body_size) > state.max_aggregate_buffer {
         state.buffered_bytes.fetch_sub(body_size, Ordering::Release);
         let correlation_id =
             thoughtgate_core::transport::jsonrpc::fast_correlation_id().to_string();
         warn!(
             correlation_id = %correlation_id,
-            buffered = prev + body_size,
+            buffered = prev.saturating_add(body_size),
             limit = state.max_aggregate_buffer,
             "Aggregate buffer limit exceeded"
         );
@@ -1475,7 +1154,8 @@ async fn handle_single_request_bytes(
     let request_start = std::time::Instant::now();
 
     // Extract tool name for tools/call requests (REQ-OBS-002 §5.1.1)
-    let tool_name = extract_tool_name(&request);
+    // Borrows from request.params (Arc<Value>) — must convert to owned before request is moved
+    let tool_name: Option<String> = extract_tool_name(&request).map(String::from);
 
     // Start MCP span with optional parent context (REQ-OBS-002 §5.1, §7.1)
     // When parent_context is provided, the span becomes a child of the caller's trace.
@@ -1565,16 +1245,11 @@ async fn handle_single_request_bytes(
 /// Extract tool name from tools/call request params.
 ///
 /// Implements: REQ-OBS-002 §5.1.1 (gen_ai.tool.name attribute)
-fn extract_tool_name(request: &McpRequest) -> Option<String> {
+fn extract_tool_name(request: &McpRequest) -> Option<&str> {
     if request.method != "tools/call" {
         return None;
     }
-    request
-        .params
-        .as_ref()?
-        .get("name")?
-        .as_str()
-        .map(|s| s.to_string())
+    request.params.as_ref()?.get("name")?.as_str()
 }
 
 /// Convert JsonRpcId to string for span attributes.
@@ -1875,6 +1550,14 @@ async fn route_through_gates(
     state: &McpState,
     mut request: McpRequest,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
+    let evaluator =
+        state
+            .evaluator
+            .as_ref()
+            .ok_or_else(|| ThoughtGateError::ServiceUnavailable {
+                reason: "Evaluator not configured".to_string(),
+            })?;
+
     let config = state
         .config
         .as_ref()
@@ -1882,12 +1565,10 @@ async fn route_through_gates(
             reason: "Configuration not loaded".to_string(),
         })?;
 
-    // Extract the governable resource name (tool name, resource URI, or prompt name)
-    // Implements: REQ-CORE-003/F-002 (Method Routing)
+    // Extract resource name for SEP-1686 validation and logging
     let resource_name = match extract_governable_name(&request) {
         Some(name) => name,
         None => {
-            // Request without required identifier is invalid params
             let field = match request.method.as_str() {
                 "tools/call" | "prompts/get" => "name",
                 "resources/read" | "resources/subscribe" => "uri",
@@ -1907,13 +1588,25 @@ async fn route_through_gates(
         resource = %resource_name,
         method = %request.method,
         source = %source_id,
-        "Routing through 4-gate model"
+        "Routing through 4-gate model (via evaluator)"
     );
+
+    // ========================================================================
+    // SEP-1686: Task Metadata Validation (proxy-specific)
+    // ========================================================================
+    // Pre-check Gate 2 result to validate task metadata before the evaluator
+    // runs all gates. This is cheap (config lookup only) and HTTP-specific.
+    let match_result = config.governance.evaluate(&resource_name, source_id);
+    validate_task_metadata(
+        &mut request,
+        &match_result.action,
+        &resource_name,
+        state.capability_cache.upstream_supports_tasks(),
+    )?;
 
     // ========================================================================
     // Start Gateway Decision Span (REQ-OBS-002 §5.3)
     // ========================================================================
-    // Tracks the overall decision-making process across all 4 gates.
     let correlation_id_str = request.correlation_id.to_string();
     let decision_span_data = GatewayDecisionSpanData {
         request_id: &correlation_id_str,
@@ -1921,194 +1614,101 @@ async fn route_through_gates(
     };
     let mut decision_span =
         start_gateway_decision_span(&decision_span_data, &opentelemetry::Context::current());
-    let mut gate_outcomes = GateOutcomes::default();
 
-    // Helper to finish span and return result
-    let finish_span_and_return = |span: &mut BoxedSpan,
-                                  outcomes: &GateOutcomes,
-                                  upstream_latency_ms: Option<f64>,
-                                  result: Result<JsonRpcResponse, ThoughtGateError>|
-     -> Result<JsonRpcResponse, ThoughtGateError> {
-        finish_gateway_decision_span(span, outcomes, upstream_latency_ms);
-        result
+    // ========================================================================
+    // Infer per-request principal (K8s service account detection)
+    // ========================================================================
+    let principal = match tokio::task::spawn_blocking(infer_principal).await {
+        Ok(Ok(policy_principal)) => Some(Principal::from_policy(
+            &policy_principal.app_name,
+            &policy_principal.namespace,
+            &policy_principal.service_account,
+            policy_principal.roles.clone(),
+        )),
+        Ok(Err(e)) => {
+            warn!(error = %e, "Principal inference failed, using evaluator default");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "Principal inference task panicked, using evaluator default");
+            None
+        }
     };
 
     // ========================================================================
-    // Gate 1: Visibility Check
+    // Build GovernanceEvaluateRequest and delegate to evaluator
     // ========================================================================
-    // Check if the tool is visible based on ExposeConfig
-    // Implements: REQ-CFG-001 Section 9.3 (Exposure Filtering)
-    //
-    // Note: If the source is not found in config, we fail closed (block the
-    // request). A missing source indicates a misconfiguration — the hardcoded
-    // "upstream" source_id doesn't match any configured source. Config
-    // validation should catch this at load time, but we enforce here as defense
-    // in depth.
-
-    if let Some(source) = config.get_source(source_id) {
-        let expose: thoughtgate_core::config::ExposeConfig = source.expose();
-        if !expose.is_visible(&resource_name) {
-            // Record gate 1 block metric (REQ-OBS-002 §6.1/MC-002)
-            if let Some(ref metrics) = state.tg_metrics {
-                metrics.record_gate_decision("gate1", "block");
-            }
-            gate_outcomes.visibility = Some("block".to_string());
-            warn!(
-                resource = %resource_name,
-                method = %request.method,
-                source = %source_id,
-                "Gate 1: Resource not exposed"
-            );
-            return finish_span_and_return(
-                &mut decision_span,
-                &gate_outcomes,
-                None,
-                Err(ThoughtGateError::ToolNotExposed {
-                    tool: resource_name,
-                    source_id: source_id.to_string(),
-                }),
-            );
-        }
-        // Record gate 1 pass metric (REQ-OBS-002 §6.1/MC-002)
-        if let Some(ref metrics) = state.tg_metrics {
-            metrics.record_gate_decision("gate1", "pass");
-        }
-        gate_outcomes.visibility = Some("pass".to_string());
-        debug!(resource = %resource_name, method = %request.method, "Gate 1 passed: resource is visible");
-    } else {
-        // Source not found in config — fail closed
-        // This indicates a misconfiguration (get_source_id returns a name
-        // that doesn't match any configured source). Allowing traffic through
-        // would bypass visibility checks entirely.
-        // Record gate 1 block metric (REQ-OBS-002 §6.1/MC-002)
-        if let Some(ref metrics) = state.tg_metrics {
-            metrics.record_gate_decision("gate1", "block");
-        }
-        gate_outcomes.visibility = Some("block".to_string());
-        warn!(
-            resource = %resource_name,
-            source = %source_id,
-            "Gate 1 blocked: source not found in config"
-        );
-        return finish_span_and_return(
-            &mut decision_span,
-            &gate_outcomes,
-            None,
-            Err(ThoughtGateError::ServiceUnavailable {
-                reason: format!("Source '{}' not found in configuration", source_id),
-            }),
-        );
-    }
-
-    // ========================================================================
-    // Gate 2: Governance Rules Evaluation
-    // ========================================================================
-    // Match against YAML governance rules to determine action
-    // Implements: REQ-CFG-001 Section 9.2 (Rule Matching)
-
-    let match_result = config.governance.evaluate(&resource_name, source_id);
-
-    info!(
-        resource = %resource_name,
-        method = %request.method,
-        action = %match_result.action,
-        matched_rule = ?match_result.matched_rule,
-        policy_id = ?match_result.policy_id,
-        "Gate 2: Governance rule matched"
-    );
-
-    // ========================================================================
-    // SEP-1686: Task Metadata Validation
-    // ========================================================================
-    // Validate that client sent params.task for actions that require it
-    // This is checked AFTER Gate 2 because we need to know the action first
-    if let Err(e) = validate_task_metadata(
-        &mut request,
-        &match_result.action,
-        &resource_name,
-        state.capability_cache.upstream_supports_tasks(),
-    ) {
-        // Record gate 2 outcome before returning
-        let outcome = match match_result.action {
-            Action::Forward => "forward",
-            Action::Deny => "deny",
-            Action::Approve => "approve",
-            Action::Policy => "policy",
-        };
-        gate_outcomes.governance = Some(outcome.to_string());
-        gate_outcomes.governance_rule_id = match_result.matched_rule.clone();
-        return finish_span_and_return(&mut decision_span, &gate_outcomes, None, Err(e));
-    }
-
-    // ========================================================================
-    // Route by Gate 2 Action
-    // ========================================================================
-
-    // Record gate 2 decision metric (REQ-OBS-002 §6.1/MC-002)
-    let gate2_outcome = match match_result.action {
-        Action::Forward => "forward",
-        Action::Deny => "deny",
-        Action::Approve => "approve",
-        Action::Policy => "policy",
+    let gov_req = GovernanceEvaluateRequest {
+        server_id: source_id.to_string(),
+        direction: StreamDirection::AgentToServer,
+        method: request.method.clone(),
+        id: request.id.clone(),
+        params: request.params.as_deref().cloned(),
+        message_type: MessageType::Request,
+        profile: Profile::Production,
     };
-    if let Some(ref metrics) = state.tg_metrics {
-        metrics.record_gate_decision("gate2", gate2_outcome);
-    }
-    gate_outcomes.governance = Some(gate2_outcome.to_string());
-    gate_outcomes.governance_rule_id = match_result.matched_rule.clone();
 
-    match match_result.action {
-        Action::Forward => {
-            // Skip all policy checks, forward directly
-            debug!(resource = %resource_name, "Gate 2: Forwarding directly to upstream");
+    let (resp, trace) = evaluator
+        .evaluate_with_principal(&gov_req, principal.as_ref())
+        .await;
+
+    // ========================================================================
+    // Map EvalTrace → GateOutcomes for the gateway decision span
+    // ========================================================================
+    let gate_outcomes = GateOutcomes {
+        visibility: trace.gate1,
+        governance: trace.gate2,
+        cedar: trace.gate3,
+        approval: trace.gate4,
+        governance_rule_id: trace.gate2_rule_id,
+        policy_evaluated: trace.gate3_policy_id.is_some(),
+    };
+
+    // ========================================================================
+    // Map GovernanceDecision to proxy actions
+    // ========================================================================
+    let result = match resp.decision {
+        GovernanceDecision::Forward => {
             let upstream_start = std::time::Instant::now();
             let result = state.upstream.forward(&request).await;
             let upstream_latency_ms = Some(upstream_start.elapsed().as_secs_f64() * 1000.0);
-            finish_span_and_return(
-                &mut decision_span,
-                &gate_outcomes,
-                upstream_latency_ms,
-                result,
-            )
+            finish_gateway_decision_span(&mut decision_span, &gate_outcomes, upstream_latency_ms);
+            return result;
         }
+        GovernanceDecision::Deny => Err(match resp.deny_source {
+            Some(DenySource::Visibility) => ThoughtGateError::ToolNotExposed {
+                tool: resource_name,
+                source_id: source_id.to_string(),
+            },
+            Some(DenySource::GovernanceRule) => ThoughtGateError::GovernanceRuleDenied {
+                tool: resource_name,
+                rule: resp.reason.clone(),
+            },
+            Some(DenySource::CedarPolicy) => ThoughtGateError::PolicyDenied {
+                tool: resource_name,
+                policy_id: resp.policy_id.clone(),
+                reason: resp.reason.clone(),
+            },
+            None => ThoughtGateError::PolicyDenied {
+                tool: resource_name,
+                policy_id: resp.policy_id.clone(),
+                reason: resp.reason.clone(),
+            },
+        }),
+        GovernanceDecision::PendingApproval => {
+            let task_id = resp.task_id.clone().unwrap_or_default();
+            let poll_interval_ms = resp.poll_interval_ms.unwrap_or(1000);
+            Ok(JsonRpcResponse::task_created(
+                request.id.clone(),
+                task_id,
+                "working".to_string(),
+                std::time::Duration::from_millis(poll_interval_ms),
+            ))
+        }
+    };
 
-        Action::Deny => {
-            // Immediate rejection
-            warn!(resource = %resource_name, "Gate 2: Request denied by governance rule");
-            finish_span_and_return(
-                &mut decision_span,
-                &gate_outcomes,
-                None,
-                Err(ThoughtGateError::GovernanceRuleDenied {
-                    tool: resource_name,
-                    rule: match_result.matched_rule,
-                }),
-            )
-        }
-
-        Action::Approve => {
-            // Gate 4: Create approval task
-            debug!(resource = %resource_name, "Gate 2 → Gate 4: Starting approval workflow");
-            gate_outcomes.approval = Some("started".to_string());
-            let result = start_approval_flow(state, request, &resource_name, &match_result).await;
-            finish_span_and_return(&mut decision_span, &gate_outcomes, None, result)
-        }
-
-        Action::Policy => {
-            // Gate 3: Cedar evaluation with proper context
-            debug!(resource = %resource_name, "Gate 2 → Gate 3: Evaluating Cedar policy");
-            gate_outcomes.policy_evaluated = true;
-            // Pass gate_outcomes to capture cedar decision for the gateway span
-            let result = evaluate_with_cedar(
-                state,
-                request,
-                Some(&match_result),
-                Some(&mut gate_outcomes),
-            )
-            .await;
-            finish_span_and_return(&mut decision_span, &gate_outcomes, None, result)
-        }
-    }
+    finish_gateway_decision_span(&mut decision_span, &gate_outcomes, None);
+    result
 }
 
 /// Start an approval workflow (Gate 4).
@@ -2426,34 +2026,43 @@ async fn evaluate_with_cedar(
 ///
 /// # Design Note: Batch Concurrency
 ///
-/// Requests are processed sequentially (single-permit-per-batch) rather than
-/// in parallel. This design choice is intentional:
+/// Batch items are processed concurrently via `buffer_unordered` with a cap
+/// of 16 in-flight items. This is safe because:
 ///
-/// 1. **Approval coupling** (F-007.5): If ANY request needs approval, the
-///    entire batch becomes task-augmented — requests are not independent.
-/// 2. **Bounded resource usage**: With `max_batch_size` limiting array length,
-///    sequential processing bounds total work per request to O(max_batch_size).
-///    Parallel processing would require additional concurrency limits to
-///    prevent a single batch from monopolizing the connection pool.
-/// 3. **Deadlock prevention**: Parallel batch items competing for the same
-///    upstream connection pool under load could deadlock if the pool is
-///    exhausted by one batch while another waits.
-/// 4. **Response ordering**: Sequential processing trivially preserves
-///    response ordering without additional synchronization.
+/// - **Independent routing**: Each item routes through `route_request()`
+///   independently. Approval decisions are per-request, not per-batch.
+/// - **Bounded concurrency**: The `.min(16)` cap prevents a single batch
+///   from monopolizing the upstream connection pool, even when
+///   `max_batch_size` allows up to 100 items.
+/// - **Response ordering**: JSON-RPC 2.0 §6 specifies batch responses may
+///   be returned in any order — clients match by `id`.
 async fn handle_batch_request_bytes(
     state: &McpState,
     items: Vec<thoughtgate_core::transport::jsonrpc::BatchItem>,
-    _parent_context: Option<&opentelemetry::Context>,
+    parent_context: Option<&opentelemetry::Context>,
 ) -> (StatusCode, Bytes) {
     use futures_util::stream::{self, StreamExt};
+    use opentelemetry::trace::{Span, SpanKind, Tracer};
     use thoughtgate_core::transport::jsonrpc::BatchItem;
 
-    // Note: For batch requests, trace context propagation is limited.
-    // ContextGuard is !Send, so we cannot attach it across async boundaries.
-    // Individual batch items don't get individual MCP spans in this implementation.
-    // The trace context from the parent will be visible via Context::current()
-    // if the caller attached it before calling this function.
-    // TODO: Consider creating a batch-level span that wraps all items.
+    // Create batch-level span for observability (REQ-OBS-002 §5.1).
+    // ContextGuard is !Send so we cannot attach the span across async
+    // boundaries, but the span itself tracks batch-level metadata.
+    let tracer = opentelemetry::global::tracer("thoughtgate");
+    let batch_size = items.len();
+    let mut batch_span = {
+        let builder = tracer
+            .span_builder(format!("jsonrpc.batch[{batch_size}]"))
+            .with_kind(SpanKind::Server)
+            .with_attributes(vec![opentelemetry::KeyValue::new(
+                "mcp.batch.size",
+                batch_size as i64,
+            )]);
+        match parent_context {
+            Some(ctx) => builder.start_with_context(&tracer, ctx),
+            None => builder.start(&tracer),
+        }
+    };
 
     // Process batch items concurrently using buffer_unordered.
     // JSON-RPC batch spec allows responses in any order (matched by id).
@@ -2506,6 +2115,16 @@ async fn handle_batch_request_bytes(
 
     // Filter out None entries (notifications)
     let responses: Vec<JsonRpcResponse> = responses.into_iter().flatten().collect();
+
+    // Record error count on the batch span.
+    let error_count = responses.iter().filter(|r| r.error.is_some()).count();
+    if error_count > 0 {
+        batch_span.set_attribute(opentelemetry::KeyValue::new(
+            "mcp.batch.error_count",
+            error_count as i64,
+        ));
+    }
+    batch_span.end();
 
     // Return batch response
     if responses.is_empty() {
@@ -2624,6 +2243,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         })
     }
 
@@ -2799,6 +2419,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         });
 
         let router = Router::new()
@@ -2847,6 +2468,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         });
 
         // Router with DefaultBodyLimit disabled - we check size manually and return JSON-RPC error
@@ -2970,14 +2592,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let body_str = response_body(response).await;
         assert!(body_str.is_empty());
-    }
-
-    #[test]
-    fn test_default_config() {
-        let config = McpServerConfig::default();
-        assert_eq!(config.listen_addr, "0.0.0.0:8080");
-        assert_eq!(config.max_body_size, 1024 * 1024);
-        assert_eq!(config.max_concurrent_requests, 10000);
     }
 
     // ========================================================================
@@ -3188,6 +2802,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         })
     }
 
@@ -3445,6 +3060,7 @@ mod tests {
             buffered_bytes: AtomicUsize::new(0),
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
+            evaluator: None,
         })
     }
 

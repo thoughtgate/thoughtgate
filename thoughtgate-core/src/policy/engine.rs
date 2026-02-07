@@ -17,17 +17,15 @@
 
 #[allow(deprecated)] // v0.1 types needed for backward compatibility
 use super::{
-    PolicyAction, PolicyError, PolicyRequest, PolicySource, PolicyStats, Resource, loader,
-    types::{
-        CedarContext, CedarDecision, CedarRequest, CedarResource, CedarStats, PolicyAnnotations,
-        PolicyInfo,
-    },
+    PolicyAction, PolicyError, PolicyRequest, PolicySource, Resource, loader,
+    types::{CedarContext, CedarDecision, CedarRequest, CedarResource, PolicyAnnotations},
 };
 use arc_swap::ArcSwap;
 use cedar_policy::{
     Authorizer, Context, Decision, Entities, EntityId, EntityTypeName, EntityUid, PolicySet,
     Request, Schema,
 };
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -258,7 +256,7 @@ impl CedarEngine {
                 self.stats_v2.forbid_count.fetch_add(1, Ordering::Relaxed);
                 return CedarDecision::Forbid {
                     reason: format!("Failed to build request: {}", e),
-                    policy_ids: vec![],
+                    policy_ids: SmallVec::new(),
                 };
             }
         };
@@ -271,7 +269,7 @@ impl CedarEngine {
                 self.stats_v2.forbid_count.fetch_add(1, Ordering::Relaxed);
                 return CedarDecision::Forbid {
                     reason: format!("Failed to build entities: {}", e),
-                    policy_ids: vec![],
+                    policy_ids: SmallVec::new(),
                 };
             }
         };
@@ -292,7 +290,7 @@ impl CedarEngine {
                 self.stats_v2.permit_count.fetch_add(1, Ordering::Relaxed);
 
                 // Extract determining policy IDs
-                let determining_policies: Vec<String> = response
+                let determining_policies: SmallVec<[String; 1]> = response
                     .diagnostics()
                     .reason()
                     .map(|id| id.to_string())
@@ -315,14 +313,14 @@ impl CedarEngine {
                 self.stats_v2.forbid_count.fetch_add(1, Ordering::Relaxed);
 
                 // Extract forbidding policy IDs
-                let policy_ids: Vec<String> = response
+                let policy_ids: SmallVec<[String; 2]> = response
                     .diagnostics()
                     .reason()
                     .map(|id| id.to_string())
                     .collect();
 
                 // Build reason from errors if any
-                let errors: Vec<String> = response
+                let errors: SmallVec<[String; 1]> = response
                     .diagnostics()
                     .errors()
                     .map(|e| e.to_string())
@@ -674,53 +672,6 @@ impl CedarEngine {
         }
     }
 
-    /// Get policy annotations.
-    ///
-    /// Implements: REQ-POL-001/§8.0 (Policy Annotations)
-    pub fn annotations(&self) -> Arc<PolicyAnnotations> {
-        self.annotations.load_full()
-    }
-
-    /// Get v0.2 statistics.
-    ///
-    /// Implements: REQ-POL-001/§6.3 (CedarStats)
-    pub fn stats_v2(&self) -> CedarStats {
-        let eval_count = self.stats_v2.evaluation_count.load(Ordering::Relaxed);
-        let total_time = self.stats_v2.total_eval_time_us.load(Ordering::Relaxed);
-
-        CedarStats {
-            evaluation_count: eval_count,
-            permit_count: self.stats_v2.permit_count.load(Ordering::Relaxed),
-            forbid_count: self.stats_v2.forbid_count.load(Ordering::Relaxed),
-            avg_eval_time_us: if eval_count > 0 {
-                total_time / eval_count
-            } else {
-                0
-            },
-        }
-    }
-
-    /// Get v0.2 policy info.
-    ///
-    /// Implements: REQ-POL-001/§6.3 (PolicyInfo)
-    pub fn policy_info(&self) -> PolicyInfo {
-        let policies = self.policies.load();
-        let annotations = self.annotations.load();
-
-        let source = self.source.load();
-        let paths = match source.as_ref() {
-            PolicySource::ConfigMap { path, .. } => vec![std::path::PathBuf::from(path)],
-            _ => vec![],
-        };
-
-        PolicyInfo {
-            paths,
-            policy_count: policies.policies().count(),
-            last_reload: *self.stats.last_reload.load().as_ref(),
-            annotated_policy_count: annotations.len(),
-        }
-    }
-
     /// Parse policy annotations at load time.
     ///
     /// Implements: REQ-POL-001/§8.0 (Using Policy Annotations for Workflow Routing)
@@ -1025,23 +976,6 @@ impl CedarEngine {
     pub fn policy_source(&self) -> PolicySource {
         (**self.source.load()).clone()
     }
-
-    /// Get policy statistics (v0.1).
-    ///
-    /// Implements: REQ-POL-001/F-005 (Hot-Reload)
-    ///
-    /// Returns runtime statistics including policy count, evaluation count,
-    /// reload count, and last reload timestamp.
-    pub fn stats(&self) -> PolicyStats {
-        let policies = self.policies.load();
-
-        PolicyStats {
-            policy_count: policies.policies().count(),
-            last_reload: *self.stats.last_reload.load().as_ref(),
-            reload_count: self.stats.reload_count.load(Ordering::Relaxed),
-            evaluation_count: self.stats.evaluation_count.load(Ordering::Relaxed),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1151,48 +1085,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn test_evaluate_v2_stats() {
-        let policy = r#"
-            permit(principal, action == ThoughtGate::Action::"tools/call", resource);
-        "#;
-
-        unsafe {
-            std::env::set_var("THOUGHTGATE_POLICIES", policy);
-        }
-
-        let engine = CedarEngine::new().expect("Failed to create engine");
-
-        let request = CedarRequest {
-            principal: test_principal(),
-            resource: CedarResource::ToolCall {
-                name: "test_tool".to_string(),
-                server: "test-server".to_string(),
-                arguments: serde_json::json!({}),
-            },
-            context: CedarContext {
-                policy_id: "test_policy".to_string(),
-                source_id: "test-server".to_string(),
-                time: TimeContext::from_timestamp(0),
-            },
-        };
-
-        // Evaluate multiple times
-        engine.evaluate_v2(&request);
-        engine.evaluate_v2(&request);
-        engine.evaluate_v2(&request);
-
-        let stats = engine.stats_v2();
-        assert_eq!(stats.evaluation_count, 3);
-        assert_eq!(stats.permit_count, 3);
-        assert_eq!(stats.forbid_count, 0);
-
-        unsafe {
-            std::env::remove_var("THOUGHTGATE_POLICIES");
-        }
-    }
-
-    #[test]
     fn test_time_context_construction() {
         let time = TimeContext::from_timestamp(1705329000);
         assert_eq!(time.hour, 14);
@@ -1241,27 +1133,6 @@ mod tests {
         // Default policies permit all actions, so first check (Forward) should return Forward
         let action = engine.evaluate(&request);
         assert!(matches!(action, PolicyAction::Forward));
-    }
-
-    #[test]
-    #[serial]
-    #[allow(deprecated)]
-    fn test_stats() {
-        let engine = CedarEngine::new().expect("Failed to create engine");
-
-        let request = PolicyRequest {
-            principal: test_principal(),
-            resource: test_tool_call("test_tool"),
-            context: None,
-        };
-
-        // Evaluate a few times
-        engine.evaluate(&request);
-        engine.evaluate(&request);
-        engine.evaluate(&request);
-
-        let stats = engine.stats();
-        assert_eq!(stats.evaluation_count, 3);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1448,34 +1319,6 @@ mod tests {
             context: None,
         };
         assert!(matches!(engine.evaluate(&request), PolicyAction::Forward));
-
-        unsafe {
-            std::env::remove_var("THOUGHTGATE_POLICIES");
-        }
-    }
-
-    /// EC-POL-009: Policy reload → Statistics updated
-    #[test]
-    #[serial]
-    fn test_ec_pol_009_reload_updates_stats() {
-        unsafe {
-            std::env::set_var(
-                "THOUGHTGATE_POLICIES",
-                "permit(principal, action, resource);",
-            );
-        }
-
-        let engine = CedarEngine::new().expect("Failed to create engine");
-
-        let stats_before = engine.stats();
-        assert_eq!(stats_before.reload_count, 0);
-
-        // Reload policies
-        let result = engine.reload();
-        assert!(result.is_ok());
-
-        let stats_after = engine.stats();
-        assert_eq!(stats_after.reload_count, 1);
 
         unsafe {
             std::env::remove_var("THOUGHTGATE_POLICIES");

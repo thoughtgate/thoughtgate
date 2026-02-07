@@ -39,7 +39,6 @@ pub use spans::{
     McpMessageType,
     McpSpanData,
     // Span Functions (stable API)
-    current_span_context,
     finish_approval_callback_span,
     finish_cedar_span,
     finish_gateway_decision_span,
@@ -58,21 +57,16 @@ pub use trace_context::{
 
 // Re-export propagation utilities (REQ-OBS-002 §7.1, §7.2, §7.3)
 pub use propagation::{
-    // Stdio transport (§7.3)
-    StdioTraceContext,
     // HTTP transport (§7.1, §7.2)
     extract_context_from_headers,
+    // Stdio transport (§7.3)
     extract_context_from_meta,
     inject_context_into_headers,
-    inject_context_into_meta,
 };
 
 // Re-export prometheus-client metrics
 pub use cardinality::CardinalityLimiter;
 pub use prom_metrics::ThoughtGateMetrics;
-
-// Re-export RAII timer helpers (REQ-CORE-002 NFR-001)
-pub use timers::{AmberPathTimer, InspectorTimer};
 
 // Re-export BoxedSpan for convenience (callers need to annotate span type)
 pub use opentelemetry::global::BoxedSpan;
@@ -566,7 +560,6 @@ mod tests {
                 protocol: "http/protobuf".to_string(),
                 headers: std::collections::HashMap::new(),
             }),
-            prometheus: None,
             sampling: Some(SamplingConfig {
                 strategy: "head".to_string(),
                 success_sample_rate: 0.5,

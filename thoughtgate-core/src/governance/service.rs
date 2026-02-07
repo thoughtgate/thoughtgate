@@ -229,44 +229,54 @@ async fn evaluate_handler(
     };
     let mut decision_span = start_gateway_decision_span(&span_data, &parent_ctx);
 
-    let resp = if let Some(ref evaluator) = state.evaluator {
-        let mut resp = evaluator.evaluate(&req).await;
+    let (resp, trace) = if let Some(ref evaluator) = state.evaluator {
+        let (mut resp, trace) = evaluator.evaluate(&req).await;
         resp.shutdown = shutdown;
-        resp
+        (resp, Some(trace))
     } else {
         // Stub mode (backward compat): always forward.
-        GovernanceEvaluateResponse {
-            decision: GovernanceDecision::Forward,
-            task_id: None,
-            policy_id: None,
-            reason: None,
-            poll_interval_ms: None,
-            shutdown,
-        }
+        (
+            GovernanceEvaluateResponse {
+                decision: GovernanceDecision::Forward,
+                task_id: None,
+                policy_id: None,
+                reason: None,
+                poll_interval_ms: None,
+                shutdown,
+                deny_source: None,
+            },
+            None,
+        )
     };
 
-    // Populate gate outcomes from the response for span attributes
-    let outcomes = GateOutcomes {
-        visibility: Some("pass".to_string()), // Gate 1 always passes in v0.3
-        governance: Some(match resp.decision {
-            GovernanceDecision::Forward => "forward".to_string(),
-            GovernanceDecision::Deny => "deny".to_string(),
-            GovernanceDecision::PendingApproval => "approve".to_string(),
-        }),
-        cedar: resp.policy_id.as_ref().map(|_| {
-            match resp.decision {
-                GovernanceDecision::Forward => "allow".to_string(),
+    // Populate gate outcomes from EvalTrace when available (precise),
+    // or reconstruct from response (lossy fallback for stub mode).
+    let outcomes = if let Some(ref t) = trace {
+        GateOutcomes {
+            visibility: t.gate1.clone(),
+            governance: t.gate2.clone(),
+            cedar: t.gate3.clone(),
+            approval: t.gate4.clone(),
+            governance_rule_id: t.gate2_rule_id.clone(),
+            policy_evaluated: t.gate3.is_some(),
+        }
+    } else {
+        GateOutcomes {
+            visibility: Some("pass".to_string()),
+            governance: Some(match resp.decision {
+                GovernanceDecision::Forward => "forward".to_string(),
                 GovernanceDecision::Deny => "deny".to_string(),
-                GovernanceDecision::PendingApproval => "allow".to_string(), // Cedar allowed, approval required
-            }
-        }),
-        approval: if resp.task_id.is_some() {
-            Some("started".to_string())
-        } else {
-            None
-        },
-        governance_rule_id: resp.policy_id.clone(),
-        policy_evaluated: resp.policy_id.is_some(),
+                GovernanceDecision::PendingApproval => "approve".to_string(),
+            }),
+            cedar: None,
+            approval: if resp.task_id.is_some() {
+                Some("started".to_string())
+            } else {
+                None
+            },
+            governance_rule_id: resp.policy_id.clone(),
+            policy_evaluated: resp.policy_id.is_some(),
+        }
     };
 
     finish_gateway_decision_span(&mut decision_span, &outcomes, None);

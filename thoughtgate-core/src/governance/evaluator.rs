@@ -44,12 +44,13 @@ use crate::governance::api::{
     GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse, MessageType,
 };
 use crate::governance::approval::{ApprovalRequest, PollingScheduler};
-use crate::governance::engine::TimeoutAction;
+use crate::governance::engine::{ApprovalEngine, TimeoutAction};
 use crate::governance::task::{Principal, TaskStatus, TaskStore, ToolCallRequest};
 use crate::jsonrpc::JsonRpcId;
 use crate::policy::engine::CedarEngine;
 use crate::policy::types::{CedarContext, CedarDecision, CedarResource, TimeContext};
 use crate::profile::Profile;
+use crate::telemetry::{CedarSpanData, ThoughtGateMetrics, finish_cedar_span, start_cedar_span};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -57,6 +58,48 @@ use crate::profile::Profile;
 
 /// Default task TTL for approval workflows.
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 300;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trace & Deny Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Gate-level trace data for telemetry (not serialized over the wire).
+///
+/// Returned alongside [`GovernanceEvaluateResponse`] so callers can populate
+/// OTel span attributes accurately without lossy reconstruction.
+///
+/// Implements: REQ-OBS-002 §5.3 (Gateway Decision Span)
+#[derive(Debug, Default)]
+pub struct EvalTrace {
+    /// Gate 1 (visibility) outcome: `"pass"` or `"block"`.
+    pub gate1: Option<String>,
+    /// Gate 2 (governance rules) outcome: `"forward"`, `"deny"`, `"approve"`, or `"policy"`.
+    pub gate2: Option<String>,
+    /// Gate 2 matched governance rule ID.
+    pub gate2_rule_id: Option<String>,
+    /// Gate 3 (Cedar policy) outcome: `"allow"` or `"deny"`.
+    pub gate3: Option<String>,
+    /// Cedar policy ID that was evaluated.
+    pub gate3_policy_id: Option<String>,
+    /// Cedar evaluation duration in milliseconds.
+    pub gate3_duration_ms: Option<f64>,
+    /// Gate 4 (approval) outcome: `"started"` if an approval was created.
+    pub gate4: Option<String>,
+}
+
+/// Where a Deny originated (for correct error code mapping).
+///
+/// Callers (proxy, service) map this to the appropriate `ThoughtGateError`
+/// variant so that JSON-RPC error codes are accurate per-gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenySource {
+    /// Gate 1 → `-32015 ToolNotExposed`
+    Visibility,
+    /// Gate 2 → `-32014 GovernanceRuleDenied`
+    GovernanceRule,
+    /// Gate 3 → `-32003 PolicyDenied`
+    CedarPolicy,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GovernanceEvaluator
@@ -76,7 +119,12 @@ pub struct GovernanceEvaluator {
     task_store: Arc<TaskStore>,
     principal: Principal,
     profile: Profile,
+    /// Legacy scheduler (used when no ApprovalEngine is configured).
     scheduler: OnceLock<Arc<PollingScheduler>>,
+    tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+    /// When set, Gate 4 delegates to the engine (preferred path).
+    /// When None, falls back to direct TaskStore + scheduler manipulation.
+    approval_engine: Option<Arc<ApprovalEngine>>,
 }
 
 impl GovernanceEvaluator {
@@ -101,7 +149,28 @@ impl GovernanceEvaluator {
             principal,
             profile,
             scheduler: OnceLock::new(),
+            tg_metrics: None,
+            approval_engine: None,
         }
+    }
+
+    /// Builder-style method to set Prometheus metrics.
+    ///
+    /// When set, the evaluator records per-gate decisions and Cedar
+    /// evaluation timing as Prometheus counters/histograms.
+    pub fn with_metrics(mut self, metrics: Arc<ThoughtGateMetrics>) -> Self {
+        self.tg_metrics = Some(metrics);
+        self
+    }
+
+    /// Builder-style method to set the approval engine.
+    ///
+    /// When set, Gate 4 delegates to the engine (which handles
+    /// pre-approval pipeline, task creation, Slack posting, and polling).
+    /// When unset, Gate 4 falls back to direct TaskStore + scheduler.
+    pub fn with_approval_engine(mut self, engine: Arc<ApprovalEngine>) -> Self {
+        self.approval_engine = Some(engine);
+        self
     }
 
     /// Set the polling scheduler (after construction).
@@ -114,21 +183,46 @@ impl GovernanceEvaluator {
 
     /// Evaluate a governance request through Gates 1–4.
     ///
-    /// Returns a [`GovernanceEvaluateResponse`] with the governance decision.
+    /// Uses the evaluator's default principal (set at construction).
+    /// For per-request principal override, use [`evaluate_with_principal`].
+    ///
+    /// Returns a [`GovernanceEvaluateResponse`] with the governance decision
+    /// and an [`EvalTrace`] carrying per-gate outcome data for telemetry.
     /// The `shutdown` field is NOT set here — the caller (service.rs) sets it.
     ///
     /// Implements: REQ-CORE-008/F-016
-    pub async fn evaluate(&self, req: &GovernanceEvaluateRequest) -> GovernanceEvaluateResponse {
+    pub async fn evaluate(
+        &self,
+        req: &GovernanceEvaluateRequest,
+    ) -> (GovernanceEvaluateResponse, EvalTrace) {
+        self.evaluate_with_principal(req, None).await
+    }
+
+    /// Evaluate with a request-specific principal (overrides default).
+    ///
+    /// Used by the proxy where principal is inferred per-request (e.g.,
+    /// K8s service account detection). Falls back to `self.principal`
+    /// when `principal_override` is `None`.
+    ///
+    /// Implements: REQ-CORE-008/F-016
+    pub async fn evaluate_with_principal(
+        &self,
+        req: &GovernanceEvaluateRequest,
+        principal_override: Option<&Principal>,
+    ) -> (GovernanceEvaluateResponse, EvalTrace) {
+        let effective_principal = principal_override.unwrap_or(&self.principal);
+        let mut trace = EvalTrace::default();
+
         // ── Fast-path: only evaluate agent→server requests ───────────────
         if req.message_type != MessageType::Request
             || req.direction != StreamDirection::AgentToServer
         {
-            return self.forward(None);
+            return (self.forward(None), trace);
         }
 
         // ── Fast-path: skip non-governable methods ──────────────────────
         if !method_requires_gates(&req.method) {
-            return self.forward(None);
+            return (self.forward(None), trace);
         }
 
         // ── Extract resource name from params ───────────────────────────
@@ -138,7 +232,7 @@ impl GovernanceEvaluator {
                 // Governable method without a resource identifier — forward.
                 // This handles list methods (tools/list, etc.) that don't
                 // reference a specific tool/resource.
-                return self.forward(None);
+                return (self.forward(None), trace);
             }
         };
 
@@ -151,13 +245,25 @@ impl GovernanceEvaluator {
                     server_id = %req.server_id,
                     "Gate 1: resource not exposed — denying"
                 );
-                return self.deny(
-                    Some(format!(
-                        "Resource '{}' not exposed on source '{}'",
-                        resource_name, req.server_id
-                    )),
-                    None,
+                trace.gate1 = Some("block".to_string());
+                if let Some(ref m) = self.tg_metrics {
+                    m.record_gate_decision("gate1", "block");
+                }
+                return (
+                    self.deny(
+                        Some(format!(
+                            "Resource '{}' not exposed on source '{}'",
+                            resource_name, req.server_id
+                        )),
+                        None,
+                        DenySource::Visibility,
+                    ),
+                    trace,
                 );
+            }
+            trace.gate1 = Some("pass".to_string());
+            if let Some(ref m) = self.tg_metrics {
+                m.record_gate_decision("gate1", "pass");
             }
             debug!(resource = %resource_name, "Gate 1 passed: resource is visible");
         } else {
@@ -168,12 +274,20 @@ impl GovernanceEvaluator {
                 server_id = %req.server_id,
                 "Gate 1: source not found in config — denying"
             );
-            return self.deny(
-                Some(format!(
-                    "Source '{}' not found in configuration",
-                    req.server_id
-                )),
-                None,
+            trace.gate1 = Some("block".to_string());
+            if let Some(ref m) = self.tg_metrics {
+                m.record_gate_decision("gate1", "block");
+            }
+            return (
+                self.deny(
+                    Some(format!(
+                        "Source '{}' not found in configuration",
+                        req.server_id
+                    )),
+                    None,
+                    DenySource::Visibility,
+                ),
+                trace,
             );
         }
 
@@ -190,34 +304,63 @@ impl GovernanceEvaluator {
             "Gate 2: governance rule matched"
         );
 
+        trace.gate2_rule_id = match_result.matched_rule.clone();
+
+        let gate2_outcome = match match_result.action {
+            Action::Forward => "forward",
+            Action::Deny => "deny",
+            Action::Policy => "policy",
+            Action::Approve => "approve",
+        };
+        trace.gate2 = Some(gate2_outcome.to_string());
+        if let Some(ref m) = self.tg_metrics {
+            m.record_gate_decision("gate2", gate2_outcome);
+        }
+
         match match_result.action {
             Action::Forward => {
                 debug!(resource = %resource_name, "Gate 2: forwarding directly");
-                self.forward(None)
+                (self.forward(None), trace)
             }
             Action::Deny => {
                 info!(resource = %resource_name, "Gate 2: denied by governance rule");
-                self.deny(
-                    Some(format!("Denied by governance rule for '{}'", resource_name)),
-                    match_result.policy_id.as_deref(),
+                (
+                    self.deny(
+                        Some(format!("Denied by governance rule for '{}'", resource_name)),
+                        match_result.policy_id.as_deref(),
+                        DenySource::GovernanceRule,
+                    ),
+                    trace,
                 )
             }
             Action::Policy => {
                 // Gate 3: Cedar policy evaluation
                 debug!(resource = %resource_name, "Gate 2 → Gate 3: evaluating Cedar policy");
-                self.evaluate_cedar(
-                    req,
-                    &resource_name,
-                    &match_result.policy_id,
-                    &match_result.approval_workflow,
-                )
-                .await
+                let resp = self
+                    .evaluate_cedar(
+                        req,
+                        &resource_name,
+                        &match_result.policy_id,
+                        &match_result.approval_workflow,
+                        effective_principal,
+                        &mut trace,
+                    )
+                    .await;
+                (resp, trace)
             }
             Action::Approve => {
                 // Gate 4: Approval workflow
                 debug!(resource = %resource_name, "Gate 2 → Gate 4: starting approval workflow");
-                self.start_approval(req, &resource_name, match_result.policy_id.as_deref())
-                    .await
+                let resp = self
+                    .start_approval(
+                        req,
+                        &resource_name,
+                        match_result.policy_id.as_deref(),
+                        effective_principal,
+                        &mut trace,
+                    )
+                    .await;
+                (resp, trace)
             }
         }
     }
@@ -235,6 +378,8 @@ impl GovernanceEvaluator {
         resource_name: &str,
         policy_id: &Option<String>,
         approval_workflow: &Option<String>,
+        principal: &Principal,
+        trace: &mut EvalTrace,
     ) -> GovernanceEvaluateResponse {
         let engine = match &self.cedar_engine {
             Some(engine) => engine,
@@ -253,11 +398,16 @@ impl GovernanceEvaluator {
                     resource = %resource_name,
                     "Gate 3: no Cedar engine — denying in production"
                 );
-                return self.deny(Some("Cedar engine not configured".to_string()), None);
+                return self.deny(
+                    Some("Cedar engine not configured".to_string()),
+                    None,
+                    DenySource::CedarPolicy,
+                );
             }
         };
 
         let pid = policy_id.clone().unwrap_or_else(|| "default".to_string());
+        trace.gate3_policy_id = Some(pid.clone());
 
         let cedar_resource = if req.method == "tools/call" {
             CedarResource::ToolCall {
@@ -272,12 +422,17 @@ impl GovernanceEvaluator {
             }
         };
 
+        let resource_type = match &cedar_resource {
+            CedarResource::ToolCall { .. } => "ThoughtGate::ToolCall",
+            CedarResource::McpMethod { .. } => "ThoughtGate::McpMethod",
+        };
+
         let cedar_request = crate::policy::types::CedarRequest {
             principal: crate::policy::Principal {
-                app_name: self.principal.app_name.clone(),
-                namespace: self.principal.namespace.clone(),
-                service_account: self.principal.service_account.clone(),
-                roles: self.principal.roles.clone(),
+                app_name: principal.app_name.clone(),
+                namespace: principal.namespace.clone(),
+                service_account: principal.service_account.clone(),
+                roles: principal.roles.clone(),
             },
             resource: cedar_resource,
             context: CedarContext {
@@ -287,17 +442,59 @@ impl GovernanceEvaluator {
             },
         };
 
-        match engine.evaluate_v2(&cedar_request) {
+        // Create Cedar OTel span (REQ-OBS-002 §5.2)
+        let cedar_span_data = CedarSpanData {
+            tool_name: resource_name.to_string(),
+            policy_id: Some(pid.clone()),
+            principal_type: "ThoughtGate::App".to_string(),
+            principal_id: principal.app_name.clone(),
+            action: req.method.clone(),
+            resource_type: resource_type.to_string(),
+            resource_id: resource_name.to_string(),
+        };
+        let mut cedar_span = start_cedar_span(&cedar_span_data, &opentelemetry::Context::current());
+
+        let eval_start = std::time::Instant::now();
+        let cedar_result = engine.evaluate_v2(&cedar_request);
+        let eval_duration_ms = eval_start.elapsed().as_secs_f64() * 1000.0;
+        trace.gate3_duration_ms = Some(eval_duration_ms);
+
+        match cedar_result {
             CedarDecision::Permit { .. } => {
+                trace.gate3 = Some("allow".to_string());
+
+                // Finish Cedar span + record metrics
+                finish_cedar_span(&mut cedar_span, "allow", &pid, eval_duration_ms, None);
+                if let Some(ref m) = self.tg_metrics {
+                    m.record_cedar_eval("allow", &pid, eval_duration_ms);
+                    m.record_gate_decision("gate3", "allow");
+                }
+
                 // Cedar permit → Gate 4 (approval workflow)
                 debug!(
                     resource = %resource_name,
                     policy_id = %pid,
                     "Gate 3: Cedar permit → Gate 4 approval"
                 );
-                self.start_approval(req, resource_name, Some(&pid)).await
+                self.start_approval(req, resource_name, Some(&pid), principal, trace)
+                    .await
             }
             CedarDecision::Forbid { reason, .. } => {
+                trace.gate3 = Some("deny".to_string());
+
+                // Finish Cedar span + record metrics
+                finish_cedar_span(
+                    &mut cedar_span,
+                    "deny",
+                    &pid,
+                    eval_duration_ms,
+                    Some(&reason),
+                );
+                if let Some(ref m) = self.tg_metrics {
+                    m.record_cedar_eval("deny", &pid, eval_duration_ms);
+                    m.record_gate_decision("gate3", "deny");
+                }
+
                 if self.profile == Profile::Development {
                     info!(
                         resource = %resource_name,
@@ -312,7 +509,7 @@ impl GovernanceEvaluator {
                     "Gate 3: Cedar forbid — denying"
                 );
                 let _ = approval_workflow; // used in future for workflow selection
-                self.deny(Some(reason), Some(&pid))
+                self.deny(Some(reason), Some(&pid), DenySource::CedarPolicy)
             }
         }
     }
@@ -324,8 +521,8 @@ impl GovernanceEvaluator {
     /// Start an approval workflow (Gate 4).
     ///
     /// In development mode, logs the would-be approval and returns Forward.
-    /// In production, creates a task, transitions to InputRequired, submits
-    /// to the polling scheduler, and returns PendingApproval.
+    /// In production, delegates to `ApprovalEngine` when available (preferred),
+    /// falling back to direct TaskStore + scheduler manipulation (legacy).
     ///
     /// Implements: REQ-CORE-008/F-016, REQ-GOV-001
     async fn start_approval(
@@ -333,6 +530,8 @@ impl GovernanceEvaluator {
         req: &GovernanceEvaluateRequest,
         resource_name: &str,
         policy_id: Option<&str>,
+        principal: &Principal,
+        trace: &mut EvalTrace,
     ) -> GovernanceEvaluateResponse {
         // ── Development mode: skip approval, auto-forward ───────────────
         if self.profile == Profile::Development {
@@ -347,7 +546,6 @@ impl GovernanceEvaluator {
             )));
         }
 
-        // ── Production: create task + submit to scheduler ───────────────
         let mcp_request_id = req.id.clone().unwrap_or(JsonRpcId::Null);
 
         let tool_request = ToolCallRequest {
@@ -357,11 +555,49 @@ impl GovernanceEvaluator {
             mcp_request_id,
         };
 
+        // ── Preferred path: delegate to ApprovalEngine ──────────────────
+        if let Some(ref engine) = self.approval_engine {
+            match engine
+                .start_approval(tool_request, principal.clone(), None)
+                .await
+            {
+                Ok(result) => {
+                    let poll_interval_ms = result.poll_interval.as_millis() as u64;
+
+                    trace.gate4 = Some("started".to_string());
+                    if let Some(ref m) = self.tg_metrics {
+                        m.record_gate_decision("gate4", "started");
+                        m.record_approval_request("slack", "pending");
+                    }
+
+                    return GovernanceEvaluateResponse {
+                        decision: GovernanceDecision::PendingApproval,
+                        task_id: Some(result.task_id.to_string()),
+                        policy_id: policy_id.map(String::from),
+                        reason: None,
+                        poll_interval_ms: Some(poll_interval_ms),
+                        shutdown: false,
+                        deny_source: None,
+                    };
+                }
+                Err(e) => {
+                    warn!(error = %e, "Gate 4: ApprovalEngine failed — denying");
+                    return self.deny(
+                        Some(format!("Approval workflow failed: {e}")),
+                        policy_id,
+                        DenySource::GovernanceRule,
+                    );
+                }
+            }
+        }
+
+        // ── Legacy path: direct TaskStore + scheduler ───────────────────
+
         // Create task in TaskStore.
         let task = match self.task_store.create(
             tool_request.clone(),
             tool_request,
-            self.principal.clone(),
+            principal.clone(),
             Some(Duration::from_secs(DEFAULT_APPROVAL_TTL_SECS)),
             TimeoutAction::Deny,
         ) {
@@ -371,6 +607,7 @@ impl GovernanceEvaluator {
                 return self.deny(
                     Some(format!("Failed to create approval task: {e}")),
                     policy_id,
+                    DenySource::GovernanceRule,
                 );
             }
         };
@@ -387,7 +624,11 @@ impl GovernanceEvaluator {
                 error = %e,
                 "Gate 4: failed to transition task to InputRequired"
             );
-            return self.deny(Some(format!("Task transition failed: {e}")), policy_id);
+            return self.deny(
+                Some(format!("Task transition failed: {e}")),
+                policy_id,
+                DenySource::GovernanceRule,
+            );
         }
 
         // Submit to scheduler (if available) for Slack posting + polling.
@@ -396,11 +637,11 @@ impl GovernanceEvaluator {
                 task_id: task_id.clone(),
                 tool_name: resource_name.to_string(),
                 tool_arguments: extract_arguments(&req.params),
-                principal: self.principal.clone(),
+                principal: principal.clone(),
                 expires_at: task.expires_at,
                 created_at: Utc::now(),
                 correlation_id: task_id.to_string(),
-                request_span_context: None, // TODO: Wire span context from request handler
+                request_span_context: None,
             };
 
             if let Err(e) = scheduler.submit(approval_req).await {
@@ -409,13 +650,16 @@ impl GovernanceEvaluator {
                     error = %e,
                     "Gate 4: failed to submit to scheduler — denying"
                 );
-                // Best-effort: cancel the task we just created.
                 let _ = self.task_store.transition(
                     &task_id,
                     TaskStatus::Failed,
                     Some(format!("Scheduler submission failed: {e}")),
                 );
-                return self.deny(Some(format!("Approval submission failed: {e}")), policy_id);
+                return self.deny(
+                    Some(format!("Approval submission failed: {e}")),
+                    policy_id,
+                    DenySource::GovernanceRule,
+                );
             }
 
             info!(
@@ -435,6 +679,12 @@ impl GovernanceEvaluator {
             .approval_poll_interval
             .as_millis() as u64;
 
+        trace.gate4 = Some("started".to_string());
+        if let Some(ref m) = self.tg_metrics {
+            m.record_gate_decision("gate4", "started");
+            m.record_approval_request("slack", "pending");
+        }
+
         GovernanceEvaluateResponse {
             decision: GovernanceDecision::PendingApproval,
             task_id: Some(task_id.to_string()),
@@ -442,6 +692,7 @@ impl GovernanceEvaluator {
             reason: None,
             poll_interval_ms: Some(poll_interval_ms),
             shutdown: false,
+            deny_source: None,
         }
     }
 
@@ -457,10 +708,16 @@ impl GovernanceEvaluator {
             reason,
             poll_interval_ms: None,
             shutdown: false,
+            deny_source: None,
         }
     }
 
-    fn deny(&self, reason: Option<String>, policy_id: Option<&str>) -> GovernanceEvaluateResponse {
+    fn deny(
+        &self,
+        reason: Option<String>,
+        policy_id: Option<&str>,
+        source: DenySource,
+    ) -> GovernanceEvaluateResponse {
         GovernanceEvaluateResponse {
             decision: GovernanceDecision::Deny,
             task_id: None,
@@ -468,6 +725,7 @@ impl GovernanceEvaluator {
             reason,
             poll_interval_ms: None,
             shutdown: false,
+            deny_source: Some(source),
         }
     }
 }
@@ -644,7 +902,7 @@ governance:
             message_type: MessageType::Notification,
             profile: Profile::Production,
         };
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -660,7 +918,7 @@ governance:
             message_type: MessageType::Response,
             profile: Profile::Production,
         };
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -676,7 +934,7 @@ governance:
             message_type: MessageType::Request,
             profile: Profile::Production,
         };
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -684,7 +942,7 @@ governance:
     async fn test_forward_for_non_governable_method() {
         let eval = test_evaluator(default_config(), Profile::Production);
         let req = make_request("initialize", "test-server", None);
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -692,7 +950,7 @@ governance:
     async fn test_forward_for_ping() {
         let eval = test_evaluator(default_config(), Profile::Production);
         let req = make_request("ping", "test-server", None);
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -700,7 +958,7 @@ governance:
     async fn test_forward_for_tools_list() {
         let eval = test_evaluator(default_config(), Profile::Production);
         let req = make_request("tools/list", "test-server", None);
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -714,7 +972,7 @@ governance:
             "test-server",
             Some(serde_json::json!({"name": "hidden_admin"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Deny);
         assert!(resp.reason.as_deref().unwrap_or("").contains("not exposed"));
     }
@@ -727,7 +985,7 @@ governance:
             "test-server",
             Some(serde_json::json!({"name": "read_file"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -739,7 +997,7 @@ governance:
             "nonexistent-server",
             Some(serde_json::json!({"name": "read_file"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Deny);
         assert!(
             resp.reason.as_deref().unwrap_or("").contains("not found"),
@@ -758,7 +1016,7 @@ governance:
             "test-server",
             Some(serde_json::json!({"name": "dangerous_delete"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Deny);
         assert!(
             resp.reason
@@ -776,7 +1034,7 @@ governance:
             "test-server",
             Some(serde_json::json!({"name": "safe_read"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -798,7 +1056,7 @@ governance:
             "test-server",
             Some(serde_json::json!({"name": "needs_approval_deploy"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::PendingApproval);
         assert!(resp.task_id.is_some());
         assert!(resp.poll_interval_ms.is_some());
@@ -812,7 +1070,7 @@ governance:
             "test-server",
             Some(serde_json::json!({"name": "needs_approval_deploy"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
         assert!(
             resp.reason
@@ -832,7 +1090,7 @@ governance:
             "test-server",
             Some(serde_json::json!({"name": "cedar_protected"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Forward);
     }
 
@@ -844,7 +1102,7 @@ governance:
             "test-server",
             Some(serde_json::json!({"name": "cedar_protected"})),
         );
-        let resp = eval.evaluate(&req).await;
+        let (resp, _trace) = eval.evaluate(&req).await;
         assert_eq!(resp.decision, GovernanceDecision::Deny);
     }
 
@@ -912,5 +1170,300 @@ governance:
     fn test_extract_arguments_missing() {
         let params = Some(serde_json::json!({"name": "x"}));
         assert_eq!(extract_arguments(&params), serde_json::json!({}));
+    }
+
+    // ── EvalTrace + DenySource tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_trace_gate1_block_sets_deny_source_visibility() {
+        let eval = test_evaluator(blocklist_config(), Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "hidden_admin"})),
+        );
+        let (resp, trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+        assert_eq!(resp.deny_source, Some(DenySource::Visibility));
+        assert_eq!(trace.gate1.as_deref(), Some("block"));
+        assert!(trace.gate2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trace_gate2_deny_sets_deny_source_governance() {
+        let eval = test_evaluator(deny_config(), Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "dangerous_delete"})),
+        );
+        let (resp, trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+        assert_eq!(resp.deny_source, Some(DenySource::GovernanceRule));
+        assert_eq!(trace.gate1.as_deref(), Some("pass"));
+        assert_eq!(trace.gate2.as_deref(), Some("deny"));
+    }
+
+    #[tokio::test]
+    async fn test_trace_gate2_forward_has_no_deny_source() {
+        let eval = test_evaluator(deny_config(), Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "safe_read"})),
+        );
+        let (resp, trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Forward);
+        assert!(resp.deny_source.is_none());
+        assert_eq!(trace.gate1.as_deref(), Some("pass"));
+        assert_eq!(trace.gate2.as_deref(), Some("forward"));
+    }
+
+    #[tokio::test]
+    async fn test_trace_gate3_no_engine_prod_sets_deny_source_cedar() {
+        let eval = test_evaluator(deny_config(), Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "cedar_protected"})),
+        );
+        let (resp, trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+        assert_eq!(resp.deny_source, Some(DenySource::CedarPolicy));
+        assert_eq!(trace.gate2.as_deref(), Some("policy"));
+    }
+
+    #[tokio::test]
+    async fn test_trace_gate4_approval_started() {
+        let config = deny_config();
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let eval = GovernanceEvaluator::new(
+            config,
+            None,
+            task_store.clone(),
+            test_principal(),
+            Profile::Production,
+        );
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "needs_approval_deploy"})),
+        );
+        let (resp, trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::PendingApproval);
+        assert!(resp.deny_source.is_none());
+        assert_eq!(trace.gate1.as_deref(), Some("pass"));
+        assert_eq!(trace.gate2.as_deref(), Some("approve"));
+        assert_eq!(trace.gate4.as_deref(), Some("started"));
+    }
+
+    // ── Metrics recording tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_evaluate_records_gate1_pass_metric() {
+        use crate::telemetry::prom_metrics::DecisionLabels;
+        use std::borrow::Cow;
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(ThoughtGateMetrics::new(&mut registry));
+
+        let eval = GovernanceEvaluator::new(
+            default_config(),
+            None,
+            Arc::new(TaskStore::with_defaults()),
+            test_principal(),
+            Profile::Production,
+        )
+        .with_metrics(metrics.clone());
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "safe_read"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Forward);
+
+        // Verify gate1 "pass" counter was incremented
+        let count = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate1"),
+                outcome: Cow::Borrowed("pass"),
+            })
+            .get();
+        assert_eq!(count, 1, "gate1 pass counter should be 1");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_records_gate1_block_metric() {
+        use crate::telemetry::prom_metrics::DecisionLabels;
+        use std::borrow::Cow;
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(ThoughtGateMetrics::new(&mut registry));
+
+        let eval = GovernanceEvaluator::new(
+            blocklist_config(),
+            None,
+            Arc::new(TaskStore::with_defaults()),
+            test_principal(),
+            Profile::Production,
+        )
+        .with_metrics(metrics.clone());
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "hidden_admin"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+
+        // Verify gate1 "block" counter was incremented
+        let count = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate1"),
+                outcome: Cow::Borrowed("block"),
+            })
+            .get();
+        assert_eq!(count, 1, "gate1 block counter should be 1");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_records_gate2_deny_metric() {
+        use crate::telemetry::prom_metrics::DecisionLabels;
+        use std::borrow::Cow;
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(ThoughtGateMetrics::new(&mut registry));
+
+        let eval = GovernanceEvaluator::new(
+            deny_config(),
+            None,
+            Arc::new(TaskStore::with_defaults()),
+            test_principal(),
+            Profile::Production,
+        )
+        .with_metrics(metrics.clone());
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "dangerous_delete"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+
+        // Gate 1 should pass, Gate 2 should deny
+        let gate1 = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate1"),
+                outcome: Cow::Borrowed("pass"),
+            })
+            .get();
+        assert_eq!(gate1, 1, "gate1 should have recorded pass");
+
+        let gate2 = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate2"),
+                outcome: Cow::Borrowed("deny"),
+            })
+            .get();
+        assert_eq!(gate2, 1, "gate2 should have recorded deny");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_records_gate4_metric() {
+        use crate::telemetry::prom_metrics::DecisionLabels;
+        use std::borrow::Cow;
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(ThoughtGateMetrics::new(&mut registry));
+
+        let eval = GovernanceEvaluator::new(
+            deny_config(),
+            None,
+            Arc::new(TaskStore::with_defaults()),
+            test_principal(),
+            Profile::Production,
+        )
+        .with_metrics(metrics.clone());
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "needs_approval_deploy"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::PendingApproval);
+
+        let gate4 = metrics
+            .decisions_total
+            .get_or_create(&DecisionLabels {
+                gate: Cow::Borrowed("gate4"),
+                outcome: Cow::Borrowed("started"),
+            })
+            .get();
+        assert_eq!(gate4, 1, "gate4 should have recorded started");
+    }
+
+    // ── Per-request principal tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_evaluate_with_override_principal() {
+        let config = deny_config();
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let eval = GovernanceEvaluator::new(
+            config,
+            None,
+            task_store.clone(),
+            test_principal(), // default: "test-app"
+            Profile::Production,
+        );
+
+        // Override principal
+        let override_principal = Principal::new("k8s-service-account");
+
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "needs_approval_deploy"})),
+        );
+        let (resp, trace) = eval
+            .evaluate_with_principal(&req, Some(&override_principal))
+            .await;
+
+        // Should still get PendingApproval (principal doesn't change the gate routing)
+        assert_eq!(resp.decision, GovernanceDecision::PendingApproval);
+        assert_eq!(trace.gate4.as_deref(), Some("started"));
+
+        // Verify the task was created with the override principal
+        let task_id_str = resp.task_id.as_deref().expect("should have task_id");
+        let task_id: crate::governance::TaskId = task_id_str.parse().unwrap();
+        let task = task_store.get(&task_id).expect("task should exist");
+        assert_eq!(
+            task.principal.app_name.as_str(),
+            "k8s-service-account",
+            "task should use override principal, not default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_with_principal_none_uses_default() {
+        let eval = test_evaluator(default_config(), Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "safe_read"})),
+        );
+
+        // None principal should behave identically to evaluate()
+        let (resp1, _) = eval.evaluate(&req).await;
+        let (resp2, _) = eval.evaluate_with_principal(&req, None).await;
+        assert_eq!(resp1.decision, resp2.decision);
     }
 }

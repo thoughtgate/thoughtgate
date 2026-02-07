@@ -31,10 +31,6 @@ pub struct StdioMessage {
     pub kind: JsonRpcMessageKind,
     /// The `params` field, if present (requests and notifications).
     pub params: Option<serde_json::Value>,
-    /// The `result` field, if present (success responses).
-    pub result: Option<serde_json::Value>,
-    /// The `error` field, if present (error responses).
-    pub error: Option<serde_json::Value>,
     /// The original NDJSON line, preserved for byte-for-byte forwarding.
     pub raw: String,
 }
@@ -42,8 +38,8 @@ pub struct StdioMessage {
 /// Parse a single NDJSON line into a [`StdioMessage`].
 ///
 /// Performs size validation, JSON parsing, batch rejection, and JSON-RPC
-/// classification in sequence. Fields (`params`, `result`, `error`) are
-/// extracted from the parsed value to avoid re-parsing downstream.
+/// classification in sequence. The `params` field is extracted from the
+/// parsed value to avoid re-parsing downstream.
 ///
 /// # Arguments
 ///
@@ -106,22 +102,12 @@ pub fn parse_stdio_message(line: &str) -> Result<StdioMessage, FramingError> {
         },
     })?;
 
-    // Extract payload fields by removing from the mutable value to avoid cloning.
-    let (params, result, error) = if let Some(obj) = value.as_object_mut() {
-        (
-            obj.remove("params"),
-            obj.remove("result"),
-            obj.remove("error"),
-        )
-    } else {
-        (None, None, None)
-    };
+    // Extract params by removing from the mutable value to avoid cloning.
+    let params = value.as_object_mut().and_then(|obj| obj.remove("params"));
 
     Ok(StdioMessage {
         kind,
         params,
-        result,
-        error,
         raw: line.to_string(),
     })
 }
@@ -205,16 +191,6 @@ mod tests {
                 id: JsonRpcId::Number(1),
             }
         );
-        assert!(msg.result.is_some());
-        assert_eq!(
-            msg.result
-                .unwrap()
-                .get("content")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "hello"
-        );
     }
 
     #[test]
@@ -240,9 +216,6 @@ mod tests {
                 id: JsonRpcId::Number(1),
             }
         );
-        assert!(msg.error.is_some());
-        let err = msg.error.unwrap();
-        assert_eq!(err.get("code").unwrap().as_i64().unwrap(), -32600);
     }
 
     #[test]
@@ -314,7 +287,6 @@ mod tests {
                 id: JsonRpcId::Number(1),
             }
         );
-        assert!(msg.result.is_some());
     }
 
     #[test]
@@ -344,27 +316,6 @@ mod tests {
         let msg = parse_stdio_message(line).unwrap();
         let params = msg.params.unwrap();
         assert_eq!(params.get("name").unwrap().as_str().unwrap(), "write_file");
-    }
-
-    #[test]
-    fn test_parse_extracts_result() {
-        let line = r#"{"jsonrpc":"2.0","id":42,"result":{"status":"ok"}}"#;
-        let msg = parse_stdio_message(line).unwrap();
-        let result = msg.result.unwrap();
-        assert_eq!(result.get("status").unwrap().as_str().unwrap(), "ok");
-    }
-
-    #[test]
-    fn test_parse_extracts_error() {
-        let line =
-            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"Method not found"}}"#;
-        let msg = parse_stdio_message(line).unwrap();
-        let error = msg.error.unwrap();
-        assert_eq!(error.get("code").unwrap().as_i64().unwrap(), -32601);
-        assert_eq!(
-            error.get("message").unwrap().as_str().unwrap(),
-            "Method not found"
-        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

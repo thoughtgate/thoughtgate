@@ -68,8 +68,6 @@ pub struct ShimOptions {
     pub governance_endpoint: String,
     /// Active configuration profile.
     pub profile: Profile,
-    /// Path to ThoughtGate config file.
-    pub config_path: PathBuf,
 }
 
 /// Errors that can occur during config operations.
@@ -496,8 +494,21 @@ fn detect_double_wrap(config: &serde_json::Value, key: &str, shim_binary: &Path)
     };
 
     for (_id, server) in servers_obj {
+        // Standard format: "command": "thoughtgate"
         if let Some(cmd) = server.get("command").and_then(|v| v.as_str()) {
             if cmd == shim_str || Path::new(cmd).file_name() == Path::new("thoughtgate").file_name()
+            {
+                return true;
+            }
+        }
+        // Zed object format: "command": { "path": "thoughtgate", ... }
+        if let Some(cmd_path) = server
+            .get("command")
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+        {
+            if cmd_path == shim_str
+                || Path::new(cmd_path).file_name() == Path::new("thoughtgate").file_name()
             {
                 return true;
             }
@@ -994,11 +1005,60 @@ impl ConfigAdapter for CursorAdapter {
         shim_binary: &Path,
         options: &ShimOptions,
     ) -> Result<PathBuf, ConfigError> {
-        standard_rewrite(config_path, "mcpServers", servers, shim_binary, options)
+        let backup_path =
+            standard_rewrite(config_path, "mcpServers", servers, shim_binary, options)?;
+
+        // Also rewrite project-level config if it exists, to prevent
+        // project overrides from bypassing governance.
+        if let Ok(cwd) = std::env::current_dir() {
+            let project_path = cwd.join(".cursor").join("mcp.json");
+            if project_path.exists() {
+                if let Ok(project_config) = read_config(&project_path) {
+                    if project_config
+                        .get("mcpServers")
+                        .and_then(|v| v.as_object())
+                        .is_some()
+                    {
+                        match standard_rewrite(
+                            &project_path,
+                            "mcpServers",
+                            servers,
+                            shim_binary,
+                            options,
+                        ) {
+                            Ok(_) | Err(ConfigError::AlreadyManaged) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %project_path.display(),
+                                    error = %e,
+                                    "Failed to rewrite project-level Cursor config; \
+                                     project servers may bypass governance"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(backup_path)
     }
 
     fn restore_config(&self, config_path: &Path, backup_path: &Path) -> Result<(), ConfigError> {
-        standard_restore(config_path, backup_path)
+        standard_restore(config_path, backup_path)?;
+
+        // Best-effort restore project-level config.
+        if let Ok(cwd) = std::env::current_dir() {
+            let project_path = cwd.join(".cursor").join("mcp.json");
+            let mut project_backup = project_path.as_os_str().to_os_string();
+            project_backup.push(".thoughtgate-backup");
+            let project_backup = PathBuf::from(project_backup);
+            if project_backup.exists() {
+                let _ = standard_restore(&project_path, &project_backup);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1366,13 +1426,15 @@ impl ConfigAdapter for ZedAdapter {
                     }),
                 );
 
-                if let Some(env_obj) = entry_obj.get_mut("env") {
-                    if let Some(env_map) = env_obj.as_object_mut() {
-                        env_map.insert(
-                            "THOUGHTGATE_SERVER_ID".to_string(),
-                            server.id.clone().into(),
-                        );
-                    }
+                // Add THOUGHTGATE_SERVER_ID to env (create env if absent).
+                let env_obj = entry_obj
+                    .entry("env")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(env_map) = env_obj.as_object_mut() {
+                    env_map.insert(
+                        "THOUGHTGATE_SERVER_ID".to_string(),
+                        server.id.clone().into(),
+                    );
                 }
             }
         }
@@ -1593,7 +1655,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         let backup = adapter
@@ -1626,7 +1687,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         adapter
@@ -1671,7 +1731,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         adapter
@@ -1715,6 +1774,62 @@ mod tests {
     }
 
     #[test]
+    fn test_zed_rewrite_injects_env_without_existing_env() {
+        let dir = temp_config_dir();
+        let config_path = dir.join("settings.json");
+        let fixture = std::fs::read_to_string(fixture_path("zed_settings.json")).unwrap();
+        std::fs::write(&config_path, &fixture).unwrap();
+
+        let adapter = ZedAdapter;
+        let servers = adapter.parse_servers(&config_path).unwrap();
+        let shim_binary = PathBuf::from("/usr/local/bin/thoughtgate");
+        let options = ShimOptions {
+            server_id: String::new(),
+            governance_endpoint: "http://127.0.0.1:19090".to_string(),
+            profile: Profile::Production,
+        };
+
+        adapter
+            .rewrite_config(&config_path, &servers, &shim_binary, &options)
+            .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        // `simple-server` has no env key in the fixture — verify it was created.
+        let simple_env = rewritten["context_servers"]["simple-server"]["env"]
+            .as_object()
+            .expect("env should be created for servers without existing env");
+        assert_eq!(
+            simple_env
+                .get("THOUGHTGATE_SERVER_ID")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "simple-server"
+        );
+
+        // `filesystem` has an existing env — verify it was preserved.
+        let fs_env = rewritten["context_servers"]["filesystem"]["env"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            fs_env.get("NODE_ENV").unwrap().as_str().unwrap(),
+            "production"
+        );
+        assert_eq!(
+            fs_env
+                .get("THOUGHTGATE_SERVER_ID")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "filesystem"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_double_wrap_detection() {
         let dir = temp_config_dir();
         let config_path = dir.join("config.json");
@@ -1728,7 +1843,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         // First rewrite succeeds.
@@ -1739,6 +1853,119 @@ mod tests {
         // Second rewrite detects double-wrap.
         let result = adapter.rewrite_config(&config_path, &servers, &shim_binary, &options);
         assert!(matches!(result, Err(ConfigError::AlreadyManaged)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_double_wrap_zed_object_format() {
+        let dir = temp_config_dir();
+        let config_path = dir.join("settings.json");
+        let fixture = std::fs::read_to_string(fixture_path("zed_settings.json")).unwrap();
+        std::fs::write(&config_path, &fixture).unwrap();
+
+        let adapter = ZedAdapter;
+        let servers = adapter.parse_servers(&config_path).unwrap();
+        let shim_binary = PathBuf::from("/usr/local/bin/thoughtgate");
+        let options = ShimOptions {
+            server_id: String::new(),
+            governance_endpoint: "http://127.0.0.1:19090".to_string(),
+            profile: Profile::Production,
+        };
+
+        // First rewrite succeeds.
+        adapter
+            .rewrite_config(&config_path, &servers, &shim_binary, &options)
+            .unwrap();
+
+        // Second rewrite detects double-wrap via object command format.
+        let result = adapter.rewrite_config(&config_path, &servers, &shim_binary, &options);
+        assert!(matches!(result, Err(ConfigError::AlreadyManaged)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cursor_project_level_rewrite() {
+        // Verify that standard_rewrite correctly wraps a project-level
+        // Cursor config (same format as global). CursorAdapter::rewrite_config
+        // calls standard_rewrite on both global and project-level configs.
+        let dir = temp_config_dir();
+        let project_config = dir.join("mcp.json");
+
+        // Project-level config has a server that could bypass governance.
+        let config = serde_json::json!({
+            "mcpServers": {
+                "dangerous-tool": {
+                    "command": "npx",
+                    "args": ["-y", "dangerous-mcp-server"]
+                }
+            }
+        });
+        std::fs::write(
+            &project_config,
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let servers = vec![McpServerEntry {
+            id: "dangerous-tool".to_string(),
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "dangerous-mcp-server".to_string()],
+            env: None,
+            enabled: true,
+        }];
+
+        let shim_binary = PathBuf::from("/usr/local/bin/thoughtgate");
+        let options = ShimOptions {
+            server_id: String::new(),
+            governance_endpoint: "http://127.0.0.1:19090".to_string(),
+            profile: Profile::Production,
+        };
+
+        // Rewrite the project-level config.
+        standard_rewrite(
+            &project_config,
+            "mcpServers",
+            &servers,
+            &shim_binary,
+            &options,
+        )
+        .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&project_config).unwrap()).unwrap();
+
+        // Verify the command was replaced with thoughtgate shim.
+        assert_eq!(
+            rewritten["mcpServers"]["dangerous-tool"]["command"]
+                .as_str()
+                .unwrap(),
+            "/usr/local/bin/thoughtgate"
+        );
+
+        // Verify THOUGHTGATE_SERVER_ID is set.
+        assert_eq!(
+            rewritten["mcpServers"]["dangerous-tool"]["env"]["THOUGHTGATE_SERVER_ID"]
+                .as_str()
+                .unwrap(),
+            "dangerous-tool"
+        );
+
+        // Verify double-wrap detection works on the rewritten project config.
+        let result = standard_rewrite(
+            &project_config,
+            "mcpServers",
+            &servers,
+            &shim_binary,
+            &options,
+        );
+        assert!(matches!(result, Err(ConfigError::AlreadyManaged)));
+
+        // Verify backup was created.
+        let mut backup_path = project_config.as_os_str().to_os_string();
+        backup_path.push(".thoughtgate-backup");
+        assert!(PathBuf::from(&backup_path).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

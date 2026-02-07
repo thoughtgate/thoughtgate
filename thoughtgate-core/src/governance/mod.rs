@@ -67,7 +67,7 @@ pub use api::{
 };
 
 // Re-export governance evaluator (REQ-CORE-008/F-016)
-pub use evaluator::GovernanceEvaluator;
+pub use evaluator::{DenySource, EvalTrace, GovernanceEvaluator};
 
 // Re-export governance HTTP service types (REQ-CORE-008/F-008, F-016)
 pub use service::{

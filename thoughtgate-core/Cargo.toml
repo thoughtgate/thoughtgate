@@ -76,13 +76,11 @@ prometheus-client = "0.24.0"
 # Fast, non-poisoning mutex (replaces std::sync::Mutex per CLAUDE.md safety rules)
 parking_lot = "0.12"
 
+# Inline small collections (avoids Vec heap allocation for 0-1 element cases)
+smallvec = "1"
+
 # Cryptographically secure random number generation (trace/span ID generation)
 rand = "0.9"
-
-[features]
-default = ["metrics"]
-metrics = []
-fuzzing = []
 
 [dev-dependencies]
 proptest = "1.0"
