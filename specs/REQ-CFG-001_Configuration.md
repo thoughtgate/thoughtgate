@@ -548,10 +548,15 @@ pub type ApprovalWorkflows = HashMap<String, HumanWorkflow>;
 #[derive(Debug, Deserialize)]
 pub struct HumanWorkflow {
     pub destination: ApprovalDestination,
-    
+
     #[serde(default, deserialize_with = "duration_format::deserialize_option")]
     pub timeout: Option<Duration>,
-    
+
+    /// Max duration to hold an HTTP connection for blocking approval.
+    /// Falls back to `timeout` if unset, then to 300s default.
+    #[serde(default, deserialize_with = "duration_format::deserialize_option")]
+    pub blocking_timeout: Option<Duration>,
+
     #[serde(default)]
     pub on_timeout: Option<TimeoutAction>,
 }
@@ -1671,6 +1676,7 @@ ThoughtGate v0.2 uses a 3-port Envoy-style architecture:
 | `THOUGHTGATE_OUTBOUND_PORT` | `7467` | Main proxy port for MCP traffic |
 | `THOUGHTGATE_ADMIN_PORT` | `7469` | Admin port for health/ready/metrics |
 | `UPSTREAM_URL` | (required) | Upstream server URL (all traffic) |
+| `THOUGHTGATE_BLOCKING_APPROVAL_TIMEOUT_SECS` | `300` | Global fallback for blocking mode HTTP hold timeout |
 
 **Note:** Port 7468 is reserved for future inbound callback functionality.
 

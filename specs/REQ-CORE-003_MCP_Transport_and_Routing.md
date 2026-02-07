@@ -506,6 +506,14 @@ async fn execute_approval(
 - **F-006.3:** Return Task ID immediately with `input_required` status
 - **F-006.4:** Background poller updates task state on decision
 - **F-006.5:** Upstream execution triggered by `tasks/result` call (see REQ-GOV-001)
+- **F-006.6:** Blocking mode (no `params.task`):
+  - If approval engine available: hold connection, call `wait_and_execute()`
+  - Return `CallToolResult` directly (approved) or `isError: true` (timeout)
+  - If no approval engine: return `TaskRequired` error (-32009)
+
+> **Blocking variant:** When `params.task` is absent, steps 1-3 above are
+> replaced by: create task internally → hold connection → poll for approval →
+> execute → return result on same connection. The agent never sees a task ID.
 
 ### F-007: Upstream Forwarding
 

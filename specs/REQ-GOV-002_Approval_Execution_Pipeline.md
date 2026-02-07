@@ -83,6 +83,19 @@ In v0.2, the execution pipeline is minimal because:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+#### v0.2 Blocking Pipeline (when `params.task` absent)
+
+```text
+Agent ─── tools/call (no task) ──► ThoughtGate ──► Slack ──► Human
+                                       │ (connection held)    │
+                                       │◄── reaction ─────────│
+                                       │ (execute upstream)
+Agent ◄── {"result": ...} ────────── ThoughtGate
+```
+
+The agent sees a normal `tools/call` → response cycle (just slow). No task ID
+is exposed. This works with ANY MCP client.
+
 ### 1.3 v0.3+: Full Pipeline (Future)
 
 The full pipeline adds inspection phases:
@@ -591,6 +604,29 @@ fn pipeline_result_to_response(result: PipelineResult, on_timeout: TimeoutAction
     }
 }
 ```
+
+### F-007: Blocking Execution Pipeline
+
+When a `tools/call` request arrives without `params.task` and the governance
+action requires approval, the proxy enters blocking mode:
+
+- **F-007.1:** Detect blocking mode: `params.task` absent + approval engine available
+- **F-007.2:** Create task via `start_approval()` (reuses F-001/F-002 pipeline)
+- **F-007.3:** Call `wait_and_execute()` which polls `execute_on_result()` in a loop
+- **F-007.4:** Emit progress heartbeats every 15s via `notifications/progress`
+  (stdio transport) or hold connection silently (HTTP transport)
+- **F-007.5:** On approval: execute upstream call, return `CallToolResult` directly
+- **F-007.6:** On rejection: return `ThoughtGateError::ApprovalRejected`
+- **F-007.7:** On timeout: return `CallToolResult` with `isError: true`:
+  ```json
+  {
+    "content": [{"type": "text", "text": "Approval timed out after 300s for tool 'delete_user'. ..."}],
+    "isError": true
+  }
+  ```
+- **F-007.8:** Resolve timeout: workflow `blocking_timeout` → workflow `timeout` → env var → 300s
+- **F-007.9:** Record metrics: `thoughtgate_blocking_approvals_total{outcome}`,
+  `thoughtgate_blocking_hold_duration_seconds{outcome}`
 
 ### 7.2 v0.3+: Full Pipeline Flow (Future Reference)
 
