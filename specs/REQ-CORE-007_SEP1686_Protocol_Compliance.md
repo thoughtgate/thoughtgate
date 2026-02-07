@@ -30,7 +30,7 @@ SEP-1686 solves this by allowing:
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Blocking mode | **Removed in v0.2** | SEP-1686 is now standard; blocking has fundamental timeout issues |
+| Blocking mode | **Implemented in v0.2** | Dual-mode: async SEP-1686 when `params.task` present; blocking when absent (requires approval engine) |
 | Task ownership | **Follows YAML config** | `forward` → passthrough; `approve` → ThoughtGate owns; `policy` → Cedar decides |
 | Capability advertisement | **Always advertise** | ThoughtGate synthesizes task support for approval-path tools |
 | Tool annotation source | **YAML config lookup** | Simple glob-based rules; Cedar only for complex `action: policy` cases |
@@ -172,9 +172,9 @@ ThoughtGate computes tool annotations from **YAML config lookup**, not Cedar pol
 |-------------|----------------|------------|-----------|
 | `forward` | Yes | `optional` | Client may use tasks, not required |
 | `forward` | No | `forbidden` | Upstream can't handle task metadata |
-| `approve` | Any | `required` | Must use tasks for approval workflow |
+| `approve` | Any | `optional` | Supports both async (SEP-1686) and blocking mode |
 | `deny` | Any | `forbidden` | Tool blocked, no execution possible |
-| `policy` | Any | `required` | Conservative: Cedar may require approval |
+| `policy` | Any | `optional` | Supports both async (SEP-1686) and blocking mode |
 
 **Lookup Algorithm:**
 
@@ -189,9 +189,9 @@ fn compute_annotation(
     match action {
         Action::Forward if upstream_supports_tasks => TaskSupportAnnotation::Optional,
         Action::Forward => TaskSupportAnnotation::Forbidden,
-        Action::Approve => TaskSupportAnnotation::Required,
+        Action::Approve => TaskSupportAnnotation::Optional, // Supports blocking mode
         Action::Deny => TaskSupportAnnotation::Forbidden,
-        Action::Policy => TaskSupportAnnotation::Required, // Conservative default
+        Action::Policy => TaskSupportAnnotation::Optional, // Supports blocking mode
     }
 }
 ```
@@ -387,7 +387,7 @@ impl CapabilityCache {
       "description": "Delete a user account",
       "inputSchema": { ... },
       "annotations": {
-        "taskSupport": "required"
+        "taskSupport": "optional"
       }
     }
   ]
@@ -631,11 +631,11 @@ See REQ-GOV-004 F-012 for TG-generated SSE events.
 - **F-002.4:** Re-compute on config hot-reload or upstream reconnect
 - **F-002.5:** Log annotation decisions at INFO level:
   ```
-  INFO Tool annotation: delete_user -> required (yaml_action=approve)
+  INFO Tool annotation: delete_user -> optional (yaml_action=approve)
   INFO Tool annotation: read_file -> optional (yaml_action=forward, upstream_tasks=true)
   INFO Tool annotation: read_config -> forbidden (yaml_action=forward, upstream_tasks=false)
   INFO Tool annotation: drop_table -> forbidden (yaml_action=deny)
-  INFO Tool annotation: transfer_funds -> required (yaml_action=policy)
+  INFO Tool annotation: transfer_funds -> optional (yaml_action=policy)
   ```
 - **F-002.6:** Metric: `thoughtgate_tools_by_annotation{annotation="required|optional|forbidden"}`
 
@@ -652,7 +652,7 @@ See REQ-GOV-004 F-012 for TG-generated SSE events.
   {
     "name": "delete_user",
     "annotations": {
-      "taskSupport": "required"
+      "taskSupport": "optional"
     }
   }
   ```
@@ -671,12 +671,14 @@ See REQ-GOV-004 F-012 for TG-generated SSE events.
 
 | Annotation | Task Present | Result |
 |------------|--------------|--------|
-| `required` | No | Error: TaskRequired (-32009) |
-| `required` | Yes | Valid, continue |
-| `optional` | No | Valid, sync path |
-| `optional` | Yes | Valid, async path |
+| `optional` | No | Blocking mode (if approval engine available) or sync path |
+| `optional` | Yes | Valid, async SEP-1686 path |
 | `forbidden` | No | Valid, sync path |
 | `forbidden` | Yes | Error: TaskForbidden (-32010) |
+
+> **Note:** Tools with `action: approve` or `action: policy` are annotated
+> `"optional"` (not `"required"`). When `params.task` is absent, the proxy
+> detects blocking mode and holds the connection open for approval.
 
 - **F-004.5:** If task metadata present, validate TTL:
   - Must be positive integer (milliseconds)
@@ -694,12 +696,13 @@ See REQ-GOV-004 F-012 for TG-generated SSE events.
 | `forward` | Present | `optional`/`required` | Upstream | Passthrough with task |
 | `forward` | Present | `forbidden` | **ThoughtGate** | Accelerated approve |
 | `forward` | Absent | Any | N/A | Sync passthrough |
-| `approve` | Present | Any | ThoughtGate | Normal approval flow |
-| `approve` | Absent | Any | Error | TaskRequired |
+| `approve` | Present | Any | ThoughtGate | Normal async approval flow |
+| `approve` | Absent | Any | **ThoughtGate (blocking)** | Holds connection, polls for approval |
 | `deny` | Any | Any | N/A | Return error |
 | `policy` → Forward | Present | `optional`/`required` | Upstream | Cedar said forward |
 | `policy` → Forward | Present | `forbidden` | **ThoughtGate** | Accelerated approve |
-| `policy` → Approve | Present | Any | ThoughtGate | Cedar said approve |
+| `policy` → Approve | Present | Any | ThoughtGate | Cedar said approve (async) |
+| `policy` → Approve | Absent | Any | **ThoughtGate (blocking)** | Cedar said approve, holds connection |
 | `policy` → Reject | Any | Any | N/A | Return error |
 
 **Flow:**
@@ -734,7 +737,7 @@ async fn determine_ownership(
             Ok(TaskOwnership::ThoughtGate { accelerated: true })
         }
         (Action::Forward, Some(_), _) => Ok(TaskOwnership::Upstream),
-        (Action::Approve, None, _) => Err(TaskRequired),
+        (Action::Approve, None, _) => Ok(TaskOwnership::ThoughtGateBlocking), // Blocking mode
         (Action::Approve, Some(_), _) => Ok(TaskOwnership::ThoughtGate { accelerated: false }),
         _ => unreachable!(),
     }
@@ -843,7 +846,7 @@ Clients can filter by prefix if they need to distinguish ownership.
 
 - **NF-003.1:** Log annotation decisions at startup (INFO level):
   ```
-  INFO Tool annotation: delete_user -> required (yaml_action=approve)
+  INFO Tool annotation: delete_user -> optional (yaml_action=approve)
   INFO Tool annotation: read_file -> optional (yaml_action=forward, upstream_tasks=true)
   ```
 - **NF-003.2:** Metric: `thoughtgate_tools_by_annotation{annotation="required|optional|forbidden"}`

@@ -360,134 +360,8 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
     };
 
     // ── Create governance evaluator (if config loaded) ───────────────────
-    let (gov_state, scheduler_state) = if let Some(config) = tg_config {
-        // Infer principal with graceful fallback for non-K8s environments.
-        let policy_principal =
-            tokio::task::spawn_blocking(thoughtgate_core::policy::principal::infer_principal)
-                .await
-                .ok()
-                .and_then(|r| r.ok());
-
-        let principal = match policy_principal {
-            Some(p) => Principal::from_policy(
-                &p.app_name,
-                &p.namespace,
-                &p.service_account,
-                p.roles.clone(),
-            ),
-            None => {
-                let user = std::env::var("USER").unwrap_or_else(|_| "anonymous".to_string());
-                tracing::info!(
-                    user = %user,
-                    "principal inference failed — using local fallback"
-                );
-                Principal::from_policy(&user, "local", "local", vec![])
-            }
-        };
-
-        // Create Cedar engine (optional — falls back to profile-dependent behavior).
-        let cedar_engine = match CedarEngine::new() {
-            Ok(engine) => {
-                tracing::info!("Cedar policy engine initialized");
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                tracing::info!(
-                    error = %e,
-                    "Cedar engine not available — Cedar policy rules will use fallback"
-                );
-                None
-            }
-        };
-
-        // Create task store.
-        let task_store = Arc::new(TaskStore::with_defaults());
-
-        // Create evaluator.
-        let mut evaluator = GovernanceEvaluator::new(
-            config.clone(),
-            cedar_engine.clone(),
-            task_store.clone(),
-            principal,
-            profile,
-        );
-
-        // Conditionally create ApprovalEngine (if config uses approval workflows).
-        let scheduler_state = if config.requires_approval_engine() {
-            let cancel_token = CancellationToken::new();
-
-            let adapter: Arc<dyn ApprovalAdapter> = match SlackConfig::from_env()
-                .and_then(SlackAdapter::new)
-            {
-                Ok(adapter) => {
-                    tracing::info!("Slack adapter initialized for approval polling");
-                    Arc::new(adapter)
-                }
-                Err(e) => {
-                    if profile == Profile::Production {
-                        return Err(StdioError::ConfigParseError {
-                            path: args.thoughtgate_config.clone(),
-                            reason: format!(
-                                "approval adapter required in production but failed to initialize: {e}"
-                            ),
-                        });
-                    }
-                    tracing::info!(
-                        error = %e,
-                        "Slack adapter unavailable — using mock adapter (auto-approve in development)"
-                    );
-                    Arc::new(MockAdapter::new(Duration::from_secs(1), true))
-                }
-            };
-
-            // Use ApprovalEngine when Cedar is available (handles pipeline + scheduling).
-            // Fall back to direct PollingScheduler when no Cedar engine.
-            if let Some(ref cedar) = cedar_engine {
-                let noop_upstream = Arc::new(NoopUpstreamForwarder);
-                let engine = ApprovalEngine::new(
-                    task_store.clone(),
-                    adapter,
-                    noop_upstream,
-                    cedar.clone(),
-                    ApprovalEngineConfig::from_env(),
-                    cancel_token.clone(),
-                );
-                engine.spawn_background_tasks().await;
-                evaluator = evaluator.with_approval_engine(Arc::new(engine));
-                tracing::info!("approval engine started (with Cedar pipeline)");
-            } else {
-                let scheduler = Arc::new(PollingScheduler::new(
-                    adapter,
-                    task_store.clone(),
-                    PollingConfig::default(),
-                    cancel_token.clone(),
-                ));
-                evaluator.set_scheduler(scheduler.clone());
-                tokio::spawn({
-                    let scheduler = scheduler.clone();
-                    async move {
-                        scheduler.run().await;
-                    }
-                });
-                tracing::info!("approval polling scheduler started (legacy, no Cedar)");
-            }
-
-            Some(cancel_token)
-        } else {
-            tracing::debug!("no approval workflows configured — scheduler not started");
-            None
-        };
-
-        let evaluator = Arc::new(evaluator);
-
-        let state = Arc::new(GovernanceServiceState::with_evaluator(
-            evaluator, task_store,
-        ));
-        (state, scheduler_state)
-    } else {
-        // No config — use stub mode.
-        (Arc::new(GovernanceServiceState::new()), None)
-    };
+    let (gov_state, scheduler_state) =
+        setup_governance(tg_config, profile, &args.thoughtgate_config).await?;
 
     // ── F-008: Start governance service ────────────────────────────────────
     let (gov_port, gov_handle) = start_governance_service(args.governance_port, gov_state.clone())
@@ -629,25 +503,7 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
     }
 
     // ── F-010: Cleanup ─────────────────────────────────────────────────────
-
-    // Stop the approval polling scheduler (if running).
-    if let Some(cancel_token) = scheduler_state {
-        cancel_token.cancel();
-        // Allow up to 5s for scheduler shutdown (engine manages its own handle).
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        tracing::debug!("approval scheduler stopped");
-    }
-
-    // Signal governance to shut down (so shims drain).
-    gov_state.trigger_shutdown();
-    tracing::info!("governance shutdown triggered");
-
-    // Wait for governance service to finish (up to 10s).
-    let _ = tokio::time::timeout(
-        Duration::from_secs(GOVERNANCE_DRAIN_TIMEOUT_SECS),
-        gov_handle,
-    )
-    .await;
+    wrap_cleanup(scheduler_state, &gov_state, gov_handle).await;
 
     // Explicit restore (belt and suspenders — Drop also calls restore).
     if !args.no_restore {
@@ -666,6 +522,162 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
 
     tracing::info!(exit_code, "wrap complete");
     Ok(exit_code)
+}
+
+/// Create the governance evaluator and optional approval engine/scheduler.
+///
+/// Implements: REQ-CORE-008/F-008 (Governance Service Startup)
+async fn setup_governance(
+    tg_config: Option<Arc<thoughtgate_core::config::Config>>,
+    profile: Profile,
+    config_path: &Path,
+) -> Result<(Arc<GovernanceServiceState>, Option<CancellationToken>), StdioError> {
+    let config = match tg_config {
+        Some(c) => c,
+        None => return Ok((Arc::new(GovernanceServiceState::new()), None)),
+    };
+
+    // Infer principal with graceful fallback for non-K8s environments.
+    let policy_principal =
+        tokio::task::spawn_blocking(thoughtgate_core::policy::principal::infer_principal)
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+
+    let principal = match policy_principal {
+        Some(p) => Principal::from_policy(
+            &p.app_name,
+            &p.namespace,
+            &p.service_account,
+            p.roles.clone(),
+        ),
+        None => {
+            let user = std::env::var("USER").unwrap_or_else(|_| "anonymous".to_string());
+            tracing::info!(
+                user = %user,
+                "principal inference failed — using local fallback"
+            );
+            Principal::from_policy(&user, "local", "local", vec![])
+        }
+    };
+
+    let cedar_engine = match CedarEngine::new_with_config(config.cedar.as_ref()) {
+        Ok(engine) => {
+            tracing::info!("Cedar policy engine initialized");
+            Some(Arc::new(engine))
+        }
+        Err(e) => {
+            tracing::info!(
+                error = %e,
+                "Cedar engine not available — Cedar policy rules will use fallback"
+            );
+            None
+        }
+    };
+
+    let task_store = Arc::new(TaskStore::with_defaults());
+
+    let mut evaluator = GovernanceEvaluator::new(
+        config.clone(),
+        cedar_engine.clone(),
+        task_store.clone(),
+        principal,
+        profile,
+    );
+
+    let scheduler_state = if config.requires_approval_engine() {
+        let cancel_token = CancellationToken::new();
+
+        let adapter: Arc<dyn ApprovalAdapter> = match SlackConfig::from_env()
+            .and_then(SlackAdapter::new)
+        {
+            Ok(adapter) => {
+                tracing::info!("Slack adapter initialized for approval polling");
+                Arc::new(adapter)
+            }
+            Err(e) => {
+                if profile == Profile::Production {
+                    return Err(StdioError::ConfigParseError {
+                        path: config_path.to_path_buf(),
+                        reason: format!(
+                            "approval adapter required in production but failed to initialize: {e}"
+                        ),
+                    });
+                }
+                tracing::info!(
+                    error = %e,
+                    "Slack adapter unavailable — using mock adapter (auto-approve in development)"
+                );
+                Arc::new(MockAdapter::new(Duration::from_secs(1), true))
+            }
+        };
+
+        if let Some(ref cedar) = cedar_engine {
+            let noop_upstream = Arc::new(NoopUpstreamForwarder);
+            let engine = ApprovalEngine::new(
+                task_store.clone(),
+                adapter,
+                noop_upstream,
+                cedar.clone(),
+                ApprovalEngineConfig::from_env(),
+                cancel_token.clone(),
+            );
+            engine.spawn_background_tasks().await;
+            evaluator = evaluator.with_approval_engine(Arc::new(engine));
+            tracing::info!("approval engine started (with Cedar pipeline)");
+        } else {
+            let scheduler = Arc::new(PollingScheduler::new(
+                adapter,
+                task_store.clone(),
+                PollingConfig::default(),
+                cancel_token.clone(),
+            ));
+            evaluator.set_scheduler(scheduler.clone());
+            tokio::spawn({
+                let scheduler = scheduler.clone();
+                async move {
+                    scheduler.run().await;
+                }
+            });
+            tracing::info!("approval polling scheduler started (legacy, no Cedar)");
+        }
+
+        Some(cancel_token)
+    } else {
+        tracing::debug!("no approval workflows configured — scheduler not started");
+        None
+    };
+
+    let evaluator = Arc::new(evaluator);
+    let state = Arc::new(GovernanceServiceState::with_evaluator(
+        evaluator, task_store,
+    ));
+
+    Ok((state, scheduler_state))
+}
+
+/// Stop scheduler and shut down governance service.
+///
+/// Implements: REQ-CORE-008/F-010 (Cleanup)
+async fn wrap_cleanup(
+    scheduler_state: Option<CancellationToken>,
+    gov_state: &GovernanceServiceState,
+    gov_handle: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+) {
+    if let Some(cancel_token) = scheduler_state {
+        cancel_token.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tracing::debug!("approval scheduler stopped");
+    }
+
+    gov_state.trigger_shutdown();
+    tracing::info!("governance shutdown triggered");
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(GOVERNANCE_DRAIN_TIMEOUT_SECS),
+        gov_handle,
+    )
+    .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

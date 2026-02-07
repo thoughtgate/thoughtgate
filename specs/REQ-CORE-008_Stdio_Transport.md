@@ -868,6 +868,22 @@ pub enum StdioError {
     - Shims MUST send a heartbeat every 5 seconds when idle (no messages flowing). If the response contains `"shutdown": true`, the shim initiates graceful shutdown (F-018). If the heartbeat request fails with connection refused or timeout, the shim treats this as an unclean governance service exit and initiates shutdown immediately.
     - Backpressure: while awaiting approval, stop reading from agent stdin (bounded channel fills, read task blocks)
     - Timeout: configurable per-profile (production: 5min, development: 10s auto-approve)
+
+    **Progress Heartbeats (Blocking Mode):**
+
+    During the approval poll loop, the shim emits `notifications/progress` to the
+    agent's stdout every 15 seconds. This resets the MCP TypeScript SDK's default
+    60-second timeout (`resetTimeoutOnProgress: true`).
+
+    ```json
+    {"jsonrpc":"2.0","method":"notifications/progress",
+     "params":{"progressToken":"blocking-{task_id}","progress":0,"total":1,
+               "message":"Awaiting approval..."}}
+    ```
+
+    The progress notification goes to the **agent** (Claude Desktop / Cursor), not
+    to the MCP server. On timeout, the shim returns a `CallToolResult` with
+    `isError: true` instead of JSON-RPC error -32008.
     - **Shutdown coordination:** When any `GovernanceEvaluateResponse` or heartbeat response contains `shutdown: true`, the shim stops accepting new messages from the agent and initiates F-018. This is the mechanism by which F-019 step 2 ("governance service signals all connected shims to drain") is implemented — the governance service sets an internal shutdown flag that is piggy-backed onto the next evaluate or heartbeat response for each connected shim.
 
 - **F-016a (Shim Readiness Check):** Before entering the proxy loop, the shim MUST poll the governance service's `/healthz` endpoint with exponential backoff (initial: 50ms, max: 2s, max attempts: 20). If the governance service is not reachable within the backoff window, exit with `StdioError::GovernanceUnavailable`. This prevents fail-closed denials during normal startup races between shim instances and the governance service.

@@ -80,7 +80,7 @@ impl UpstreamConfig {
     ///
     /// Returns `ThoughtGateError::InvalidParams` if:
     /// - `THOUGHTGATE_UPSTREAM` is not set
-    /// - `THOUGHTGATE_REQUEST_TIMEOUT_SECS` is set but not a valid u64
+    /// - `THOUGHTGATE_UPSTREAM_TIMEOUT_SECS` (or fallback `THOUGHTGATE_REQUEST_TIMEOUT_SECS`) is set but not a valid u64
     /// - `THOUGHTGATE_UPSTREAM_CONNECT_TIMEOUT_SECS` is set but not a valid u64
     pub fn from_env() -> Result<Self, ThoughtGateError> {
         let base_url =
@@ -88,10 +88,16 @@ impl UpstreamConfig {
                 details: "THOUGHTGATE_UPSTREAM environment variable is required".to_string(),
             })?;
 
-        let timeout_secs: u64 = match std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS") {
+        // THOUGHTGATE_UPSTREAM_TIMEOUT_SECS controls the HTTP client timeout for
+        // upstream requests (default 30s). Falls back to THOUGHTGATE_REQUEST_TIMEOUT_SECS
+        // for backward compatibility, but that var also controls the per-request
+        // pipeline timeout in the proxy (default 300s) — prefer the specific name.
+        let timeout_secs: u64 = match std::env::var("THOUGHTGATE_UPSTREAM_TIMEOUT_SECS")
+            .or_else(|_| std::env::var("THOUGHTGATE_REQUEST_TIMEOUT_SECS"))
+        {
             Ok(val) => val.parse().map_err(|_| ThoughtGateError::InvalidParams {
                 details: format!(
-                    "THOUGHTGATE_REQUEST_TIMEOUT_SECS must be a valid integer, got: '{}'",
+                    "THOUGHTGATE_UPSTREAM_TIMEOUT_SECS must be a valid integer, got: '{}'",
                     val
                 ),
             })?,
@@ -913,7 +919,7 @@ mod tests {
             Err(ThoughtGateError::InvalidParams { .. })
         ));
         if let Err(ThoughtGateError::InvalidParams { details }) = result {
-            assert!(details.contains("THOUGHTGATE_REQUEST_TIMEOUT_SECS"));
+            assert!(details.contains("THOUGHTGATE_UPSTREAM_TIMEOUT_SECS"));
             assert!(details.contains("not-a-number"));
         }
     }

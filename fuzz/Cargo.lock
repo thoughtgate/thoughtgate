@@ -2974,7 +2974,7 @@ dependencies = [
 
 [[package]]
 name = "thoughtgate"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "clap",
  "dirs",
@@ -2998,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "thoughtgate-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3010,7 +3010,6 @@ dependencies = [
  "dashmap",
  "glob",
  "governor",
- "hex",
  "http",
  "humantime",
  "iso8601-duration",
@@ -3059,7 +3058,7 @@ dependencies = [
 
 [[package]]
 name = "thoughtgate-proxy"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -3069,7 +3068,6 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "httparse",
  "hyper",
  "hyper-rustls",
  "hyper-util",
@@ -3087,7 +3085,6 @@ dependencies = [
  "tokio-util",
  "tower",
  "tower-http",
- "tower-service",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

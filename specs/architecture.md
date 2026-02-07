@@ -209,7 +209,7 @@ Response handling is the same for all paths: pass it through.
 No response inspection or streaming distinction in v0.2.
 ```
 
-### 4.2 Approval Flow (v0.2 SEP-1686 Mode)
+### 4.2 Approval Flow (v0.2 Dual Mode)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -267,6 +267,22 @@ No response inspection or streaming distinction in v0.2.
 
 From client perspective: Immediate Task ID, poll for status, retrieve result when ready.
 ```
+
+#### 4.2.2 Blocking Mode (when `params.task` absent)
+
+```text
+Agent ─── tools/call (no task) ──► ThoughtGate ──► Slack ──► Human
+                                       │ (holds connection)   │
+                                       │  progress heartbeat  │
+                                       │  every 15s (stdio)   │
+                                       │◄── reaction ─────────│
+                                       │ (execute upstream)
+Agent ◄── {"result": ...} ────────── ThoughtGate
+```
+
+Mode detection: if `params.task` is present → async (above). If absent and
+approval engine configured → blocking. If absent and no approval engine →
+error (`TaskRequired`).
 
 ## 5. Component Integration Matrix
 
@@ -552,7 +568,7 @@ Environment variables can override specific settings but cannot define complex s
 |---------|-------|
 | **Zero-Copy Streaming (Green Path)** | Deferred until response streaming/inspection needed |
 | **Buffered Inspection (Amber Path)** | Deferred until request/response inspection needed |
-| **Blocking Mode** | Removed; SEP-1686 is the v0.2 standard |
+| **Blocking Mode** | ✅ Implemented in v0.2 — dual-mode: async when `params.task` present; blocking when absent |
 | **Gateway Deployment Mode** | Centralized proxy for multiple agents; requires auth |
 | **Agent Authentication** | API keys, mTLS, JWT for gateway mode |
 | Persistent Task Storage | Tasks are in-memory only; lost on restart |
@@ -571,6 +587,7 @@ Environment variables can override specific settings but cannot define complex s
 | Single upstream | Can't route to multiple MCP servers | Deploy multiple instances |
 | Per-component metrics | No unified tracing | Correlation IDs in logs |
 | Slack rate limits | Burst approval requests queue | Outbound rate limiter |
+| HTTP blocking mode has no heartbeats | Intermediary proxies (nginx 60s, ALB 60s, Cloudflare 100s) may kill idle connections during approval holds | Configure `proxy_read_timeout 600s` on reverse proxies. Stdio transport emits `notifications/progress` every 15s. HTTP SSE streaming planned for future release. |
 
 ## 8. Deployment Architecture
 
@@ -890,11 +907,11 @@ JSON-RPC batch requests are handled **independently** per JSON-RPC 2.0 specifica
 - Granular approval control - human can approve individual tools, not forced to approve unrelated operations
 - Agents wanting atomic behavior should use composite tools, not rely on batch semantics
 
-### 12.2 Approval Handling (v0.2 SEP-1686 Mode)
+### 12.2 Approval Handling (v0.2 Dual Mode)
 
-v0.2 uses SEP-1686 task mode for approval workflows.
+v0.2 supports two approval modes, selected automatically based on the presence of `params.task`.
 
-When a client sends a `tools/call` request and the governance rules require approval:
+**Async mode (when `params.task` present):**
 
 1. Create SEP-1686 task, post approval request to Slack, return task ID immediately
 2. Background poller waits for human reaction (👍/👎) on Slack message
@@ -902,10 +919,18 @@ When a client sends a `tools/call` request and the governance rules require appr
 4. On REJECT: Mark task failed with error -32007 (ApprovalRejected)
 5. On TIMEOUT: Execute `on_timeout` action (default: return -32008 ApprovalTimeout)
 
-**Why SEP-1686 for v0.2:**
-- Handles long-running approvals without HTTP timeout issues
-- Agent can do other work while waiting
-- Visibility into approval progress via task status
+**Blocking mode (when `params.task` absent):**
+
+1. Detect blocking mode (no task metadata + approval engine available)
+2. Create task, post approval to Slack (same as async)
+3. Hold connection, poll for approval decision
+4. On APPROVE: Execute tool call, return `CallToolResult` directly
+5. On REJECT: Return error -32007
+6. On TIMEOUT: Return `CallToolResult` with `isError: true` (tool-level error)
+
+**Why dual mode:**
+- Async (SEP-1686): For clients that support task primitives (agent free during wait)
+- Blocking: For legacy clients (Claude Desktop, Cursor) that don't support tasks
 
 ### 12.3 Configuration Hot-Reload
 
@@ -953,6 +978,7 @@ Timeouts at different layers and their cascade effects:
 | Approval workflow | 10m | `approval.*.timeout` | Fails task with -32008 |
 | Task TTL | 1h | Client request metadata | Expires task with -32005 |
 | Slack poll interval | 5s | Calculated from timeout | Retry loop (internal) |
+| Blocking hold | 5m | `approval.*.blocking_timeout` → `approval.*.timeout` → env var → 300s | Releases held HTTP connection |
 | Drain timeout | 30s | `THOUGHTGATE_DRAIN_TIMEOUT` | Force shutdown |
 
 **Timeout Precedence:**
@@ -960,6 +986,7 @@ Timeouts at different layers and their cascade effects:
 2. Approval workflow timeout determines approval wait limit
 3. Upstream call timeout applies per-request to MCP server
 4. Drain timeout is the final backstop during shutdown
+5. Blocking hold timeout applies when no `params.task` is present
 
 ## 13. Glossary
 

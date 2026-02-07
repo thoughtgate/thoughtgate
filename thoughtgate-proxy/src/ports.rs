@@ -75,6 +75,20 @@ pub fn admin_port() -> u16 {
         .unwrap_or(DEFAULT_ADMIN_PORT)
 }
 
+/// Validate that outbound and admin ports are not the same.
+///
+/// Returns an error message if ports conflict.
+pub fn validate_ports() -> Result<(), String> {
+    let outbound = outbound_port();
+    let admin = admin_port();
+    if outbound == admin {
+        return Err(format!(
+            "outbound port ({outbound}) and admin port ({admin}) must be different"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +117,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_outbound_port_from_env() {
         // Test env var override
         unsafe {
@@ -115,6 +130,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_admin_port_from_env() {
         // Test env var override
         unsafe {
@@ -127,6 +143,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_invalid_env_var_falls_back_to_default() {
         // Invalid port value should fall back to default
         unsafe {
@@ -136,5 +153,46 @@ mod tests {
         unsafe {
             std::env::remove_var("THOUGHTGATE_OUTBOUND_PORT");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_validate_ports_different() {
+        unsafe {
+            std::env::set_var("THOUGHTGATE_OUTBOUND_PORT", "8080");
+            std::env::set_var("THOUGHTGATE_ADMIN_PORT", "9090");
+        }
+        assert!(validate_ports().is_ok());
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_OUTBOUND_PORT");
+            std::env::remove_var("THOUGHTGATE_ADMIN_PORT");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_validate_ports_same() {
+        unsafe {
+            std::env::set_var("THOUGHTGATE_OUTBOUND_PORT", "8080");
+            std::env::set_var("THOUGHTGATE_ADMIN_PORT", "8080");
+        }
+        let result = validate_ports();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("8080"));
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_OUTBOUND_PORT");
+            std::env::remove_var("THOUGHTGATE_ADMIN_PORT");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_validate_ports_defaults() {
+        // Defaults should be different (7467 vs 7469)
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_OUTBOUND_PORT");
+            std::env::remove_var("THOUGHTGATE_ADMIN_PORT");
+        }
+        assert!(validate_ports().is_ok());
     }
 }

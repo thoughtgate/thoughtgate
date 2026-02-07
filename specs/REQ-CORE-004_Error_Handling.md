@@ -99,7 +99,7 @@ The system must:
 | -32005 | Task Expired | - | Task TTL exceeded |
 | -32006 | Task Cancelled | - | Task was cancelled |
 | -32007 | Approval Rejected | 4 | Human rejected the request |
-| -32008 | Approval Timeout | 4 | Approval window expired |
+| -32008 | Approval Timeout | 4 | Approval window expired (async mode). Blocking mode returns `CallToolResult` with `isError: true` instead. |
 | -32009 | Rate Limited | - | Too many requests |
 | -32010 | Inspection Failed | - | Amber path inspector rejected |
 | -32011 | Policy Drift | - | Policy changed, denying approved request |
@@ -174,11 +174,15 @@ pub enum ThoughtGateError {
         rejected_by: Option<String>,
         workflow: Option<String>,
     },
-    ApprovalTimeout { 
-        tool: String, 
+    ApprovalTimeout {
+        tool: String,
         timeout_secs: u64,
         workflow: Option<String>,
     },
+    // Note: In blocking mode, approval timeouts are returned as
+    // `CallToolResult { isError: true }` (tool-level error), not as JSON-RPC
+    // error -32008. This lets the LLM reason about the timeout and decide
+    // whether to retry. Error -32008 is reserved for the async SEP-1686 path.
     WorkflowNotFound {
         workflow: String,
     },

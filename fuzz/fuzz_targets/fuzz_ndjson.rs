@@ -17,7 +17,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use thoughtgate::shim::ndjson::{detect_smuggling, parse_stdio_message, MAX_MESSAGE_BYTES};
+use thoughtgate::shim::ndjson::{detect_smuggling, parse_stdio_message};
 
 /// Fuzz input for NDJSON testing
 #[derive(Arbitrary, Debug)]

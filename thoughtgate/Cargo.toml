@@ -25,7 +25,7 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 which = "7"
@@ -34,11 +34,11 @@ similar = "2"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # OpenTelemetry for trace context propagation (REQ-OBS-002 §7.3)
-opentelemetry = { version = "=0.31.0" }
-opentelemetry_sdk = { version = "=0.31.0" }
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 
 # UUID for correlation IDs (REQ-OBS-002)
-uuid = { version = "1", features = ["v4"] }
+uuid.workspace = true
 
 [dev-dependencies]
 proptest = "1.0"

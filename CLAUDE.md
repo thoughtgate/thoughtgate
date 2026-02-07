@@ -127,6 +127,10 @@ Authorization, Cookie, x-api-key, THOUGHTGATE_SLACK_BOT_TOKEN, tool_arguments
 ? operator or explicit error handling
 tokio::time::sleep()
 tokio::sync::Mutex
+
+// ✅ EXCEPTION: .expect() on LazyLock with compile-time literal constants
+// where the parse function is not const fn. Must include a // SAFETY: comment.
+static FOO: LazyLock<T> = LazyLock::new(|| T::parse("literal").expect("BUG: ..."));
 ```
 
 ### Observability Systems
@@ -270,7 +274,7 @@ cargo bench --bench policy_eval
 
 ### Environment Variables
 ```bash
-THOUGHTGATE_UPSTREAM=http://mcp-server:3000  # Required
+THOUGHTGATE_UPSTREAM=http://mcp-server:3000  # Required (proxy crate)
 THOUGHTGATE_OUTBOUND_PORT=7467               # Main proxy port (default: 7467)
 THOUGHTGATE_ADMIN_PORT=7469                  # Admin/health port (default: 7469)
 THOUGHTGATE_CONFIG=/etc/thoughtgate/config.yaml  # Optional YAML config
@@ -278,10 +282,17 @@ THOUGHTGATE_POLICIES=/etc/thoughtgate/policies/
 THOUGHTGATE_SLACK_BOT_TOKEN=xoxb-...
 THOUGHTGATE_SLACK_CHANNEL=#approvals
 THOUGHTGATE_APPROVAL_TIMEOUT_SECS=300
-THOUGHTGATE_REQUEST_TIMEOUT_SECS=300
+THOUGHTGATE_BLOCKING_APPROVAL_TIMEOUT_SECS=300  # Blocking HTTP hold timeout (default: 300s)
+THOUGHTGATE_REQUEST_TIMEOUT_SECS=300          # Per-request pipeline timeout (default: 300s)
+THOUGHTGATE_UPSTREAM_TIMEOUT_SECS=30          # Upstream HTTP client timeout (default: 30s)
 THOUGHTGATE_MAX_BATCH_SIZE=100
-THOUGHTGATE_ENVIRONMENT=production
+THOUGHTGATE_ENVIRONMENT=production            # Controls dev/production behavior (default: production)
 ```
+
+**Note on upstream URL naming:**
+- `UPSTREAM_URL` is the **CLI argument** (`--upstream-url`) used by `thoughtgate-proxy` binary via clap
+- `THOUGHTGATE_UPSTREAM` is the **env var** used by `UpstreamConfig::from_env()` in core
+- Both serve the same purpose but are read at different layers
 
 ## Requirement-Specific Notes
 

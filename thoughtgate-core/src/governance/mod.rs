@@ -28,6 +28,7 @@ pub mod approval;
 pub mod engine;
 pub mod evaluator;
 pub mod handlers;
+pub mod list_filtering;
 pub mod pipeline;
 pub mod service;
 pub mod task;
@@ -52,7 +53,7 @@ pub use approval::{
 // Re-export pipeline types
 pub use pipeline::{
     ApprovalPipeline, ExecutionPipeline, PipelineConfig, PipelineError, PipelineResult,
-    PreHitlResult, TransformDriftMode,
+    PreHitlResult, TransformDriftMode, check_policy_drift,
 };
 
 // Re-export engine types
@@ -63,7 +64,7 @@ pub use engine::{
 // Re-export governance API wire types (REQ-CORE-008)
 pub use api::{
     ApprovalOutcome, GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse,
-    MessageType, TaskStatusResponse,
+    MessageType, RevalidateResponse, TaskStatusResponse,
 };
 
 // Re-export governance evaluator (REQ-CORE-008/F-016)

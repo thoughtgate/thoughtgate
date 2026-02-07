@@ -18,12 +18,30 @@ This requirement defines **task lifecycle management** for ThoughtGate's approva
 | Version | Mode | Task Exposure | Description |
 |---------|------|---------------|-------------|
 | **v0.2** | **SEP-1686** | Full API | Async tasks with `tasks/*` methods |
+| **v0.2** | **Blocking** | None | Hold connection, return result directly (no `params.task`) |
 
-> **Note:** Blocking mode (holding HTTP connection during approval) was considered for v0.2 but removed due to fundamental timeout issues. SEP-1686 is now the standard implementation.
+### 1.2 v0.2: Blocking Mode
 
-### 1.2 Historical: Blocking Mode (Removed)
+Blocking mode holds the HTTP connection (or stdio pipe) open during approval,
+returning the tool result directly. This supports MCP clients that do NOT
+implement SEP-1686 task primitives.
 
-The blocking mode design was considered but **removed** in favor of SEP-1686:
+**Mode Detection:**
+
+| Client sends | Tool action | Result |
+|---|---|---|
+| `params.task` present | Approve/Policy | Async SEP-1686 mode |
+| `params.task` absent | Approve/Policy | Blocking mode |
+| `params.task` absent | Forward/Deny | Normal sync (no approval) |
+
+**Blocking mode requires:**
+- An approval engine configured (YAML `approval:` section)
+- `taskSupport: "optional"` annotation (not `"required"`)
+
+**Timeout behavior:**
+- Workflow `blocking_timeout` → workflow `timeout` → env var → 300s default
+- On timeout: return `CallToolResult` with `isError: true` (tool-level, not JSON-RPC -32008)
+- Progress heartbeats emitted every 15s (`notifications/progress`) to reset SDK timeout
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -67,19 +85,7 @@ Key characteristics:
 • Works with ANY MCP client (no SEP-1686 support required)
 ```
 
-**Why Blocking Mode for v0.2?**
-- Simplest possible implementation
-- Works with all existing MCP clients
-- No client-side changes required
-- Approval timeouts are typically short (< 30 minutes)
-
-**Limitations of Blocking Mode:**
-- HTTP connection may timeout for long approvals
-- Agent cannot do other work while waiting
-- No visibility into approval progress
-- Connection drops lose the request
-
-### 1.3 v0.2: SEP-1686 Mode
+### 1.3 v0.2: SEP-1686 Async Mode
 
 SEP-1686 introduces the "task primitive" to MCP, enabling:
 - Deferred result retrieval via polling
@@ -171,7 +177,7 @@ The system must additionally:
 | Rate limiting | ✅ In Scope | Via `governor` crate (lock-free) |
 | Admission control | ✅ In Scope | `max_pending_global` with atomic `compare_exchange` |
 | SSE notifications | ❌ Deferred | v0.3+ (polling works for v0.2) |
-| Blocking mode | ❌ Removed | Replaced by SEP-1686 async |
+| Blocking mode | ✅ In Scope | Dual-mode: async SEP-1686 when `params.task` present; blocking when absent |
 | Client disconnection detection | ❌ Removed | Less critical with async polling |
 
 ## 5. Constraints

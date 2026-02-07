@@ -76,10 +76,14 @@ impl ThoughtGateDefaults {
     /// - `THOUGHTGATE_APPROVAL_POLL_INTERVAL_SECS`
     /// - `THOUGHTGATE_APPROVAL_POLL_MAX_INTERVAL_SECS`
     /// - `THOUGHTGATE_HEALTH_CHECK_INTERVAL_SECS`
-    pub fn from_env() -> Self {
+    /// - `THOUGHTGATE_DEFAULT_APPROVAL_TIMEOUT_SECS`
+    /// - `THOUGHTGATE_DEFAULT_TASK_TTL_SECS`
+    /// - `THOUGHTGATE_MAX_TASK_TTL_SECS`
+    /// - `THOUGHTGATE_TASK_CLEANUP_INTERVAL_SECS`
+    pub fn from_env() -> Result<Self, String> {
         let default = Self::default();
 
-        Self {
+        let result = Self {
             execution_timeout: Duration::from_secs(parse_env_warn(
                 "THOUGHTGATE_EXECUTION_TIMEOUT_SECS",
                 default.execution_timeout.as_secs(),
@@ -110,12 +114,29 @@ impl ThoughtGateDefaults {
                 default.health_check_interval.as_secs(),
             )),
 
-            // These are not typically overridden via env var
-            default_approval_timeout: default.default_approval_timeout,
-            default_task_ttl: default.default_task_ttl,
-            max_task_ttl: default.max_task_ttl,
-            task_cleanup_interval: default.task_cleanup_interval,
-        }
+            default_approval_timeout: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_DEFAULT_APPROVAL_TIMEOUT_SECS",
+                default.default_approval_timeout.as_secs(),
+            )),
+
+            default_task_ttl: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_DEFAULT_TASK_TTL_SECS",
+                default.default_task_ttl.as_secs(),
+            )),
+
+            max_task_ttl: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_MAX_TASK_TTL_SECS",
+                default.max_task_ttl.as_secs(),
+            )),
+
+            task_cleanup_interval: Duration::from_secs(parse_env_warn(
+                "THOUGHTGATE_TASK_CLEANUP_INTERVAL_SECS",
+                default.task_cleanup_interval.as_secs(),
+            )),
+        };
+
+        result.validate()?;
+        Ok(result)
     }
 
     /// Validate the defaults satisfy invariants.
@@ -229,8 +250,40 @@ mod tests {
     fn test_from_env() {
         // Note: This test may be affected by environment variables
         // In a real test suite, we'd use temp_env or similar
-        let defaults = ThoughtGateDefaults::from_env();
+        let defaults = ThoughtGateDefaults::from_env().unwrap();
         // Just verify it doesn't panic and returns something reasonable
         assert!(defaults.execution_timeout.as_secs() > 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_from_env_approval_timeout_override() {
+        unsafe {
+            std::env::set_var("THOUGHTGATE_DEFAULT_APPROVAL_TIMEOUT_SECS", "120");
+        }
+        let defaults = ThoughtGateDefaults::from_env().unwrap();
+        assert_eq!(defaults.default_approval_timeout, Duration::from_secs(120));
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_DEFAULT_APPROVAL_TIMEOUT_SECS");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_from_env_task_ttl_override() {
+        unsafe {
+            std::env::set_var("THOUGHTGATE_DEFAULT_TASK_TTL_SECS", "1800");
+            std::env::set_var("THOUGHTGATE_MAX_TASK_TTL_SECS", "3600");
+            std::env::set_var("THOUGHTGATE_TASK_CLEANUP_INTERVAL_SECS", "120");
+        }
+        let defaults = ThoughtGateDefaults::from_env().unwrap();
+        assert_eq!(defaults.default_task_ttl, Duration::from_secs(1800));
+        assert_eq!(defaults.max_task_ttl, Duration::from_secs(3600));
+        assert_eq!(defaults.task_cleanup_interval, Duration::from_secs(120));
+        unsafe {
+            std::env::remove_var("THOUGHTGATE_DEFAULT_TASK_TTL_SECS");
+            std::env::remove_var("THOUGHTGATE_MAX_TASK_TTL_SECS");
+            std::env::remove_var("THOUGHTGATE_TASK_CLEANUP_INTERVAL_SECS");
+        }
     }
 }

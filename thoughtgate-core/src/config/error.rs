@@ -52,16 +52,41 @@ pub enum ConfigError {
     #[error("undefined workflow '{workflow}' in rule '{pattern}'")]
     UndefinedWorkflow { workflow: String, pattern: String },
 
+    /// V-006b: action: approve without explicit workflow when ambiguous.
+    #[error(
+        "rule '{pattern}' has action: approve but no 'approval' field and {workflow_count} workflows are defined (implicit selection requires exactly 1)"
+    )]
+    MissingApprovalWorkflow {
+        pattern: String,
+        workflow_count: usize,
+    },
+
     /// V-009: Invalid glob pattern.
     #[error("invalid glob pattern '{pattern}': {message}")]
     InvalidGlobPattern { pattern: String, message: String },
 
+    /// V-007: Rule references undefined source.
+    #[error("rule '{pattern}' references undefined source '{source_id}'")]
+    UndefinedSourceInRule { source_id: String, pattern: String },
+
     // ─────────────────────────────────────────────────────────────────────────
-    // Value validation errors (V-007, V-008, V-013, V-014)
+    // Value validation errors (V-008, V-013, V-014, V-015, V-016)
     // ─────────────────────────────────────────────────────────────────────────
     /// V-008: Invalid URL format.
     #[error("invalid URL '{url}': {message}")]
     InvalidUrl { url: String, message: String },
+
+    /// V-015: Workflow timeout too short.
+    #[error("workflow '{workflow}' has {field} of {duration_secs}s, minimum is 5s")]
+    InvalidWorkflowTimeout {
+        workflow: String,
+        field: String,
+        duration_secs: u64,
+    },
+
+    /// V-016: Invalid source ID format.
+    #[error("source ID '{id}' is invalid: {reason}")]
+    InvalidSourceId { id: String, reason: String },
 
     /// V-013: Cedar policy file not found.
     #[error("policy file not found: {path}")]
@@ -97,6 +122,19 @@ pub enum ConfigError {
     /// V-TEL-006: Batch delay too small.
     #[error("invalid scheduled_delay_ms {delay_ms}: must be >= 100")]
     InvalidBatchDelay { delay_ms: u64 },
+
+    /// V-TEL-007: Export batch size must be > 0 and <= max_queue_size.
+    #[error(
+        "invalid max_export_batch_size {batch_size}: must be > 0 and <= max_queue_size ({queue_size})"
+    )]
+    InvalidExportBatchSize {
+        batch_size: usize,
+        queue_size: usize,
+    },
+
+    /// V-TEL-008: Export timeout too small.
+    #[error("invalid export_timeout_ms {timeout_ms}: must be >= 100")]
+    InvalidExportTimeout { timeout_ms: u64 },
 
     // ─────────────────────────────────────────────────────────────────────────
     // Schema validation errors
@@ -136,6 +174,9 @@ pub enum ValidationWarning {
 
     /// Glob pattern matches zero tools (informational).
     PatternMatchesNothing { pattern: String },
+
+    /// Per-workflow Slack settings are specified but not yet supported.
+    PerWorkflowSlackNotSupported { workflow: String },
 }
 
 impl std::fmt::Display for ValidationWarning {
@@ -149,6 +190,12 @@ impl std::fmt::Display for ValidationWarning {
             }
             Self::PatternMatchesNothing { pattern } => {
                 write!(f, "glob pattern '{pattern}' may match no tools")
+            }
+            Self::PerWorkflowSlackNotSupported { workflow } => {
+                write!(
+                    f,
+                    "workflow '{workflow}' specifies per-workflow Slack settings (token_env, mention, or non-default channel) which are not yet supported; global THOUGHTGATE_SLACK_* env vars will be used"
+                )
             }
         }
     }

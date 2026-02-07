@@ -211,7 +211,7 @@ async fn test_e2e_approval_flow() {
     let principal = Principal::new("e2e-test-app");
 
     let start_result = engine
-        .start_approval(request, principal, None)
+        .start_approval(request, principal, None, None)
         .await
         .expect("start_approval should succeed");
 
@@ -358,7 +358,7 @@ async fn test_e2e_rejection_flow() {
     };
 
     let start_result = engine
-        .start_approval(request, Principal::new("test-app"), None)
+        .start_approval(request, Principal::new("test-app"), None, None)
         .await
         .expect("start_approval should succeed");
 

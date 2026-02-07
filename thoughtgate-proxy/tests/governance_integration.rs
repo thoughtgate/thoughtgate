@@ -1049,8 +1049,9 @@ async fn test_task_methods_handled_locally() {
     let task_store = Arc::new(TaskStore::with_defaults());
 
     // Pre-create a task so we have something to query.
-    // Use "dev-app" principal to match the dev mode principal from infer_principal()
-    // (THOUGHTGATE_DEV_MODE=true defaults to app_name="dev-app").
+    // Use dev-mode principal with full K8s identity to match what
+    // verify_task_principal() infers (THOUGHTGATE_DEV_MODE=true defaults to
+    // app_name="dev-app", namespace="development", sa="dev-sa", roles=["dev"]).
     let request = ToolCallRequest {
         method: "tools/call".to_string(),
         name: "test_tool".to_string(),
@@ -1061,7 +1062,7 @@ async fn test_task_methods_handled_locally() {
         .create(
             request.clone(),
             request,
-            Principal::new("dev-app"),
+            Principal::from_policy("dev-app", "development", "dev-sa", vec!["dev".to_string()]),
             None,
             TimeoutAction::Deny,
         )

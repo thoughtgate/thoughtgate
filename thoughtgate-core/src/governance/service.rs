@@ -35,9 +35,10 @@ use crate::telemetry::{
 
 use super::api::{
     ApprovalOutcome, GovernanceDecision, GovernanceEvaluateRequest, GovernanceEvaluateResponse,
-    TaskStatusResponse,
+    RevalidateResponse, TaskStatusResponse,
 };
 use super::evaluator::GovernanceEvaluator;
+use super::pipeline::check_policy_drift;
 use super::task::{ApprovalDecision, TaskStatus, TaskStore};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,6 +192,10 @@ pub fn governance_router(state: Arc<GovernanceServiceState>) -> Router {
         .route("/governance/heartbeat", post(heartbeat_handler))
         .route("/governance/shutdown", post(shutdown_handler))
         .route("/governance/task/{task_id}", get(task_status_handler))
+        .route(
+            "/governance/task/{task_id}/revalidate",
+            post(revalidate_handler),
+        )
         .route("/healthz", get(healthz_handler))
         .with_state(state)
 }
@@ -242,6 +247,7 @@ async fn evaluate_handler(
                 policy_id: None,
                 reason: None,
                 poll_interval_ms: None,
+                timeout_secs: None,
                 shutdown,
                 deny_source: None,
             },
@@ -370,6 +376,68 @@ async fn task_status_handler(
         decision,
         reason,
     }))
+}
+
+/// Handle `POST /governance/task/{task_id}/revalidate`.
+///
+/// Checks if Cedar policy still permits execution for a previously-approved
+/// task. This allows the shim to detect "policy drift" — where a policy
+/// changed during the approval window — before forwarding.
+///
+/// Returns 200 with `RevalidateResponse`. Returns 404 if the task or
+/// task store is not found. If no Cedar engine is configured, returns
+/// `allowed: true` (no drift possible without a policy engine).
+///
+/// Implements: REQ-GOV-002/F-004 (Policy Re-evaluation)
+async fn revalidate_handler(
+    State(state): State<Arc<GovernanceServiceState>>,
+    Path(task_id): Path<String>,
+) -> Result<Json<RevalidateResponse>, StatusCode> {
+    let task_store = state.task_store.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let evaluator = state.evaluator.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+
+    let task_id_parsed = task_id.parse().map_err(|_| StatusCode::NOT_FOUND)?;
+    let task = task_store
+        .get(&task_id_parsed)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // If no Cedar engine is configured, drift is impossible.
+    let cedar_engine = match evaluator.cedar_engine() {
+        Some(engine) => engine,
+        None => {
+            return Ok(Json(RevalidateResponse {
+                allowed: true,
+                drift_detected: false,
+                reason: None,
+            }));
+        }
+    };
+
+    match check_policy_drift(
+        cedar_engine,
+        &task.pre_approval_transformed,
+        &task.principal,
+    )
+    .await
+    {
+        Ok(()) => Ok(Json(RevalidateResponse {
+            allowed: true,
+            drift_detected: false,
+            reason: None,
+        })),
+        Err(reason) => {
+            tracing::warn!(
+                task_id = %task_id,
+                reason = %reason,
+                "Policy drift detected during revalidation"
+            );
+            Ok(Json(RevalidateResponse {
+                allowed: false,
+                drift_detected: true,
+                reason: Some(reason),
+            }))
+        }
+    }
 }
 
 /// Handle `GET /healthz`.
@@ -843,5 +911,83 @@ governance:
             let shims = state.shims.lock().await;
             assert_eq!(shims.len(), 3);
         }
+    }
+
+    // ── Revalidate endpoint tests ──────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_revalidate_no_cedar_engine_returns_allowed() {
+        use crate::governance::engine::TimeoutAction;
+        use crate::governance::task::{Principal, ToolCallRequest};
+        use crate::jsonrpc::JsonRpcId;
+
+        let (port, _state, task_store) = start_evaluator_service().await;
+
+        // Create a task
+        let tool_req = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "deploy".to_string(),
+            arguments: serde_json::json!({}),
+            mcp_request_id: JsonRpcId::Number(1),
+        };
+        let task = task_store
+            .create(
+                tool_req.clone(),
+                tool_req,
+                Principal::new("test"),
+                None,
+                TimeoutAction::Deny,
+            )
+            .unwrap();
+        let task_id = task.id.to_string();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{port}/governance/task/{task_id}/revalidate"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: super::super::api::RevalidateResponse = resp.json().await.unwrap();
+        // No Cedar engine in test config → always allowed
+        assert!(body.allowed);
+        assert!(!body.drift_detected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_revalidate_task_not_found() {
+        let (port, _state, _) = start_evaluator_service().await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{port}/governance/task/tg_nonexistent/revalidate"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_revalidate_stub_mode_returns_not_found() {
+        // Stub mode service has no evaluator
+        let (port, _state) = start_test_service().await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{port}/governance/task/tg_any/revalidate"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        // Stub mode: no evaluator → 404
+        assert_eq!(resp.status(), 404);
     }
 }

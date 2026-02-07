@@ -124,18 +124,10 @@ impl ApprovalEngineConfig {
     }
 }
 
-/// Action to take when approval times out.
+/// Re-export TimeoutAction from config to avoid duplication.
 ///
 /// Implements: REQ-GOV-002/F-006.4
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TimeoutAction {
-    /// Deny the request on timeout (return -32008)
-    #[default]
-    Deny,
-    /// Auto-approve on timeout (dangerous, use with caution)
-    Approve,
-}
+pub use crate::config::TimeoutAction;
 
 // ============================================================================
 // Approval Engine Errors
@@ -402,6 +394,7 @@ impl ApprovalEngine {
         request: ToolCallRequest,
         principal: Principal,
         workflow_timeout: Option<Duration>,
+        on_timeout_override: Option<TimeoutAction>,
     ) -> Result<ApprovalStartResult, ApprovalEngineError> {
         let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
 
@@ -431,7 +424,7 @@ impl ApprovalEngine {
                 pre_result.transformed_request,
                 principal.clone(),
                 Some(timeout),
-                self.config.on_timeout,
+                on_timeout_override.unwrap_or(self.config.on_timeout),
             )
             .map_err(|e| ApprovalEngineError::TaskCreation {
                 details: e.to_string(),
@@ -486,6 +479,143 @@ impl ApprovalEngine {
         })
     }
 
+    /// Wait for approval and execute in blocking mode.
+    ///
+    /// Polls `execute_on_result()` in a loop. Emits progress heartbeats via
+    /// `progress_tx` every `heartbeat_interval` to keep client connections alive.
+    /// On timeout, returns a `ToolCallResult` with `is_error: true` (tool-level error).
+    ///
+    /// Implements: REQ-GOV-002/F-007 (Blocking Approval Wait)
+    pub async fn wait_and_execute(
+        &self,
+        task_id: &TaskId,
+        tool_name: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+        heartbeat_interval: Duration,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
+    ) -> Result<ToolCallResult, ThoughtGateError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Clamp poll interval to [100ms, 30s]
+        let poll_interval =
+            poll_interval.clamp(Duration::from_millis(100), Duration::from_secs(30));
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut last_heartbeat = tokio::time::Instant::now();
+        let mut poll_count: u64 = 0;
+
+        loop {
+            // Check deadline before polling
+            if tokio::time::Instant::now() >= deadline {
+                info!(
+                    task_id = %task_id,
+                    tool = %tool_name,
+                    timeout_secs = timeout.as_secs(),
+                    "Blocking approval timed out"
+                );
+                return Ok(ToolCallResult {
+                    content: serde_json::json!([{
+                        "type": "text",
+                        "text": format!(
+                            "Approval timed out after {}s for tool '{}'. \
+                             The request was sent to the approval channel but no response \
+                             was received. The tool call was NOT executed. You may retry.",
+                            timeout.as_secs(), tool_name
+                        )
+                    }]),
+                    is_error: true,
+                });
+            }
+
+            interval.tick().await;
+            poll_count += 1;
+
+            // Emit heartbeat if interval elapsed
+            if let Some(ref tx) = progress_tx {
+                if last_heartbeat.elapsed() >= heartbeat_interval {
+                    let progress = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": {
+                            "progressToken": format!("blocking-{}", task_id),
+                            "progress": 0,
+                            "total": 1,
+                            "message": "Awaiting approval..."
+                        }
+                    });
+                    // Best-effort: if the receiver is gone, the connection was dropped
+                    let _ = tx.send(progress);
+                    last_heartbeat = tokio::time::Instant::now();
+                }
+            }
+
+            // Poll for result
+            match self.execute_on_result(task_id).await {
+                Ok(result) => {
+                    info!(
+                        task_id = %task_id,
+                        tool = %tool_name,
+                        poll_count,
+                        "Blocking approval completed successfully"
+                    );
+                    return Ok(result);
+                }
+                Err(ThoughtGateError::TaskResultNotReady { .. }) => {
+                    // Still waiting — continue polling
+                    continue;
+                }
+                Err(ThoughtGateError::ApprovalRejected {
+                    tool,
+                    rejected_by,
+                    workflow,
+                }) => {
+                    info!(
+                        task_id = %task_id,
+                        tool = %tool_name,
+                        poll_count,
+                        "Blocking approval rejected"
+                    );
+                    return Err(ThoughtGateError::ApprovalRejected {
+                        tool,
+                        rejected_by,
+                        workflow,
+                    });
+                }
+                Err(ThoughtGateError::ApprovalTimeout {
+                    tool, timeout_secs, ..
+                }) => {
+                    // Task-level timeout — map to tool-level error for blocking mode
+                    return Ok(ToolCallResult {
+                        content: serde_json::json!([{
+                            "type": "text",
+                            "text": format!(
+                                "Approval timed out after {}s for tool '{}'. \
+                                 The request was sent to the approval channel but no response \
+                                 was received. The tool call was NOT executed. You may retry.",
+                                timeout_secs, tool
+                            )
+                        }]),
+                        is_error: true,
+                    });
+                }
+                Err(e @ ThoughtGateError::TaskCancelled { .. })
+                | Err(e @ ThoughtGateError::TaskNotFound { .. }) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    // Other errors (ServiceUnavailable, etc.) — propagate
+                    warn!(
+                        task_id = %task_id,
+                        error = %e,
+                        "Blocking approval poll encountered error"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     /// Execute an approved task and return the result.
     ///
     /// Implements: REQ-GOV-002/F-005, F-006 (Result retrieval and execution)
@@ -517,134 +647,25 @@ impl ApprovalEngine {
             },
         })?;
 
-        // Check task status
+        // Check task status — dispatch to status-specific handlers
         match task.status {
-            TaskStatus::InputRequired => {
-                // Still waiting for approval - return TaskResultNotReady per SEP-1686
+            TaskStatus::InputRequired | TaskStatus::Working => {
                 return Err(ThoughtGateError::TaskResultNotReady {
                     task_id: task_id.to_string(),
                 });
             }
             TaskStatus::Executing => {
-                // Already being executed (approval was recorded, now executing)
-                // This is the "approved" state - continue below
+                // Approved, continue to execution below
             }
             TaskStatus::Rejected => {
                 return Err(ThoughtGateError::ApprovalRejected {
                     tool: task.original_request.name.clone(),
                     rejected_by: task.approval.as_ref().map(|a| a.decided_by.clone()),
-                    workflow: None, // v0.2: workflow not tracked
+                    workflow: None,
                 });
             }
             TaskStatus::Expired => {
-                // Handle timeout based on task's captured on_timeout (not current config)
-                // This ensures "complete with state at decision time" semantics
-                match task.on_timeout {
-                    TimeoutAction::Deny => {
-                        return Err(ThoughtGateError::ApprovalTimeout {
-                            tool: task.original_request.name.clone(),
-                            timeout_secs: task.ttl.as_secs(),
-                            workflow: None, // v0.2: workflow not tracked
-                        });
-                    }
-                    TimeoutAction::Approve => {
-                        // Auto-approve: create synthetic approval and execute directly
-                        // Note: Expired is terminal, so we can't transition. Instead,
-                        // we create a synthetic approval record and execute the pipeline.
-
-                        // Prevent concurrent execution - ensures at-most-once semantics
-                        if !self.executing.insert(task_id.clone()) {
-                            return Err(ThoughtGateError::ServiceUnavailable {
-                                reason: "Task execution already in progress".to_string(),
-                            });
-                        }
-                        // RAII guard ensures executing set is cleaned up on all exit
-                        // paths (success, error, timeout, panic)
-                        let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
-
-                        warn!(
-                            task_id = %task_id,
-                            "Auto-approving timed-out task (on_timeout: approve)"
-                        );
-
-                        // Create synthetic approval record for pipeline execution
-                        let now = chrono::Utc::now();
-                        let synthetic_approval = ApprovalRecord {
-                            decision: ApprovalDecision::Approved,
-                            decided_by: "system:auto-approve".to_string(),
-                            decided_at: now,
-                            approval_valid_until: now
-                                + chrono::Duration::from_std(self.config.execution_timeout)
-                                    .unwrap_or(chrono::Duration::zero()),
-                            metadata: Some(serde_json::json!({
-                                "auto_approve": true,
-                                "reason": "timeout with on_timeout: approve"
-                            })),
-                        };
-
-                        // Clone task with Executing status so pipeline validation passes.
-                        // The pipeline's validate_approval() requires TaskStatus::Executing,
-                        // but auto-approved tasks are in Expired (terminal) state.
-                        let mut auto_approved_task = Task::clone(&task);
-                        auto_approved_task.status = TaskStatus::Executing;
-
-                        // Execute the pipeline with timeout protection
-                        let pipeline_result = match tokio::time::timeout(
-                            self.config.execution_timeout,
-                            self.pipeline
-                                .execute_approved(&auto_approved_task, &synthetic_approval),
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_elapsed) => {
-                                error!(
-                                    task_id = %task_id,
-                                    timeout_secs = self.config.execution_timeout.as_secs(),
-                                    "Auto-approved task execution timed out"
-                                );
-                                return Err(ThoughtGateError::ServiceUnavailable {
-                                    reason: format!(
-                                        "Auto-approved task execution timed out after {}s",
-                                        self.config.execution_timeout.as_secs()
-                                    ),
-                                });
-                            }
-                        };
-                        // Guard drops here, cleaning up executing set
-
-                        return match pipeline_result {
-                            PipelineResult::Success { result } => {
-                                // Record result on the expired task for audit trail.
-                                // We can't complete() since Expired is terminal, but we
-                                // record the result and approval to close the audit gap.
-                                if let Err(e) = self.task_store.record_auto_approve_result(
-                                    task_id,
-                                    result.clone(),
-                                    synthetic_approval.clone(),
-                                ) {
-                                    warn!(
-                                        task_id = %task_id,
-                                        error = %e,
-                                        "Failed to record auto-approve result on task"
-                                    );
-                                }
-                                info!(
-                                    task_id = %task_id,
-                                    "Auto-approved task executed successfully"
-                                );
-                                Ok(result)
-                            }
-                            PipelineResult::Failure { reason, .. } => {
-                                Err(ThoughtGateError::ServiceUnavailable {
-                                    reason: format!(
-                                        "Auto-approved task execution failed: {reason}"
-                                    ),
-                                })
-                            }
-                        };
-                    }
-                }
+                return self.handle_expired_task(task_id, &task).await;
             }
             TaskStatus::Failed => {
                 return Err(ThoughtGateError::ServiceUnavailable {
@@ -661,7 +682,6 @@ impl ApprovalEngine {
                 });
             }
             TaskStatus::Completed => {
-                // Already completed - return cached result
                 if let Some(ref result) = task.result {
                     return Ok(result.clone());
                 }
@@ -669,29 +689,17 @@ impl ApprovalEngine {
                     reason: "Task completed but no result available".to_string(),
                 });
             }
-            TaskStatus::Working => {
-                // Still in pre-approval phase - return TaskResultNotReady per SEP-1686
-                return Err(ThoughtGateError::TaskResultNotReady {
-                    task_id: task_id.to_string(),
-                });
-            }
         }
 
-        // At this point, task is in Executing state (approval was recorded)
-        // The task was already transitioned to Executing by record_approval()
-
-        // Prevent concurrent execution - ensures at-most-once semantics
-        // If another call is already executing this task, return "in progress" error
+        // At this point, task is in Executing state (approval was recorded).
+        // Acquire at-most-once execution guard.
         if !self.executing.insert(task_id.clone()) {
             return Err(ThoughtGateError::ServiceUnavailable {
                 reason: "Task execution already in progress".to_string(),
             });
         }
-        // RAII guard ensures executing set is cleaned up on all exit
-        // paths (success, error, timeout, panic)
         let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
 
-        // Execute the full pipeline (with approval record)
         let approval =
             task.approval
                 .as_ref()
@@ -699,9 +707,117 @@ impl ApprovalEngine {
                     reason: "Task approved but no approval record".to_string(),
                 })?;
 
-        let pipeline_result = match tokio::time::timeout(
+        let pipeline_result = self
+            .run_pipeline_with_timeout(&task, approval, task_id)
+            .await;
+        self.handle_pipeline_result(pipeline_result, task_id, &task)
+    }
+
+    /// Handle an expired task — either deny or auto-approve based on `on_timeout`.
+    async fn handle_expired_task(
+        &self,
+        task_id: &TaskId,
+        task: &Task,
+    ) -> Result<ToolCallResult, ThoughtGateError> {
+        match task.on_timeout {
+            TimeoutAction::Deny => Err(ThoughtGateError::ApprovalTimeout {
+                tool: task.original_request.name.clone(),
+                timeout_secs: task.ttl.as_secs(),
+                workflow: None,
+            }),
+            TimeoutAction::Approve => {
+                // Auto-approve: create synthetic approval and execute directly.
+                // Expired is terminal, so we can't transition — instead we
+                // create a synthetic approval record and execute the pipeline.
+                if !self.executing.insert(task_id.clone()) {
+                    return Err(ThoughtGateError::ServiceUnavailable {
+                        reason: "Task execution already in progress".to_string(),
+                    });
+                }
+                let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
+
+                warn!(
+                    task_id = %task_id,
+                    "Auto-approving timed-out task (on_timeout: approve)"
+                );
+
+                let now = chrono::Utc::now();
+                let synthetic_approval = ApprovalRecord {
+                    decision: ApprovalDecision::Approved,
+                    decided_by: "system:auto-approve".to_string(),
+                    decided_at: now,
+                    approval_valid_until: now
+                        + chrono::Duration::from_std(self.config.execution_timeout)
+                            .unwrap_or(chrono::Duration::zero()),
+                    metadata: Some(serde_json::json!({
+                        "auto_approve": true,
+                        "reason": "timeout with on_timeout: approve"
+                    })),
+                };
+
+                // Clone task with Executing status so pipeline validation passes.
+                let mut auto_approved_task = Task::clone(task);
+                auto_approved_task.status = TaskStatus::Executing;
+
+                let pipeline_result = match tokio::time::timeout(
+                    self.config.execution_timeout,
+                    self.pipeline
+                        .execute_approved(&auto_approved_task, &synthetic_approval),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        error!(
+                            task_id = %task_id,
+                            timeout_secs = self.config.execution_timeout.as_secs(),
+                            "Auto-approved task execution timed out"
+                        );
+                        return Err(ThoughtGateError::ServiceUnavailable {
+                            reason: format!(
+                                "Auto-approved task execution timed out after {}s",
+                                self.config.execution_timeout.as_secs()
+                            ),
+                        });
+                    }
+                };
+
+                match pipeline_result {
+                    PipelineResult::Success { result } => {
+                        if let Err(e) = self.task_store.record_auto_approve_result(
+                            task_id,
+                            result.clone(),
+                            synthetic_approval.clone(),
+                        ) {
+                            warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "Failed to record auto-approve result on task"
+                            );
+                        }
+                        info!(task_id = %task_id, "Auto-approved task executed successfully");
+                        Ok(result)
+                    }
+                    PipelineResult::Failure { reason, .. } => {
+                        Err(ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Auto-approved task execution failed: {reason}"),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute the approval pipeline with timeout protection.
+    async fn run_pipeline_with_timeout(
+        &self,
+        task: &Task,
+        approval: &ApprovalRecord,
+        task_id: &TaskId,
+    ) -> PipelineResult {
+        match tokio::time::timeout(
             self.config.execution_timeout,
-            self.pipeline.execute_approved(&task, approval),
+            self.pipeline.execute_approved(task, approval),
         )
         .await
         {
@@ -721,16 +837,21 @@ impl ApprovalEngine {
                     retriable: true,
                 }
             }
-        };
+        }
+    }
 
-        // Handle pipeline result and record governance metrics
+    /// Handle the pipeline result: record metrics, update task store, map errors.
+    fn handle_pipeline_result(
+        &self,
+        pipeline_result: PipelineResult,
+        task_id: &TaskId,
+        task: &Task,
+    ) -> Result<ToolCallResult, ThoughtGateError> {
         match pipeline_result {
             PipelineResult::Success { result } => {
-                // Store result and mark complete
                 if let Err(e) = self.task_store.complete(task_id, result.clone()) {
                     error!(task_id = %task_id, error = %e, "Failed to complete task");
                 }
-                // Record MC-008: tasks_completed_total (prometheus-client)
                 if let Some(ref metrics) = self.tg_metrics {
                     metrics.record_task_completed("approval", "completed");
                 }
@@ -741,7 +862,6 @@ impl ApprovalEngine {
                 reason,
                 retriable,
             } => {
-                // Record failure (clone stage since we need it for error mapping)
                 let failure = FailureInfo {
                     stage: stage.clone(),
                     reason: reason.clone(),
@@ -750,48 +870,55 @@ impl ApprovalEngine {
                 if let Err(e) = self.task_store.fail(task_id, failure) {
                     error!(task_id = %task_id, error = %e, "Failed to record task failure");
                 }
-                // Record MC-008: tasks_completed_total (prometheus-client)
                 if let Some(ref metrics) = self.tg_metrics {
                     metrics.record_task_completed("approval", "failed");
                 }
+                self.map_pipeline_failure(stage, reason, task)
+            }
+        }
+    }
 
-                // Map failure to appropriate error
-                let tool_name = task.original_request.name.clone();
-                match stage {
-                    FailureStage::ApprovalTimeout => Err(ThoughtGateError::ApprovalTimeout {
-                        tool: tool_name,
-                        timeout_secs: self.config.approval_timeout.as_secs(),
-                        workflow: None, // v0.2: workflow not tracked
-                    }),
-                    FailureStage::ApprovalRejected => Err(ThoughtGateError::ApprovalRejected {
-                        tool: tool_name,
-                        rejected_by: task.approval.as_ref().map(|a| a.decided_by.clone()),
-                        workflow: None, // v0.2: workflow not tracked
-                    }),
-                    FailureStage::PolicyDrift => Err(ThoughtGateError::PolicyDenied {
-                        tool: tool_name,
-                        policy_id: None, // v0.2: policy_id not tracked
-                        reason: Some(reason),
-                    }),
-                    FailureStage::TransformDrift => Err(ThoughtGateError::ServiceUnavailable {
-                        reason: format!("Transform drift: {reason}"),
-                    }),
-                    FailureStage::UpstreamError => {
-                        if reason.contains("timeout") || reason.contains("timed out") {
-                            Err(ThoughtGateError::UpstreamTimeout {
-                                url: "unknown".to_string(), // URL not available in failure info
-                                timeout_secs: self.config.execution_timeout.as_secs(),
-                            })
-                        } else {
-                            Err(ThoughtGateError::UpstreamError {
-                                code: -32002,
-                                message: reason,
-                            })
-                        }
-                    }
-                    _ => Err(ThoughtGateError::ServiceUnavailable { reason }),
+    /// Map a pipeline failure stage to the appropriate `ThoughtGateError`.
+    fn map_pipeline_failure(
+        &self,
+        stage: FailureStage,
+        reason: String,
+        task: &Task,
+    ) -> Result<ToolCallResult, ThoughtGateError> {
+        let tool_name = task.original_request.name.clone();
+        match stage {
+            FailureStage::ApprovalTimeout => Err(ThoughtGateError::ApprovalTimeout {
+                tool: tool_name,
+                timeout_secs: self.config.approval_timeout.as_secs(),
+                workflow: None,
+            }),
+            FailureStage::ApprovalRejected => Err(ThoughtGateError::ApprovalRejected {
+                tool: tool_name,
+                rejected_by: task.approval.as_ref().map(|a| a.decided_by.clone()),
+                workflow: None,
+            }),
+            FailureStage::PolicyDrift => Err(ThoughtGateError::PolicyDenied {
+                tool: tool_name,
+                policy_id: None,
+                reason: Some(reason),
+            }),
+            FailureStage::TransformDrift => Err(ThoughtGateError::ServiceUnavailable {
+                reason: format!("Transform drift: {reason}"),
+            }),
+            FailureStage::UpstreamError => {
+                if reason.contains("timeout") || reason.contains("timed out") {
+                    Err(ThoughtGateError::UpstreamTimeout {
+                        url: "unknown".to_string(),
+                        timeout_secs: self.config.execution_timeout.as_secs(),
+                    })
+                } else {
+                    Err(ThoughtGateError::UpstreamError {
+                        code: -32002,
+                        message: reason,
+                    })
                 }
             }
+            _ => Err(ThoughtGateError::ServiceUnavailable { reason }),
         }
     }
 
@@ -1014,7 +1141,7 @@ mod tests {
         );
 
         let result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await;
 
         assert!(result.is_ok(), "start_approval should succeed");
@@ -1082,7 +1209,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1121,7 +1248,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1177,7 +1304,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1220,7 +1347,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1261,7 +1388,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1316,7 +1443,7 @@ mod tests {
         );
 
         let result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1382,7 +1509,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None)
+            .start_approval(test_request(), test_principal(), None, None)
             .await
             .unwrap();
 
@@ -1405,6 +1532,236 @@ mod tests {
             upstream.forward_count.load(Ordering::SeqCst),
             1,
             "Upstream should have been called exactly once"
+        );
+    }
+
+    // ========================================================================
+    // Blocking Mode Tests (wait_and_execute)
+    // ========================================================================
+
+    /// Tests that wait_and_execute returns result when task is approved.
+    ///
+    /// Verifies: REQ-GOV-002/F-007 (Blocking approval — approved)
+    #[tokio::test]
+    async fn test_wait_and_execute_approved() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream.clone(),
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval
+        let start_result = engine
+            .start_approval(test_request(), test_principal(), None, None)
+            .await
+            .unwrap();
+
+        // Approve the task (simulating Slack decision)
+        task_store
+            .record_approval(
+                &start_result.task_id,
+                ApprovalDecision::Approved,
+                "test-reviewer".to_string(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        // wait_and_execute should poll, find approval, execute, and return
+        let result = engine
+            .wait_and_execute(
+                &start_result.task_id,
+                "delete_user",
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                Duration::from_secs(15),
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "wait_and_execute should succeed: {:?}",
+            result.err()
+        );
+        let tool_result = result.unwrap();
+        assert!(!tool_result.is_error, "Tool result should not be error");
+        assert_eq!(upstream.forward_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Tests that wait_and_execute returns rejection error.
+    ///
+    /// Verifies: REQ-GOV-002/F-007 (Blocking approval — rejected)
+    #[tokio::test]
+    async fn test_wait_and_execute_rejected() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval
+        let start_result = engine
+            .start_approval(test_request(), test_principal(), None, None)
+            .await
+            .unwrap();
+
+        // Reject the task
+        task_store
+            .record_approval(
+                &start_result.task_id,
+                ApprovalDecision::Rejected {
+                    reason: Some("Not authorized".to_string()),
+                },
+                "test-reviewer".to_string(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        // wait_and_execute should return ApprovalRejected
+        let result = engine
+            .wait_and_execute(
+                &start_result.task_id,
+                "delete_user",
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                Duration::from_secs(15),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ThoughtGateError::ApprovalRejected { tool, .. } => {
+                assert_eq!(tool, "delete_user");
+            }
+            other => panic!("Expected ApprovalRejected, got {:?}", other),
+        }
+    }
+
+    /// Tests that wait_and_execute returns tool-level timeout error (isError: true).
+    ///
+    /// Verifies: REQ-GOV-002/F-007 (Blocking approval — timeout)
+    #[tokio::test]
+    async fn test_wait_and_execute_timeout() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval but never approve
+        let start_result = engine
+            .start_approval(test_request(), test_principal(), None, None)
+            .await
+            .unwrap();
+
+        // wait_and_execute with very short timeout
+        let result = engine
+            .wait_and_execute(
+                &start_result.task_id,
+                "delete_user",
+                Duration::from_millis(200), // Very short timeout
+                Duration::from_millis(100),
+                Duration::from_secs(15),
+                None,
+            )
+            .await;
+
+        // Should return Ok with is_error: true (tool-level timeout, not JSON-RPC error)
+        assert!(
+            result.is_ok(),
+            "Should return Ok (tool-level error), got: {:?}",
+            result.err()
+        );
+        let tool_result = result.unwrap();
+        assert!(
+            tool_result.is_error,
+            "Should have is_error: true for timeout"
+        );
+        let text = tool_result.content.to_string();
+        assert!(text.contains("timed out"), "Should mention timeout: {text}");
+        assert!(
+            text.contains("delete_user"),
+            "Should mention tool name: {text}"
+        );
+    }
+
+    /// Tests that wait_and_execute emits progress notifications.
+    ///
+    /// Verifies: REQ-GOV-002/F-007 (Blocking approval — progress heartbeats)
+    #[tokio::test]
+    async fn test_wait_and_execute_emits_progress() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval but never approve
+        let _start_result = engine
+            .start_approval(test_request(), test_principal(), None, None)
+            .await
+            .unwrap();
+
+        // Set up progress channel
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Run with short timeout and very short heartbeat interval
+        let _ = engine
+            .wait_and_execute(
+                &_start_result.task_id,
+                "delete_user",
+                Duration::from_millis(500),
+                Duration::from_millis(100),
+                Duration::from_millis(150), // Heartbeat every 150ms
+                Some(tx),
+            )
+            .await;
+
+        // Should have received at least one progress notification
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert!(
+            count >= 1,
+            "Should have received at least 1 progress notification, got {count}"
         );
     }
 }

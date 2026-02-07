@@ -239,6 +239,15 @@ pub enum PolicyError {
         /// Error details
         details: String,
     },
+
+    /// Policy file I/O error (file exists but cannot be read)
+    #[error("failed to load policy from {path}: {reason}")]
+    PolicyLoadError {
+        /// File path that failed
+        path: String,
+        /// Underlying I/O error description
+        reason: String,
+    },
 }
 
 /// Policy loading source.

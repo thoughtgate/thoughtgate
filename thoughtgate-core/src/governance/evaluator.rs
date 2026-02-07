@@ -142,6 +142,11 @@ impl GovernanceEvaluator {
         principal: Principal,
         profile: Profile,
     ) -> Self {
+        if profile == Profile::Development {
+            warn!(
+                "SECURITY: Development mode active — Cedar denials and approval workflows will be bypassed"
+            );
+        }
         Self {
             config,
             cedar_engine,
@@ -152,6 +157,14 @@ impl GovernanceEvaluator {
             tg_metrics: None,
             approval_engine: None,
         }
+    }
+
+    /// Returns a reference to the Cedar engine, if configured.
+    ///
+    /// Used by the revalidate endpoint to check policy drift independently
+    /// of the full evaluation pipeline.
+    pub fn cedar_engine(&self) -> Option<&Arc<CedarEngine>> {
+        self.cedar_engine.as_ref()
     }
 
     /// Builder-style method to set Prometheus metrics.
@@ -178,7 +191,9 @@ impl GovernanceEvaluator {
     /// The scheduler is set after construction because it may depend on
     /// whether approval workflows are needed (determined after config load).
     pub fn set_scheduler(&self, scheduler: Arc<PollingScheduler>) {
-        let _ = self.scheduler.set(scheduler);
+        if self.scheduler.set(scheduler).is_err() {
+            debug!("Scheduler already initialized, ignoring duplicate set_scheduler call");
+        }
     }
 
     /// Evaluate a governance request through Gates 1–4.
@@ -226,7 +241,7 @@ impl GovernanceEvaluator {
         }
 
         // ── Extract resource name from params ───────────────────────────
-        let resource_name = match extract_resource_name(&req.method, &req.params) {
+        let resource_name = match extract_resource_name(&req.method, req.params.as_ref()) {
             Some(name) => name,
             None => {
                 // Governable method without a resource identifier — forward.
@@ -238,6 +253,26 @@ impl GovernanceEvaluator {
 
         // ── Gate 1: Visibility check ────────────────────────────────────
         if let Some(source) = self.config.get_source(&req.server_id) {
+            // Check if source is enabled before visibility
+            if !source.is_enabled() {
+                info!(
+                    server_id = %req.server_id,
+                    "Gate 1: source disabled — denying"
+                );
+                trace.gate1 = Some("block".to_string());
+                if let Some(ref m) = self.tg_metrics {
+                    m.record_gate_decision("gate1", "block");
+                }
+                return (
+                    self.deny(
+                        Some(format!("Source '{}' is disabled", req.server_id)),
+                        None,
+                        DenySource::Visibility,
+                    ),
+                    trace,
+                );
+            }
+
             let expose = source.expose();
             if !expose.is_visible(&resource_name) {
                 info!(
@@ -356,6 +391,7 @@ impl GovernanceEvaluator {
                         req,
                         &resource_name,
                         match_result.policy_id.as_deref(),
+                        match_result.approval_workflow.as_deref(),
                         effective_principal,
                         &mut trace,
                     )
@@ -386,7 +422,7 @@ impl GovernanceEvaluator {
             None => {
                 // No Cedar engine — profile-dependent fallback.
                 if self.profile == Profile::Development {
-                    info!(
+                    warn!(
                         resource = %resource_name,
                         "Gate 3: no Cedar engine, auto-forwarding in dev mode"
                     );
@@ -413,7 +449,7 @@ impl GovernanceEvaluator {
             CedarResource::ToolCall {
                 name: resource_name.to_string(),
                 server: req.server_id.clone(),
-                arguments: extract_arguments(&req.params),
+                arguments: extract_arguments(req.params.as_ref()),
             }
         } else {
             CedarResource::McpMethod {
@@ -476,8 +512,15 @@ impl GovernanceEvaluator {
                     policy_id = %pid,
                     "Gate 3: Cedar permit → Gate 4 approval"
                 );
-                self.start_approval(req, resource_name, Some(&pid), principal, trace)
-                    .await
+                self.start_approval(
+                    req,
+                    resource_name,
+                    Some(&pid),
+                    approval_workflow.as_deref(),
+                    principal,
+                    trace,
+                )
+                .await
             }
             CedarDecision::Forbid { reason, .. } => {
                 trace.gate3 = Some("deny".to_string());
@@ -496,7 +539,7 @@ impl GovernanceEvaluator {
                 }
 
                 if self.profile == Profile::Development {
-                    info!(
+                    warn!(
                         resource = %resource_name,
                         reason = %reason,
                         "Gate 3: WOULD_DENY (Cedar forbid) — auto-forwarding in dev mode"
@@ -508,7 +551,6 @@ impl GovernanceEvaluator {
                     reason = %reason,
                     "Gate 3: Cedar forbid — denying"
                 );
-                let _ = approval_workflow; // used in future for workflow selection
                 self.deny(Some(reason), Some(&pid), DenySource::CedarPolicy)
             }
         }
@@ -530,12 +572,13 @@ impl GovernanceEvaluator {
         req: &GovernanceEvaluateRequest,
         resource_name: &str,
         policy_id: Option<&str>,
+        approval_workflow: Option<&str>,
         principal: &Principal,
         trace: &mut EvalTrace,
     ) -> GovernanceEvaluateResponse {
         // ── Development mode: skip approval, auto-forward ───────────────
         if self.profile == Profile::Development {
-            info!(
+            warn!(
                 method = %req.method,
                 resource = %resource_name,
                 "WOULD_REQUIRE_APPROVAL — auto-forwarding in dev mode"
@@ -551,18 +594,30 @@ impl GovernanceEvaluator {
         let tool_request = ToolCallRequest {
             method: req.method.clone(),
             name: resource_name.to_string(),
-            arguments: extract_arguments(&req.params),
+            arguments: extract_arguments(req.params.as_ref()),
             mcp_request_id,
         };
+
+        // ── Resolve workflow-specific settings ────────────────────────────
+        let wf = approval_workflow.and_then(|name| self.config.get_workflow(name));
+        let wf_timeout = wf.map(|w| w.timeout_or_default());
+        let wf_on_timeout = wf.map(|w| w.on_timeout_or_default());
 
         // ── Preferred path: delegate to ApprovalEngine ──────────────────
         if let Some(ref engine) = self.approval_engine {
             match engine
-                .start_approval(tool_request, principal.clone(), None)
+                .start_approval(tool_request, principal.clone(), wf_timeout, wf_on_timeout)
                 .await
             {
                 Ok(result) => {
                     let poll_interval_ms = result.poll_interval.as_millis() as u64;
+
+                    // Look up task TTL for the shim's timeout hint.
+                    let timeout_secs = self
+                        .task_store
+                        .get(&result.task_id)
+                        .ok()
+                        .map(|task| task.ttl.as_secs());
 
                     trace.gate4 = Some("started".to_string());
                     if let Some(ref m) = self.tg_metrics {
@@ -576,6 +631,7 @@ impl GovernanceEvaluator {
                         policy_id: policy_id.map(String::from),
                         reason: None,
                         poll_interval_ms: Some(poll_interval_ms),
+                        timeout_secs,
                         shutdown: false,
                         deny_source: None,
                     };
@@ -636,7 +692,7 @@ impl GovernanceEvaluator {
             let approval_req = ApprovalRequest {
                 task_id: task_id.clone(),
                 tool_name: resource_name.to_string(),
-                tool_arguments: extract_arguments(&req.params),
+                tool_arguments: extract_arguments(req.params.as_ref()),
                 principal: principal.clone(),
                 expires_at: task.expires_at,
                 created_at: Utc::now(),
@@ -650,11 +706,13 @@ impl GovernanceEvaluator {
                     error = %e,
                     "Gate 4: failed to submit to scheduler — denying"
                 );
-                let _ = self.task_store.transition(
+                if let Err(te) = self.task_store.transition(
                     &task_id,
                     TaskStatus::Failed,
                     Some(format!("Scheduler submission failed: {e}")),
-                );
+                ) {
+                    warn!(task_id = %task_id, error = %te, "Failed to transition task to Failed after scheduler submission error");
+                }
                 return self.deny(
                     Some(format!("Approval submission failed: {e}")),
                     policy_id,
@@ -691,6 +749,7 @@ impl GovernanceEvaluator {
             policy_id: policy_id.map(String::from),
             reason: None,
             poll_interval_ms: Some(poll_interval_ms),
+            timeout_secs: Some(DEFAULT_APPROVAL_TTL_SECS),
             shutdown: false,
             deny_source: None,
         }
@@ -707,6 +766,7 @@ impl GovernanceEvaluator {
             policy_id: None,
             reason,
             poll_interval_ms: None,
+            timeout_secs: None,
             shutdown: false,
             deny_source: None,
         }
@@ -724,6 +784,7 @@ impl GovernanceEvaluator {
             policy_id: policy_id.map(String::from),
             reason,
             poll_interval_ms: None,
+            timeout_secs: None,
             shutdown: false,
             deny_source: Some(source),
         }
@@ -744,7 +805,7 @@ impl GovernanceEvaluator {
 ///
 /// All other methods (list methods, initialize, notifications, etc.)
 /// are forwarded without governance evaluation.
-fn method_requires_gates(method: &str) -> bool {
+pub fn method_requires_gates(method: &str) -> bool {
     matches!(
         method,
         "tools/call" | "resources/read" | "resources/subscribe" | "prompts/get"
@@ -753,12 +814,11 @@ fn method_requires_gates(method: &str) -> bool {
 
 /// Extract the governable resource name from JSON-RPC params.
 ///
-/// Ported from `mcp_handler.rs::extract_governable_name`, adapted to
-/// operate on `&Option<Value>` instead of `&McpRequest`.
+/// Returns the tool name, resource URI, or prompt name depending on the method.
 ///
 /// Implements: REQ-CORE-008/F-016
-fn extract_resource_name(method: &str, params: &Option<serde_json::Value>) -> Option<String> {
-    let params = params.as_ref()?;
+pub fn extract_resource_name(method: &str, params: Option<&serde_json::Value>) -> Option<String> {
+    let params = params?;
 
     match method {
         "tools/call" => params.get("name")?.as_str().map(String::from),
@@ -770,10 +830,11 @@ fn extract_resource_name(method: &str, params: &Option<serde_json::Value>) -> Op
 
 /// Extract tool arguments from JSON-RPC params.
 ///
-/// Ported from `mcp_handler.rs::extract_tool_arguments`.
-fn extract_arguments(params: &Option<serde_json::Value>) -> serde_json::Value {
+/// Returns `params.arguments` if present, otherwise an empty JSON object.
+///
+/// Implements: REQ-CORE-008/F-016
+pub fn extract_arguments(params: Option<&serde_json::Value>) -> serde_json::Value {
     params
-        .as_ref()
         .and_then(|p| p.get("arguments").cloned())
         .unwrap_or(serde_json::json!({}))
 }
@@ -990,6 +1051,62 @@ governance:
     }
 
     #[tokio::test]
+    async fn test_deny_disabled_source_gate1() {
+        let config = test_config(
+            r#"
+schema: 1
+sources:
+  - id: test-server
+    kind: mcp
+    url: http://localhost:3000
+    enabled: false
+governance:
+  defaults:
+    action: forward
+"#,
+        );
+        let eval = test_evaluator(config, Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "read_file"})),
+        );
+        let (resp, trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Deny);
+        assert!(
+            resp.reason.as_deref().unwrap_or("").contains("disabled"),
+            "reason should mention source disabled, got: {:?}",
+            resp.reason
+        );
+        assert_eq!(trace.gate1.as_deref(), Some("block"));
+    }
+
+    #[tokio::test]
+    async fn test_allow_enabled_source_gate1() {
+        let config = test_config(
+            r#"
+schema: 1
+sources:
+  - id: test-server
+    kind: mcp
+    url: http://localhost:3000
+    enabled: true
+governance:
+  defaults:
+    action: forward
+"#,
+        );
+        let eval = test_evaluator(config, Profile::Production);
+        let req = make_request(
+            "tools/call",
+            "test-server",
+            Some(serde_json::json!({"name": "read_file"})),
+        );
+        let (resp, _trace) = eval.evaluate(&req).await;
+        assert_eq!(resp.decision, GovernanceDecision::Forward);
+    }
+
+    #[tokio::test]
     async fn test_deny_unknown_source_gate1() {
         let eval = test_evaluator(default_config(), Profile::Production);
         let req = make_request(
@@ -1124,7 +1241,7 @@ governance:
     fn test_extract_resource_name_tools_call() {
         let params = Some(serde_json::json!({"name": "read_file", "arguments": {}}));
         assert_eq!(
-            extract_resource_name("tools/call", &params),
+            extract_resource_name("tools/call", params.as_ref()),
             Some("read_file".to_string())
         );
     }
@@ -1133,7 +1250,7 @@ governance:
     fn test_extract_resource_name_resources_read() {
         let params = Some(serde_json::json!({"uri": "file:///tmp/data.txt"}));
         assert_eq!(
-            extract_resource_name("resources/read", &params),
+            extract_resource_name("resources/read", params.as_ref()),
             Some("file:///tmp/data.txt".to_string())
         );
     }
@@ -1142,26 +1259,26 @@ governance:
     fn test_extract_resource_name_prompts_get() {
         let params = Some(serde_json::json!({"name": "code_review"}));
         assert_eq!(
-            extract_resource_name("prompts/get", &params),
+            extract_resource_name("prompts/get", params.as_ref()),
             Some("code_review".to_string())
         );
     }
 
     #[test]
     fn test_extract_resource_name_none_for_list() {
-        assert_eq!(extract_resource_name("tools/list", &None), None);
+        assert_eq!(extract_resource_name("tools/list", None), None);
     }
 
     #[test]
     fn test_extract_resource_name_none_for_missing_params() {
-        assert_eq!(extract_resource_name("tools/call", &None), None);
+        assert_eq!(extract_resource_name("tools/call", None), None);
     }
 
     #[test]
     fn test_extract_arguments() {
         let params = Some(serde_json::json!({"name": "x", "arguments": {"path": "/tmp"}}));
         assert_eq!(
-            extract_arguments(&params),
+            extract_arguments(params.as_ref()),
             serde_json::json!({"path": "/tmp"})
         );
     }
@@ -1169,7 +1286,7 @@ governance:
     #[test]
     fn test_extract_arguments_missing() {
         let params = Some(serde_json::json!({"name": "x"}));
-        assert_eq!(extract_arguments(&params), serde_json::json!({}));
+        assert_eq!(extract_arguments(params.as_ref()), serde_json::json!({}));
     }
 
     // ── EvalTrace + DenySource tests ─────────────────────────────────────

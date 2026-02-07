@@ -40,6 +40,10 @@ use tracing::{debug, error, info, warn};
 // These are parsed once at first access and reused for every evaluation,
 // avoiding repeated string parsing in the hot path.
 
+// SAFETY: .expect() on LazyLock with compile-time literal constants.
+// EntityTypeName::from_str is not const fn, but these string literals are
+// known-valid Cedar entity type names (Namespace::Type format). The .expect()
+// can never fail at runtime.
 static ENTITY_TYPE_APP: LazyLock<EntityTypeName> = LazyLock::new(|| {
     EntityTypeName::from_str("ThoughtGate::App")
         .expect("BUG: 'ThoughtGate::App' is a valid entity type name")
@@ -89,21 +93,27 @@ static ENTITY_TYPE_ROLE: LazyLock<EntityTypeName> = LazyLock::new(|| {
 ///     }
 /// }
 /// ```
+/// Atomically-swapped bundle of policies, annotations, and source.
+///
+/// Ensures concurrent readers always see a consistent triple during
+/// hot-reload, preventing torn reads between e.g. new policies and
+/// old annotations.
+struct PolicySnapshot {
+    policies: Arc<PolicySet>,
+    #[allow(dead_code)] // Stored for future annotation-based routing; ensures consistent reads
+    annotations: Arc<PolicyAnnotations>,
+    source: Arc<PolicySource>,
+}
+
 pub struct CedarEngine {
     /// Cedar authorizer
     authorizer: Authorizer,
 
-    /// Current policy set (atomic for hot-reload)
-    policies: ArcSwap<PolicySet>,
+    /// Current policy snapshot (atomic for hot-reload)
+    snapshot: ArcSwap<PolicySnapshot>,
 
     /// Cedar schema for validation
     schema: Schema,
-
-    /// Policy annotations (cached at load time)
-    annotations: ArcSwap<PolicyAnnotations>,
-
-    /// Policy source information
-    source: Arc<ArcSwap<PolicySource>>,
 
     /// v0.2 statistics counters
     stats_v2: Arc<StatsV2>,
@@ -131,7 +141,7 @@ struct Stats {
 }
 
 impl CedarEngine {
-    /// Create a new Cedar engine.
+    /// Create a new Cedar engine using env vars only.
     ///
     /// Implements: REQ-POL-001/F-003 (Policy Loading)
     ///
@@ -141,16 +151,37 @@ impl CedarEngine {
     /// - Policy parsing fails
     /// - Schema validation fails
     pub fn new() -> Result<Self, PolicyError> {
+        Self::new_with_config(None)
+    }
+
+    /// Create a new Cedar engine with optional YAML config paths.
+    ///
+    /// Implements: REQ-POL-001/F-003 (Policy Loading)
+    ///
+    /// When `cedar_config` is `Some`, policy files from `cedar.policies[]`
+    /// and the schema from `cedar.schema` are used as fallbacks after env
+    /// vars but before embedded defaults.
+    ///
+    /// # Errors
+    /// Returns `PolicyError` if:
+    /// - Schema parsing fails
+    /// - Policy parsing fails
+    /// - Schema validation fails
+    pub fn new_with_config(
+        cedar_config: Option<&crate::config::CedarConfig>,
+    ) -> Result<Self, PolicyError> {
         info!("Initializing Cedar policy engine");
 
         // Load schema
-        let schema_str = loader::load_schema();
+        let schema_str =
+            loader::load_schema_with_config(cedar_config.and_then(|c| c.schema.as_deref()))?;
         let schema = Schema::from_str(&schema_str).map_err(|e| PolicyError::SchemaValidation {
             details: format!("Failed to parse schema: {}", e),
         })?;
 
         // Load policies
-        let (policy_str, source) = loader::load_policies();
+        let (policy_str, source) =
+            loader::load_policies_with_config(cedar_config.map(|c| c.policies.as_slice()))?;
         let policies = Self::parse_policies(&policy_str, &schema)?;
 
         // Parse annotations
@@ -165,10 +196,12 @@ impl CedarEngine {
 
         Ok(Self {
             authorizer: Authorizer::new(),
-            policies: ArcSwap::new(Arc::new(policies)),
+            snapshot: ArcSwap::new(Arc::new(PolicySnapshot {
+                policies: Arc::new(policies),
+                annotations: Arc::new(annotations),
+                source: Arc::new(source),
+            })),
             schema,
-            annotations: ArcSwap::new(Arc::new(annotations)),
-            source: Arc::new(ArcSwap::new(Arc::new(source))),
             stats_v2: Arc::new(StatsV2 {
                 evaluation_count: AtomicU64::new(0),
                 permit_count: AtomicU64::new(0),
@@ -192,7 +225,7 @@ impl CedarEngine {
     /// gauge on initialization and after each reload.
     pub fn set_metrics(&mut self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) {
         // Set the initial gauge value
-        let policy_count = self.policies.load().policies().count() as i64;
+        let policy_count = self.snapshot.load().policies.policies().count() as i64;
         metrics.cedar_policies_loaded.set(policy_count);
         self.tg_metrics = Some(metrics);
     }
@@ -240,7 +273,8 @@ impl CedarEngine {
             .evaluation_count
             .fetch_add(1, Ordering::Relaxed);
 
-        let policies = self.policies.load();
+        let snap = self.snapshot.load();
+        let policies = &snap.policies;
 
         // Determine action based on resource type
         let action_name = match &request.resource {
@@ -277,7 +311,7 @@ impl CedarEngine {
         // Evaluate
         let response = self
             .authorizer
-            .is_authorized(&cedar_request, &policies, &entities);
+            .is_authorized(&cedar_request, policies, &entities);
 
         let elapsed = start.elapsed();
         self.stats_v2
@@ -714,13 +748,14 @@ impl CedarEngine {
     pub fn evaluate(&self, request: &PolicyRequest) -> PolicyAction {
         self.stats.evaluation_count.fetch_add(1, Ordering::Relaxed);
 
-        let policies = self.policies.load();
+        let snap = self.snapshot.load();
+        let policies = &snap.policies;
 
         // v0.1: Check actions in priority order: Forward → Approve
         let actions = ["Forward", "Approve"];
 
         for action_name in &actions {
-            if self.is_action_permitted(request, action_name, &policies) {
+            if self.is_action_permitted(request, action_name, policies) {
                 debug!(
                     principal = %request.principal.app_name,
                     resource = ?request.resource,
@@ -905,7 +940,7 @@ impl CedarEngine {
         info!("Reloading policies");
 
         // Retry once on parse failure in case the file was partially written
-        let (policy_str, source) = loader::load_policies();
+        let (policy_str, source) = loader::load_policies()?;
         let (new_policies, new_annotations) = match Self::parse_policies(&policy_str, &self.schema)
         {
             Ok(policies) => {
@@ -917,7 +952,7 @@ impl CedarEngine {
                     error = %first_err,
                     "Policy parse failed, retrying immediately in case of partial file write"
                 );
-                let (retry_str, retry_source) = loader::load_policies();
+                let (retry_str, retry_source) = loader::load_policies()?;
                 let policies =
                     Self::parse_policies(&retry_str, &self.schema).map_err(|retry_err| {
                         warn!(
@@ -930,40 +965,12 @@ impl CedarEngine {
                 let annotations = Self::parse_annotations(&policies);
                 // Use the retried source on success
                 drop(source);
-                return {
-                    let policy_count = policies.policies().count();
-                    self.policies.store(Arc::new(policies));
-                    self.annotations.store(Arc::new(annotations));
-                    self.source.store(Arc::new(retry_source));
-                    self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
-                    self.stats
-                        .last_reload
-                        .store(Arc::new(Some(std::time::SystemTime::now())));
-                    // Update MG-003 gauge
-                    if let Some(ref metrics) = self.tg_metrics {
-                        metrics.cedar_policies_loaded.set(policy_count as i64);
-                    }
-                    info!("Policies reloaded successfully (after retry)");
-                    Ok(())
-                };
+                self.apply_reload(policies, annotations, retry_source);
+                return Ok(());
             }
         };
 
-        // Atomic swap
-        let policy_count = new_policies.policies().count();
-        self.policies.store(Arc::new(new_policies));
-        self.annotations.store(Arc::new(new_annotations));
-        self.source.store(Arc::new(source));
-        self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .last_reload
-            .store(Arc::new(Some(std::time::SystemTime::now())));
-        // Update MG-003 gauge
-        if let Some(ref metrics) = self.tg_metrics {
-            metrics.cedar_policies_loaded.set(policy_count as i64);
-        }
-
-        info!("Policies reloaded successfully");
+        self.apply_reload(new_policies, new_annotations, source);
         Ok(())
     }
 
@@ -974,7 +981,31 @@ impl CedarEngine {
     /// Returns information about where the currently loaded policies came from:
     /// ConfigMap, Environment variable, or embedded defaults.
     pub fn policy_source(&self) -> PolicySource {
-        (**self.source.load()).clone()
+        (*self.snapshot.load().source).clone()
+    }
+
+    /// Atomically apply a policy reload: swap policies, annotations, source,
+    /// bump counters, update metrics, and log success.
+    fn apply_reload(
+        &self,
+        policies: PolicySet,
+        annotations: PolicyAnnotations,
+        source: PolicySource,
+    ) {
+        let policy_count = policies.policies().count();
+        self.snapshot.store(Arc::new(PolicySnapshot {
+            policies: Arc::new(policies),
+            annotations: Arc::new(annotations),
+            source: Arc::new(source),
+        }));
+        self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_reload
+            .store(Arc::new(Some(std::time::SystemTime::now())));
+        if let Some(ref metrics) = self.tg_metrics {
+            metrics.cedar_policies_loaded.set(policy_count as i64);
+        }
+        info!("Policies reloaded successfully");
     }
 }
 
