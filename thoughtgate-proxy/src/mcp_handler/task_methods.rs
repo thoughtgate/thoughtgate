@@ -173,7 +173,12 @@ async fn verify_task_principal(
     // This prevents unauthorized access to tasks when identity inference
     // fails due to I/O errors, misconfiguration, or spawn_blocking panics.
     let caller_principal = match tokio::task::spawn_blocking(infer_principal).await {
-        Ok(Ok(p)) => Principal::new(&p.app_name),
+        Ok(Ok(p)) => Principal::from_policy(
+            &p.app_name,
+            &p.namespace,
+            &p.service_account,
+            p.roles.clone(),
+        ),
         Ok(Err(e)) => {
             warn!(error = %e, "Principal inference failed, denying task access");
             return Err(ThoughtGateError::TaskNotFound {
