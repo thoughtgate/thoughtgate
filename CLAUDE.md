@@ -127,6 +127,10 @@ Authorization, Cookie, x-api-key, THOUGHTGATE_SLACK_BOT_TOKEN, tool_arguments
 ? operator or explicit error handling
 tokio::time::sleep()
 tokio::sync::Mutex
+
+// ✅ EXCEPTION: .expect() on LazyLock with compile-time literal constants
+// where the parse function is not const fn. Must include a // SAFETY: comment.
+static FOO: LazyLock<T> = LazyLock::new(|| T::parse("literal").expect("BUG: ..."));
 ```
 
 ### Observability Systems

@@ -40,6 +40,10 @@ use tracing::{debug, error, info, warn};
 // These are parsed once at first access and reused for every evaluation,
 // avoiding repeated string parsing in the hot path.
 
+// SAFETY: .expect() on LazyLock with compile-time literal constants.
+// EntityTypeName::from_str is not const fn, but these string literals are
+// known-valid Cedar entity type names (Namespace::Type format). The .expect()
+// can never fail at runtime.
 static ENTITY_TYPE_APP: LazyLock<EntityTypeName> = LazyLock::new(|| {
     EntityTypeName::from_str("ThoughtGate::App")
         .expect("BUG: 'ThoughtGate::App' is a valid entity type name")

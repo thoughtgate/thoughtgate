@@ -135,7 +135,8 @@ pub fn load_and_validate(
 // Environment Variable Substitution
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// Regex for ${VAR} and ${VAR:-default} patterns
+// SAFETY: .expect() on LazyLock with a compile-time literal regex pattern.
+// The pattern is known-valid and tested by test_env_var_pattern_compiles().
 static ENV_VAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
         .expect("BUG: ENV_VAR_PATTERN regex is invalid — this is a programmer error")
