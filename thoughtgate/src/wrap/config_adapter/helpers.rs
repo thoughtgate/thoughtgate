@@ -8,6 +8,20 @@ use thoughtgate_core::profile::Profile;
 
 use super::{ConfigError, McpServerEntry, ShimOptions};
 
+/// Write content atomically using temp-file + rename.
+///
+/// POSIX `rename(2)` is atomic on the same filesystem, so readers never see
+/// a half-written file. On failure the temp file is cleaned up best-effort.
+fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, content)?;
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Read a config file and parse as JSON.
 pub(super) fn read_config(path: &Path) -> Result<serde_json::Value, ConfigError> {
     let content = std::fs::read_to_string(path).map_err(|e| {
@@ -25,16 +39,20 @@ pub(super) fn read_config(path: &Path) -> Result<serde_json::Value, ConfigError>
 }
 
 /// Write JSON to a config file with pretty-printing.
+///
+/// Uses atomic temp-file + rename to prevent corruption on crash.
 pub(super) fn write_config(path: &Path, value: &serde_json::Value) -> Result<(), ConfigError> {
     let content = serde_json::to_string_pretty(value).map_err(|e| ConfigError::Write {
         reason: e.to_string(),
     })?;
-    std::fs::write(path, content).map_err(|e| ConfigError::Write {
+    atomic_write(path, content.as_bytes()).map_err(|e| ConfigError::Write {
         reason: e.to_string(),
     })
 }
 
 /// Create backup at `<path>.thoughtgate-backup`, verify, return backup path.
+///
+/// Uses atomic temp-file + rename to prevent corruption on crash.
 ///
 /// Implements: REQ-CORE-008/F-005
 pub(super) fn backup_config(config_path: &Path) -> Result<PathBuf, ConfigError> {
@@ -42,11 +60,13 @@ pub(super) fn backup_config(config_path: &Path) -> Result<PathBuf, ConfigError> 
     backup_path.push(".thoughtgate-backup");
     let backup_path = PathBuf::from(backup_path);
 
-    // Copy original to backup.
-    std::fs::copy(config_path, &backup_path)?;
+    // Read original, then atomic-write to backup.
+    let original = std::fs::read(config_path)?;
+    atomic_write(&backup_path, &original).map_err(|e| ConfigError::Write {
+        reason: format!("backup write failed: {e}"),
+    })?;
 
     // Verify backup was written successfully.
-    let original = std::fs::read(config_path)?;
     let backed_up = std::fs::read(&backup_path)?;
     if original != backed_up {
         return Err(ConfigError::Write {
@@ -248,9 +268,12 @@ pub(super) fn standard_rewrite(
     Ok(backup_path)
 }
 
-/// Shared restore logic: copy backup over config, remove backup.
+/// Shared restore logic: atomic-write backup content over config, remove backup.
 pub(super) fn standard_restore(config_path: &Path, backup_path: &Path) -> Result<(), ConfigError> {
-    std::fs::copy(backup_path, config_path)?;
+    let content = std::fs::read(backup_path)?;
+    atomic_write(config_path, &content).map_err(|e| ConfigError::Write {
+        reason: format!("restore write failed: {e}"),
+    })?;
     // Best-effort removal of backup.
     let _ = std::fs::remove_file(backup_path);
     Ok(())

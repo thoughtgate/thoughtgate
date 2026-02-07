@@ -750,6 +750,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── Atomic Write Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_atomic_write_leaves_no_temp_on_success() {
+        let dir = temp_config_dir();
+        let config_path = dir.join("config.json");
+
+        let content = serde_json::json!({ "key": "value" });
+        helpers::write_config(&config_path, &content).unwrap();
+
+        // Config was written correctly.
+        let read_back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(read_back["key"], "value");
+
+        // No leftover .tmp file.
+        let temp_path = config_path.with_extension("tmp");
+        assert!(
+            !temp_path.exists(),
+            "temp file should be cleaned up after atomic write"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Environment Variable Expansion Tests ─────────────────────────────
 
     #[test]
