@@ -115,6 +115,24 @@ pub(super) fn format_deny_response(
     line
 }
 
+/// Format a JSON-RPC error response for any [`ThoughtGateError`] variant.
+///
+/// Generalised version of [`format_deny_response`] that preserves the
+/// error code encoded in each `ThoughtGateError` variant. Returns a
+/// complete NDJSON line (with trailing newline).
+///
+/// Implements: REQ-CORE-008/F-012
+pub(super) fn format_error_response(
+    id: &JsonRpcId,
+    error: &thoughtgate_core::error::ThoughtGateError,
+    correlation_id: &str,
+) -> String {
+    let mut line =
+        thoughtgate_core::transport::jsonrpc::error_response_string(id, error, correlation_id);
+    line.push('\n');
+    line
+}
+
 /// Format a tool-level timeout response for blocking approval mode.
 ///
 /// Returns a JSON-RPC success response containing a `CallToolResult` with
@@ -538,4 +556,83 @@ pub(super) async fn poll_approval_status(
         "approval poll: cycle limit reached"
     );
     ApprovalPollResult::Timeout
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thoughtgate_core::error::ThoughtGateError;
+    use thoughtgate_core::jsonrpc::JsonRpcId;
+
+    #[test]
+    fn test_format_error_response_rejected() {
+        let id = JsonRpcId::Number(42);
+        let error = ThoughtGateError::ApprovalRejected {
+            tool: "deploy".to_string(),
+            rejected_by: None,
+            workflow: None,
+        };
+        let line = format_error_response(&id, &error, "corr-1");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["error"]["code"], -32007);
+        assert_eq!(parsed["id"], 42);
+    }
+
+    #[test]
+    fn test_format_error_response_expired() {
+        let id = JsonRpcId::Number(1);
+        let error = ThoughtGateError::TaskExpired {
+            task_id: "tg_abc".to_string(),
+        };
+        let line = format_error_response(&id, &error, "corr-2");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["error"]["code"], -32005);
+    }
+
+    #[test]
+    fn test_format_error_response_cancelled() {
+        let id = JsonRpcId::Number(1);
+        let error = ThoughtGateError::TaskCancelled {
+            task_id: "tg_def".to_string(),
+        };
+        let line = format_error_response(&id, &error, "corr-3");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["error"]["code"], -32006);
+    }
+
+    #[test]
+    fn test_format_error_response_service_unavailable() {
+        let id = JsonRpcId::String("req-1".to_string());
+        let error = ThoughtGateError::ServiceUnavailable {
+            reason: "poll failed".to_string(),
+        };
+        let line = format_error_response(&id, &error, "corr-4");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["error"]["code"], -32013);
+        assert_eq!(parsed["id"], "req-1");
+    }
+
+    #[test]
+    fn test_format_deny_response_still_uses_policy_denied() {
+        let id = JsonRpcId::Number(1);
+        let line = format_deny_response(&id, "server-1", Some("policy-1"));
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["error"]["code"], -32003);
+    }
+
+    #[test]
+    fn test_format_error_response_trailing_newline() {
+        let id = JsonRpcId::Number(1);
+        let error = ThoughtGateError::TaskExpired {
+            task_id: "tg_x".to_string(),
+        };
+        let line = format_error_response(&id, &error, "corr-5");
+        assert!(line.ends_with('\n'));
+        // Exactly one trailing newline
+        assert!(!line.ends_with("\n\n"));
+    }
 }

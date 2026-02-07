@@ -26,8 +26,8 @@ use crate::shim::ndjson::{detect_smuggling, parse_stdio_message};
 use super::helpers::{
     ApprovalPollResult, DEFAULT_APPROVAL_POLL_MS, EVALUATE_TIMEOUT_MS, MAX_APPROVAL_POLL_MS,
     MIN_APPROVAL_POLL_MS, PendingRequest, PendingRequests, bounded_read_line, extract_tool_name,
-    format_deny_response, format_timeout_tool_response, framing_error_type, id_from_kind,
-    is_passthrough, jsonrpc_id_to_string, message_type_from_kind, method_from_kind,
+    format_deny_response, format_error_response, format_timeout_tool_response, framing_error_type,
+    id_from_kind, is_passthrough, jsonrpc_id_to_string, message_type_from_kind, method_from_kind,
     poll_approval_status, rebuild_message_with_params, write_stdout,
 };
 
@@ -496,20 +496,22 @@ pub(super) async fn agent_to_server(
 
                         finish_mcp_span(&mut mcp_span, false, None, None);
                     }
-                    ApprovalPollResult::Rejected(reason) => {
+                    ApprovalPollResult::Rejected(_reason) => {
                         tracing::info!(
                             server_id,
                             task_id,
-                            ?reason,
+                            ?_reason,
                             "approval rejected — sending deny"
                         );
                         if let Some(id) = id_from_kind(&msg.kind) {
-                            let deny_line = format_deny_response(
-                                &id,
-                                &server_id,
-                                eval_resp.policy_id.as_deref(),
-                            );
-                            write_stdout(&agent_stdout, deny_line.as_bytes())
+                            let error =
+                                thoughtgate_core::error::ThoughtGateError::ApprovalRejected {
+                                    tool: tool_name.clone().unwrap_or_default(),
+                                    rejected_by: None,
+                                    workflow: None,
+                                };
+                            let error_line = format_error_response(&id, &error, &correlation_id);
+                            write_stdout(&agent_stdout, error_line.as_bytes())
                                 .await
                                 .map_err(StdioError::StdioIo)?;
                         }
@@ -521,29 +523,43 @@ pub(super) async fn agent_to_server(
                             Some("approval_rejected"),
                         );
                     }
-                    ApprovalPollResult::Expired | ApprovalPollResult::Cancelled => {
-                        tracing::info!(
-                            server_id,
-                            task_id,
-                            result = ?outcome,
-                            "approval expired/cancelled — sending deny"
-                        );
+                    ApprovalPollResult::Expired => {
+                        tracing::info!(server_id, task_id, "approval expired — sending error");
                         if let Some(id) = id_from_kind(&msg.kind) {
-                            let deny_line = format_deny_response(
-                                &id,
-                                &server_id,
-                                eval_resp.policy_id.as_deref(),
-                            );
-                            write_stdout(&agent_stdout, deny_line.as_bytes())
+                            let error = thoughtgate_core::error::ThoughtGateError::TaskExpired {
+                                task_id: task_id.to_string(),
+                            };
+                            let error_line = format_error_response(&id, &error, &correlation_id);
+                            write_stdout(&agent_stdout, error_line.as_bytes())
                                 .await
                                 .map_err(StdioError::StdioIo)?;
                         }
 
-                        let error_type = match outcome {
-                            ApprovalPollResult::Expired => "approval_expired",
-                            _ => "approval_cancelled",
-                        };
-                        finish_mcp_span(&mut mcp_span, true, Some(-32005), Some(error_type));
+                        finish_mcp_span(
+                            &mut mcp_span,
+                            true,
+                            Some(-32005),
+                            Some("approval_expired"),
+                        );
+                    }
+                    ApprovalPollResult::Cancelled => {
+                        tracing::info!(server_id, task_id, "approval cancelled — sending error");
+                        if let Some(id) = id_from_kind(&msg.kind) {
+                            let error = thoughtgate_core::error::ThoughtGateError::TaskCancelled {
+                                task_id: task_id.to_string(),
+                            };
+                            let error_line = format_error_response(&id, &error, &correlation_id);
+                            write_stdout(&agent_stdout, error_line.as_bytes())
+                                .await
+                                .map_err(StdioError::StdioIo)?;
+                        }
+
+                        finish_mcp_span(
+                            &mut mcp_span,
+                            true,
+                            Some(-32006),
+                            Some("approval_cancelled"),
+                        );
                     }
                     ApprovalPollResult::Timeout => {
                         tracing::warn!(
@@ -569,19 +585,19 @@ pub(super) async fn agent_to_server(
                         );
                     }
                     ApprovalPollResult::Error => {
-                        tracing::warn!(server_id, task_id, "approval poll error — sending deny");
+                        tracing::warn!(server_id, task_id, "approval poll error — sending error");
                         if let Some(id) = id_from_kind(&msg.kind) {
-                            let deny_line = format_deny_response(
-                                &id,
-                                &server_id,
-                                eval_resp.policy_id.as_deref(),
-                            );
-                            write_stdout(&agent_stdout, deny_line.as_bytes())
+                            let error =
+                                thoughtgate_core::error::ThoughtGateError::ServiceUnavailable {
+                                    reason: "Approval poll failed".to_string(),
+                                };
+                            let error_line = format_error_response(&id, &error, &correlation_id);
+                            write_stdout(&agent_stdout, error_line.as_bytes())
                                 .await
                                 .map_err(StdioError::StdioIo)?;
                         }
 
-                        finish_mcp_span(&mut mcp_span, true, Some(-32008), Some("approval_error"));
+                        finish_mcp_span(&mut mcp_span, true, Some(-32013), Some("approval_error"));
                     }
                     ApprovalPollResult::Shutdown => {
                         tracing::info!(
