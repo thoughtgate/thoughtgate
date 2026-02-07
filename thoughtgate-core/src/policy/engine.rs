@@ -93,21 +93,27 @@ static ENTITY_TYPE_ROLE: LazyLock<EntityTypeName> = LazyLock::new(|| {
 ///     }
 /// }
 /// ```
+/// Atomically-swapped bundle of policies, annotations, and source.
+///
+/// Ensures concurrent readers always see a consistent triple during
+/// hot-reload, preventing torn reads between e.g. new policies and
+/// old annotations.
+struct PolicySnapshot {
+    policies: Arc<PolicySet>,
+    #[allow(dead_code)] // Stored for future annotation-based routing; ensures consistent reads
+    annotations: Arc<PolicyAnnotations>,
+    source: Arc<PolicySource>,
+}
+
 pub struct CedarEngine {
     /// Cedar authorizer
     authorizer: Authorizer,
 
-    /// Current policy set (atomic for hot-reload)
-    policies: ArcSwap<PolicySet>,
+    /// Current policy snapshot (atomic for hot-reload)
+    snapshot: ArcSwap<PolicySnapshot>,
 
     /// Cedar schema for validation
     schema: Schema,
-
-    /// Policy annotations (cached at load time)
-    annotations: ArcSwap<PolicyAnnotations>,
-
-    /// Policy source information
-    source: Arc<ArcSwap<PolicySource>>,
 
     /// v0.2 statistics counters
     stats_v2: Arc<StatsV2>,
@@ -190,10 +196,12 @@ impl CedarEngine {
 
         Ok(Self {
             authorizer: Authorizer::new(),
-            policies: ArcSwap::new(Arc::new(policies)),
+            snapshot: ArcSwap::new(Arc::new(PolicySnapshot {
+                policies: Arc::new(policies),
+                annotations: Arc::new(annotations),
+                source: Arc::new(source),
+            })),
             schema,
-            annotations: ArcSwap::new(Arc::new(annotations)),
-            source: Arc::new(ArcSwap::new(Arc::new(source))),
             stats_v2: Arc::new(StatsV2 {
                 evaluation_count: AtomicU64::new(0),
                 permit_count: AtomicU64::new(0),
@@ -217,7 +225,7 @@ impl CedarEngine {
     /// gauge on initialization and after each reload.
     pub fn set_metrics(&mut self, metrics: Arc<crate::telemetry::ThoughtGateMetrics>) {
         // Set the initial gauge value
-        let policy_count = self.policies.load().policies().count() as i64;
+        let policy_count = self.snapshot.load().policies.policies().count() as i64;
         metrics.cedar_policies_loaded.set(policy_count);
         self.tg_metrics = Some(metrics);
     }
@@ -265,7 +273,8 @@ impl CedarEngine {
             .evaluation_count
             .fetch_add(1, Ordering::Relaxed);
 
-        let policies = self.policies.load();
+        let snap = self.snapshot.load();
+        let policies = &snap.policies;
 
         // Determine action based on resource type
         let action_name = match &request.resource {
@@ -302,7 +311,7 @@ impl CedarEngine {
         // Evaluate
         let response = self
             .authorizer
-            .is_authorized(&cedar_request, &policies, &entities);
+            .is_authorized(&cedar_request, policies, &entities);
 
         let elapsed = start.elapsed();
         self.stats_v2
@@ -739,13 +748,14 @@ impl CedarEngine {
     pub fn evaluate(&self, request: &PolicyRequest) -> PolicyAction {
         self.stats.evaluation_count.fetch_add(1, Ordering::Relaxed);
 
-        let policies = self.policies.load();
+        let snap = self.snapshot.load();
+        let policies = &snap.policies;
 
         // v0.1: Check actions in priority order: Forward → Approve
         let actions = ["Forward", "Approve"];
 
         for action_name in &actions {
-            if self.is_action_permitted(request, action_name, &policies) {
+            if self.is_action_permitted(request, action_name, policies) {
                 debug!(
                     principal = %request.principal.app_name,
                     resource = ?request.resource,
@@ -971,7 +981,7 @@ impl CedarEngine {
     /// Returns information about where the currently loaded policies came from:
     /// ConfigMap, Environment variable, or embedded defaults.
     pub fn policy_source(&self) -> PolicySource {
-        (**self.source.load()).clone()
+        (*self.snapshot.load().source).clone()
     }
 
     /// Atomically apply a policy reload: swap policies, annotations, source,
@@ -983,9 +993,11 @@ impl CedarEngine {
         source: PolicySource,
     ) {
         let policy_count = policies.policies().count();
-        self.policies.store(Arc::new(policies));
-        self.annotations.store(Arc::new(annotations));
-        self.source.store(Arc::new(source));
+        self.snapshot.store(Arc::new(PolicySnapshot {
+            policies: Arc::new(policies),
+            annotations: Arc::new(annotations),
+            source: Arc::new(source),
+        }));
         self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
         self.stats
             .last_reload
