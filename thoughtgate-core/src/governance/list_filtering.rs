@@ -18,8 +18,9 @@ use tracing::{debug, warn};
 /// Gate 1: Filter tools by visibility (ExposeConfig) and annotate `execution.taskSupport`.
 ///
 /// Removes tools not visible under the source's `expose` configuration,
-/// then annotates remaining tools with `execution.taskSupport = "required"`
+/// then annotates remaining tools with `execution.taskSupport = "optional"`
 /// when the governance rule maps to `Approve` or `Policy` actions.
+/// Clients MAY omit `params.task` to use blocking approval mode.
 ///
 /// Returns the number of tools removed by visibility filtering.
 ///
@@ -41,12 +42,14 @@ pub fn filter_and_annotate_tools(
         let match_result = config.governance.evaluate(tool_name, source_id);
         match match_result.action {
             Action::Approve | Action::Policy => {
-                // ThoughtGate requires async task mode for approval/policy actions.
-                // Set execution.taskSupport = "required" per MCP spec.
+                // ThoughtGate supports both async task mode and blocking approval.
+                // Set execution.taskSupport = "optional" per MCP spec.
+                // Clients that send params.task get async SEP-1686 flow;
+                // clients that omit it get blocking approval (connection held open).
                 if let Some(obj) = tool.as_object_mut() {
                     obj.insert(
                         "execution".to_string(),
-                        serde_json::json!({"taskSupport": "required"}),
+                        serde_json::json!({"taskSupport": "optional"}),
                     );
                 }
             }

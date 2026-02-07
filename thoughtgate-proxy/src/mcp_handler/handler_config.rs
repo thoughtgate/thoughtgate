@@ -16,6 +16,9 @@ pub struct McpHandlerConfig {
     /// Maximum aggregate buffered bytes across all in-flight requests.
     /// Prevents OOM when many concurrent requests buffer large bodies.
     pub max_aggregate_buffer: usize,
+    /// Global fallback timeout (seconds) for blocking approval mode.
+    /// Used when no workflow-specific blocking_timeout is configured.
+    pub blocking_approval_timeout_secs: u64,
 }
 
 impl Default for McpHandlerConfig {
@@ -25,6 +28,7 @@ impl Default for McpHandlerConfig {
             max_concurrent_requests: 10000,
             max_batch_size: 100,
             max_aggregate_buffer: 512 * 1024 * 1024, // 512MB
+            blocking_approval_timeout_secs: 300,
         }
     }
 }
@@ -58,11 +62,18 @@ impl McpHandlerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(512 * 1024 * 1024); // 512MB default
 
+        let blocking_approval_timeout_secs: u64 =
+            std::env::var("THOUGHTGATE_BLOCKING_APPROVAL_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300);
+
         Self {
             max_body_size,
             max_concurrent_requests,
             max_batch_size,
             max_aggregate_buffer,
+            blocking_approval_timeout_secs,
         }
     }
 }

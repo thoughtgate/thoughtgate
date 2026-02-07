@@ -526,6 +526,15 @@ pub struct HumanWorkflow {
     /// Action to take on timeout.
     #[serde(default)]
     pub on_timeout: Option<TimeoutAction>,
+
+    /// Max duration to hold an HTTP connection for blocking approval.
+    /// Falls back to `timeout` if unset, then to 300s default.
+    #[serde(
+        default,
+        deserialize_with = "duration_format::deserialize_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub blocking_timeout: Option<Duration>,
 }
 
 impl HumanWorkflow {
@@ -538,6 +547,14 @@ impl HumanWorkflow {
     /// Get the timeout action, using default if not specified.
     pub fn on_timeout_or_default(&self) -> TimeoutAction {
         self.on_timeout.clone().unwrap_or_default()
+    }
+
+    /// Get the blocking timeout for holding HTTP connections during approval.
+    /// Falls back to `timeout`, then to 300s default.
+    pub fn blocking_timeout_or_default(&self) -> Duration {
+        self.blocking_timeout
+            .or(self.timeout)
+            .unwrap_or(Duration::from_secs(300))
     }
 }
 

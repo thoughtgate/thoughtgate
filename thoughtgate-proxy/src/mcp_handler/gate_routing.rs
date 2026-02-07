@@ -95,11 +95,12 @@ pub(crate) async fn route_through_gates(
     // SEP-1686: Task Metadata Validation (proxy-specific)
     // ========================================================================
     let match_result = config.governance.evaluate(&resource_name, source_id);
-    super::validate_task_metadata(
+    let is_blocking_mode = super::validate_task_metadata(
         &mut request,
         &match_result.action,
         &resource_name,
         state.capability_cache.upstream_supports_tasks(),
+        state.approval_engine.is_some(),
     )?;
 
     // ========================================================================
@@ -188,12 +189,79 @@ pub(crate) async fn route_through_gates(
         GovernanceDecision::PendingApproval => {
             let task_id = resp.task_id.clone().unwrap_or_default();
             let poll_interval_ms = resp.poll_interval_ms.unwrap_or(1000);
-            Ok(JsonRpcResponse::task_created(
-                request.id.clone(),
-                task_id,
-                "working".to_string(),
-                std::time::Duration::from_millis(poll_interval_ms),
-            ))
+
+            if is_blocking_mode {
+                // Blocking mode: hold the connection, wait for approval, execute, return result.
+                let approval_engine = match state.approval_engine.as_ref() {
+                    Some(engine) => engine,
+                    None => {
+                        return Err(ThoughtGateError::ServiceUnavailable {
+                            reason: "Approval engine not available for blocking mode".to_string(),
+                        });
+                    }
+                };
+
+                // Resolve blocking timeout: workflow config → handler config → 300s default
+                let blocking_timeout = match_result
+                    .approval_workflow
+                    .as_ref()
+                    .and_then(|name| state.config.as_ref().and_then(|c| c.get_workflow(name)))
+                    .map(|w| w.blocking_timeout_or_default())
+                    .unwrap_or_else(|| {
+                        std::time::Duration::from_secs(state.blocking_approval_timeout_secs)
+                    });
+
+                // Sep1686TaskId::from_str is infallible
+                let task_id_parsed = thoughtgate_core::governance::TaskId::from_raw(&task_id);
+
+                info!(
+                    task_id = %task_id,
+                    tool = %resource_name,
+                    timeout_secs = blocking_timeout.as_secs(),
+                    "Blocking approval mode: holding connection"
+                );
+
+                let start = std::time::Instant::now();
+                let result = approval_engine
+                    .wait_and_execute(
+                        &task_id_parsed,
+                        &resource_name,
+                        blocking_timeout,
+                        std::time::Duration::from_millis(poll_interval_ms),
+                        std::time::Duration::from_secs(15),
+                        None, // No progress_tx for HTTP proxy v0.4
+                    )
+                    .await;
+
+                // Record blocking metrics
+                let elapsed = start.elapsed();
+                let outcome = match &result {
+                    Ok(r) if r.is_error => "timeout",
+                    Ok(_) => "approved",
+                    Err(ThoughtGateError::ApprovalRejected { .. }) => "rejected",
+                    Err(_) => "error",
+                };
+                if let Some(ref metrics) = state.tg_metrics {
+                    metrics.record_blocking_approval_completed(outcome, elapsed);
+                }
+
+                match result {
+                    Ok(tool_result) => {
+                        let response_value = serde_json::to_value(&tool_result)
+                            .unwrap_or(serde_json::json!({"error": "serialization failed"}));
+                        Ok(JsonRpcResponse::success(request.id.clone(), response_value))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                // Async SEP-1686 mode: return task ID immediately
+                Ok(JsonRpcResponse::task_created(
+                    request.id.clone(),
+                    task_id,
+                    "working".to_string(),
+                    std::time::Duration::from_millis(poll_interval_ms),
+                ))
+            }
         }
     };
 

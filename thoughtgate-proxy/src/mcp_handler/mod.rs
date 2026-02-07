@@ -86,6 +86,8 @@ pub struct McpState {
     /// When present, `route_through_gates()` delegates to this instead of
     /// reimplementing gate logic. None in legacy mode (no YAML config).
     pub evaluator: Option<Arc<GovernanceEvaluator>>,
+    /// Global fallback timeout (seconds) for blocking approval mode.
+    pub blocking_approval_timeout_secs: u64,
 }
 
 /// MCP request handler for direct invocation.
@@ -153,6 +155,7 @@ impl McpHandler {
             max_aggregate_buffer: config.max_aggregate_buffer,
             tg_metrics: None,
             evaluator: None,
+            blocking_approval_timeout_secs: config.blocking_approval_timeout_secs,
         });
 
         Self { state }
@@ -229,6 +232,7 @@ impl McpHandler {
             max_aggregate_buffer: handler_config.max_aggregate_buffer,
             tg_metrics,
             evaluator,
+            blocking_approval_timeout_secs: handler_config.blocking_approval_timeout_secs,
         });
 
         Self { state }
@@ -413,6 +417,7 @@ mod tests {
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
             evaluator: None,
+            blocking_approval_timeout_secs: 300,
         })
     }
 
@@ -589,6 +594,7 @@ mod tests {
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
             evaluator: None,
+            blocking_approval_timeout_secs: 300,
         });
 
         let router = Router::new()
@@ -638,6 +644,7 @@ mod tests {
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
             evaluator: None,
+            blocking_approval_timeout_secs: 300,
         });
 
         // Router with DefaultBodyLimit disabled - we check size manually and return JSON-RPC error
@@ -972,6 +979,7 @@ mod tests {
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
             evaluator: None,
+            blocking_approval_timeout_secs: 300,
         })
     }
 
@@ -1230,6 +1238,7 @@ mod tests {
             max_aggregate_buffer: 512 * 1024 * 1024,
             tg_metrics: None,
             evaluator: None,
+            blocking_approval_timeout_secs: 300,
         })
     }
 

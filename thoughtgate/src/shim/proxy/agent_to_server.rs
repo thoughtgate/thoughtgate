@@ -26,9 +26,9 @@ use crate::shim::ndjson::{detect_smuggling, parse_stdio_message};
 use super::helpers::{
     ApprovalPollResult, DEFAULT_APPROVAL_POLL_MS, EVALUATE_TIMEOUT_MS, MAX_APPROVAL_POLL_MS,
     MIN_APPROVAL_POLL_MS, PendingRequest, PendingRequests, bounded_read_line, extract_tool_name,
-    format_deny_response, framing_error_type, id_from_kind, is_passthrough, jsonrpc_id_to_string,
-    message_type_from_kind, method_from_kind, poll_approval_status, rebuild_message_with_params,
-    write_stdout,
+    format_deny_response, format_timeout_tool_response, framing_error_type, id_from_kind,
+    is_passthrough, jsonrpc_id_to_string, message_type_from_kind, method_from_kind,
+    poll_approval_status, rebuild_message_with_params, write_stdout,
 };
 
 /// Read from agent stdin, evaluate via governance, forward to server stdin.
@@ -453,9 +453,16 @@ pub(super) async fn agent_to_server(
                 );
 
                 let approval_start = Instant::now();
-                let outcome =
-                    poll_approval_status(&client, &task_url, poll_interval, shutdown_rx, profile)
-                        .await;
+                let outcome = poll_approval_status(
+                    &client,
+                    &task_url,
+                    poll_interval,
+                    shutdown_rx,
+                    profile,
+                    &agent_stdout,
+                    task_id,
+                )
+                .await;
                 if let Some(ref m) = metrics {
                     m.record_stdio_approval_latency(&server_id, approval_start.elapsed());
                 }
@@ -538,13 +545,31 @@ pub(super) async fn agent_to_server(
                         };
                         finish_mcp_span(&mut mcp_span, true, Some(-32005), Some(error_type));
                     }
-                    ApprovalPollResult::Timeout | ApprovalPollResult::Error => {
+                    ApprovalPollResult::Timeout => {
                         tracing::warn!(
                             server_id,
                             task_id,
-                            result = ?outcome,
-                            "approval poll failed — sending deny"
+                            "approval poll timed out — sending tool-level error"
                         );
+                        // Return tool-level isError: true so the LLM can reason
+                        // about the timeout (e.g., retry or inform the user).
+                        if let Some(id) = id_from_kind(&msg.kind) {
+                            let name = tool_name.as_deref().unwrap_or("unknown");
+                            let timeout_line = format_timeout_tool_response(&id, name);
+                            write_stdout(&agent_stdout, timeout_line.as_bytes())
+                                .await
+                                .map_err(StdioError::StdioIo)?;
+                        }
+
+                        finish_mcp_span(
+                            &mut mcp_span,
+                            true,
+                            Some(-32008),
+                            Some("approval_timeout"),
+                        );
+                    }
+                    ApprovalPollResult::Error => {
+                        tracing::warn!(server_id, task_id, "approval poll error — sending deny");
                         if let Some(id) = id_from_kind(&msg.kind) {
                             let deny_line = format_deny_response(
                                 &id,
@@ -556,11 +581,7 @@ pub(super) async fn agent_to_server(
                                 .map_err(StdioError::StdioIo)?;
                         }
 
-                        let error_type = match outcome {
-                            ApprovalPollResult::Timeout => "approval_timeout",
-                            _ => "approval_error",
-                        };
-                        finish_mcp_span(&mut mcp_span, true, Some(-32008), Some(error_type));
+                        finish_mcp_span(&mut mcp_span, true, Some(-32008), Some("approval_error"));
                     }
                     ApprovalPollResult::Shutdown => {
                         tracing::info!(

@@ -486,6 +486,143 @@ impl ApprovalEngine {
         })
     }
 
+    /// Wait for approval and execute in blocking mode.
+    ///
+    /// Polls `execute_on_result()` in a loop. Emits progress heartbeats via
+    /// `progress_tx` every `heartbeat_interval` to keep client connections alive.
+    /// On timeout, returns a `ToolCallResult` with `is_error: true` (tool-level error).
+    ///
+    /// Implements: REQ-GOV-002/F-007 (Blocking Approval Wait)
+    pub async fn wait_and_execute(
+        &self,
+        task_id: &TaskId,
+        tool_name: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+        heartbeat_interval: Duration,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
+    ) -> Result<ToolCallResult, ThoughtGateError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Clamp poll interval to [100ms, 30s]
+        let poll_interval =
+            poll_interval.clamp(Duration::from_millis(100), Duration::from_secs(30));
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut last_heartbeat = tokio::time::Instant::now();
+        let mut poll_count: u64 = 0;
+
+        loop {
+            // Check deadline before polling
+            if tokio::time::Instant::now() >= deadline {
+                info!(
+                    task_id = %task_id,
+                    tool = %tool_name,
+                    timeout_secs = timeout.as_secs(),
+                    "Blocking approval timed out"
+                );
+                return Ok(ToolCallResult {
+                    content: serde_json::json!([{
+                        "type": "text",
+                        "text": format!(
+                            "Approval timed out after {}s for tool '{}'. \
+                             The request was sent to the approval channel but no response \
+                             was received. The tool call was NOT executed. You may retry.",
+                            timeout.as_secs(), tool_name
+                        )
+                    }]),
+                    is_error: true,
+                });
+            }
+
+            interval.tick().await;
+            poll_count += 1;
+
+            // Emit heartbeat if interval elapsed
+            if let Some(ref tx) = progress_tx {
+                if last_heartbeat.elapsed() >= heartbeat_interval {
+                    let progress = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": {
+                            "progressToken": format!("blocking-{}", task_id),
+                            "progress": 0,
+                            "total": 1,
+                            "message": "Awaiting approval..."
+                        }
+                    });
+                    // Best-effort: if the receiver is gone, the connection was dropped
+                    let _ = tx.send(progress);
+                    last_heartbeat = tokio::time::Instant::now();
+                }
+            }
+
+            // Poll for result
+            match self.execute_on_result(task_id).await {
+                Ok(result) => {
+                    info!(
+                        task_id = %task_id,
+                        tool = %tool_name,
+                        poll_count,
+                        "Blocking approval completed successfully"
+                    );
+                    return Ok(result);
+                }
+                Err(ThoughtGateError::TaskResultNotReady { .. }) => {
+                    // Still waiting — continue polling
+                    continue;
+                }
+                Err(ThoughtGateError::ApprovalRejected {
+                    tool,
+                    rejected_by,
+                    workflow,
+                }) => {
+                    info!(
+                        task_id = %task_id,
+                        tool = %tool_name,
+                        poll_count,
+                        "Blocking approval rejected"
+                    );
+                    return Err(ThoughtGateError::ApprovalRejected {
+                        tool,
+                        rejected_by,
+                        workflow,
+                    });
+                }
+                Err(ThoughtGateError::ApprovalTimeout {
+                    tool, timeout_secs, ..
+                }) => {
+                    // Task-level timeout — map to tool-level error for blocking mode
+                    return Ok(ToolCallResult {
+                        content: serde_json::json!([{
+                            "type": "text",
+                            "text": format!(
+                                "Approval timed out after {}s for tool '{}'. \
+                                 The request was sent to the approval channel but no response \
+                                 was received. The tool call was NOT executed. You may retry.",
+                                timeout_secs, tool
+                            )
+                        }]),
+                        is_error: true,
+                    });
+                }
+                Err(e @ ThoughtGateError::TaskCancelled { .. })
+                | Err(e @ ThoughtGateError::TaskNotFound { .. }) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    // Other errors (ServiceUnavailable, etc.) — propagate
+                    warn!(
+                        task_id = %task_id,
+                        error = %e,
+                        "Blocking approval poll encountered error"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     /// Execute an approved task and return the result.
     ///
     /// Implements: REQ-GOV-002/F-005, F-006 (Result retrieval and execution)
@@ -1402,6 +1539,236 @@ mod tests {
             upstream.forward_count.load(Ordering::SeqCst),
             1,
             "Upstream should have been called exactly once"
+        );
+    }
+
+    // ========================================================================
+    // Blocking Mode Tests (wait_and_execute)
+    // ========================================================================
+
+    /// Tests that wait_and_execute returns result when task is approved.
+    ///
+    /// Verifies: REQ-GOV-002/F-007 (Blocking approval — approved)
+    #[tokio::test]
+    async fn test_wait_and_execute_approved() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream.clone(),
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval
+        let start_result = engine
+            .start_approval(test_request(), test_principal(), None)
+            .await
+            .unwrap();
+
+        // Approve the task (simulating Slack decision)
+        task_store
+            .record_approval(
+                &start_result.task_id,
+                ApprovalDecision::Approved,
+                "test-reviewer".to_string(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        // wait_and_execute should poll, find approval, execute, and return
+        let result = engine
+            .wait_and_execute(
+                &start_result.task_id,
+                "delete_user",
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                Duration::from_secs(15),
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "wait_and_execute should succeed: {:?}",
+            result.err()
+        );
+        let tool_result = result.unwrap();
+        assert!(!tool_result.is_error, "Tool result should not be error");
+        assert_eq!(upstream.forward_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Tests that wait_and_execute returns rejection error.
+    ///
+    /// Verifies: REQ-GOV-002/F-007 (Blocking approval — rejected)
+    #[tokio::test]
+    async fn test_wait_and_execute_rejected() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval
+        let start_result = engine
+            .start_approval(test_request(), test_principal(), None)
+            .await
+            .unwrap();
+
+        // Reject the task
+        task_store
+            .record_approval(
+                &start_result.task_id,
+                ApprovalDecision::Rejected {
+                    reason: Some("Not authorized".to_string()),
+                },
+                "test-reviewer".to_string(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        // wait_and_execute should return ApprovalRejected
+        let result = engine
+            .wait_and_execute(
+                &start_result.task_id,
+                "delete_user",
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                Duration::from_secs(15),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ThoughtGateError::ApprovalRejected { tool, .. } => {
+                assert_eq!(tool, "delete_user");
+            }
+            other => panic!("Expected ApprovalRejected, got {:?}", other),
+        }
+    }
+
+    /// Tests that wait_and_execute returns tool-level timeout error (isError: true).
+    ///
+    /// Verifies: REQ-GOV-002/F-007 (Blocking approval — timeout)
+    #[tokio::test]
+    async fn test_wait_and_execute_timeout() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval but never approve
+        let start_result = engine
+            .start_approval(test_request(), test_principal(), None)
+            .await
+            .unwrap();
+
+        // wait_and_execute with very short timeout
+        let result = engine
+            .wait_and_execute(
+                &start_result.task_id,
+                "delete_user",
+                Duration::from_millis(200), // Very short timeout
+                Duration::from_millis(100),
+                Duration::from_secs(15),
+                None,
+            )
+            .await;
+
+        // Should return Ok with is_error: true (tool-level timeout, not JSON-RPC error)
+        assert!(
+            result.is_ok(),
+            "Should return Ok (tool-level error), got: {:?}",
+            result.err()
+        );
+        let tool_result = result.unwrap();
+        assert!(
+            tool_result.is_error,
+            "Should have is_error: true for timeout"
+        );
+        let text = tool_result.content.to_string();
+        assert!(text.contains("timed out"), "Should mention timeout: {text}");
+        assert!(
+            text.contains("delete_user"),
+            "Should mention tool name: {text}"
+        );
+    }
+
+    /// Tests that wait_and_execute emits progress notifications.
+    ///
+    /// Verifies: REQ-GOV-002/F-007 (Blocking approval — progress heartbeats)
+    #[tokio::test]
+    async fn test_wait_and_execute_emits_progress() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let adapter = Arc::new(MockApprovalAdapter::new());
+        let upstream = Arc::new(MockUpstream::new());
+        let config = ApprovalEngineConfig::default();
+        let shutdown = CancellationToken::new();
+
+        let engine = ApprovalEngine::new(
+            task_store.clone(),
+            adapter,
+            upstream,
+            test_cedar_engine(),
+            config,
+            shutdown,
+        );
+
+        // Start approval but never approve
+        let _start_result = engine
+            .start_approval(test_request(), test_principal(), None)
+            .await
+            .unwrap();
+
+        // Set up progress channel
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Run with short timeout and very short heartbeat interval
+        let _ = engine
+            .wait_and_execute(
+                &_start_result.task_id,
+                "delete_user",
+                Duration::from_millis(500),
+                Duration::from_millis(100),
+                Duration::from_millis(150), // Heartbeat every 150ms
+                Some(tx),
+            )
+            .await;
+
+        // Should have received at least one progress notification
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert!(
+            count >= 1,
+            "Should have received at least 1 progress notification, got {count}"
         );
     }
 }

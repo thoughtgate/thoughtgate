@@ -233,6 +233,13 @@ pub struct StdioServerStateLabels {
 // Governance Pipeline Labels (REQ-GOV-002)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Labels for blocking approval metrics.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BlockingApprovalLabels {
+    /// Outcome: "approved", "rejected", "timeout", "error"
+    pub outcome: Cow<'static, str>,
+}
+
 /// Labels for pending task gauges.
 ///
 /// Implements: REQ-OBS-002 §6.4/MG-002
@@ -389,6 +396,12 @@ pub struct ThoughtGateMetrics {
     ///
     /// Implements: REQ-OBS-002 §6.2/MH-005
     pub request_payload_size_bytes: Family<PayloadLabels, Histogram>,
+
+    /// Blocking approval outcomes counter.
+    pub blocking_approvals_total: Family<BlockingApprovalLabels, Counter>,
+
+    /// Duration of blocking approval holds in seconds.
+    pub blocking_hold_duration_s: Family<BlockingApprovalLabels, Histogram>,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Gauges (§6.4)
@@ -624,6 +637,27 @@ impl ThoughtGateMetrics {
         );
 
         // ─────────────────────────────────────────────────────────────────────
+        // Blocking Approval Metrics
+        // ─────────────────────────────────────────────────────────────────────
+
+        let blocking_approvals_total = Family::<BlockingApprovalLabels, Counter>::default();
+        registry.register(
+            "thoughtgate_blocking_approvals_total",
+            "Blocking approval outcomes",
+            blocking_approvals_total.clone(),
+        );
+
+        let blocking_hold_duration_s =
+            Family::<BlockingApprovalLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(APPROVAL_BUCKETS.iter().copied())
+            });
+        registry.register(
+            "thoughtgate_blocking_hold_duration_seconds",
+            "Duration of blocking approval holds in seconds",
+            blocking_hold_duration_s.clone(),
+        );
+
+        // ─────────────────────────────────────────────────────────────────────
         // Gauges (§6.4 — wired in respective subsystems, see struct docs)
         // ─────────────────────────────────────────────────────────────────────
 
@@ -757,6 +791,8 @@ impl ThoughtGateMetrics {
             upstream_duration_ms,
             approval_wait_duration_s,
             request_payload_size_bytes,
+            blocking_approvals_total,
+            blocking_hold_duration_s,
             connections_active,
             tasks_pending,
             cedar_policies_loaded,
@@ -967,6 +1003,22 @@ impl ThoughtGateMetrics {
                 outcome: Cow::Owned(outcome.to_string()),
             })
             .observe(duration_secs);
+    }
+
+    /// Record a completed blocking approval hold.
+    ///
+    /// # Arguments
+    ///
+    /// * `outcome` - "approved", "rejected", "timeout", or "error"
+    /// * `duration` - Wall-clock time the connection was held
+    pub fn record_blocking_approval_completed(&self, outcome: &str, duration: std::time::Duration) {
+        let labels = BlockingApprovalLabels {
+            outcome: Cow::Owned(outcome.to_string()),
+        };
+        self.blocking_approvals_total.get_or_create(&labels).inc();
+        self.blocking_hold_duration_s
+            .get_or_create(&labels)
+            .observe(duration.as_secs_f64());
     }
 
     /// Record a SEP-1686 task creation.

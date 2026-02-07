@@ -57,6 +57,12 @@ pub(super) const TASK_STATUS_TIMEOUT_MS: u64 = 5000;
 /// Real timeout is server-side TTL. 720 polls × 5s = 1 hour.
 pub(super) const MAX_POLL_CYCLES: u32 = 720;
 
+/// Interval for MCP progress heartbeats during approval polling (seconds).
+///
+/// Emitting `notifications/progress` every 15s resets the MCP TypeScript SDK's
+/// default 60-second request timeout (`resetTimeoutOnProgress: true`).
+pub(super) const PROGRESS_HEARTBEAT_SECS: u64 = 15;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure Helper Functions
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +111,36 @@ pub(super) fn format_deny_response(
     };
     let mut line =
         thoughtgate_core::transport::jsonrpc::error_response_string(id, &error, server_id);
+    line.push('\n');
+    line
+}
+
+/// Format a tool-level timeout response for blocking approval mode.
+///
+/// Returns a JSON-RPC success response containing a `CallToolResult` with
+/// `isError: true`. This lets the LLM see and reason about the timeout
+/// (e.g., retry or inform the user), unlike a JSON-RPC error which is
+/// typically opaque to agents.
+///
+/// Implements: REQ-GOV-002/F-007 (Blocking Approval Timeout)
+pub(super) fn format_timeout_tool_response(id: &JsonRpcId, tool_name: &str) -> String {
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "Approval timed out for tool '{}'. The request was sent to the \
+                     approval channel but no response was received. The tool call \
+                     was NOT executed. You may retry.",
+                    tool_name
+                )
+            }],
+            "isError": true
+        }
+    });
+    let mut line = serde_json::to_string(&response).unwrap_or_default();
     line.push('\n');
     line
 }
@@ -404,14 +440,24 @@ pub(super) struct PendingRequests {
 /// for stdio — the MCP protocol is sequential per-connection. The server→agent
 /// task and heartbeat continue concurrently.
 ///
+/// Emits `notifications/progress` to the agent's stdout every
+/// [`PROGRESS_HEARTBEAT_SECS`] to reset the MCP SDK's 60-second timeout
+/// (`resetTimeoutOnProgress: true`).
+///
 /// Implements: REQ-CORE-008/F-016
+/// Implements: REQ-GOV-002/F-007 (Progress Heartbeats)
 pub(super) async fn poll_approval_status(
     client: &reqwest::Client,
     task_url: &str,
     poll_interval: Duration,
     shutdown_rx: &mut watch::Receiver<bool>,
     profile: Profile,
+    agent_stdout: &Mutex<Stdout>,
+    task_id: &str,
 ) -> ApprovalPollResult {
+    let heartbeat_interval = Duration::from_secs(PROGRESS_HEARTBEAT_SECS);
+    let mut last_heartbeat = Instant::now();
+
     for cycle in 0..MAX_POLL_CYCLES {
         // Check shutdown between polls.
         tokio::select! {
@@ -420,6 +466,25 @@ pub(super) async fn poll_approval_status(
                 return ApprovalPollResult::Shutdown;
             }
             _ = tokio::time::sleep(poll_interval) => {}
+        }
+
+        // Emit progress heartbeat to agent stdout to reset MCP SDK timeout.
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            let progress = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": format!("blocking-{task_id}"),
+                    "progress": 0,
+                    "total": 1,
+                    "message": "Awaiting approval..."
+                }
+            });
+            let line = format!("{progress}\n");
+            if let Err(e) = write_stdout(agent_stdout, line.as_bytes()).await {
+                tracing::debug!(error = %e, "failed to emit progress heartbeat");
+            }
+            last_heartbeat = Instant::now();
         }
 
         // GET task status.

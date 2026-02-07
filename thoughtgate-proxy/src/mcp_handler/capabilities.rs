@@ -186,29 +186,47 @@ pub(super) async fn handle_list_method(
     }
 }
 
-/// Validate task metadata presence for SEP-1686 compliance.
+/// Validate task metadata and detect blocking mode for SEP-1686 compliance.
 ///
 /// Implements: SEP-1686 Section 3.3 (TaskRequired/TaskForbidden)
 ///
-/// - For `action: approve` or `action: policy`: client MUST send `params.task`
-/// - For `action: forward` or `action: deny`: if client sent task metadata but
-///   upstream doesn't support tasks, return TaskForbidden error
+/// Returns `Ok(true)` if the request should use blocking approval mode
+/// (no task metadata, but an approval engine is available).
+/// Returns `Ok(false)` for async SEP-1686 mode or non-approval actions.
+///
+/// - For `action: approve` or `action: policy`:
+///   - With `params.task` → async mode (`Ok(false)`)
+///   - Without `params.task` + approval engine → blocking mode (`Ok(true)`)
+///   - Without `params.task` + no approval engine → error (legacy reject)
+/// - For `action: forward` or `action: deny`: strip task metadata if upstream
+///   doesn't support tasks, return `Ok(false)`
 pub(super) fn validate_task_metadata(
     request: &mut McpRequest,
     action: &thoughtgate_core::config::Action,
     tool_name: &str,
     upstream_supports_tasks: bool,
-) -> Result<(), ThoughtGateError> {
+    has_approval_engine: bool,
+) -> Result<bool, ThoughtGateError> {
     let has_task_metadata = request.is_task_augmented();
 
     match action {
         thoughtgate_core::config::Action::Approve | thoughtgate_core::config::Action::Policy => {
-            // Task-required: client MUST send params.task
-            if !has_task_metadata {
-                return Err(ThoughtGateError::TaskRequired {
+            if has_task_metadata {
+                // Async SEP-1686 mode
+                Ok(false)
+            } else if has_approval_engine {
+                // Blocking mode: hold connection, wait for approval
+                debug!(
+                    tool = %tool_name,
+                    "No task metadata — using blocking approval mode"
+                );
+                Ok(true)
+            } else {
+                // Legacy mode: no approval engine, can't block
+                Err(ThoughtGateError::TaskRequired {
                     tool: tool_name.to_string(),
                     hint: "Include params.task per tools/list taskSupport annotation".to_string(),
-                });
+                })
             }
         }
         thoughtgate_core::config::Action::Forward | thoughtgate_core::config::Action::Deny => {
@@ -222,8 +240,141 @@ pub(super) fn validate_task_metadata(
                 );
                 request.task_metadata = None;
             }
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use thoughtgate_core::config::Action;
+    use thoughtgate_core::transport::jsonrpc::{
+        JsonRpcId, McpRequest, TaskMetadata, fast_correlation_id,
+    };
+
+    /// Helper: build a bare McpRequest for unit testing.
+    fn make_request(has_task: bool) -> McpRequest {
+        McpRequest {
+            id: Some(JsonRpcId::Number(1)),
+            method: "tools/call".to_string(),
+            params: Some(Arc::new(serde_json::json!({"name": "deploy"}))),
+            task_metadata: if has_task {
+                Some(TaskMetadata { ttl: None })
+            } else {
+                None
+            },
+            received_at: Instant::now(),
+            correlation_id: fast_correlation_id(),
         }
     }
 
-    Ok(())
+    #[test]
+    fn test_blocking_mode_detected() {
+        // No task metadata + approval engine available → blocking mode (true)
+        let mut req = make_request(false);
+        let result = validate_task_metadata(
+            &mut req,
+            &Action::Approve,
+            "deploy",
+            false, // upstream_supports_tasks
+            true,  // has_approval_engine
+        );
+        assert_eq!(result.unwrap(), true);
+    }
+
+    #[test]
+    fn test_async_mode_with_task() {
+        // Task metadata present → async SEP-1686 mode (false)
+        let mut req = make_request(true);
+        let result = validate_task_metadata(
+            &mut req,
+            &Action::Approve,
+            "deploy",
+            false, // upstream_supports_tasks
+            true,  // has_approval_engine
+        );
+        assert_eq!(result.unwrap(), false);
+    }
+
+    #[test]
+    fn test_no_engine_rejects() {
+        // No task metadata + no approval engine → TaskRequired error
+        let mut req = make_request(false);
+        let result = validate_task_metadata(
+            &mut req,
+            &Action::Approve,
+            "deploy",
+            false, // upstream_supports_tasks
+            false, // has_approval_engine
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ThoughtGateError::TaskRequired { .. }));
+    }
+
+    #[test]
+    fn test_policy_action_also_detects_blocking() {
+        // Action::Policy behaves same as Action::Approve for mode detection
+        let mut req = make_request(false);
+        let result = validate_task_metadata(&mut req, &Action::Policy, "analyze", false, true);
+        assert_eq!(result.unwrap(), true);
+    }
+
+    #[test]
+    fn test_forward_action_returns_false() {
+        // Forward action never triggers blocking mode
+        let mut req = make_request(false);
+        let result = validate_task_metadata(&mut req, &Action::Forward, "ping", true, true);
+        assert_eq!(result.unwrap(), false);
+    }
+
+    #[test]
+    fn test_forward_strips_task_when_upstream_unsupported() {
+        // Forward + task metadata + upstream doesn't support → strip metadata
+        let mut req = make_request(true);
+        assert!(req.task_metadata.is_some());
+
+        let result = validate_task_metadata(
+            &mut req,
+            &Action::Forward,
+            "ping",
+            false, // upstream does NOT support tasks
+            false,
+        );
+        assert_eq!(result.unwrap(), false);
+        assert!(
+            req.task_metadata.is_none(),
+            "task metadata should be stripped"
+        );
+    }
+
+    #[test]
+    fn test_forward_preserves_task_when_upstream_supports() {
+        // Forward + task metadata + upstream supports → keep metadata
+        let mut req = make_request(true);
+        assert!(req.task_metadata.is_some());
+
+        let result = validate_task_metadata(
+            &mut req,
+            &Action::Forward,
+            "ping",
+            true, // upstream supports tasks
+            false,
+        );
+        assert_eq!(result.unwrap(), false);
+        assert!(
+            req.task_metadata.is_some(),
+            "task metadata should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_deny_action_returns_false() {
+        let mut req = make_request(false);
+        let result = validate_task_metadata(&mut req, &Action::Deny, "dangerous", false, true);
+        assert_eq!(result.unwrap(), false);
+    }
 }
