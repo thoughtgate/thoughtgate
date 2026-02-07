@@ -222,6 +222,16 @@ pub enum JsonRpcId {
     Null,
 }
 
+impl std::fmt::Display for JsonRpcId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JsonRpcId::Number(n) => write!(f, "{n}"),
+            JsonRpcId::String(s) => f.write_str(s),
+            JsonRpcId::Null => f.write_str("null"),
+        }
+    }
+}
+
 impl Serialize for JsonRpcId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -763,6 +773,29 @@ fn extract_task_metadata(params: &Option<Value>) -> Option<TaskMetadata> {
         .map(|ms| std::time::Duration::from_millis(ms.min(MAX_TTL_MS)));
 
     Some(TaskMetadata { ttl })
+}
+
+/// Format a complete JSON-RPC error response as a string.
+///
+/// Used by the CLI stdio transport for deny responses where the full
+/// `JsonRpcResponse` serialization pipeline is needed but the caller
+/// only needs the final JSON string.
+///
+/// Implements: REQ-CORE-008/F-016
+pub fn error_response_string(
+    id: &JsonRpcId,
+    error: &ThoughtGateError,
+    correlation_id: &str,
+) -> String {
+    let jsonrpc_error = error.to_jsonrpc_error(correlation_id);
+    let response = JsonRpcResponse::error(Some(id.clone()), jsonrpc_error);
+    serde_json::to_string(&response).unwrap_or_else(|_| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":{},"message":"{}"}}}}"#,
+            error.to_jsonrpc_code(),
+            error
+        )
+    })
 }
 
 #[cfg(test)]

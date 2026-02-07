@@ -89,8 +89,8 @@ pub(super) fn is_passthrough(method: &str) -> bool {
 /// Format a JSON-RPC error response for a denied message.
 ///
 /// Returns a complete NDJSON line (with trailing newline) containing a
-/// JSON-RPC 2.0 error response with code -32003 (PolicyDenied) and
-/// ThoughtGate denial details in the `data` field.
+/// JSON-RPC 2.0 error response with code -32003 (PolicyDenied).
+/// Delegates to core's `error_response_string` for consistent wire format.
 ///
 /// Implements: REQ-CORE-008/F-012
 pub(super) fn format_deny_response(
@@ -98,28 +98,13 @@ pub(super) fn format_deny_response(
     server_id: &str,
     policy_id: Option<&str>,
 ) -> String {
-    let id_json = serde_json::to_value(id).unwrap_or(serde_json::Value::Null);
-    let mut data = serde_json::json!({
-        "server_id": server_id,
-    });
-    if let Some(pid) = policy_id {
-        data["policy_id"] = serde_json::Value::String(pid.to_string());
-    }
-    let response = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id_json,
-        "error": {
-            "code": -32003,
-            "message": "Denied by ThoughtGate policy",
-            "data": data,
-        }
-    });
-    // Static fallback: the json!() macro above should always serialize, but
-    // guard against truly pathological id values. An empty string + '\n' would
-    // be an unparseable NDJSON line for the agent.
-    let mut line = serde_json::to_string(&response).unwrap_or_else(|_| {
-        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32003,"message":"Denied by ThoughtGate policy"}}"#.to_string()
-    });
+    let error = thoughtgate_core::error::ThoughtGateError::PolicyDenied {
+        tool: String::new(),
+        policy_id: policy_id.map(String::from),
+        reason: None,
+    };
+    let mut line =
+        thoughtgate_core::transport::jsonrpc::error_response_string(id, &error, server_id);
     line.push('\n');
     line
 }
@@ -181,12 +166,10 @@ pub(super) fn id_from_kind(kind: &JsonRpcMessageKind) -> Option<JsonRpcId> {
 }
 
 /// Convert a JsonRpcId to a string for span attributes.
+///
+/// Delegates to the `Display` impl on `JsonRpcId`.
 pub(super) fn jsonrpc_id_to_string(id: &JsonRpcId) -> String {
-    match id {
-        JsonRpcId::Number(n) => n.to_string(),
-        JsonRpcId::String(s) => s.clone(),
-        JsonRpcId::Null => "null".to_string(),
-    }
+    id.to_string()
 }
 
 /// Extract the tool name from a parsed message's params, if it's a tools/call.

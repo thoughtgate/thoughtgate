@@ -934,40 +934,12 @@ impl CedarEngine {
                 let annotations = Self::parse_annotations(&policies);
                 // Use the retried source on success
                 drop(source);
-                return {
-                    let policy_count = policies.policies().count();
-                    self.policies.store(Arc::new(policies));
-                    self.annotations.store(Arc::new(annotations));
-                    self.source.store(Arc::new(retry_source));
-                    self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
-                    self.stats
-                        .last_reload
-                        .store(Arc::new(Some(std::time::SystemTime::now())));
-                    // Update MG-003 gauge
-                    if let Some(ref metrics) = self.tg_metrics {
-                        metrics.cedar_policies_loaded.set(policy_count as i64);
-                    }
-                    info!("Policies reloaded successfully (after retry)");
-                    Ok(())
-                };
+                self.apply_reload(policies, annotations, retry_source);
+                return Ok(());
             }
         };
 
-        // Atomic swap
-        let policy_count = new_policies.policies().count();
-        self.policies.store(Arc::new(new_policies));
-        self.annotations.store(Arc::new(new_annotations));
-        self.source.store(Arc::new(source));
-        self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .last_reload
-            .store(Arc::new(Some(std::time::SystemTime::now())));
-        // Update MG-003 gauge
-        if let Some(ref metrics) = self.tg_metrics {
-            metrics.cedar_policies_loaded.set(policy_count as i64);
-        }
-
-        info!("Policies reloaded successfully");
+        self.apply_reload(new_policies, new_annotations, source);
         Ok(())
     }
 
@@ -979,6 +951,28 @@ impl CedarEngine {
     /// ConfigMap, Environment variable, or embedded defaults.
     pub fn policy_source(&self) -> PolicySource {
         (**self.source.load()).clone()
+    }
+
+    /// Atomically apply a policy reload: swap policies, annotations, source,
+    /// bump counters, update metrics, and log success.
+    fn apply_reload(
+        &self,
+        policies: PolicySet,
+        annotations: PolicyAnnotations,
+        source: PolicySource,
+    ) {
+        let policy_count = policies.policies().count();
+        self.policies.store(Arc::new(policies));
+        self.annotations.store(Arc::new(annotations));
+        self.source.store(Arc::new(source));
+        self.stats.reload_count.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_reload
+            .store(Arc::new(Some(std::time::SystemTime::now())));
+        if let Some(ref metrics) = self.tg_metrics {
+            metrics.cedar_policies_loaded.set(policy_count as i64);
+        }
+        info!("Policies reloaded successfully");
     }
 }
 

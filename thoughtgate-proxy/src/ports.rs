@@ -103,6 +103,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_outbound_port_from_env() {
         // Test env var override
         unsafe {
@@ -115,6 +116,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_admin_port_from_env() {
         // Test env var override
         unsafe {
@@ -127,6 +129,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_invalid_env_var_falls_back_to_default() {
         // Invalid port value should fall back to default
         unsafe {

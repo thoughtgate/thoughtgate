@@ -4,7 +4,10 @@
 
 use thoughtgate_core::config::MatchResult;
 use thoughtgate_core::error::ThoughtGateError;
-use thoughtgate_core::policy::principal::infer_principal;
+use thoughtgate_core::governance::evaluator::{
+    extract_arguments, extract_resource_name, method_requires_gates,
+};
+use thoughtgate_core::policy::principal::infer_principal_or_error;
 use thoughtgate_core::policy::{
     CedarContext, CedarDecision, CedarRequest, CedarResource, TimeContext,
 };
@@ -15,51 +18,6 @@ use thoughtgate_core::transport::jsonrpc::{JsonRpcResponse, McpRequest};
 use tracing::{debug, warn};
 
 use super::McpState;
-
-/// Extract the governable resource name from an MCP request.
-///
-/// Implements: REQ-CORE-003/F-002 (Method Routing)
-///
-/// Returns the name/identifier that governance rules should match against:
-/// - `tools/call` → params.name (tool name)
-/// - `resources/read` → params.uri (resource URI)
-/// - `resources/subscribe` → params.uri (resource URI)
-/// - `prompts/get` → params.name (prompt name)
-///
-/// Returns `None` for list methods or unsupported methods.
-pub(crate) fn extract_governable_name(request: &McpRequest) -> Option<String> {
-    let params = request.params.as_ref()?;
-
-    match request.method.as_str() {
-        "tools/call" => params.get("name")?.as_str().map(String::from),
-        "resources/read" | "resources/subscribe" => params.get("uri")?.as_str().map(String::from),
-        "prompts/get" => params.get("name")?.as_str().map(String::from),
-        // List methods don't have a specific resource to check
-        // They require response filtering instead (not implemented in v0.2)
-        _ => None,
-    }
-}
-
-/// Check if a method requires gate routing (vs pass-through).
-///
-/// Returns true if the method should go through the 4-gate model.
-pub(crate) fn method_requires_gates(method: &str) -> bool {
-    matches!(
-        method,
-        "tools/call" | "resources/read" | "resources/subscribe" | "prompts/get"
-    )
-}
-
-/// Extract tool arguments from a tools/call request.
-///
-/// Implements: REQ-GOV-002/F-001 (Task creation with tool arguments)
-pub(crate) fn extract_tool_arguments(request: &McpRequest) -> serde_json::Value {
-    request
-        .params
-        .as_ref()
-        .and_then(|p| p.get("arguments").cloned())
-        .unwrap_or(serde_json::json!({}))
-}
 
 /// Get source ID for the request.
 ///
@@ -89,7 +47,7 @@ pub(crate) async fn evaluate_with_cedar(
     gate_outcomes: Option<&mut GateOutcomes>,
 ) -> Result<JsonRpcResponse, ThoughtGateError> {
     // List methods bypass Cedar - they don't reference a specific resource
-    if !method_requires_gates(&request.method) {
+    if !method_requires_gates(request.method.as_str()) {
         debug!(
             method = %request.method,
             "Gate 3: Bypassing Cedar for list method - forwarding to upstream"
@@ -98,7 +56,7 @@ pub(crate) async fn evaluate_with_cedar(
     }
 
     // Extract resource name for all governable methods
-    let resource_name = match extract_governable_name(&request) {
+    let resource_name = match extract_resource_name(&request.method, request.params.as_deref()) {
         Some(name) => name,
         None => {
             // Governable method without required identifier is invalid params
@@ -117,16 +75,7 @@ pub(crate) async fn evaluate_with_cedar(
     };
 
     // Infer principal from environment (uses spawn_blocking for file I/O)
-    let policy_principal = tokio::task::spawn_blocking(infer_principal)
-        .await
-        .map_err(|e| ThoughtGateError::ServiceUnavailable {
-            reason: format!("Principal inference task failed: {}", e),
-        })?
-        .map_err(|e| ThoughtGateError::PolicyDenied {
-            tool: String::new(),
-            policy_id: None,
-            reason: Some(format!("Identity unavailable: {}", e)),
-        })?;
+    let policy_principal = infer_principal_or_error().await?;
 
     // Get policy_id and source_id from Gate 2 result, or use defaults
     let policy_id = match_result
@@ -140,7 +89,7 @@ pub(crate) async fn evaluate_with_cedar(
         CedarResource::ToolCall {
             name: resource_name.clone(),
             server: source_id.clone(),
-            arguments: extract_tool_arguments(&request),
+            arguments: extract_arguments(request.params.as_deref()),
         }
     } else {
         // resources/read, resources/subscribe, prompts/get use McpMethod
@@ -244,6 +193,7 @@ pub(crate) async fn evaluate_with_cedar(
                 .await;
             }
 
+            // TODO(v0.5): Deprecate config-less mode; route all evaluation through GovernanceEvaluator
             // Legacy mode (no Gate 2 result): Cedar permit → forward to upstream
             debug!(
                 resource = %resource_name,

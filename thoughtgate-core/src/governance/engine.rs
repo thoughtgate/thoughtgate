@@ -517,134 +517,25 @@ impl ApprovalEngine {
             },
         })?;
 
-        // Check task status
+        // Check task status — dispatch to status-specific handlers
         match task.status {
-            TaskStatus::InputRequired => {
-                // Still waiting for approval - return TaskResultNotReady per SEP-1686
+            TaskStatus::InputRequired | TaskStatus::Working => {
                 return Err(ThoughtGateError::TaskResultNotReady {
                     task_id: task_id.to_string(),
                 });
             }
             TaskStatus::Executing => {
-                // Already being executed (approval was recorded, now executing)
-                // This is the "approved" state - continue below
+                // Approved, continue to execution below
             }
             TaskStatus::Rejected => {
                 return Err(ThoughtGateError::ApprovalRejected {
                     tool: task.original_request.name.clone(),
                     rejected_by: task.approval.as_ref().map(|a| a.decided_by.clone()),
-                    workflow: None, // v0.2: workflow not tracked
+                    workflow: None,
                 });
             }
             TaskStatus::Expired => {
-                // Handle timeout based on task's captured on_timeout (not current config)
-                // This ensures "complete with state at decision time" semantics
-                match task.on_timeout {
-                    TimeoutAction::Deny => {
-                        return Err(ThoughtGateError::ApprovalTimeout {
-                            tool: task.original_request.name.clone(),
-                            timeout_secs: task.ttl.as_secs(),
-                            workflow: None, // v0.2: workflow not tracked
-                        });
-                    }
-                    TimeoutAction::Approve => {
-                        // Auto-approve: create synthetic approval and execute directly
-                        // Note: Expired is terminal, so we can't transition. Instead,
-                        // we create a synthetic approval record and execute the pipeline.
-
-                        // Prevent concurrent execution - ensures at-most-once semantics
-                        if !self.executing.insert(task_id.clone()) {
-                            return Err(ThoughtGateError::ServiceUnavailable {
-                                reason: "Task execution already in progress".to_string(),
-                            });
-                        }
-                        // RAII guard ensures executing set is cleaned up on all exit
-                        // paths (success, error, timeout, panic)
-                        let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
-
-                        warn!(
-                            task_id = %task_id,
-                            "Auto-approving timed-out task (on_timeout: approve)"
-                        );
-
-                        // Create synthetic approval record for pipeline execution
-                        let now = chrono::Utc::now();
-                        let synthetic_approval = ApprovalRecord {
-                            decision: ApprovalDecision::Approved,
-                            decided_by: "system:auto-approve".to_string(),
-                            decided_at: now,
-                            approval_valid_until: now
-                                + chrono::Duration::from_std(self.config.execution_timeout)
-                                    .unwrap_or(chrono::Duration::zero()),
-                            metadata: Some(serde_json::json!({
-                                "auto_approve": true,
-                                "reason": "timeout with on_timeout: approve"
-                            })),
-                        };
-
-                        // Clone task with Executing status so pipeline validation passes.
-                        // The pipeline's validate_approval() requires TaskStatus::Executing,
-                        // but auto-approved tasks are in Expired (terminal) state.
-                        let mut auto_approved_task = Task::clone(&task);
-                        auto_approved_task.status = TaskStatus::Executing;
-
-                        // Execute the pipeline with timeout protection
-                        let pipeline_result = match tokio::time::timeout(
-                            self.config.execution_timeout,
-                            self.pipeline
-                                .execute_approved(&auto_approved_task, &synthetic_approval),
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_elapsed) => {
-                                error!(
-                                    task_id = %task_id,
-                                    timeout_secs = self.config.execution_timeout.as_secs(),
-                                    "Auto-approved task execution timed out"
-                                );
-                                return Err(ThoughtGateError::ServiceUnavailable {
-                                    reason: format!(
-                                        "Auto-approved task execution timed out after {}s",
-                                        self.config.execution_timeout.as_secs()
-                                    ),
-                                });
-                            }
-                        };
-                        // Guard drops here, cleaning up executing set
-
-                        return match pipeline_result {
-                            PipelineResult::Success { result } => {
-                                // Record result on the expired task for audit trail.
-                                // We can't complete() since Expired is terminal, but we
-                                // record the result and approval to close the audit gap.
-                                if let Err(e) = self.task_store.record_auto_approve_result(
-                                    task_id,
-                                    result.clone(),
-                                    synthetic_approval.clone(),
-                                ) {
-                                    warn!(
-                                        task_id = %task_id,
-                                        error = %e,
-                                        "Failed to record auto-approve result on task"
-                                    );
-                                }
-                                info!(
-                                    task_id = %task_id,
-                                    "Auto-approved task executed successfully"
-                                );
-                                Ok(result)
-                            }
-                            PipelineResult::Failure { reason, .. } => {
-                                Err(ThoughtGateError::ServiceUnavailable {
-                                    reason: format!(
-                                        "Auto-approved task execution failed: {reason}"
-                                    ),
-                                })
-                            }
-                        };
-                    }
-                }
+                return self.handle_expired_task(task_id, &task).await;
             }
             TaskStatus::Failed => {
                 return Err(ThoughtGateError::ServiceUnavailable {
@@ -661,7 +552,6 @@ impl ApprovalEngine {
                 });
             }
             TaskStatus::Completed => {
-                // Already completed - return cached result
                 if let Some(ref result) = task.result {
                     return Ok(result.clone());
                 }
@@ -669,29 +559,17 @@ impl ApprovalEngine {
                     reason: "Task completed but no result available".to_string(),
                 });
             }
-            TaskStatus::Working => {
-                // Still in pre-approval phase - return TaskResultNotReady per SEP-1686
-                return Err(ThoughtGateError::TaskResultNotReady {
-                    task_id: task_id.to_string(),
-                });
-            }
         }
 
-        // At this point, task is in Executing state (approval was recorded)
-        // The task was already transitioned to Executing by record_approval()
-
-        // Prevent concurrent execution - ensures at-most-once semantics
-        // If another call is already executing this task, return "in progress" error
+        // At this point, task is in Executing state (approval was recorded).
+        // Acquire at-most-once execution guard.
         if !self.executing.insert(task_id.clone()) {
             return Err(ThoughtGateError::ServiceUnavailable {
                 reason: "Task execution already in progress".to_string(),
             });
         }
-        // RAII guard ensures executing set is cleaned up on all exit
-        // paths (success, error, timeout, panic)
         let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
 
-        // Execute the full pipeline (with approval record)
         let approval =
             task.approval
                 .as_ref()
@@ -699,9 +577,117 @@ impl ApprovalEngine {
                     reason: "Task approved but no approval record".to_string(),
                 })?;
 
-        let pipeline_result = match tokio::time::timeout(
+        let pipeline_result = self
+            .run_pipeline_with_timeout(&task, approval, task_id)
+            .await;
+        self.handle_pipeline_result(pipeline_result, task_id, &task)
+    }
+
+    /// Handle an expired task — either deny or auto-approve based on `on_timeout`.
+    async fn handle_expired_task(
+        &self,
+        task_id: &TaskId,
+        task: &Task,
+    ) -> Result<ToolCallResult, ThoughtGateError> {
+        match task.on_timeout {
+            TimeoutAction::Deny => Err(ThoughtGateError::ApprovalTimeout {
+                tool: task.original_request.name.clone(),
+                timeout_secs: task.ttl.as_secs(),
+                workflow: None,
+            }),
+            TimeoutAction::Approve => {
+                // Auto-approve: create synthetic approval and execute directly.
+                // Expired is terminal, so we can't transition — instead we
+                // create a synthetic approval record and execute the pipeline.
+                if !self.executing.insert(task_id.clone()) {
+                    return Err(ThoughtGateError::ServiceUnavailable {
+                        reason: "Task execution already in progress".to_string(),
+                    });
+                }
+                let _guard = ExecutingGuard::new(task_id.clone(), &self.executing);
+
+                warn!(
+                    task_id = %task_id,
+                    "Auto-approving timed-out task (on_timeout: approve)"
+                );
+
+                let now = chrono::Utc::now();
+                let synthetic_approval = ApprovalRecord {
+                    decision: ApprovalDecision::Approved,
+                    decided_by: "system:auto-approve".to_string(),
+                    decided_at: now,
+                    approval_valid_until: now
+                        + chrono::Duration::from_std(self.config.execution_timeout)
+                            .unwrap_or(chrono::Duration::zero()),
+                    metadata: Some(serde_json::json!({
+                        "auto_approve": true,
+                        "reason": "timeout with on_timeout: approve"
+                    })),
+                };
+
+                // Clone task with Executing status so pipeline validation passes.
+                let mut auto_approved_task = Task::clone(task);
+                auto_approved_task.status = TaskStatus::Executing;
+
+                let pipeline_result = match tokio::time::timeout(
+                    self.config.execution_timeout,
+                    self.pipeline
+                        .execute_approved(&auto_approved_task, &synthetic_approval),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        error!(
+                            task_id = %task_id,
+                            timeout_secs = self.config.execution_timeout.as_secs(),
+                            "Auto-approved task execution timed out"
+                        );
+                        return Err(ThoughtGateError::ServiceUnavailable {
+                            reason: format!(
+                                "Auto-approved task execution timed out after {}s",
+                                self.config.execution_timeout.as_secs()
+                            ),
+                        });
+                    }
+                };
+
+                match pipeline_result {
+                    PipelineResult::Success { result } => {
+                        if let Err(e) = self.task_store.record_auto_approve_result(
+                            task_id,
+                            result.clone(),
+                            synthetic_approval.clone(),
+                        ) {
+                            warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "Failed to record auto-approve result on task"
+                            );
+                        }
+                        info!(task_id = %task_id, "Auto-approved task executed successfully");
+                        Ok(result)
+                    }
+                    PipelineResult::Failure { reason, .. } => {
+                        Err(ThoughtGateError::ServiceUnavailable {
+                            reason: format!("Auto-approved task execution failed: {reason}"),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute the approval pipeline with timeout protection.
+    async fn run_pipeline_with_timeout(
+        &self,
+        task: &Task,
+        approval: &ApprovalRecord,
+        task_id: &TaskId,
+    ) -> PipelineResult {
+        match tokio::time::timeout(
             self.config.execution_timeout,
-            self.pipeline.execute_approved(&task, approval),
+            self.pipeline.execute_approved(task, approval),
         )
         .await
         {
@@ -721,16 +707,21 @@ impl ApprovalEngine {
                     retriable: true,
                 }
             }
-        };
+        }
+    }
 
-        // Handle pipeline result and record governance metrics
+    /// Handle the pipeline result: record metrics, update task store, map errors.
+    fn handle_pipeline_result(
+        &self,
+        pipeline_result: PipelineResult,
+        task_id: &TaskId,
+        task: &Task,
+    ) -> Result<ToolCallResult, ThoughtGateError> {
         match pipeline_result {
             PipelineResult::Success { result } => {
-                // Store result and mark complete
                 if let Err(e) = self.task_store.complete(task_id, result.clone()) {
                     error!(task_id = %task_id, error = %e, "Failed to complete task");
                 }
-                // Record MC-008: tasks_completed_total (prometheus-client)
                 if let Some(ref metrics) = self.tg_metrics {
                     metrics.record_task_completed("approval", "completed");
                 }
@@ -741,7 +732,6 @@ impl ApprovalEngine {
                 reason,
                 retriable,
             } => {
-                // Record failure (clone stage since we need it for error mapping)
                 let failure = FailureInfo {
                     stage: stage.clone(),
                     reason: reason.clone(),
@@ -750,48 +740,55 @@ impl ApprovalEngine {
                 if let Err(e) = self.task_store.fail(task_id, failure) {
                     error!(task_id = %task_id, error = %e, "Failed to record task failure");
                 }
-                // Record MC-008: tasks_completed_total (prometheus-client)
                 if let Some(ref metrics) = self.tg_metrics {
                     metrics.record_task_completed("approval", "failed");
                 }
+                self.map_pipeline_failure(stage, reason, task)
+            }
+        }
+    }
 
-                // Map failure to appropriate error
-                let tool_name = task.original_request.name.clone();
-                match stage {
-                    FailureStage::ApprovalTimeout => Err(ThoughtGateError::ApprovalTimeout {
-                        tool: tool_name,
-                        timeout_secs: self.config.approval_timeout.as_secs(),
-                        workflow: None, // v0.2: workflow not tracked
-                    }),
-                    FailureStage::ApprovalRejected => Err(ThoughtGateError::ApprovalRejected {
-                        tool: tool_name,
-                        rejected_by: task.approval.as_ref().map(|a| a.decided_by.clone()),
-                        workflow: None, // v0.2: workflow not tracked
-                    }),
-                    FailureStage::PolicyDrift => Err(ThoughtGateError::PolicyDenied {
-                        tool: tool_name,
-                        policy_id: None, // v0.2: policy_id not tracked
-                        reason: Some(reason),
-                    }),
-                    FailureStage::TransformDrift => Err(ThoughtGateError::ServiceUnavailable {
-                        reason: format!("Transform drift: {reason}"),
-                    }),
-                    FailureStage::UpstreamError => {
-                        if reason.contains("timeout") || reason.contains("timed out") {
-                            Err(ThoughtGateError::UpstreamTimeout {
-                                url: "unknown".to_string(), // URL not available in failure info
-                                timeout_secs: self.config.execution_timeout.as_secs(),
-                            })
-                        } else {
-                            Err(ThoughtGateError::UpstreamError {
-                                code: -32002,
-                                message: reason,
-                            })
-                        }
-                    }
-                    _ => Err(ThoughtGateError::ServiceUnavailable { reason }),
+    /// Map a pipeline failure stage to the appropriate `ThoughtGateError`.
+    fn map_pipeline_failure(
+        &self,
+        stage: FailureStage,
+        reason: String,
+        task: &Task,
+    ) -> Result<ToolCallResult, ThoughtGateError> {
+        let tool_name = task.original_request.name.clone();
+        match stage {
+            FailureStage::ApprovalTimeout => Err(ThoughtGateError::ApprovalTimeout {
+                tool: tool_name,
+                timeout_secs: self.config.approval_timeout.as_secs(),
+                workflow: None,
+            }),
+            FailureStage::ApprovalRejected => Err(ThoughtGateError::ApprovalRejected {
+                tool: tool_name,
+                rejected_by: task.approval.as_ref().map(|a| a.decided_by.clone()),
+                workflow: None,
+            }),
+            FailureStage::PolicyDrift => Err(ThoughtGateError::PolicyDenied {
+                tool: tool_name,
+                policy_id: None,
+                reason: Some(reason),
+            }),
+            FailureStage::TransformDrift => Err(ThoughtGateError::ServiceUnavailable {
+                reason: format!("Transform drift: {reason}"),
+            }),
+            FailureStage::UpstreamError => {
+                if reason.contains("timeout") || reason.contains("timed out") {
+                    Err(ThoughtGateError::UpstreamTimeout {
+                        url: "unknown".to_string(),
+                        timeout_secs: self.config.execution_timeout.as_secs(),
+                    })
+                } else {
+                    Err(ThoughtGateError::UpstreamError {
+                        code: -32002,
+                        message: reason,
+                    })
                 }
             }
+            _ => Err(ThoughtGateError::ServiceUnavailable { reason }),
         }
     }
 

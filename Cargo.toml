@@ -24,6 +24,13 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 async-trait = "0.1"
 arc-swap = "1.8.0"
 tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+axum = "0.8"
+opentelemetry = { version = "=0.31.0", features = ["trace"] }
+opentelemetry_sdk = { version = "=0.31.0", features = ["rt-tokio", "trace"] }
+prometheus-client = "0.24.0"
+serde-saphyr = "0.0.17"
+serial_test = "3.0"
 
 [profile.release]
 opt-level = 3

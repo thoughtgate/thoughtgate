@@ -8,18 +8,19 @@ use thoughtgate_core::config::MatchResult;
 use thoughtgate_core::error::ThoughtGateError;
 use thoughtgate_core::governance::api::{GovernanceEvaluateRequest, MessageType};
 use thoughtgate_core::governance::evaluator::DenySource;
+use thoughtgate_core::governance::evaluator::{extract_arguments, extract_resource_name};
 use thoughtgate_core::governance::{GovernanceDecision, Principal, ToolCallRequest};
-use thoughtgate_core::policy::principal::infer_principal;
+use thoughtgate_core::policy::principal::{infer_principal_optional, infer_principal_or_error};
 use thoughtgate_core::profile::Profile;
 use thoughtgate_core::telemetry::{
     GateOutcomes, GatewayDecisionSpanData, finish_gateway_decision_span,
     start_gateway_decision_span,
 };
 use thoughtgate_core::transport::jsonrpc::{JsonRpcId, JsonRpcResponse, McpRequest};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::McpState;
-use super::cedar_eval::{extract_governable_name, extract_tool_arguments, get_source_id};
+use super::cedar_eval::get_source_id;
 
 /// Route a tools/call request through the 4-gate model.
 ///
@@ -65,7 +66,7 @@ pub(crate) async fn route_through_gates(
         })?;
 
     // Extract resource name for SEP-1686 validation and logging
-    let resource_name = match extract_governable_name(&request) {
+    let resource_name = match extract_resource_name(&request.method, request.params.as_deref()) {
         Some(name) => name,
         None => {
             let field = match request.method.as_str() {
@@ -115,22 +116,14 @@ pub(crate) async fn route_through_gates(
     // ========================================================================
     // Infer per-request principal (K8s service account detection)
     // ========================================================================
-    let principal = match tokio::task::spawn_blocking(infer_principal).await {
-        Ok(Ok(policy_principal)) => Some(Principal::from_policy(
-            &policy_principal.app_name,
-            &policy_principal.namespace,
-            &policy_principal.service_account,
-            policy_principal.roles.clone(),
-        )),
-        Ok(Err(e)) => {
-            warn!(error = %e, "Principal inference failed, using evaluator default");
-            None
-        }
-        Err(e) => {
-            warn!(error = %e, "Principal inference task panicked, using evaluator default");
-            None
-        }
-    };
+    let principal = infer_principal_optional().await.map(|p| {
+        Principal::from_policy(
+            &p.app_name,
+            &p.namespace,
+            &p.service_account,
+            p.roles.clone(),
+        )
+    });
 
     // ========================================================================
     // Build GovernanceEvaluateRequest and delegate to evaluator
@@ -229,16 +222,7 @@ pub(crate) async fn start_approval_flow(
             })?;
 
     // Infer principal from environment (uses spawn_blocking for file I/O)
-    let policy_principal = tokio::task::spawn_blocking(infer_principal)
-        .await
-        .map_err(|e| ThoughtGateError::ServiceUnavailable {
-            reason: format!("Principal inference task failed: {}", e),
-        })?
-        .map_err(|e| ThoughtGateError::PolicyDenied {
-            tool: String::new(),
-            policy_id: None,
-            reason: Some(format!("Identity unavailable: {}", e)),
-        })?;
+    let policy_principal = infer_principal_or_error().await?;
 
     // Create ToolCallRequest for the approval engine
     // Transport and governance now share the same JsonRpcId type
@@ -247,7 +231,7 @@ pub(crate) async fn start_approval_flow(
     let tool_request = ToolCallRequest {
         method: request.method.clone(),
         name: tool_name.to_string(),
-        arguments: extract_tool_arguments(&request),
+        arguments: extract_arguments(request.params.as_deref()),
         mcp_request_id,
     };
 

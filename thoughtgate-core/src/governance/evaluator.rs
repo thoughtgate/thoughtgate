@@ -178,7 +178,9 @@ impl GovernanceEvaluator {
     /// The scheduler is set after construction because it may depend on
     /// whether approval workflows are needed (determined after config load).
     pub fn set_scheduler(&self, scheduler: Arc<PollingScheduler>) {
-        let _ = self.scheduler.set(scheduler);
+        if self.scheduler.set(scheduler).is_err() {
+            debug!("Scheduler already initialized, ignoring duplicate set_scheduler call");
+        }
     }
 
     /// Evaluate a governance request through Gates 1–4.
@@ -226,7 +228,7 @@ impl GovernanceEvaluator {
         }
 
         // ── Extract resource name from params ───────────────────────────
-        let resource_name = match extract_resource_name(&req.method, &req.params) {
+        let resource_name = match extract_resource_name(&req.method, req.params.as_ref()) {
             Some(name) => name,
             None => {
                 // Governable method without a resource identifier — forward.
@@ -413,7 +415,7 @@ impl GovernanceEvaluator {
             CedarResource::ToolCall {
                 name: resource_name.to_string(),
                 server: req.server_id.clone(),
-                arguments: extract_arguments(&req.params),
+                arguments: extract_arguments(req.params.as_ref()),
             }
         } else {
             CedarResource::McpMethod {
@@ -551,7 +553,7 @@ impl GovernanceEvaluator {
         let tool_request = ToolCallRequest {
             method: req.method.clone(),
             name: resource_name.to_string(),
-            arguments: extract_arguments(&req.params),
+            arguments: extract_arguments(req.params.as_ref()),
             mcp_request_id,
         };
 
@@ -636,7 +638,7 @@ impl GovernanceEvaluator {
             let approval_req = ApprovalRequest {
                 task_id: task_id.clone(),
                 tool_name: resource_name.to_string(),
-                tool_arguments: extract_arguments(&req.params),
+                tool_arguments: extract_arguments(req.params.as_ref()),
                 principal: principal.clone(),
                 expires_at: task.expires_at,
                 created_at: Utc::now(),
@@ -650,11 +652,13 @@ impl GovernanceEvaluator {
                     error = %e,
                     "Gate 4: failed to submit to scheduler — denying"
                 );
-                let _ = self.task_store.transition(
+                if let Err(te) = self.task_store.transition(
                     &task_id,
                     TaskStatus::Failed,
                     Some(format!("Scheduler submission failed: {e}")),
-                );
+                ) {
+                    warn!(task_id = %task_id, error = %te, "Failed to transition task to Failed after scheduler submission error");
+                }
                 return self.deny(
                     Some(format!("Approval submission failed: {e}")),
                     policy_id,
@@ -744,7 +748,7 @@ impl GovernanceEvaluator {
 ///
 /// All other methods (list methods, initialize, notifications, etc.)
 /// are forwarded without governance evaluation.
-fn method_requires_gates(method: &str) -> bool {
+pub fn method_requires_gates(method: &str) -> bool {
     matches!(
         method,
         "tools/call" | "resources/read" | "resources/subscribe" | "prompts/get"
@@ -753,12 +757,11 @@ fn method_requires_gates(method: &str) -> bool {
 
 /// Extract the governable resource name from JSON-RPC params.
 ///
-/// Ported from `mcp_handler.rs::extract_governable_name`, adapted to
-/// operate on `&Option<Value>` instead of `&McpRequest`.
+/// Returns the tool name, resource URI, or prompt name depending on the method.
 ///
 /// Implements: REQ-CORE-008/F-016
-fn extract_resource_name(method: &str, params: &Option<serde_json::Value>) -> Option<String> {
-    let params = params.as_ref()?;
+pub fn extract_resource_name(method: &str, params: Option<&serde_json::Value>) -> Option<String> {
+    let params = params?;
 
     match method {
         "tools/call" => params.get("name")?.as_str().map(String::from),
@@ -770,10 +773,11 @@ fn extract_resource_name(method: &str, params: &Option<serde_json::Value>) -> Op
 
 /// Extract tool arguments from JSON-RPC params.
 ///
-/// Ported from `mcp_handler.rs::extract_tool_arguments`.
-fn extract_arguments(params: &Option<serde_json::Value>) -> serde_json::Value {
+/// Returns `params.arguments` if present, otherwise an empty JSON object.
+///
+/// Implements: REQ-CORE-008/F-016
+pub fn extract_arguments(params: Option<&serde_json::Value>) -> serde_json::Value {
     params
-        .as_ref()
         .and_then(|p| p.get("arguments").cloned())
         .unwrap_or(serde_json::json!({}))
 }
@@ -1124,7 +1128,7 @@ governance:
     fn test_extract_resource_name_tools_call() {
         let params = Some(serde_json::json!({"name": "read_file", "arguments": {}}));
         assert_eq!(
-            extract_resource_name("tools/call", &params),
+            extract_resource_name("tools/call", params.as_ref()),
             Some("read_file".to_string())
         );
     }
@@ -1133,7 +1137,7 @@ governance:
     fn test_extract_resource_name_resources_read() {
         let params = Some(serde_json::json!({"uri": "file:///tmp/data.txt"}));
         assert_eq!(
-            extract_resource_name("resources/read", &params),
+            extract_resource_name("resources/read", params.as_ref()),
             Some("file:///tmp/data.txt".to_string())
         );
     }
@@ -1142,26 +1146,26 @@ governance:
     fn test_extract_resource_name_prompts_get() {
         let params = Some(serde_json::json!({"name": "code_review"}));
         assert_eq!(
-            extract_resource_name("prompts/get", &params),
+            extract_resource_name("prompts/get", params.as_ref()),
             Some("code_review".to_string())
         );
     }
 
     #[test]
     fn test_extract_resource_name_none_for_list() {
-        assert_eq!(extract_resource_name("tools/list", &None), None);
+        assert_eq!(extract_resource_name("tools/list", None), None);
     }
 
     #[test]
     fn test_extract_resource_name_none_for_missing_params() {
-        assert_eq!(extract_resource_name("tools/call", &None), None);
+        assert_eq!(extract_resource_name("tools/call", None), None);
     }
 
     #[test]
     fn test_extract_arguments() {
         let params = Some(serde_json::json!({"name": "x", "arguments": {"path": "/tmp"}}));
         assert_eq!(
-            extract_arguments(&params),
+            extract_arguments(params.as_ref()),
             serde_json::json!({"path": "/tmp"})
         );
     }
@@ -1169,7 +1173,7 @@ governance:
     #[test]
     fn test_extract_arguments_missing() {
         let params = Some(serde_json::json!({"name": "x"}));
-        assert_eq!(extract_arguments(&params), serde_json::json!({}));
+        assert_eq!(extract_arguments(params.as_ref()), serde_json::json!({}));
     }
 
     // ── EvalTrace + DenySource tests ─────────────────────────────────────

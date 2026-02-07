@@ -257,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_config_env_loading() {
         // Test 1: Default values (explicit construction to avoid env var pollution)
         let default_config = ProxyConfig::default();
@@ -278,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_amber_path_env_loading() {
         // Test Amber Path configuration from environment variables
         unsafe {

@@ -326,58 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Phase 8: Upstream connectivity check and health checker
     // Implements: REQ-CORE-005/F-001.4, F-008
-    let health_check_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("Failed to create health check client: {}", e))?;
-
-    if let Some(ref upstream_url) = cli_config.upstream_url {
-        // Check startup upstream connectivity if required
-        // Implements: REQ-CORE-005/F-001.4
-        if lifecycle.config().require_upstream_at_startup {
-            info!(upstream = %upstream_url, "Verifying upstream connectivity at startup");
-            match health_check_client.head(upstream_url).send().await {
-                Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
-                    lifecycle.update_upstream_health(true, None);
-                    info!(
-                        upstream = %upstream_url,
-                        status = %resp.status(),
-                        "Upstream connectivity verified"
-                    );
-                }
-                Ok(resp) => {
-                    return Err(format!(
-                        "Upstream {} returned non-success status {} at startup",
-                        upstream_url,
-                        resp.status()
-                    )
-                    .into());
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "Cannot connect to upstream {} at startup: {}",
-                        upstream_url, e
-                    )
-                    .into());
-                }
-            }
-        } else {
-            // Mark upstream as healthy initially (will be updated by health checker)
-            lifecycle.update_upstream_health(true, None);
-        }
-
-        // Spawn background upstream health checker
-        // Implements: REQ-CORE-005/F-008
-        lifecycle.spawn_upstream_health_checker(upstream_url.clone(), health_check_client);
-        info!(
-            upstream = %upstream_url,
-            interval_secs = lifecycle.config().upstream_health_interval.as_secs(),
-            "Background upstream health checker started"
-        );
-    } else {
-        // No upstream configured - mark as healthy (forward proxy mode)
-        lifecycle.update_upstream_health(true, None);
-    }
+    verify_upstream_connectivity(&cli_config, &lifecycle).await?;
 
     // Check startup timeout before marking ready
     // Implements: REQ-CORE-005/F-001 (startup timeout enforcement)
@@ -534,8 +483,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful shutdown sequence
     // Implements: REQ-CORE-005/F-004, F-005
-    // Note: admin_shutdown is the same token as shutdown, already cancelled by signal handler
+    graceful_shutdown(
+        shutdown_task_store,
+        &lifecycle,
+        telemetry_guard,
+        &tg_metrics,
+    )
+    .await
+}
 
+/// Verify upstream connectivity at startup and spawn background health checker.
+///
+/// Implements: REQ-CORE-005/F-001.4, F-008
+async fn verify_upstream_connectivity(
+    cli_config: &Config,
+    lifecycle: &Arc<LifecycleManager>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let health_check_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create health check client: {}", e))?;
+
+    if let Some(ref upstream_url) = cli_config.upstream_url {
+        if lifecycle.config().require_upstream_at_startup {
+            info!(upstream = %upstream_url, "Verifying upstream connectivity at startup");
+            match health_check_client.head(upstream_url).send().await {
+                Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+                    lifecycle.update_upstream_health(true, None);
+                    info!(
+                        upstream = %upstream_url,
+                        status = %resp.status(),
+                        "Upstream connectivity verified"
+                    );
+                }
+                Ok(resp) => {
+                    return Err(format!(
+                        "Upstream {} returned non-success status {} at startup",
+                        upstream_url,
+                        resp.status()
+                    )
+                    .into());
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Cannot connect to upstream {} at startup: {}",
+                        upstream_url, e
+                    )
+                    .into());
+                }
+            }
+        } else {
+            lifecycle.update_upstream_health(true, None);
+        }
+
+        lifecycle.spawn_upstream_health_checker(upstream_url.clone(), health_check_client);
+        info!(
+            upstream = %upstream_url,
+            interval_secs = lifecycle.config().upstream_health_interval.as_secs(),
+            "Background upstream health checker started"
+        );
+    } else {
+        lifecycle.update_upstream_health(true, None);
+    }
+
+    Ok(())
+}
+
+/// Execute the graceful shutdown sequence.
+///
+/// Implements: REQ-CORE-005/F-004, F-005
+async fn graceful_shutdown(
+    shutdown_task_store: Option<Arc<thoughtgate_core::governance::TaskStore>>,
+    lifecycle: &LifecycleManager,
+    telemetry_guard: thoughtgate_core::telemetry::TelemetryGuard,
+    tg_metrics: &thoughtgate_core::telemetry::ThoughtGateMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Fail all pending tasks before draining
     // Implements: REQ-CORE-005/F-004.2, F-006
     if let Some(ref task_store) = shutdown_task_store {
@@ -554,8 +576,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Waiting for active requests to drain"
     );
 
-    // Drain requests
-    // Implements: REQ-CORE-005/F-005
     let drain_result = lifecycle.drain_requests().await;
 
     // Flush pending telemetry spans before exit (REQ-OBS-002/B-OBS2-002)
@@ -563,21 +583,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %e, "Telemetry shutdown error (non-fatal)");
     }
 
-    // Mark as stopped
     lifecycle.mark_stopped();
 
-    // Exit with appropriate code
-    // Implements: REQ-CORE-005/F-004.6
     match drain_result {
         DrainResult::Complete => {
             info!("All requests drained, shutting down cleanly");
             Ok(())
         }
         DrainResult::Timeout { remaining } => {
-            // Record drain timeout metric (REQ-CORE-005/NFR-001)
             tg_metrics.record_drain_timeout();
-            // Return error instead of std::process::exit(1) to allow proper cleanup
-            // The caller (main) will convert this to an exit code
             Err(format!(
                 "Drain timeout exceeded with {} remaining requests",
                 remaining
@@ -695,10 +709,13 @@ where
 
         warn!("Rejected CONNECT request - ThoughtGate is a termination proxy");
 
-        let body = "405 Method Not Allowed\n\n\
+        let body = format!(
+            "405 Method Not Allowed\n\n\
                  ThoughtGate is a termination proxy for AI governance.\n\
                  It requires visibility into request headers and bodies.\n\n\
-                 Send plain HTTP requests to http://127.0.0.1:4141 instead.";
+                 Send plain HTTP requests to http://127.0.0.1:{} instead.",
+            thoughtgate_proxy::ports::DEFAULT_OUTBOUND_PORT
+        );
         let content_length = body.len();
         let response = format!(
             "HTTP/1.1 405 Method Not Allowed\r\n\

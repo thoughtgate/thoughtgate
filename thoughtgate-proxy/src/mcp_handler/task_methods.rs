@@ -4,7 +4,7 @@
 
 use thoughtgate_core::error::ThoughtGateError;
 use thoughtgate_core::governance::Principal;
-use thoughtgate_core::policy::principal::infer_principal;
+use thoughtgate_core::policy::principal::{infer_principal, infer_principal_or_error};
 use thoughtgate_core::protocol::{
     TasksCancelRequest, TasksGetRequest, TasksListRequest, TasksResultRequest,
 };
@@ -112,16 +112,7 @@ pub(crate) async fn handle_task_method(
             // request headers (e.g. X-Forwarded-User, mTLS client cert CN) instead
             // of the sidecar's own K8s identity. Without this, all tasks/list calls
             // in gateway mode would return the same principal's tasks.
-            let policy_principal = tokio::task::spawn_blocking(infer_principal)
-                .await
-                .map_err(|e| ThoughtGateError::ServiceUnavailable {
-                    reason: format!("Principal inference task failed: {}", e),
-                })?
-                .map_err(|e| ThoughtGateError::PolicyDenied {
-                    tool: String::new(),
-                    policy_id: None,
-                    reason: Some(format!("Identity unavailable: {}", e)),
-                })?;
+            let policy_principal = infer_principal_or_error().await?;
             let principal = Principal::from_policy(
                 &policy_principal.app_name,
                 &policy_principal.namespace,
@@ -215,9 +206,7 @@ async fn verify_task_principal(
 /// Convert TaskError to ThoughtGateError.
 ///
 /// Implements: REQ-CORE-004 (Error Handling)
-fn task_error_to_thoughtgate(
-    error: thoughtgate_core::governance::TaskError,
-) -> ThoughtGateError {
+fn task_error_to_thoughtgate(error: thoughtgate_core::governance::TaskError) -> ThoughtGateError {
     use thoughtgate_core::governance::TaskError;
 
     match error {

@@ -3,6 +3,7 @@
 //! Implements: REQ-POL-001/F-006 (Identity Inference)
 
 use super::{PolicyError, Principal};
+use crate::error::ThoughtGateError;
 use base64::Engine;
 use std::env;
 use std::fs;
@@ -30,6 +31,45 @@ pub fn infer_principal() -> Result<Principal, PolicyError> {
 
     // Try Kubernetes identity
     kubernetes_principal()
+}
+
+/// Infer principal asynchronously, failing with ThoughtGateError.
+///
+/// Wraps [`infer_principal`] in `spawn_blocking` and maps errors to
+/// `ServiceUnavailable` (join failure) or `PolicyDenied` (identity failure).
+///
+/// Implements: REQ-POL-001/F-006
+pub async fn infer_principal_or_error() -> Result<Principal, ThoughtGateError> {
+    tokio::task::spawn_blocking(infer_principal)
+        .await
+        .map_err(|e| ThoughtGateError::ServiceUnavailable {
+            reason: format!("Principal inference task failed: {e}"),
+        })?
+        .map_err(|e| ThoughtGateError::PolicyDenied {
+            tool: String::new(),
+            policy_id: None,
+            reason: Some(format!("Identity unavailable: {e}")),
+        })
+}
+
+/// Infer principal asynchronously, returning `None` on failure.
+///
+/// Wraps [`infer_principal`] in `spawn_blocking` and logs any failures
+/// at warn level. Used in contexts where principal is optional.
+///
+/// Implements: REQ-POL-001/F-006
+pub async fn infer_principal_optional() -> Option<Principal> {
+    match tokio::task::spawn_blocking(infer_principal).await {
+        Ok(Ok(p)) => Some(p),
+        Ok(Err(e)) => {
+            warn!(error = %e, "Principal inference failed");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "Principal inference task panicked");
+            None
+        }
+    }
 }
 
 /// Create principal for development mode.

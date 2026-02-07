@@ -345,9 +345,9 @@ mod tests {
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["id"], 42);
         assert_eq!(parsed["error"]["code"], -32003);
-        assert_eq!(parsed["error"]["message"], "Denied by ThoughtGate policy");
-        assert_eq!(parsed["error"]["data"]["server_id"], "filesystem");
-        assert_eq!(parsed["error"]["data"]["policy_id"], "pol-001");
+        // Core error format uses correlation_id (our server_id) and error_type
+        assert_eq!(parsed["error"]["data"]["correlation_id"], "filesystem");
+        assert_eq!(parsed["error"]["data"]["error_type"], "policy_denied");
     }
 
     #[test]
@@ -355,8 +355,7 @@ mod tests {
         let line = format_deny_response(&JsonRpcId::String("req-abc".to_string()), "github", None);
         let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(parsed["id"], "req-abc");
-        assert_eq!(parsed["error"]["data"]["server_id"], "github");
-        assert!(parsed["error"]["data"]["policy_id"].is_null());
+        assert_eq!(parsed["error"]["data"]["correlation_id"], "github");
     }
 
     #[test]
