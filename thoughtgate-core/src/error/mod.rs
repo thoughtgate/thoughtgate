@@ -226,6 +226,20 @@ pub enum ThoughtGateError {
     },
 
     // ═══════════════════════════════════════════════════════════
+    // Post-approval drift errors (from REQ-GOV-002)
+    // ═══════════════════════════════════════════════════════════
+    /// Cedar policy changed between approval and execution.
+    ///
+    /// Implements: REQ-CORE-004/§5.2 (-32011)
+    #[error("Policy changed since approval for tool '{tool}'")]
+    PolicyDrift {
+        /// The tool that was affected
+        tool: String,
+        /// The task ID for the approval
+        task_id: String,
+    },
+
+    // ═══════════════════════════════════════════════════════════
     // Operational errors
     // ═══════════════════════════════════════════════════════════
     /// Too many requests - rate limit exceeded.
@@ -290,6 +304,9 @@ impl ThoughtGateError {
             Self::ApprovalRejected { .. } => -32007,
             Self::ApprovalTimeout { .. } => -32008,
 
+            // ThoughtGate custom codes: Post-approval drift (-32011)
+            Self::PolicyDrift { .. } => -32011,
+
             // ThoughtGate custom codes: Rate limiting (-32009)
             Self::RateLimited { .. } => -32009,
 
@@ -328,6 +345,7 @@ impl ThoughtGateError {
             Self::TaskResultNotReady { .. } => "task_result_not_ready",
             Self::ApprovalRejected { .. } => "approval_rejected",
             Self::ApprovalTimeout { .. } => "approval_timeout",
+            Self::PolicyDrift { .. } => "policy_drift",
             Self::RateLimited { .. } => "rate_limited",
             Self::ServiceUnavailable { .. } => "service_unavailable",
             Self::InternalError { .. } => "internal_error",
@@ -362,6 +380,9 @@ impl ThoughtGateError {
             // Gate 4: Approval
             Self::ApprovalRejected { .. } | Self::ApprovalTimeout { .. } => Some("approval"),
 
+            // Post-approval: Policy Drift
+            Self::PolicyDrift { .. } => Some("policy"),
+
             // Non-gate errors
             _ => None,
         }
@@ -377,6 +398,7 @@ impl ThoughtGateError {
             | Self::PolicyDenied { tool, .. }
             | Self::ApprovalRejected { tool, .. }
             | Self::ApprovalTimeout { tool, .. }
+            | Self::PolicyDrift { tool, .. }
             | Self::TaskRequired { tool, .. } => Some(tool),
             _ => None,
         }
@@ -395,7 +417,7 @@ impl ThoughtGateError {
             Self::GovernanceRuleDenied { .. } => None,
 
             // Gate 3: Policy - No details (security: don't expose policy internals)
-            Self::PolicyDenied { .. } => None,
+            Self::PolicyDenied { .. } | Self::PolicyDrift { .. } => None,
 
             // Gate 4: Approval
             Self::ApprovalRejected { rejected_by, .. } => rejected_by
@@ -573,6 +595,14 @@ mod tests {
             }
             .to_jsonrpc_code(),
             -32008
+        );
+        assert_eq!(
+            ThoughtGateError::PolicyDrift {
+                tool: "test".to_string(),
+                task_id: "tg_1".to_string(),
+            }
+            .to_jsonrpc_code(),
+            -32011
         );
         assert_eq!(
             ThoughtGateError::RateLimited {

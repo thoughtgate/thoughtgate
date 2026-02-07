@@ -309,6 +309,43 @@ pub trait ExecutionPipeline: Send + Sync {
 }
 
 // ============================================================================
+// Standalone Policy Drift Check
+// ============================================================================
+
+/// Check if Cedar policy still permits execution for a previously-approved task.
+///
+/// Callable independently of the full execution pipeline. Used by the
+/// governance service's `/revalidate` endpoint to let the stdio shim detect
+/// policy drift before forwarding an approved message.
+///
+/// Returns `Ok(())` if the policy still permits (Forward or Approve),
+/// or `Err(reason)` if the policy now rejects the request.
+///
+/// Implements: REQ-GOV-002/F-004 (Policy Re-evaluation)
+#[allow(deprecated)] // Using v0.1 PolicyAction API
+pub async fn check_policy_drift(
+    cedar_engine: &Arc<CedarEngine>,
+    request: &ToolCallRequest,
+    principal: &Principal,
+) -> Result<(), String> {
+    let engine = Arc::clone(cedar_engine);
+    let req = request.clone();
+    let princ = principal.clone();
+
+    let action = tokio::task::spawn_blocking(move || {
+        let policy_request = build_policy_request(&req, &princ, None);
+        engine.evaluate(&policy_request)
+    })
+    .await
+    .map_err(|e| format!("Policy re-evaluation task failed: {e}"))?;
+
+    match action {
+        PolicyAction::Forward | PolicyAction::Approve { .. } => Ok(()),
+        PolicyAction::Reject { reason } => Err(reason),
+    }
+}
+
+// ============================================================================
 // Approval Pipeline Implementation
 // ============================================================================
 

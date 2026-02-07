@@ -151,6 +151,24 @@ pub enum ApprovalOutcome {
     Cancelled,
 }
 
+/// Response from `POST /governance/task/{task_id}/revalidate`.
+///
+/// Allows the shim to check if Cedar policy still permits execution after
+/// an approval has been granted. Detects "policy drift" — where the policy
+/// changes during the approval window.
+///
+/// Implements: REQ-GOV-002/F-004 (Policy Re-evaluation)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RevalidateResponse {
+    /// Whether execution is still permitted under current policy.
+    pub allowed: bool,
+    /// Whether the policy outcome changed since approval time.
+    pub drift_detected: bool,
+    /// Human-readable reason when `allowed` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +324,38 @@ mod tests {
         // Required fields always present
         assert!(json.contains("decision"));
         assert!(json.contains("shutdown"));
+    }
+
+    #[test]
+    fn test_revalidate_response_serde_allowed() {
+        let resp = RevalidateResponse {
+            allowed: true,
+            drift_detected: false,
+            reason: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: RevalidateResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.allowed);
+        assert!(!parsed.drift_detected);
+        assert!(parsed.reason.is_none());
+        // reason should be omitted when None
+        assert!(!json.contains("reason"));
+    }
+
+    #[test]
+    fn test_revalidate_response_serde_denied() {
+        let resp = RevalidateResponse {
+            allowed: false,
+            drift_detected: true,
+            reason: Some("Policy now rejects this tool".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: RevalidateResponse = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.allowed);
+        assert!(parsed.drift_detected);
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("Policy now rejects this tool")
+        );
     }
 }

@@ -28,7 +28,7 @@ use super::helpers::{
     MIN_APPROVAL_POLL_MS, PendingRequest, PendingRequests, bounded_read_line, extract_tool_name,
     format_deny_response, format_error_response, format_timeout_tool_response, framing_error_type,
     id_from_kind, is_passthrough, jsonrpc_id_to_string, message_type_from_kind, method_from_kind,
-    poll_approval_status, rebuild_message_with_params, write_stdout,
+    poll_approval_status, rebuild_message_with_params, revalidate_before_forward, write_stdout,
 };
 
 /// Read from agent stdin, evaluate via governance, forward to server stdin.
@@ -490,7 +490,63 @@ pub(super) async fn agent_to_server(
 
                 match outcome {
                     ApprovalPollResult::Approved => {
-                        tracing::info!(server_id, task_id, "approval granted — forwarding");
+                        tracing::info!(
+                            server_id,
+                            task_id,
+                            "approval granted — revalidating policy"
+                        );
+
+                        // REQ-GOV-002/F-004: Check for policy drift before forwarding.
+                        let revalidation_ok =
+                            match revalidate_before_forward(&client, &governance_endpoint, task_id)
+                                .await
+                            {
+                                Ok(allowed) => allowed,
+                                Err(e) => {
+                                    // HTTP error from revalidation endpoint
+                                    if profile == Profile::Production {
+                                        tracing::warn!(
+                                            server_id,
+                                            task_id,
+                                            error = %e,
+                                            "revalidation failed — denying in production"
+                                        );
+                                        false
+                                    } else {
+                                        tracing::warn!(
+                                            server_id,
+                                            task_id,
+                                            error = %e,
+                                            "revalidation failed — forwarding in dev"
+                                        );
+                                        true
+                                    }
+                                }
+                            };
+
+                        if !revalidation_ok {
+                            if let Some(id) = id_from_kind(&msg.kind) {
+                                let error =
+                                    thoughtgate_core::error::ThoughtGateError::PolicyDrift {
+                                        tool: tool_name.clone().unwrap_or_default(),
+                                        task_id: task_id.to_string(),
+                                    };
+                                let error_line =
+                                    format_error_response(&id, &error, &correlation_id);
+                                write_stdout(&agent_stdout, error_line.as_bytes())
+                                    .await
+                                    .map_err(StdioError::StdioIo)?;
+                            }
+                            finish_mcp_span(
+                                &mut mcp_span,
+                                true,
+                                Some(-32011),
+                                Some("policy_drift"),
+                            );
+                            continue;
+                        }
+
+                        tracing::info!(server_id, task_id, "revalidation passed — forwarding");
                         child_stdin.write_all(&forward_bytes).await.map_err(|e| {
                             StdioError::Framing {
                                 server_id: server_id.clone(),

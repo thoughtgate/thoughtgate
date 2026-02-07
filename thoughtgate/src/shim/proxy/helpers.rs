@@ -410,6 +410,55 @@ async fn drain_until_newline<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Policy Revalidation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Request timeout for `POST /governance/task/{id}/revalidate` (ms).
+pub(super) const REVALIDATE_TIMEOUT_MS: u64 = 2000;
+
+/// Check if Cedar policy still permits execution after approval.
+///
+/// Calls `POST /governance/task/{task_id}/revalidate` on the governance
+/// service. Returns `true` if execution is allowed, `false` if policy drift
+/// was detected.
+///
+/// If the endpoint returns HTTP 404 (e.g., older governance service without
+/// the revalidate endpoint), returns `true` for backward compatibility.
+///
+/// Implements: REQ-GOV-002/F-004 (Policy Re-evaluation)
+pub(super) async fn revalidate_before_forward(
+    client: &reqwest::Client,
+    governance_endpoint: &str,
+    task_id: &str,
+) -> Result<bool, reqwest::Error> {
+    let url = format!("{governance_endpoint}/governance/task/{task_id}/revalidate");
+
+    let resp = client
+        .post(&url)
+        .timeout(Duration::from_millis(REVALIDATE_TIMEOUT_MS))
+        .send()
+        .await?;
+
+    // HTTP 404 = old governance service without this endpoint → allow
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(true);
+    }
+
+    if !resp.status().is_success() {
+        tracing::warn!(
+            task_id,
+            status = %resp.status(),
+            "revalidate endpoint returned non-200"
+        );
+        // Non-200 non-404: treat as allowed to avoid false denials.
+        return Ok(true);
+    }
+
+    let body: thoughtgate_core::governance::api::RevalidateResponse = resp.json().await?;
+    Ok(body.allowed)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Approval Polling Types
 // ─────────────────────────────────────────────────────────────────────────────
 

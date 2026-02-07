@@ -154,6 +154,14 @@ impl GovernanceEvaluator {
         }
     }
 
+    /// Returns a reference to the Cedar engine, if configured.
+    ///
+    /// Used by the revalidate endpoint to check policy drift independently
+    /// of the full evaluation pipeline.
+    pub fn cedar_engine(&self) -> Option<&Arc<CedarEngine>> {
+        self.cedar_engine.as_ref()
+    }
+
     /// Builder-style method to set Prometheus metrics.
     ///
     /// When set, the evaluator records per-gate decisions and Cedar
