@@ -82,7 +82,7 @@ mimalloc = "0.1"
 
 # OpenTelemetry types for trace context propagation (REQ-OBS-002 §7)
 # Note: SDK is in dev-dependencies for testing; metrics use prometheus-client
-opentelemetry = "0.31"
+opentelemetry = "=0.31.0"
 
 # Prometheus metrics (REQ-OBS-002 §6)
 prometheus-client = "0.24.0"
@@ -121,7 +121,7 @@ tempfile = "3.18"
 proptest = "1.0"
 
 # OpenTelemetry testing utilities (InMemorySpanExporter)
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "testing"] }
+opentelemetry_sdk = { version = "=0.31.0", features = ["rt-tokio", "testing"] }
 
 # Benchmarking (REQ-CORE-001 Section 5 - TTFB verification)
 criterion = { version = "0.8", features = ["async_tokio"] }
