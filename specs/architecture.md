@@ -587,6 +587,7 @@ Environment variables can override specific settings but cannot define complex s
 | Single upstream | Can't route to multiple MCP servers | Deploy multiple instances |
 | Per-component metrics | No unified tracing | Correlation IDs in logs |
 | Slack rate limits | Burst approval requests queue | Outbound rate limiter |
+| HTTP blocking mode has no heartbeats | Intermediary proxies (nginx 60s, ALB 60s, Cloudflare 100s) may kill idle connections during approval holds | Configure `proxy_read_timeout 600s` on reverse proxies. Stdio transport emits `notifications/progress` every 15s. HTTP SSE streaming planned for future release. |
 
 ## 8. Deployment Architecture
 

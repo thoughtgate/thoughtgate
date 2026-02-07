@@ -229,7 +229,15 @@ pub(crate) async fn route_through_gates(
                         blocking_timeout,
                         std::time::Duration::from_millis(poll_interval_ms),
                         std::time::Duration::from_secs(15),
-                        None, // No progress_tx for HTTP proxy v0.4
+                        // Known limitation: no heartbeats during blocking hold.
+                        // The progress_tx parameter is plumbed for future SSE/chunked
+                        // streaming support, but HTTP mode currently returns a single
+                        // JSON body. Without heartbeats, intermediary proxies may time
+                        // out idle connections (nginx 60s, ALB 60s, Cloudflare 100s).
+                        // Workaround: configure `proxy_read_timeout 600s` on reverse
+                        // proxies. TCP keepalive prevents socket death for direct
+                        // connections. TODO: implement SSE streaming for HTTP transport.
+                        None,
                     )
                     .await;
 
