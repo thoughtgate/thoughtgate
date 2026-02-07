@@ -215,7 +215,7 @@ async fn verify_task_principal(
 /// Convert TaskError to ThoughtGateError.
 ///
 /// Implements: REQ-CORE-004 (Error Handling)
-pub(crate) fn task_error_to_thoughtgate(
+fn task_error_to_thoughtgate(
     error: thoughtgate_core::governance::TaskError,
 ) -> ThoughtGateError {
     use thoughtgate_core::governance::TaskError;

@@ -179,9 +179,9 @@ mod tests {
             serde_json::json!({"uri": "hidden_resource"}),
         ];
         let filtered = filter_resources_by_visibility(&mut resources, &config, "upstream");
-        // ExposeConfig for tools doesn't filter resources by default — depends on config structure
-        // This test validates the mechanics of the filtering function
-        assert!(filtered <= 2);
+        assert_eq!(filtered, 1);
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["uri"], "allowed_resource");
     }
 
     #[test]
