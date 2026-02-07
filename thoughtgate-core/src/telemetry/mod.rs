@@ -57,10 +57,9 @@ pub use trace_context::{
 
 // Re-export propagation utilities (REQ-OBS-002 §7.1, §7.2, §7.3)
 pub use propagation::{
-    // Stdio transport (§7.3)
-    StdioTraceContext,
     // HTTP transport (§7.1, §7.2)
     extract_context_from_headers,
+    // Stdio transport (§7.3)
     extract_context_from_meta,
     inject_context_into_headers,
 };
@@ -68,9 +67,6 @@ pub use propagation::{
 // Re-export prometheus-client metrics
 pub use cardinality::CardinalityLimiter;
 pub use prom_metrics::ThoughtGateMetrics;
-
-// Re-export RAII timer helpers (REQ-CORE-002 NFR-001)
-pub use timers::{AmberPathTimer, InspectorTimer};
 
 // Re-export BoxedSpan for convenience (callers need to annotate span type)
 pub use opentelemetry::global::BoxedSpan;

@@ -244,37 +244,6 @@ impl McpHandler {
         Self { state }
     }
 
-    /// Create a new MCP handler with custom task handler.
-    ///
-    /// This is useful for testing with mock components.
-    pub fn with_task_handler(
-        upstream: Arc<dyn UpstreamForwarder>,
-        cedar_engine: Arc<CedarEngine>,
-        task_handler: TaskHandler,
-        config: McpHandlerConfig,
-    ) -> Self {
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
-
-        let state = Arc::new(McpState {
-            upstream,
-            router: McpRouter::new(),
-            task_handler,
-            cedar_engine,
-            config: None,
-            approval_engine: None,
-            semaphore,
-            max_body_size: config.max_body_size,
-            max_batch_size: config.max_batch_size,
-            capability_cache: Arc::new(CapabilityCache::new()),
-            buffered_bytes: AtomicUsize::new(0),
-            max_aggregate_buffer: config.max_aggregate_buffer,
-            tg_metrics: None,
-            evaluator: None,
-        });
-
-        Self { state }
-    }
-
     /// Create a new MCP handler with full 4-gate governance stack.
     ///
     /// This constructor is used when wiring governance into `ProxyService` in `main.rs`.

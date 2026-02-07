@@ -5,8 +5,6 @@
 //! Dispatches to `wrap` (config rewrite + governance + agent launch) or
 //! `shim` (per-server stdio proxy) subcommands.
 
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
 use thoughtgate_core::profile::Profile;
 
@@ -74,7 +72,6 @@ async fn run_shim_from_args(args: ShimArgs) -> i32 {
         server_id: args.server_id,
         governance_endpoint: args.governance_endpoint,
         profile,
-        config_path: PathBuf::from("/dev/null"),
     };
 
     if args.command.is_empty() {

@@ -169,37 +169,6 @@ pub struct UpstreamHealthLabels {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Amber Path Labels (REQ-CORE-002)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Labels for per-inspector duration histograms.
-///
-/// Implements: REQ-CORE-002 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct InspectorLabels {
-    /// Inspector name (cardinality-limited)
-    pub inspector_name: Cow<'static, str>,
-}
-
-/// Labels for amber path inspection decision counters.
-///
-/// Implements: REQ-CORE-002 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct AmberDecisionLabels {
-    /// Decision: "approve", "modify", or "reject"
-    pub decision: Cow<'static, str>,
-}
-
-/// Labels for amber path error counters.
-///
-/// Implements: REQ-CORE-002 NFR-001
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct AmberErrorLabels {
-    /// Error type: "timeout", "limit", "semaphore", "panic", "compressed", "dropped"
-    pub error_type: Cow<'static, str>,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Stdio Transport Labels (REQ-CORE-008)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -317,14 +286,6 @@ const APPROVAL_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 180
 const PAYLOAD_BUCKETS: &[f64] = &[
     128.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0,
 ];
-
-/// Amber path buffer size buckets in bytes (same as payload buckets).
-const AMBER_BUFFER_BUCKETS: &[f64] = &[
-    128.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0,
-];
-
-/// Amber path duration buckets in seconds (sub-millisecond to 5 seconds).
-const AMBER_DURATION_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0];
 
 /// Stdio approval latency buckets in seconds (1 second to 1 hour).
 const STDIO_APPROVAL_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0];
@@ -497,39 +458,6 @@ pub struct ThoughtGateMetrics {
     pub drain_timeout_total: Counter,
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Amber Path Metrics (REQ-CORE-002)
-    // ─────────────────────────────────────────────────────────────────────────
-    /// Buffered payload sizes in bytes.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_buffer_size_bytes: Histogram,
-
-    /// Total amber path operation duration in seconds.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_duration_seconds: Histogram,
-
-    /// Per-inspector execution duration in seconds.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_inspector_duration_seconds: Family<InspectorLabels, Histogram>,
-
-    /// Inspection decisions by decision type.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_inspections_total: Family<AmberDecisionLabels, Counter>,
-
-    /// Amber path errors by error type.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_errors_total: Family<AmberErrorLabels, Counter>,
-
-    /// Currently active amber path buffers.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub amber_buffers_active: Gauge,
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Stdio Transport Metrics (REQ-CORE-008)
     // ─────────────────────────────────────────────────────────────────────────
     /// Total stdio messages processed.
@@ -572,9 +500,6 @@ pub struct ThoughtGateMetrics {
 
     /// Cardinality limiter for server_id labels (max 50 distinct values).
     server_id_limiter: CardinalityLimiter,
-
-    /// Cardinality limiter for inspector_name labels (max 50 distinct values).
-    inspector_name_limiter: CardinalityLimiter,
 }
 
 impl ThoughtGateMetrics {
@@ -770,55 +695,6 @@ impl ThoughtGateMetrics {
         );
 
         // ─────────────────────────────────────────────────────────────────────
-        // Amber Path Metrics (REQ-CORE-002)
-        // ─────────────────────────────────────────────────────────────────────
-
-        let amber_buffer_size_bytes = Histogram::new(AMBER_BUFFER_BUCKETS.iter().copied());
-        registry.register(
-            "thoughtgate_amber_buffer_size_bytes",
-            "Buffered payload sizes in bytes",
-            amber_buffer_size_bytes.clone(),
-        );
-
-        let amber_duration_seconds = Histogram::new(AMBER_DURATION_BUCKETS.iter().copied());
-        registry.register(
-            "thoughtgate_amber_duration_seconds",
-            "Total amber path operation duration",
-            amber_duration_seconds.clone(),
-        );
-
-        let amber_inspector_duration_seconds =
-            Family::<InspectorLabels, Histogram>::new_with_constructor(|| {
-                Histogram::new(AMBER_DURATION_BUCKETS.iter().copied())
-            });
-        registry.register(
-            "thoughtgate_amber_inspector_duration_seconds",
-            "Per-inspector execution duration",
-            amber_inspector_duration_seconds.clone(),
-        );
-
-        let amber_inspections_total = Family::<AmberDecisionLabels, Counter>::default();
-        registry.register(
-            "thoughtgate_amber_inspections_total",
-            "Inspection decisions by decision type",
-            amber_inspections_total.clone(),
-        );
-
-        let amber_errors_total = Family::<AmberErrorLabels, Counter>::default();
-        registry.register(
-            "thoughtgate_amber_errors_total",
-            "Amber path errors by error type",
-            amber_errors_total.clone(),
-        );
-
-        let amber_buffers_active = Gauge::default();
-        registry.register(
-            "thoughtgate_amber_buffers_active",
-            "Currently active amber path buffers",
-            amber_buffers_active.clone(),
-        );
-
-        // ─────────────────────────────────────────────────────────────────────
         // Stdio Transport Metrics (REQ-CORE-008)
         // ─────────────────────────────────────────────────────────────────────
 
@@ -891,13 +767,6 @@ impl ThoughtGateMetrics {
             startup_duration_seconds,
             active_requests,
             drain_timeout_total,
-            // Amber Path
-            amber_buffer_size_bytes,
-            amber_duration_seconds,
-            amber_inspector_duration_seconds,
-            amber_inspections_total,
-            amber_errors_total,
-            amber_buffers_active,
             // Stdio
             stdio_messages_total,
             stdio_governance_decisions_total,
@@ -908,7 +777,6 @@ impl ThoughtGateMetrics {
             // Cardinality limiters
             tool_name_limiter: CardinalityLimiter::new(200),
             server_id_limiter: CardinalityLimiter::new(50),
-            inspector_name_limiter: CardinalityLimiter::new(50),
         }
     }
 
@@ -1202,72 +1070,6 @@ impl ThoughtGateMetrics {
     /// Implements: REQ-CORE-005/NFR-001
     pub fn record_drain_timeout(&self) {
         self.drain_timeout_total.inc();
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Amber Path Methods (REQ-CORE-002)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Record amber path buffer size.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_buffer_size(&self, bytes: u64) {
-        self.amber_buffer_size_bytes.observe(bytes as f64);
-    }
-
-    /// Record amber path operation duration.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_duration(&self, seconds: f64) {
-        self.amber_duration_seconds.observe(seconds);
-    }
-
-    /// Record per-inspector execution duration.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_inspector_duration(&self, inspector_name: &str, seconds: f64) {
-        let limited_name = self.inspector_name_limiter.resolve(inspector_name);
-        self.amber_inspector_duration_seconds
-            .get_or_create(&InspectorLabels {
-                inspector_name: Cow::Owned(limited_name.to_string()),
-            })
-            .observe(seconds);
-    }
-
-    /// Record an inspection decision.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_inspection(&self, decision: &str) {
-        self.amber_inspections_total
-            .get_or_create(&AmberDecisionLabels {
-                decision: Cow::Owned(decision.to_string()),
-            })
-            .inc();
-    }
-
-    /// Record an amber path error.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn record_amber_error(&self, error_type: &str) {
-        self.amber_errors_total
-            .get_or_create(&AmberErrorLabels {
-                error_type: Cow::Owned(error_type.to_string()),
-            })
-            .inc();
-    }
-
-    /// Increment active amber path buffers.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn increment_amber_buffers_active(&self) {
-        self.amber_buffers_active.inc();
-    }
-
-    /// Decrement active amber path buffers.
-    ///
-    /// Implements: REQ-CORE-002 NFR-001
-    pub fn decrement_amber_buffers_active(&self) {
-        self.amber_buffers_active.dec();
     }
 
     // ─────────────────────────────────────────────────────────────────────────

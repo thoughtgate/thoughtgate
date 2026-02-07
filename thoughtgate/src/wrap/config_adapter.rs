@@ -68,8 +68,6 @@ pub struct ShimOptions {
     pub governance_endpoint: String,
     /// Active configuration profile.
     pub profile: Profile,
-    /// Path to ThoughtGate config file.
-    pub config_path: PathBuf,
 }
 
 /// Errors that can occur during config operations.
@@ -1657,7 +1655,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         let backup = adapter
@@ -1690,7 +1687,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         adapter
@@ -1735,7 +1731,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         adapter
@@ -1792,7 +1787,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         adapter
@@ -1849,7 +1843,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         // First rewrite succeeds.
@@ -1878,7 +1871,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         // First rewrite succeeds.
@@ -1929,7 +1921,6 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
-            config_path: PathBuf::from("thoughtgate.yaml"),
         };
 
         // Rewrite the project-level config.

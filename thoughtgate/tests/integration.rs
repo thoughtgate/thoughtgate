@@ -241,7 +241,6 @@ fn test_config_backup_restore_full_cycle() {
         server_id: String::new(),
         governance_endpoint: "http://127.0.0.1:19090".to_string(),
         profile: Profile::Production,
-        config_path: PathBuf::from("thoughtgate.yaml"),
     };
 
     let backup_path = adapter
@@ -407,7 +406,6 @@ fn test_stale_backup_overwritten_ec006() {
         server_id: String::new(),
         governance_endpoint: "http://127.0.0.1:19090".to_string(),
         profile: Profile::Production,
-        config_path: PathBuf::from("thoughtgate.yaml"),
     };
     let backup = adapter
         .rewrite_config(&config_path, &servers, &shim, &opts)

@@ -175,7 +175,6 @@ fn run_dry_run(
         server_id: String::new(),
         governance_endpoint: "http://127.0.0.1:0".to_string(),
         profile,
-        config_path: PathBuf::from("/dev/null"),
     };
 
     let _backup = adapter
@@ -521,7 +520,6 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         server_id: String::new(), // per-server; rewrite sets each server_id
         governance_endpoint: governance_endpoint.clone(),
         profile,
-        config_path: args.thoughtgate_config.clone(),
     };
 
     let backup_path = adapter

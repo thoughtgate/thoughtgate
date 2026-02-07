@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Sep1686TaskId, Sep1686TaskListEntry, Sep1686TaskMetadata, Sep1686TaskResult};
+use super::{Sep1686TaskId, Sep1686TaskListEntry};
 
 // ============================================================================
 // tasks/get
@@ -34,13 +34,6 @@ impl TasksGetRequest {
     }
 }
 
-/// Response for `tasks/get`.
-///
-/// Implements: REQ-CORE-007/§6.6
-///
-/// Returns the same format as `tools/call` task response.
-pub type TasksGetResponse = Sep1686TaskMetadata;
-
 // ============================================================================
 // tasks/result
 // ============================================================================
@@ -62,13 +55,6 @@ impl TasksResultRequest {
         Self { task_id }
     }
 }
-
-/// Response for `tasks/result`.
-///
-/// Implements: REQ-CORE-007/§6.6
-///
-/// Returns the actual tool result (same format as sync `tools/call` response).
-pub type TasksResultResponse = Sep1686TaskResult;
 
 // ============================================================================
 // tasks/list

@@ -165,7 +165,6 @@ fn framing_error_type(e: &FramingError) -> &'static str {
         FramingError::MalformedJson { .. } => "malformed_json",
         FramingError::MissingVersion => "missing_version",
         FramingError::UnsupportedVersion { .. } => "unsupported_version",
-        FramingError::BrokenPipe => "broken_pipe",
         FramingError::UnsupportedBatch => "unsupported_batch",
         FramingError::Io(_) => "io_error",
     }
@@ -1830,7 +1829,6 @@ mod tests {
             }),
             "unsupported_version"
         );
-        assert_eq!(framing_error_type(&FramingError::BrokenPipe), "broken_pipe");
         assert_eq!(
             framing_error_type(&FramingError::UnsupportedBatch),
             "unsupported_batch"

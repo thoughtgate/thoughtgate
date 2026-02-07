@@ -49,10 +49,6 @@ pub enum FramingError {
         version: String,
     },
 
-    /// The stdio pipe closed unexpectedly (EOF or broken pipe).
-    #[error("Pipe closed unexpectedly")]
-    BrokenPipe,
-
     /// The message is a JSON array, indicating a JSON-RPC batch request.
     ///
     /// MCP does not support batch requests (F-007b).
@@ -116,15 +112,6 @@ pub enum StdioError {
         reason: String,
     },
 
-    /// Failed to restore config from backup.
-    #[error("Failed to restore config from backup: {reason}")]
-    RestoreError {
-        /// The path to the backup file.
-        backup_path: PathBuf,
-        /// Human-readable description of the restore failure.
-        reason: String,
-    },
-
     /// Server process failed to start.
     #[error("Server process failed to start: {reason}")]
     ServerSpawnError {
@@ -132,15 +119,6 @@ pub enum StdioError {
         server_id: String,
         /// Human-readable description of the spawn failure.
         reason: String,
-    },
-
-    /// Server process exited unexpectedly.
-    #[error("Server process exited unexpectedly with code {code}")]
-    ServerCrashed {
-        /// The MCP server identifier.
-        server_id: String,
-        /// The exit code from the server process.
-        code: i32,
     },
 
     /// Framing error encountered during proxying.
@@ -157,13 +135,6 @@ pub enum StdioError {
     /// Governance service unavailable after readiness polling.
     #[error("Governance service unavailable after readiness polling")]
     GovernanceUnavailable,
-
-    /// Agent process exited with the given code.
-    #[error("Agent process exited with code {code}")]
-    AgentExited {
-        /// The exit code from the agent process.
-        code: i32,
-    },
 
     /// An underlying IO error occurred.
     #[error("IO error: {0}")]

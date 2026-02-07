@@ -175,11 +175,6 @@ impl ProxyService {
         self
     }
 
-    /// Check if this proxy service has MCP handling enabled.
-    pub fn has_mcp_handler(&self) -> bool {
-        self.mcp_handler.is_some()
-    }
-
     /// Get a reference to the proxy configuration.
     pub fn config(&self) -> &ProxyConfig {
         &self.config
@@ -940,17 +935,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(discriminate_traffic(&req), TrafficType::Http);
-    }
-
-    /// Test MCP handler configuration.
-    #[test]
-    fn test_mcp_handler_configuration() {
-        let service =
-            ProxyService::new_with_upstream(Some("https://upstream.example.com".to_string()))
-                .expect("Failed to create proxy service");
-
-        // By default, no MCP handler
-        assert!(!service.has_mcp_handler());
     }
 
     /// Test MCP traffic with content-type charset is still detected.
