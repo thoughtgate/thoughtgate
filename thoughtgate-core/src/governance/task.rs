@@ -644,6 +644,8 @@ impl Task {
 /// because `serde_json/preserve_order` is enabled transitively by
 /// `cedar-policy-core`, making `Value::to_string()` insertion-order dependent.
 /// Returns an error if arguments exceed maximum nesting depth.
+///
+/// Implements: REQ-GOV-001/F-002
 pub fn hash_request(request: &ToolCallRequest) -> Result<String, String> {
     let mut hasher = Sha256::new();
     hasher.update(request.method.as_bytes());

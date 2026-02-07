@@ -46,6 +46,8 @@ static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// of Uuid::new_v4() on every request while still producing unique 128-bit IDs.
 ///
 /// The result has correct v4 version and RFC 4122 variant bits set.
+///
+/// Implements: REQ-CORE-003/F-002
 pub fn fast_correlation_id() -> Uuid {
     let prefix = *CORRELATION_PREFIX;
     let counter = CORRELATION_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -581,6 +583,8 @@ pub enum ParsedRequests {
 /// - EC-MCP-002: Malformed JSON returns ParseError
 /// - EC-MCP-003: Missing jsonrpc field returns InvalidRequest
 /// - EC-MCP-006: Empty batch returns InvalidRequest
+///
+/// Implements: REQ-CORE-003/F-001
 pub fn parse_jsonrpc(bytes: &[u8]) -> Result<ParsedRequests, ThoughtGateError> {
     // Peek at the first non-whitespace byte to determine single vs batch
     // without parsing the entire payload into an intermediate Value.
