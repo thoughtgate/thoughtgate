@@ -36,6 +36,7 @@ jobs:
               - 'thoughtgate-core/**'
               - 'thoughtgate-proxy/**'
               - 'thoughtgate/**'
+              - 'fuzz/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Dockerfile'
@@ -74,6 +75,9 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check fuzz targets compile
+        run: cargo check --manifest-path fuzz/Cargo.toml
 
       - name: Security & license audit
         run: cargo deny check

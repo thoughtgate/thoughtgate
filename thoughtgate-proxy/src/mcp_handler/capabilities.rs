@@ -282,7 +282,7 @@ mod tests {
             false, // upstream_supports_tasks
             true,  // has_approval_engine
         );
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -296,7 +296,7 @@ mod tests {
             false, // upstream_supports_tasks
             true,  // has_approval_engine
         );
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -320,7 +320,7 @@ mod tests {
         // Action::Policy behaves same as Action::Approve for mode detection
         let mut req = make_request(false);
         let result = validate_task_metadata(&mut req, &Action::Policy, "analyze", false, true);
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -328,7 +328,7 @@ mod tests {
         // Forward action never triggers blocking mode
         let mut req = make_request(false);
         let result = validate_task_metadata(&mut req, &Action::Forward, "ping", true, true);
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
             false, // upstream does NOT support tasks
             false,
         );
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
         assert!(
             req.task_metadata.is_none(),
             "task metadata should be stripped"
@@ -364,7 +364,7 @@ mod tests {
             true, // upstream supports tasks
             false,
         );
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
         assert!(
             req.task_metadata.is_some(),
             "task metadata should be preserved"
@@ -375,6 +375,6 @@ mod tests {
     fn test_deny_action_returns_false() {
         let mut req = make_request(false);
         let result = validate_task_metadata(&mut req, &Action::Deny, "dangerous", false, true);
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 }

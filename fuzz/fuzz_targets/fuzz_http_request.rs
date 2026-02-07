@@ -15,7 +15,6 @@ struct FuzzRequest {
     method_bytes: Vec<u8>,
     uri_bytes: Vec<u8>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
-    body_bytes: Vec<u8>,
 }
 
 fuzz_target!(|input: FuzzRequest| {

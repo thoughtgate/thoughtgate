@@ -56,6 +56,10 @@ impl TestEnv {
                 "thoughtgate-proxy",
                 "--features",
                 "mock",
+                "--bin",
+                "mock_mcp",
+                "--bin",
+                "thoughtgate-proxy",
             ])
             .status()
             .expect("Failed to run cargo build");
