@@ -6,10 +6,14 @@
 # Flow:
 #   1. Release PR (from prepare-release.yml) merges to main
 #   2. This workflow creates an annotated git tag (format: v0.4.0)
-#   3. Dispatches release.yml via workflow_dispatch (no PAT needed)
-#   4. cargo-dist builds binaries and creates the GitHub Release
+#   3. Dispatches release.yml via workflow_dispatch
+#   4. cargo-dist builds binaries with SLSA provenance attestation
 #
-# No extra secrets required — GITHUB_TOKEN can trigger workflow_dispatch.
+# Security model:
+#   - The PR merge (signed by the developer) is the authorization gate
+#   - The tag is an automation artifact, not a trust anchor
+#   - SLSA provenance on release artifacts provides verifiable integrity
+#   - Tag ruleset should restrict v* creation to this workflow + maintainers
 
 name: Tag Release
 
@@ -38,6 +42,8 @@ jobs:
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           VERSION="${HEAD_REF#release/}"
           echo "Creating tag: $VERSION"
           git tag -a "$VERSION" -m "chore(release): $VERSION"
