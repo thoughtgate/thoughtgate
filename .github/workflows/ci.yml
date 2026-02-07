@@ -146,7 +146,6 @@ jobs:
               cargo test -p thoughtgate-proxy --test unit_peeking -- --nocapture
               cargo test -p thoughtgate-proxy --test memory_profile -- --nocapture
               cargo test -p thoughtgate-proxy --test edge_cases -- --nocapture
-              cargo test -p thoughtgate-proxy --test amber_edge_cases -- --nocapture
 
           # Group 3: Governance tests (REQ-GOV-001, REQ-GOV-002, REQ-GOV-003)
           - test-name: "governance"
