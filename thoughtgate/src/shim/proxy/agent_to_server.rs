@@ -472,8 +472,20 @@ pub(super) async fn agent_to_server(
                     deadline,
                 )
                 .await;
+                let approval_elapsed = approval_start.elapsed();
+
+                // Map outcome to metric label string.
+                let outcome_label = match &outcome {
+                    ApprovalPollResult::Approved => "approved",
+                    ApprovalPollResult::Rejected(_) => "rejected",
+                    ApprovalPollResult::Expired => "expired",
+                    ApprovalPollResult::Cancelled => "cancelled",
+                    ApprovalPollResult::Timeout => "timeout",
+                    ApprovalPollResult::Error => "error",
+                    ApprovalPollResult::Shutdown => "shutdown",
+                };
                 if let Some(ref m) = metrics {
-                    m.record_stdio_approval_latency(&server_id, approval_start.elapsed());
+                    m.record_stdio_approval_outcome(&server_id, outcome_label, approval_elapsed);
                 }
 
                 match outcome {

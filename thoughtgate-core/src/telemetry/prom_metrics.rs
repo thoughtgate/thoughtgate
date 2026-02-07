@@ -218,6 +218,17 @@ pub struct StdioServerLabels {
     pub server_id: Cow<'static, str>,
 }
 
+/// Labels for stdio approval outcome counters and histograms.
+///
+/// Implements: REQ-CORE-008 NFR-002
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StdioApprovalLabels {
+    /// Server identifier (cardinality-limited)
+    pub server_id: Cow<'static, str>,
+    /// Outcome: "approved", "rejected", "expired", "cancelled", "timeout", "error", "shutdown"
+    pub outcome: Cow<'static, str>,
+}
+
 /// Labels for stdio server state gauge (info-style enum metric).
 ///
 /// Implements: REQ-CORE-008 NFR-002
@@ -500,10 +511,20 @@ pub struct ThoughtGateMetrics {
     /// Implements: REQ-CORE-008 NFR-002
     pub stdio_server_state: Family<StdioServerStateLabels, Gauge>,
 
-    /// Approval latency for stdio requests in seconds.
+    /// Approval latency for stdio requests in seconds (unlabelled, legacy).
     ///
     /// Implements: REQ-CORE-008 NFR-002
     pub stdio_approval_latency_seconds: Family<StdioServerLabels, Histogram>,
+
+    /// Stdio approval outcomes counter (labelled by outcome).
+    ///
+    /// Implements: REQ-CORE-008 NFR-002
+    pub stdio_approval_outcomes_total: Family<StdioApprovalLabels, Counter>,
+
+    /// Stdio approval duration histogram (labelled by outcome).
+    ///
+    /// Implements: REQ-CORE-008 NFR-002
+    pub stdio_approval_duration_seconds: Family<StdioApprovalLabels, Histogram>,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Internal State
@@ -777,6 +798,23 @@ impl ThoughtGateMetrics {
             stdio_approval_latency_seconds.clone(),
         );
 
+        let stdio_approval_outcomes_total = Family::<StdioApprovalLabels, Counter>::default();
+        registry.register(
+            "thoughtgate_stdio_approval_outcomes_total",
+            "Stdio approval outcomes by server and result",
+            stdio_approval_outcomes_total.clone(),
+        );
+
+        let stdio_approval_duration_seconds =
+            Family::<StdioApprovalLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(STDIO_APPROVAL_BUCKETS.iter().copied())
+            });
+        registry.register(
+            "thoughtgate_stdio_approval_duration_seconds",
+            "Stdio approval duration by server and outcome",
+            stdio_approval_duration_seconds.clone(),
+        );
+
         Self {
             requests_total,
             decisions_total,
@@ -810,6 +848,8 @@ impl ThoughtGateMetrics {
             stdio_active_servers,
             stdio_server_state,
             stdio_approval_latency_seconds,
+            stdio_approval_outcomes_total,
+            stdio_approval_duration_seconds,
             // Cardinality limiters
             tool_name_limiter: CardinalityLimiter::new(200),
             server_id_limiter: CardinalityLimiter::new(50),
@@ -1209,7 +1249,7 @@ impl ThoughtGateMetrics {
         }
     }
 
-    /// Record approval latency for stdio transport.
+    /// Record approval latency for stdio transport (unlabelled, legacy).
     ///
     /// Implements: REQ-CORE-008 NFR-002
     pub fn record_stdio_approval_latency(&self, server_id: &str, duration: std::time::Duration) {
@@ -1218,6 +1258,32 @@ impl ThoughtGateMetrics {
             .get_or_create(&StdioServerLabels {
                 server_id: Cow::Owned(limited_id.to_string()),
             })
+            .observe(duration.as_secs_f64());
+    }
+
+    /// Record a stdio approval outcome with duration.
+    ///
+    /// Increments the outcome counter and observes the duration histogram,
+    /// both labelled by `server_id` and `outcome`. This replaces the unlabelled
+    /// `record_stdio_approval_latency` for new callers.
+    ///
+    /// Implements: REQ-CORE-008 NFR-002
+    pub fn record_stdio_approval_outcome(
+        &self,
+        server_id: &str,
+        outcome: &str,
+        duration: std::time::Duration,
+    ) {
+        let limited_id = self.server_id_limiter.resolve(server_id);
+        let labels = StdioApprovalLabels {
+            server_id: Cow::Owned(limited_id.to_string()),
+            outcome: Cow::Owned(outcome.to_string()),
+        };
+        self.stdio_approval_outcomes_total
+            .get_or_create(&labels)
+            .inc();
+        self.stdio_approval_duration_seconds
+            .get_or_create(&labels)
             .observe(duration.as_secs_f64());
     }
 }
