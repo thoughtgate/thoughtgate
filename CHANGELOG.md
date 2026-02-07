@@ -5,7 +5,62 @@ All notable changes to ThoughtGate will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-02-07
+
+### Features
+
+- *(ci)* Add PR-based release workflow for OpenSSF compliance
+- *(telemetry)* Add batch-level span for JSON-RPC batch requests
+- *(governance)* Add metrics + OTel spans to evaluator
+- *(governance)* Wire ApprovalEngine into evaluator + add NoopUpstreamForwarder
+- *(governance)* Add per-request principal support to evaluator
+
+### Bug Fixes
+
+- *(ci)* Use dispatch-releases to avoid PAT requirement
+- *(ci)* Harden release workflows against shell injection
+- *(adapter)* Inject THOUGHTGATE_SERVER_ID for Zed servers without env
+- *(adapter)* Detect double-wrap for Zed object command format
+- *(adapter)* Rewrite Cursor project-level config to prevent governance bypass
+- *(ci)* Remove stale references to deleted amber_path and inspector chain code
+- *(proxy,cli)* Harden protocol compliance, UTF-8 validation, and panic safety
+- *(ci)* Harden CI supply chain security and scanning
+- *(config)* Add missing description field to Source::Mcp
+- *(deps)* Update time crate to fix RUSTSEC-2026-0009
+
+### Refactoring
+
+- *(governance)* Add EvalTrace and DenySource types for gate-level tracing
+- *(wrap)* Use ApprovalEngine in agent_launch when Cedar available
+- *(proxy)* Delegate route_through_gates to GovernanceEvaluator
+- *(error)* Remove 7 unused ThoughtGateError variants and LifecycleError
+- *(policy)* Remove unused PolicyDecision, PolicyStats, and dead engine methods
+- *(config)* Remove unimplemented config fields and ApprovalDestination variants
+- *(protocol)* Remove dead capability types, ToolsCallRequest, and ProfileBehaviour
+- *(telemetry)* Remove green path metrics, dead methods, and unused re-exports
+- *(proxy)* Remove McpServer, dead ProxyError variants, and unused socket helpers
+- *(cli)* Remove unused StdioMessage fields and dead lifecycle types
+- Remove dead code across all three workspace crates
+
+### Documentation
+
+- *(handler)* Fix batch concurrency doc comment to match implementation
+
+### Miscellaneous
+
+- *(cargo)* Remove dead feature flags and unused governance error variant
+
+### Performance
+
+- Eliminate ~12 heap allocations per request on hot path
+
 ## [0.3.1] - 2026-02-06
+
+### Bug Fixes
+
+- *(dist)* Add cargo profile for dist builds
+
+## [0.3.0] - 2026-02-06
 
 ### Features
 
@@ -75,7 +130,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(bench)* Ensure mock_mcp binary exists before ttfb benchmark
 - *(ci)* Remove broken PR preview deployment from docs workflow
 - *(ci)* Restore cargo-dist expected comments in release.yml announce job
-- *(dist)* Add cargo profile for dist builds
 
 ### Refactoring
 
