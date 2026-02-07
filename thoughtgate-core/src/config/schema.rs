@@ -188,6 +188,10 @@ pub enum Source {
         /// Whether this source is enabled.
         #[serde(default = "default_true")]
         enabled: bool,
+
+        /// Human-readable description of this source.
+        #[serde(default)]
+        description: Option<String>,
     },
     // v0.3+: A2a
     // v0.4+: McpDiscovery, OpenApi, A2aDiscovery
@@ -749,6 +753,7 @@ mod tests {
             prefix: Some("test_".to_string()),
             expose: None,
             enabled: true,
+            description: None,
         };
 
         assert_eq!(source.id(), "test");
