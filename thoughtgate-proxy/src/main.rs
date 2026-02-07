@@ -96,11 +96,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_config = ProxyConfig::from_env();
 
     // Validate centralized defaults (REQ-CFG-001/5.6)
-    let defaults = thoughtgate_core::config::ThoughtGateDefaults::from_env();
-    if let Err(msg) = defaults.validate() {
-        error!(reason = %msg, "Invalid configuration defaults — refusing to start");
-        std::process::exit(1);
-    }
+    let _defaults =
+        thoughtgate_core::config::ThoughtGateDefaults::from_env().unwrap_or_else(|msg| {
+            error!(reason = %msg, "Invalid configuration defaults — refusing to start");
+            std::process::exit(1);
+        });
 
     // Phase 1b: Validate environment safety
     // Implements: REQ-CORE-005/F-001 (Startup Safety)

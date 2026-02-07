@@ -76,10 +76,10 @@ impl ThoughtGateDefaults {
     /// - `THOUGHTGATE_APPROVAL_POLL_INTERVAL_SECS`
     /// - `THOUGHTGATE_APPROVAL_POLL_MAX_INTERVAL_SECS`
     /// - `THOUGHTGATE_HEALTH_CHECK_INTERVAL_SECS`
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, String> {
         let default = Self::default();
 
-        Self {
+        let result = Self {
             execution_timeout: Duration::from_secs(parse_env_warn(
                 "THOUGHTGATE_EXECUTION_TIMEOUT_SECS",
                 default.execution_timeout.as_secs(),
@@ -115,7 +115,10 @@ impl ThoughtGateDefaults {
             default_task_ttl: default.default_task_ttl,
             max_task_ttl: default.max_task_ttl,
             task_cleanup_interval: default.task_cleanup_interval,
-        }
+        };
+
+        result.validate()?;
+        Ok(result)
     }
 
     /// Validate the defaults satisfy invariants.
@@ -229,7 +232,7 @@ mod tests {
     fn test_from_env() {
         // Note: This test may be affected by environment variables
         // In a real test suite, we'd use temp_env or similar
-        let defaults = ThoughtGateDefaults::from_env();
+        let defaults = ThoughtGateDefaults::from_env().unwrap();
         // Just verify it doesn't panic and returns something reasonable
         assert!(defaults.execution_timeout.as_secs() > 0);
     }
