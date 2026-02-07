@@ -371,21 +371,33 @@ async fn bounded_read_line<R: tokio::io::AsyncBufRead + Unpin>(
 ///
 /// Used after detecting an oversized line to skip the remainder of the
 /// offending message so the reader is positioned at the start of the next line.
+/// A 30-second timeout prevents hanging on slow or stalled peers.
 async fn drain_until_newline<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) {
-    loop {
-        match reader.fill_buf().await {
-            Ok([]) => return, // EOF
-            Ok(buf) => {
-                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let consume = pos + 1;
-                    reader.consume(consume);
+    let drain = async {
+        loop {
+            match reader.fill_buf().await {
+                Ok([]) => return, // EOF
+                Ok(buf) => {
+                    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        let consume = pos + 1;
+                        reader.consume(consume);
+                        return;
+                    }
+                    let len = buf.len();
+                    reader.consume(len);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "IO error while draining oversized message");
                     return;
                 }
-                let len = buf.len();
-                reader.consume(len);
             }
-            Err(_) => return,
         }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("drain_until_newline timed out after 30s");
     }
 }
 
@@ -879,10 +891,22 @@ async fn agent_to_server(
             break;
         }
 
-        // Convert raw bytes to string (full line is contiguous, so lossy
-        // conversion handles any genuinely invalid UTF-8 without splitting
-        // multi-byte characters across buffer boundaries).
-        let buf = String::from_utf8_lossy(&raw_buf);
+        // Validate UTF-8 strictly: lossy conversion would silently replace
+        // invalid bytes with U+FFFD, corrupting JSON-RPC message content.
+        let buf = match String::from_utf8(raw_buf.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                if let Some(ref m) = metrics {
+                    m.record_stdio_framing_error(&server_id, "invalid_utf8");
+                }
+                tracing::warn!(
+                    server_id,
+                    len = raw_buf.len(),
+                    "agent→server: invalid UTF-8, skipping"
+                );
+                continue;
+            }
+        };
 
         // Skip empty lines (lenient parsing per §10.2).
         if buf.trim().is_empty() {
@@ -1443,8 +1467,25 @@ async fn server_to_agent(
             break;
         }
 
-        // Convert raw bytes to string (full line is contiguous).
-        let buf = String::from_utf8_lossy(&raw_buf);
+        // Validate UTF-8: invalid bytes would corrupt audit logs and metrics.
+        // The raw bytes are always forwarded regardless of validation.
+        let buf = match String::from_utf8(raw_buf.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                if let Some(ref m) = metrics {
+                    m.record_stdio_framing_error(&server_id, "invalid_utf8");
+                }
+                tracing::warn!(
+                    server_id,
+                    len = raw_buf.len(),
+                    "server→agent: invalid UTF-8, forwarding raw"
+                );
+                write_stdout(&agent_stdout, &raw_buf)
+                    .await
+                    .map_err(StdioError::StdioIo)?;
+                continue;
+            }
+        };
 
         // Skip empty lines.
         if buf.trim().is_empty() {

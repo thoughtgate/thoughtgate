@@ -253,8 +253,10 @@ impl ProxyService {
                     r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32600,"message":"Request body exceeds maximum size of {} bytes"}}}}"#,
                     max_body_size
                 )));
+                // MCP Streamable HTTP transport requires HTTP 200 for all
+                // JSON-RPC responses, including errors (the error is in the body).
                 return Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
                     // Full<Bytes> has Infallible error - convert using absurd pattern
                     .body(body.map_err(|e| match e {}).boxed())

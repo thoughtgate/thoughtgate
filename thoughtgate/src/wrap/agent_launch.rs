@@ -556,7 +556,12 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
                 }
             }
         }
-        eprintln!("thoughtgate panicked: {info}");
+        // Use write! instead of eprintln! to avoid double-panic if stderr
+        // is closed (eprintln! panics on write failure).
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("thoughtgate panicked: {info}\n"),
+        );
         prev_hook(info);
     }));
 

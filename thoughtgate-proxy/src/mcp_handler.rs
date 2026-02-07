@@ -559,13 +559,13 @@ async fn handle_mcp_body_bytes(
     // Increment before processing; decrement when this request completes.
     let body_size = body.len();
     let prev = state.buffered_bytes.fetch_add(body_size, Ordering::AcqRel);
-    if prev + body_size > state.max_aggregate_buffer {
+    if prev.saturating_add(body_size) > state.max_aggregate_buffer {
         state.buffered_bytes.fetch_sub(body_size, Ordering::Release);
         let correlation_id =
             thoughtgate_core::transport::jsonrpc::fast_correlation_id().to_string();
         warn!(
             correlation_id = %correlation_id,
-            buffered = prev + body_size,
+            buffered = prev.saturating_add(body_size),
             limit = state.max_aggregate_buffer,
             "Aggregate buffer limit exceeded"
         );
