@@ -464,6 +464,7 @@ pub(super) struct PendingRequests {
 ///
 /// Implements: REQ-CORE-008/F-016
 /// Implements: REQ-GOV-002/F-007 (Progress Heartbeats)
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn poll_approval_status(
     client: &reqwest::Client,
     task_url: &str,
@@ -472,11 +473,22 @@ pub(super) async fn poll_approval_status(
     profile: Profile,
     agent_stdout: &Mutex<Stdout>,
     task_id: &str,
+    deadline: Option<Instant>,
 ) -> ApprovalPollResult {
     let heartbeat_interval = Duration::from_secs(PROGRESS_HEARTBEAT_SECS);
     let mut last_heartbeat = Instant::now();
+    let mut cycle: u32 = 0;
 
-    for cycle in 0..MAX_POLL_CYCLES {
+    loop {
+        // Deadline-based exit (server-side timeout hint) or cycle-limit fallback.
+        let should_stop = match deadline {
+            Some(dl) => Instant::now() >= dl,
+            None => cycle >= MAX_POLL_CYCLES,
+        };
+        if should_stop {
+            break;
+        }
+        cycle += 1;
         // Check shutdown between polls.
         tokio::select! {
             biased;
@@ -551,10 +563,14 @@ pub(super) async fn poll_approval_status(
         }
     }
 
-    tracing::warn!(
-        max_cycles = MAX_POLL_CYCLES,
-        "approval poll: cycle limit reached"
-    );
+    if deadline.is_some() {
+        tracing::warn!("approval poll: deadline reached");
+    } else {
+        tracing::warn!(
+            max_cycles = MAX_POLL_CYCLES,
+            "approval poll: cycle limit reached"
+        );
+    }
     ApprovalPollResult::Timeout
 }
 

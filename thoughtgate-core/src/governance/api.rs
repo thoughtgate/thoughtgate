@@ -80,6 +80,14 @@ pub struct GovernanceEvaluateResponse {
     /// `GET /governance/task/{task_id}` at this interval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval_ms: Option<u64>,
+    /// Approval timeout hint in seconds for PendingApproval decisions.
+    ///
+    /// When `decision` is `PendingApproval`, the shim should use this as the
+    /// deadline for approval polling. Derived from the task's TTL on the
+    /// governance service side. When `None`, the shim falls back to its
+    /// hardcoded `MAX_POLL_CYCLES` safety net.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     /// When true, the shim must initiate graceful shutdown (F-018).
     /// Set by the governance service when `wrap` triggers shutdown (F-019).
     pub shutdown: bool,
@@ -176,6 +184,7 @@ mod tests {
             policy_id: Some("policy-1".to_string()),
             reason: None,
             poll_interval_ms: None,
+            timeout_secs: None,
             shutdown: false,
             deny_source: None,
         };
@@ -196,6 +205,7 @@ mod tests {
             policy_id: None,
             reason: Some("service shutting down".to_string()),
             poll_interval_ms: None,
+            timeout_secs: None,
             shutdown: true,
             deny_source: None,
         };
@@ -215,6 +225,7 @@ mod tests {
             policy_id: Some("require-approval".to_string()),
             reason: None,
             poll_interval_ms: Some(5000),
+            timeout_secs: Some(300),
             shutdown: false,
             deny_source: None,
         };
@@ -224,6 +235,20 @@ mod tests {
 
         assert_eq!(parsed.decision, GovernanceDecision::PendingApproval);
         assert_eq!(parsed.task_id.as_deref(), Some("tg_abc123"));
+        assert_eq!(parsed.timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_timeout_secs_serde_roundtrip() {
+        // With timeout_secs present
+        let json = r#"{"decision":"pending_approval","task_id":"tg_1","poll_interval_ms":5000,"timeout_secs":300,"shutdown":false}"#;
+        let parsed: GovernanceEvaluateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.timeout_secs, Some(300));
+
+        // Without timeout_secs (backward compatibility with older governance services)
+        let json = r#"{"decision":"forward","shutdown":false}"#;
+        let parsed: GovernanceEvaluateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.timeout_secs, None);
     }
 
     #[test]
@@ -266,6 +291,7 @@ mod tests {
             policy_id: None,
             reason: None,
             poll_interval_ms: None,
+            timeout_secs: None,
             shutdown: false,
             deny_source: None,
         };
@@ -274,6 +300,7 @@ mod tests {
         // Optional None fields should be skipped
         assert!(!json.contains("task_id"));
         assert!(!json.contains("policy_id"));
+        assert!(!json.contains("timeout_secs"));
         assert!(!json.contains("reason"));
         assert!(!json.contains("poll_interval_ms"));
         // Required fields always present

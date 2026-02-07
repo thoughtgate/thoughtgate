@@ -566,6 +566,13 @@ impl GovernanceEvaluator {
                 Ok(result) => {
                     let poll_interval_ms = result.poll_interval.as_millis() as u64;
 
+                    // Look up task TTL for the shim's timeout hint.
+                    let timeout_secs = self
+                        .task_store
+                        .get(&result.task_id)
+                        .ok()
+                        .map(|task| task.ttl.as_secs());
+
                     trace.gate4 = Some("started".to_string());
                     if let Some(ref m) = self.tg_metrics {
                         m.record_gate_decision("gate4", "started");
@@ -578,6 +585,7 @@ impl GovernanceEvaluator {
                         policy_id: policy_id.map(String::from),
                         reason: None,
                         poll_interval_ms: Some(poll_interval_ms),
+                        timeout_secs,
                         shutdown: false,
                         deny_source: None,
                     };
@@ -695,6 +703,7 @@ impl GovernanceEvaluator {
             policy_id: policy_id.map(String::from),
             reason: None,
             poll_interval_ms: Some(poll_interval_ms),
+            timeout_secs: Some(DEFAULT_APPROVAL_TTL_SECS),
             shutdown: false,
             deny_source: None,
         }
@@ -711,6 +720,7 @@ impl GovernanceEvaluator {
             policy_id: None,
             reason,
             poll_interval_ms: None,
+            timeout_secs: None,
             shutdown: false,
             deny_source: None,
         }
@@ -728,6 +738,7 @@ impl GovernanceEvaluator {
             policy_id: policy_id.map(String::from),
             reason,
             poll_interval_ms: None,
+            timeout_secs: None,
             shutdown: false,
             deny_source: Some(source),
         }

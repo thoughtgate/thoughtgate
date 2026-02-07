@@ -242,6 +242,7 @@ async fn evaluate_handler(
                 policy_id: None,
                 reason: None,
                 poll_interval_ms: None,
+                timeout_secs: None,
                 shutdown,
                 deny_source: None,
             },

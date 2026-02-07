@@ -293,6 +293,7 @@ pub(super) async fn agent_to_server(
                         policy_id: None,
                         reason: None,
                         poll_interval_ms: None,
+                        timeout_secs: None,
                         shutdown: false,
                         deny_source: None,
                     }
@@ -332,6 +333,7 @@ pub(super) async fn agent_to_server(
                     policy_id: None,
                     reason: None,
                     poll_interval_ms: None,
+                    timeout_secs: None,
                     shutdown: false,
                     deny_source: None,
                 }
@@ -452,6 +454,12 @@ pub(super) async fn agent_to_server(
                     "PendingApproval — starting poll loop"
                 );
 
+                // Convert server-side timeout hint to a deadline, falling back
+                // to MAX_POLL_CYCLES if the governance service didn't provide one.
+                let deadline = eval_resp
+                    .timeout_secs
+                    .map(|t| Instant::now() + Duration::from_secs(t));
+
                 let approval_start = Instant::now();
                 let outcome = poll_approval_status(
                     &client,
@@ -461,6 +469,7 @@ pub(super) async fn agent_to_server(
                     profile,
                     &agent_stdout,
                     task_id,
+                    deadline,
                 )
                 .await;
                 if let Some(ref m) = metrics {
