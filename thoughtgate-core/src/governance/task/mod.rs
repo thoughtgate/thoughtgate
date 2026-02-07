@@ -392,6 +392,44 @@ mod tests {
         assert!(matches!(result, Err(TaskError::CapacityExceeded)));
     }
 
+    /// Tests counter rollback when Task::new() fails.
+    ///
+    /// Verifies: Issue #9 (pending counter leak on Task::new failure)
+    #[test]
+    fn test_counter_rollback_on_task_creation_failure() {
+        let store = TaskStore::with_defaults();
+
+        // Build arguments nested >64 levels deep to trigger canonical_json depth limit
+        let mut deep = serde_json::json!("leaf");
+        for _ in 0..100 {
+            deep = serde_json::json!({ "a": deep });
+        }
+
+        let bad_request = ToolCallRequest {
+            method: "tools/call".to_string(),
+            name: "deep_tool".to_string(),
+            arguments: deep,
+            mcp_request_id: JsonRpcId::Number(1),
+        };
+
+        let result = store.create(
+            bad_request.clone(),
+            bad_request,
+            test_principal(),
+            None,
+            TimeoutAction::default(),
+        );
+        assert!(
+            result.is_err(),
+            "Task::new should fail on deeply nested JSON"
+        );
+        assert_eq!(
+            store.pending_count(),
+            0,
+            "pending_count should be rolled back to 0 after Task::new failure"
+        );
+    }
+
     /// Tests task cancellation.
     ///
     /// Verifies: EC-TASK-007, REQ-GOV-001/F-006.1

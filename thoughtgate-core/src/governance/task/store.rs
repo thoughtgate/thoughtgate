@@ -289,7 +289,12 @@ impl TaskStore {
             ttl,
             on_timeout,
         )
-        .map_err(|e| TaskError::Internal { details: e })?;
+        .map_err(|e| {
+            // Rollback counters reserved above (same pattern as rate-limit rollback)
+            principal_counter.fetch_sub(1, Ordering::Release);
+            self.pending_count.fetch_sub(1, Ordering::Release);
+            TaskError::Internal { details: e }
+        })?;
         let task_id = task.id.clone();
         let task_arc = Arc::new(task);
 
