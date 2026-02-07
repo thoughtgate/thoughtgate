@@ -135,7 +135,7 @@ struct Stats {
 }
 
 impl CedarEngine {
-    /// Create a new Cedar engine.
+    /// Create a new Cedar engine using env vars only.
     ///
     /// Implements: REQ-POL-001/F-003 (Policy Loading)
     ///
@@ -145,16 +145,37 @@ impl CedarEngine {
     /// - Policy parsing fails
     /// - Schema validation fails
     pub fn new() -> Result<Self, PolicyError> {
+        Self::new_with_config(None)
+    }
+
+    /// Create a new Cedar engine with optional YAML config paths.
+    ///
+    /// Implements: REQ-POL-001/F-003 (Policy Loading)
+    ///
+    /// When `cedar_config` is `Some`, policy files from `cedar.policies[]`
+    /// and the schema from `cedar.schema` are used as fallbacks after env
+    /// vars but before embedded defaults.
+    ///
+    /// # Errors
+    /// Returns `PolicyError` if:
+    /// - Schema parsing fails
+    /// - Policy parsing fails
+    /// - Schema validation fails
+    pub fn new_with_config(
+        cedar_config: Option<&crate::config::CedarConfig>,
+    ) -> Result<Self, PolicyError> {
         info!("Initializing Cedar policy engine");
 
         // Load schema
-        let schema_str = loader::load_schema();
+        let schema_str =
+            loader::load_schema_with_config(cedar_config.and_then(|c| c.schema.as_deref()))?;
         let schema = Schema::from_str(&schema_str).map_err(|e| PolicyError::SchemaValidation {
             details: format!("Failed to parse schema: {}", e),
         })?;
 
         // Load policies
-        let (policy_str, source) = loader::load_policies();
+        let (policy_str, source) =
+            loader::load_policies_with_config(cedar_config.map(|c| c.policies.as_slice()))?;
         let policies = Self::parse_policies(&policy_str, &schema)?;
 
         // Parse annotations
@@ -909,7 +930,7 @@ impl CedarEngine {
         info!("Reloading policies");
 
         // Retry once on parse failure in case the file was partially written
-        let (policy_str, source) = loader::load_policies();
+        let (policy_str, source) = loader::load_policies()?;
         let (new_policies, new_annotations) = match Self::parse_policies(&policy_str, &self.schema)
         {
             Ok(policies) => {
@@ -921,7 +942,7 @@ impl CedarEngine {
                     error = %first_err,
                     "Policy parse failed, retrying immediately in case of partial file write"
                 );
-                let (retry_str, retry_source) = loader::load_policies();
+                let (retry_str, retry_source) = loader::load_policies()?;
                 let policies =
                     Self::parse_policies(&retry_str, &self.schema).map_err(|retry_err| {
                         warn!(
