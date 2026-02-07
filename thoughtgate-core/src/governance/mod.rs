@@ -28,6 +28,7 @@ pub mod approval;
 pub mod engine;
 pub mod evaluator;
 pub mod handlers;
+pub mod list_filtering;
 pub mod pipeline;
 pub mod service;
 pub mod task;

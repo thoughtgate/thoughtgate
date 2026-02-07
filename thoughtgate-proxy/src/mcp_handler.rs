@@ -865,11 +865,13 @@ async fn handle_list_method(
 
     let source_id = get_source_id(state);
 
-    // Gate 1: Filter by visibility (ExposeConfig) for all list methods
-    // Per REQ-CORE-003/F-003: Gate 1 applies to tools, resources, and prompts
+    use thoughtgate_core::governance::list_filtering;
+
+    // Gate 1+2: Filter by visibility and annotate taskSupport.
+    // Delegates to core so both proxy and CLI share identical filtering.
+    // Per REQ-CORE-003/F-003: Gate 1 applies to tools, resources, and prompts.
     match request.method.as_str() {
         "tools/list" => {
-            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
             let mut new_result = result.clone();
             let tools_arr = match new_result
                 .as_object_mut()
@@ -879,67 +881,10 @@ async fn handle_list_method(
                 Some(arr) => arr,
                 None => return Ok(response),
             };
-
-            // Gate 1: Filter by visibility (ExposeConfig)
-            if let Some(source) = config.get_source(source_id) {
-                let expose = source.expose();
-                let original_count = tools_arr.len();
-                tools_arr.retain(|tool| {
-                    tool.get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|name| expose.is_visible(name))
-                        .unwrap_or(false) // Fail closed: hide unparseable tools
-                });
-                let filtered_count = original_count - tools_arr.len();
-                if filtered_count > 0 {
-                    debug!(
-                        source = source_id,
-                        filtered = filtered_count,
-                        remaining = tools_arr.len(),
-                        "Gate 1: Filtered tools by visibility"
-                    );
-                }
-            } else {
-                // Fail closed: source not in config, hide all tools
-                warn!(
-                    source = source_id,
-                    "Gate 1: source not in config, hiding all tools"
-                );
-                tools_arr.clear();
-            }
-
-            // Gate 2: Annotate execution.taskSupport based on governance rules
-            // Per MCP Tasks Specification (Protocol Revision 2025-11-25)
-            for tool in tools_arr.iter_mut() {
-                let tool_name = match tool.get("name").and_then(|n| n.as_str()) {
-                    Some(name) => name,
-                    None => continue,
-                };
-                let match_result = config.governance.evaluate(tool_name, source_id);
-                match match_result.action {
-                    thoughtgate_core::config::Action::Approve
-                    | thoughtgate_core::config::Action::Policy => {
-                        // ThoughtGate requires async task mode for approval/policy actions
-                        // Set execution.taskSupport = "required" per MCP spec
-                        if let Some(obj) = tool.as_object_mut() {
-                            obj.insert(
-                                "execution".to_string(),
-                                serde_json::json!({"taskSupport": "required"}),
-                            );
-                        }
-                    }
-                    thoughtgate_core::config::Action::Forward
-                    | thoughtgate_core::config::Action::Deny => {
-                        // Preserve upstream's execution.taskSupport (don't modify)
-                        // Note: Deny tools are visible but denied at call-time
-                    }
-                }
-            }
-
+            list_filtering::filter_and_annotate_tools(tools_arr, config, source_id);
             Ok(JsonRpcResponse::success(response.id, new_result))
         }
         "resources/list" => {
-            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
             let mut new_result = result.clone();
             let resources_arr = match new_result
                 .as_object_mut()
@@ -949,41 +894,10 @@ async fn handle_list_method(
                 Some(arr) => arr,
                 None => return Ok(response),
             };
-
-            // Gate 1: Filter by visibility (ExposeConfig)
-            // Resources are filtered by URI pattern
-            if let Some(source) = config.get_source(source_id) {
-                let expose = source.expose();
-                let original_count = resources_arr.len();
-                resources_arr.retain(|resource| {
-                    resource
-                        .get("uri")
-                        .and_then(|u| u.as_str())
-                        .map(|uri| expose.is_visible(uri))
-                        .unwrap_or(false) // Fail closed: hide unparseable resources
-                });
-                let filtered_count = original_count - resources_arr.len();
-                if filtered_count > 0 {
-                    debug!(
-                        source = source_id,
-                        filtered = filtered_count,
-                        remaining = resources_arr.len(),
-                        "Gate 1: Filtered resources by visibility"
-                    );
-                }
-            } else {
-                // Fail closed: source not in config, hide all resources
-                warn!(
-                    source = source_id,
-                    "Gate 1: source not in config, hiding all resources"
-                );
-                resources_arr.clear();
-            }
-
+            list_filtering::filter_resources_by_visibility(resources_arr, config, source_id);
             Ok(JsonRpcResponse::success(response.id, new_result))
         }
         "prompts/list" => {
-            // Operate directly on the Value tree to avoid deserialize/serialize cycle.
             let mut new_result = result.clone();
             let prompts_arr = match new_result
                 .as_object_mut()
@@ -993,37 +907,7 @@ async fn handle_list_method(
                 Some(arr) => arr,
                 None => return Ok(response),
             };
-
-            // Gate 1: Filter by visibility (ExposeConfig)
-            // Prompts are filtered by name pattern
-            if let Some(source) = config.get_source(source_id) {
-                let expose = source.expose();
-                let original_count = prompts_arr.len();
-                prompts_arr.retain(|prompt| {
-                    prompt
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|name| expose.is_visible(name))
-                        .unwrap_or(false) // Fail closed: hide unparseable prompts
-                });
-                let filtered_count = original_count - prompts_arr.len();
-                if filtered_count > 0 {
-                    debug!(
-                        source = source_id,
-                        filtered = filtered_count,
-                        remaining = prompts_arr.len(),
-                        "Gate 1: Filtered prompts by visibility"
-                    );
-                }
-            } else {
-                // Fail closed: source not in config, hide all prompts
-                warn!(
-                    source = source_id,
-                    "Gate 1: source not in config, hiding all prompts"
-                );
-                prompts_arr.clear();
-            }
-
+            list_filtering::filter_prompts_by_visibility(prompts_arr, config, source_id);
             Ok(JsonRpcResponse::success(response.id, new_result))
         }
         _ => {
