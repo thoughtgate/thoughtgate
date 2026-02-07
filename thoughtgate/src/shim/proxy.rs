@@ -1707,7 +1707,9 @@ async fn shutdown_server(
         use nix::unistd::Pid;
         if let Some(pid) = child.id() {
             tracing::info!(server_id, pid, "sending SIGTERM to process group");
-            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM);
+            if let Err(e) = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                tracing::warn!(server_id, pid, error = ?e, "killpg SIGTERM failed");
+            }
         }
     }
 
