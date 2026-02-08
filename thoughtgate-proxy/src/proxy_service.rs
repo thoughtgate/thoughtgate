@@ -245,6 +245,8 @@ impl ProxyService {
         req: Request<Incoming>,
         mcp_handler: Arc<McpHandler>,
     ) -> ProxyResult<Response<UnifiedBody>> {
+        use crate::mcp_handler::McpResponse;
+
         // Extract W3C trace context BEFORE dropping headers.
         // This allows MCP spans to become children of the caller's trace.
         // Implements: REQ-OBS-002 §7.1
@@ -282,20 +284,43 @@ impl ProxyService {
 
         debug!(size = body_bytes.len(), "Collected MCP request body");
 
-        // Handle the MCP request with trace context - returns (StatusCode, Bytes) directly.
-        // This avoids double-buffering (Simplification #5).
+        // Handle the MCP request with trace context.
         // The trace context enables W3C trace propagation (REQ-OBS-002 §7.1).
-        let (status, response_bytes) = mcp_handler
+        let mcp_response = mcp_handler
             .handle_with_context(body_bytes, trace_context)
             .await;
 
-        // Build unified response directly from bytes
-        // Full<Bytes> has Infallible error - convert using absurd pattern
-        Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Full::new(response_bytes).map_err(|e| match e {}).boxed())
-            .map_err(|e| ProxyError::Connection(e.to_string()))
+        match mcp_response {
+            McpResponse::Buffered(status, response_bytes) => {
+                // Standard buffered response — build directly from bytes.
+                // Full<Bytes> has Infallible error - convert using absurd pattern.
+                Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(response_bytes).map_err(|e| match e {}).boxed())
+                    .map_err(|e: http::Error| ProxyError::Connection(e.to_string()))
+            }
+            McpResponse::Streaming {
+                status,
+                mut body_rx,
+            } => {
+                // Streaming response for blocking approval mode.
+                // The channel yields keepalive whitespace bytes followed by JSON body.
+                // JSON parsers ignore leading whitespace (RFC 8259 §2).
+                let stream = futures_util::stream::poll_fn(move |cx| {
+                    body_rx.poll_recv(cx).map(|opt: Option<Bytes>| {
+                        opt.map(|chunk| Ok::<_, ProxyError>(http_body::Frame::data(chunk)))
+                    })
+                });
+                let stream_body = StreamBody::new(stream);
+                Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::TRANSFER_ENCODING, "chunked")
+                    .body(BodyExt::boxed(stream_body))
+                    .map_err(|e: http::Error| ProxyError::Connection(e.to_string()))
+            }
+        }
     }
 
     /// Handle an incoming HTTP request with zero-copy streaming.
@@ -1090,7 +1115,7 @@ mod tests {
             let handler = create_test_mcp_handler();
 
             let body = Bytes::from(r#"{"jsonrpc":"2.0","id":1,"method":"test"}"#);
-            let (status, response) = handler.handle(body).await;
+            let (status, response) = handler.handle(body).await.into_buffered();
 
             assert_eq!(status, StatusCode::OK);
             let response_str = String::from_utf8(response.to_vec()).unwrap();
@@ -1111,7 +1136,7 @@ mod tests {
 
             // Create body larger than limit
             let large_body = Bytes::from(vec![b'x'; 200]);
-            let (status, response) = handler.handle(large_body).await;
+            let (status, response) = handler.handle(large_body).await.into_buffered();
 
             // JSON-RPC errors return HTTP 200 per spec; the error is in the body
             assert_eq!(status, StatusCode::OK);
@@ -1136,7 +1161,7 @@ mod tests {
             let handler = create_test_mcp_handler();
 
             let body = Bytes::from("not valid json");
-            let (status, response) = handler.handle(body).await;
+            let (status, response) = handler.handle(body).await.into_buffered();
 
             // JSON-RPC errors return HTTP 200 per spec; the error is in the body
             assert_eq!(status, StatusCode::OK);
@@ -1154,7 +1179,7 @@ mod tests {
 
             // Notification has no "id" field
             let body = Bytes::from(r#"{"jsonrpc":"2.0","method":"test"}"#);
-            let (status, _response) = handler.handle(body).await;
+            let (status, _response) = handler.handle(body).await.into_buffered();
 
             assert_eq!(status, StatusCode::NO_CONTENT);
         }
@@ -1170,7 +1195,7 @@ mod tests {
             let body = Bytes::from(
                 r#"[{"jsonrpc":"2.0","id":1,"method":"test"},{"jsonrpc":"2.0","id":2,"method":"test2"}]"#,
             );
-            let (status, response) = handler.handle(body).await;
+            let (status, response) = handler.handle(body).await.into_buffered();
 
             assert_eq!(status, StatusCode::OK);
             let response_str = String::from_utf8(response.to_vec()).unwrap();

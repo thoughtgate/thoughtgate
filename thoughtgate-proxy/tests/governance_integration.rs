@@ -760,7 +760,10 @@ async fn test_gate2_forward_action_passthrough() {
         "id": 1
     });
 
-    let (status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK);
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -846,7 +849,10 @@ async fn test_gate2_deny_action_rejects() {
         "id": 1
     });
 
-    let (status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK); // JSON-RPC errors return 200
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -918,7 +924,10 @@ async fn test_gate3_cedar_permit_continues() {
         "id": 1
     });
 
-    let (status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK);
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -997,7 +1006,10 @@ async fn test_non_tool_methods_bypass_governance() {
         "id": 1
     });
 
-    let (status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK);
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1091,7 +1103,10 @@ async fn test_task_methods_handled_locally() {
         "id": 1
     });
 
-    let (_status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (_status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert!(
@@ -1178,7 +1193,10 @@ async fn test_batch_requests_processed_correctly() {
         }
     ]);
 
-    let (status, body) = handler.handle(Bytes::from(batch.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(batch.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK);
     let responses: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
@@ -1244,7 +1262,7 @@ async fn test_invalid_json_returns_parse_error() {
 
     // Send invalid JSON
     let invalid = "{ not valid json }";
-    let (status, body) = handler.handle(Bytes::from(invalid)).await;
+    let (status, body) = handler.handle(Bytes::from(invalid)).await.into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK); // JSON-RPC errors return 200
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();

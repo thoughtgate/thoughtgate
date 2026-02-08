@@ -29,25 +29,32 @@ pub(crate) mod task_methods;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use axum::http::StatusCode;
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 
 use thoughtgate_core::config::Config;
-use thoughtgate_core::error::ThoughtGateError;
 use thoughtgate_core::governance::evaluator::GovernanceEvaluator;
 use thoughtgate_core::governance::{ApprovalEngine, Principal, TaskHandler, TaskStore};
 use thoughtgate_core::policy::engine::CedarEngine;
 use thoughtgate_core::profile::Profile;
 use thoughtgate_core::protocol::CapabilityCache;
 use thoughtgate_core::telemetry::ThoughtGateMetrics;
-use thoughtgate_core::transport::jsonrpc::{JsonRpcResponse, McpRequest};
+use thoughtgate_core::transport::jsonrpc::McpRequest;
 use thoughtgate_core::transport::router::{McpRouter, RouteTarget};
 use thoughtgate_core::transport::upstream::UpstreamForwarder;
+
+// Re-exported for tests (used via `use super::*` in mod tests).
+#[cfg(test)]
+pub(crate) use axum::http::StatusCode;
+#[cfg(test)]
+pub(crate) use thoughtgate_core::error::ThoughtGateError;
+#[cfg(test)]
+pub(crate) use thoughtgate_core::transport::jsonrpc::JsonRpcResponse;
 
 // Re-export public API
 pub use factory::create_governance_components_with_metrics;
 pub use handler_config::McpHandlerConfig;
+pub use request::McpResponse;
 
 // Re-export for gate_routing (used via `super::`)
 use capabilities::validate_task_metadata;
@@ -257,12 +264,12 @@ impl McpHandler {
     ///
     /// # Returns
     ///
-    /// A tuple of (StatusCode, response bytes) for direct use by ProxyService.
-    /// This avoids double-buffering when converting to UnifiedBody.
+    /// An `McpResponse` — either buffered bytes or a streaming body for blocking
+    /// approval mode.
     ///
     /// # Traceability
     /// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
-    pub async fn handle(&self, body: Bytes) -> (StatusCode, Bytes) {
+    pub async fn handle(&self, body: Bytes) -> request::McpResponse {
         request::handle_mcp_body_bytes(&self.state, body, None).await
     }
 
@@ -279,7 +286,8 @@ impl McpHandler {
     ///
     /// # Returns
     ///
-    /// A tuple of (StatusCode, response bytes) for direct use by ProxyService.
+    /// An `McpResponse` — either buffered bytes or a streaming body for blocking
+    /// approval mode.
     ///
     /// # Traceability
     /// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
@@ -288,7 +296,7 @@ impl McpHandler {
         &self,
         body: Bytes,
         parent_context: opentelemetry::Context,
-    ) -> (StatusCode, Bytes) {
+    ) -> request::McpResponse {
         request::handle_mcp_body_bytes(&self.state, body, Some(parent_context)).await
     }
 
@@ -318,10 +326,8 @@ impl Clone for McpHandler {
 /// Shared routing logic used by both single and batch request handlers.
 /// Dispatches to the 4-gate model, task handler, initialize handler,
 /// or pass-through based on the router's classification.
-async fn route_request(
-    state: &McpState,
-    request: McpRequest,
-) -> Result<JsonRpcResponse, ThoughtGateError> {
+async fn route_request(state: &McpState, request: McpRequest) -> gate_routing::GateResult {
+    use gate_routing::GateResult;
     match state.router.route(request) {
         RouteTarget::PolicyEvaluation { request } => {
             // Apply 4-gate model for governable methods when config is present
@@ -332,24 +338,28 @@ async fn route_request(
                 } else if helpers::is_list_method(&request.method) {
                     // List methods: tools/list, resources/list, prompts/list
                     // Intercept response, apply Gate 1 filter, annotate taskSupport
-                    capabilities::handle_list_method(state, request).await
+                    GateResult::Immediate(capabilities::handle_list_method(state, request).await)
                 } else {
                     // Other methods: forward directly
-                    state.upstream.forward(&request).await
+                    GateResult::Immediate(state.upstream.forward(&request).await)
                 }
             } else {
                 // Legacy mode (no config): direct Cedar evaluation (Gate 3 only)
-                cedar_eval::evaluate_with_cedar(state, request, None, None).await
+                GateResult::Immediate(
+                    cedar_eval::evaluate_with_cedar(state, request, None, None).await,
+                )
             }
         }
         RouteTarget::TaskHandler { method, request } => {
-            task_methods::handle_task_method(state, method, &request).await
+            GateResult::Immediate(task_methods::handle_task_method(state, method, &request).await)
         }
         RouteTarget::InitializeHandler { request } => {
             // Implements: REQ-CORE-007/F-001 (Capability Injection)
-            capabilities::handle_initialize_method(state, request).await
+            GateResult::Immediate(capabilities::handle_initialize_method(state, request).await)
         }
-        RouteTarget::PassThrough { request } => state.upstream.forward(&request).await,
+        RouteTarget::PassThrough { request } => {
+            GateResult::Immediate(state.upstream.forward(&request).await)
+        }
     }
 }
 

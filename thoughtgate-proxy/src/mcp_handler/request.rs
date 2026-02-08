@@ -20,6 +20,41 @@ use thoughtgate_core::transport::jsonrpc::{
 use super::McpState;
 use super::helpers::{BufferGuard, error_bytes, extract_tool_name, json_bytes};
 
+/// Response from MCP request processing.
+///
+/// Most requests return a buffered response. Blocking approval mode returns
+/// a streaming response with periodic keepalive whitespace to prevent
+/// intermediary proxy timeouts (nginx 60s, ALB 60s, Cloudflare 100s).
+///
+/// Implements: REQ-CORE-003/§10 (Request Handler Pattern)
+pub enum McpResponse {
+    /// Standard buffered response (all paths except blocking approval).
+    Buffered(StatusCode, Bytes),
+    /// Streaming response for blocking approval mode.
+    /// The receiver yields keepalive whitespace bytes followed by the final JSON body.
+    /// JSON parsers ignore leading whitespace (RFC 8259 §2), so the client
+    /// parses the final JSON body correctly.
+    Streaming {
+        status: StatusCode,
+        body_rx: tokio::sync::mpsc::Receiver<Bytes>,
+    },
+}
+
+impl McpResponse {
+    /// Extract `(StatusCode, Bytes)` from a buffered response.
+    ///
+    /// Panics if called on a `Streaming` variant. Used in tests where
+    /// blocking approval mode is not exercised.
+    pub fn into_buffered(self) -> (StatusCode, Bytes) {
+        match self {
+            McpResponse::Buffered(status, bytes) => (status, bytes),
+            McpResponse::Streaming { .. } => {
+                panic!("Expected McpResponse::Buffered, got Streaming")
+            }
+        }
+    }
+}
+
 /// Handle POST /mcp/v1 requests (Axum handler for tests).
 ///
 /// Implements: REQ-CORE-003/§10 (Request Handler Pattern)
@@ -31,8 +66,20 @@ pub(super) async fn handle_mcp_request(
     use axum::http::header;
     use axum::response::IntoResponse;
 
-    let (status, bytes) = handle_mcp_body_bytes(&state, body, None).await;
-    (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+    match handle_mcp_body_bytes(&state, body, None).await {
+        McpResponse::Buffered(status, bytes) => {
+            (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+        }
+        McpResponse::Streaming { status, .. } => {
+            // Tests don't exercise blocking approval streaming; return 500 if this happens.
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                Bytes::new(),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Handle a buffered MCP request body, returning (StatusCode, Bytes).
@@ -59,7 +106,7 @@ pub(super) async fn handle_mcp_body_bytes(
     state: &McpState,
     body: Bytes,
     parent_context: Option<opentelemetry::Context>,
-) -> (StatusCode, Bytes) {
+) -> McpResponse {
     // Check body size limit (generate unique correlation ID per REQ-CORE-004)
     if body.len() > state.max_body_size {
         let correlation_id =
@@ -70,7 +117,8 @@ pub(super) async fn handle_mcp_body_bytes(
                 state.max_body_size
             ),
         };
-        return error_bytes(None, &error, &correlation_id);
+        let (status, bytes) = error_bytes(None, &error, &correlation_id);
+        return McpResponse::Buffered(status, bytes);
     }
 
     // Track aggregate buffered bytes to prevent OOM.
@@ -90,7 +138,8 @@ pub(super) async fn handle_mcp_body_bytes(
         let error = ThoughtGateError::RateLimited {
             retry_after_secs: Some(1),
         };
-        return error_bytes(None, &error, &correlation_id);
+        let (status, bytes) = error_bytes(None, &error, &correlation_id);
+        return McpResponse::Buffered(status, bytes);
     }
 
     // Ensure we decrement buffered_bytes when this request completes.
@@ -106,7 +155,8 @@ pub(super) async fn handle_mcp_body_bytes(
         Err(e) => {
             let correlation_id =
                 thoughtgate_core::transport::jsonrpc::fast_correlation_id().to_string();
-            return error_bytes(None, &e, &correlation_id);
+            let (status, bytes) = error_bytes(None, &e, &correlation_id);
+            return McpResponse::Buffered(status, bytes);
         }
     };
 
@@ -126,7 +176,8 @@ pub(super) async fn handle_mcp_body_bytes(
                         state.max_batch_size
                     ),
                 };
-                return error_bytes(None, &error, &correlation_id);
+                let (status, bytes) = error_bytes(None, &error, &correlation_id);
+                return McpResponse::Buffered(status, bytes);
             }
             // For batch, use "batch" as method label
             (requests.len().max(1) as u32, "batch".to_string())
@@ -163,28 +214,39 @@ pub(super) async fn handle_mcp_body_bytes(
                         br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32009,"message":"Rate limited"}}"#,
                     )
                 });
-            return (StatusCode::OK, bytes);
+            return McpResponse::Buffered(StatusCode::OK, bytes);
         }
     };
 
-    let (status, response_bytes) = match parsed {
+    match parsed {
         ParsedRequests::Single(request) => {
-            handle_single_request_bytes(state, request, parent_context.as_ref()).await
+            let response =
+                handle_single_request_bytes(state, request, parent_context.as_ref()).await;
+            // Record outbound payload size for buffered responses only.
+            // Streaming responses record size when the final body is sent.
+            if let McpResponse::Buffered(_, ref bytes) = response {
+                if let Some(ref metrics) = state.tg_metrics {
+                    metrics.record_payload_size("outbound", &inbound_method, bytes.len() as f64);
+                }
+            }
+            response
         }
         ParsedRequests::Batch(requests) => {
-            handle_batch_request_bytes(state, requests, parent_context.as_ref()).await
+            let (status, response_bytes) =
+                handle_batch_request_bytes(state, requests, parent_context.as_ref()).await;
+            if let Some(ref metrics) = state.tg_metrics {
+                metrics.record_payload_size(
+                    "outbound",
+                    &inbound_method,
+                    response_bytes.len() as f64,
+                );
+            }
+            McpResponse::Buffered(status, response_bytes)
         }
-    };
-
-    // Record outbound payload size (REQ-OBS-002 §6.2/MH-005)
-    if let Some(ref metrics) = state.tg_metrics {
-        metrics.record_payload_size("outbound", &inbound_method, response_bytes.len() as f64);
     }
-
-    (status, response_bytes)
 }
 
-/// Handle a single JSON-RPC request, returning (StatusCode, Bytes).
+/// Handle a single JSON-RPC request, returning an `McpResponse`.
 ///
 /// Implements the v0.2 4-gate model:
 /// - Gate 1: Visibility (ExposeConfig filtering)
@@ -192,13 +254,16 @@ pub(super) async fn handle_mcp_body_bytes(
 /// - Gate 3: Cedar Policy (when action: policy)
 /// - Gate 4: Approval Workflow (when action: approve)
 ///
+/// For blocking approval mode, returns `McpResponse::Streaming` with periodic
+/// keepalive whitespace to prevent intermediary proxy timeouts.
+///
 /// # Traceability
 /// - Implements: REQ-CORE-003/F-002 (Method Routing)
 async fn handle_single_request_bytes(
     state: &McpState,
     request: McpRequest,
     parent_context: Option<&opentelemetry::Context>,
-) -> (StatusCode, Bytes) {
+) -> McpResponse {
     let correlation_id = request.correlation_id.to_string();
     let id = request.id.clone();
     let is_notification = request.is_notification();
@@ -246,7 +311,47 @@ async fn handle_single_request_bytes(
     // 1. The MCP span was created with the correct parent context
     // 2. The global propagator extracts context from the current span
     // 3. forward_once() calls Context::current() which finds the span
-    let result = super::route_request(state, request).await;
+    let gate_result = super::route_request(state, request).await;
+
+    // Handle blocking approval: spawn keepalive streaming task.
+    // This returns immediately with a Streaming response; the background task
+    // sends periodic whitespace bytes to keep the connection alive.
+    if let super::gate_routing::GateResult::BlockingApproval {
+        approval_engine,
+        task_id_parsed,
+        task_id_str,
+        resource_name,
+        request_id,
+        blocking_timeout,
+        poll_interval,
+        tg_metrics,
+    } = gate_result
+    {
+        // Record that we started a blocking approval (spans/metrics will complete
+        // in the background task).
+        finish_mcp_span(&mut mcp_span, false, None, None);
+
+        if let Some(ref metrics) = tg_metrics {
+            metrics.record_request(&method, tool_name.as_deref(), "blocking");
+        }
+
+        return spawn_blocking_approval_stream(
+            approval_engine,
+            task_id_parsed,
+            task_id_str,
+            resource_name,
+            request_id,
+            blocking_timeout,
+            poll_interval,
+            tg_metrics,
+        );
+    }
+
+    // For immediate results, extract the inner Result.
+    let result = match gate_result {
+        super::gate_routing::GateResult::Immediate(r) => r,
+        super::gate_routing::GateResult::BlockingApproval { .. } => unreachable!(),
+    };
 
     // Determine error info for span (REQ-OBS-002 §5.1.1)
     let (is_error, error_code, error_type): (bool, Option<i32>, Option<String>) = match &result {
@@ -283,14 +388,15 @@ async fn handle_single_request_bytes(
                 "Notification processing failed"
             );
         }
-        return (StatusCode::NO_CONTENT, Bytes::new());
+        return McpResponse::Buffered(StatusCode::NO_CONTENT, Bytes::new());
     }
 
     // Return response
-    match result {
+    let (status, bytes) = match result {
         Ok(response) => json_bytes(&response),
         Err(e) => error_bytes(id, &e, &correlation_id),
-    }
+    };
+    McpResponse::Buffered(status, bytes)
 }
 
 /// Handle a batch JSON-RPC request, returning (StatusCode, Bytes).
@@ -360,7 +466,35 @@ async fn handle_batch_request_bytes(
                     let correlation_id = request.correlation_id.to_string();
 
                     // Route through shared routing logic
-                    let result = super::route_request(state, request).await;
+                    let gate_result = super::route_request(state, request).await;
+
+                    // Convert GateResult to Result<JsonRpcResponse, ThoughtGateError>.
+                    // In batch mode, blocking approval falls back to synchronous wait
+                    // (can't stream individual items in a JSON array).
+                    let result = match gate_result {
+                        super::gate_routing::GateResult::Immediate(r) => r,
+                        super::gate_routing::GateResult::BlockingApproval {
+                            approval_engine,
+                            task_id_parsed,
+                            resource_name,
+                            request_id,
+                            blocking_timeout,
+                            poll_interval,
+                            tg_metrics,
+                            ..
+                        } => {
+                            blocking_approval_sync(
+                                &approval_engine,
+                                &task_id_parsed,
+                                &resource_name,
+                                request_id,
+                                blocking_timeout,
+                                poll_interval,
+                                tg_metrics.as_deref(),
+                            )
+                            .await
+                        }
+                    };
 
                     // F-007.4: Notifications don't produce response entries
                     if is_notification {
@@ -419,5 +553,203 @@ async fn handle_batch_request_bytes(
                 ),
             )
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Blocking Approval Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default keepalive interval for blocking approval streaming responses.
+///
+/// 30 seconds is well under the default idle timeouts of common reverse proxies:
+/// - nginx: 60s (`proxy_read_timeout`)
+/// - AWS ALB: 60s (`idle_timeout`)
+/// - Cloudflare: 100s
+const KEEPALIVE_INTERVAL_SECS: u64 = 30;
+
+/// Spawn a background task that sends keepalive whitespace while waiting for
+/// blocking approval, then sends the final JSON response.
+///
+/// Returns an `McpResponse::Streaming` immediately. The background task:
+/// 1. Sends a single space byte every 30s as keepalive
+/// 2. Awaits `wait_and_execute()` for the approval result
+/// 3. Sends the final JSON-RPC response bytes
+/// 4. Drops the sender to close the stream
+///
+/// JSON parsers ignore leading whitespace (RFC 8259 §2), so the client
+/// receives `" " ... " " {"jsonrpc":"2.0",...}` and parses correctly.
+///
+/// Implements: REQ-CORE-003 (MCP Transport Reliability)
+#[allow(clippy::too_many_arguments)]
+fn spawn_blocking_approval_stream(
+    approval_engine: std::sync::Arc<thoughtgate_core::governance::ApprovalEngine>,
+    task_id_parsed: thoughtgate_core::governance::TaskId,
+    task_id_str: String,
+    resource_name: String,
+    request_id: Option<thoughtgate_core::transport::jsonrpc::JsonRpcId>,
+    blocking_timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+    tg_metrics: Option<std::sync::Arc<thoughtgate_core::telemetry::ThoughtGateMetrics>>,
+) -> McpResponse {
+    let keepalive_secs = std::env::var("THOUGHTGATE_KEEPALIVE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(KEEPALIVE_INTERVAL_SECS);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+
+    tokio::spawn(async move {
+        let keepalive_interval = tokio::time::Duration::from_secs(keepalive_secs);
+        let start = std::time::Instant::now();
+
+        // Race: keepalive ticks vs. approval completion.
+        let result = tokio::select! {
+            biased;
+            result = approval_engine.wait_and_execute(
+                &task_id_parsed,
+                &resource_name,
+                blocking_timeout,
+                poll_interval,
+                std::time::Duration::from_secs(15),
+                None,
+            ) => result,
+            () = async {
+                let mut interval = tokio::time::interval(keepalive_interval);
+                // Skip the first tick (fires immediately).
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    // Send whitespace keepalive. If the receiver is dropped, stop.
+                    if tx.send(Bytes::from_static(b" ")).await.is_err() {
+                        return;
+                    }
+                }
+            } => {
+                // Keepalive loop only exits if the receiver drops — treat as error.
+                Err(thoughtgate_core::error::ThoughtGateError::ServiceUnavailable {
+                    reason: "Client disconnected during blocking approval".to_string(),
+                })
+            }
+        };
+
+        // Record blocking metrics
+        let elapsed = start.elapsed();
+        let outcome = match &result {
+            Ok(r) if r.is_error => "timeout",
+            Ok(_) => "approved",
+            Err(thoughtgate_core::error::ThoughtGateError::ApprovalRejected { .. }) => "rejected",
+            Err(_) => "error",
+        };
+        if let Some(ref metrics) = tg_metrics {
+            metrics.record_blocking_approval_completed(outcome, elapsed);
+        }
+
+        // Serialize the final response and send it.
+        let response_bytes = match result {
+            Ok(tool_result) => {
+                let response_value = serde_json::to_value(&tool_result)
+                    .unwrap_or(serde_json::json!({"error": "serialization failed"}));
+                let response = thoughtgate_core::transport::jsonrpc::JsonRpcResponse::success(
+                    request_id,
+                    response_value,
+                );
+                serde_json::to_vec(&response)
+                    .map(Bytes::from)
+                    .unwrap_or_else(|_| {
+                        Bytes::from_static(
+                            br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#,
+                        )
+                    })
+            }
+            Err(e) => {
+                let correlation_id =
+                    thoughtgate_core::transport::jsonrpc::fast_correlation_id().to_string();
+                let jsonrpc_error = e.to_jsonrpc_error(&correlation_id);
+                let response = thoughtgate_core::transport::jsonrpc::JsonRpcResponse::error(
+                    request_id,
+                    jsonrpc_error,
+                );
+                serde_json::to_vec(&response)
+                    .map(Bytes::from)
+                    .unwrap_or_else(|_| {
+                        Bytes::from_static(
+                            br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#,
+                        )
+                    })
+            }
+        };
+
+        // Ignore send error — client may have disconnected.
+        let _ = tx.send(response_bytes).await;
+
+        debug!(
+            task_id = %task_id_str,
+            elapsed_ms = elapsed.as_millis(),
+            outcome = outcome,
+            "Blocking approval streaming response completed"
+        );
+    });
+
+    McpResponse::Streaming {
+        status: StatusCode::OK,
+        body_rx: rx,
+    }
+}
+
+/// Synchronous blocking approval wait (for batch mode).
+///
+/// In batch mode we can't stream individual items, so we fall back to the
+/// original synchronous behavior: hold the connection and await the result.
+///
+/// Implements: REQ-CORE-003 (MCP Transport & Routing)
+#[allow(clippy::too_many_arguments)]
+async fn blocking_approval_sync(
+    approval_engine: &thoughtgate_core::governance::ApprovalEngine,
+    task_id_parsed: &thoughtgate_core::governance::TaskId,
+    resource_name: &str,
+    request_id: Option<thoughtgate_core::transport::jsonrpc::JsonRpcId>,
+    blocking_timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+    tg_metrics: Option<&thoughtgate_core::telemetry::ThoughtGateMetrics>,
+) -> Result<
+    thoughtgate_core::transport::jsonrpc::JsonRpcResponse,
+    thoughtgate_core::error::ThoughtGateError,
+> {
+    let start = std::time::Instant::now();
+    let result = approval_engine
+        .wait_and_execute(
+            task_id_parsed,
+            resource_name,
+            blocking_timeout,
+            poll_interval,
+            std::time::Duration::from_secs(15),
+            None,
+        )
+        .await;
+
+    let elapsed = start.elapsed();
+    let outcome = match &result {
+        Ok(r) if r.is_error => "timeout",
+        Ok(_) => "approved",
+        Err(thoughtgate_core::error::ThoughtGateError::ApprovalRejected { .. }) => "rejected",
+        Err(_) => "error",
+    };
+    if let Some(metrics) = tg_metrics {
+        metrics.record_blocking_approval_completed(outcome, elapsed);
+    }
+
+    match result {
+        Ok(tool_result) => {
+            let response_value = serde_json::to_value(&tool_result)
+                .unwrap_or(serde_json::json!({"error": "serialization failed"}));
+            Ok(
+                thoughtgate_core::transport::jsonrpc::JsonRpcResponse::success(
+                    request_id,
+                    response_value,
+                ),
+            )
+        }
+        Err(e) => Err(e),
     }
 }
