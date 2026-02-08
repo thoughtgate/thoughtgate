@@ -175,6 +175,7 @@ fn run_dry_run(
         server_id: String::new(),
         governance_endpoint: "http://127.0.0.1:0".to_string(),
         profile,
+        config_path: None,
     };
 
     let _backup = adapter
@@ -395,10 +396,19 @@ pub async fn run_wrap(args: WrapArgs) -> Result<i32, StdioError> {
         ConfigGuard::lock(&config_path).map_err(|e| config_err_to_stdio(e, &config_path))?;
 
     // ── F-005/F-006: Rewrite config (under lock) ─────────────────────────
+    // Resolve the absolute config path for shim processes.
+    // Shim processes use this to load the config for list response filtering.
+    let resolved_config_path = if args.thoughtgate_config.as_os_str().is_empty() {
+        None
+    } else {
+        args.thoughtgate_config.canonicalize().ok()
+    };
+
     let shim_options = ShimOptions {
         server_id: String::new(), // per-server; rewrite sets each server_id
         governance_endpoint: governance_endpoint.clone(),
         profile,
+        config_path: resolved_config_path,
     };
 
     let backup_path = adapter

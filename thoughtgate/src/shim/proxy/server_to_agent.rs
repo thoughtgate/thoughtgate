@@ -9,6 +9,7 @@ use tokio::io::{BufReader, Stdout};
 use tokio::sync::{Mutex, watch};
 
 use thoughtgate_core::StreamDirection;
+use thoughtgate_core::config::Config;
 use thoughtgate_core::jsonrpc::JsonRpcMessageKind;
 use thoughtgate_core::telemetry::ThoughtGateMetrics;
 
@@ -16,8 +17,8 @@ use crate::error::{FramingError, StdioError};
 use crate::shim::ndjson::{detect_smuggling, parse_stdio_message};
 
 use super::helpers::{
-    PendingRequest, PendingRequests, bounded_read_line, framing_error_type, method_from_kind,
-    write_stdout,
+    PendingRequest, PendingRequests, bounded_read_line, filter_list_response, framing_error_type,
+    is_list_method, method_from_kind, write_stdout,
 };
 
 /// Read from server stdout, forward to agent stdout.
@@ -33,6 +34,7 @@ pub(super) async fn server_to_agent(
     agent_stdout: Arc<Mutex<Stdout>>,
     shutdown_rx: &mut watch::Receiver<bool>,
     pending: Arc<tokio::sync::Mutex<PendingRequests>>,
+    config: Option<Arc<Config>>,
 ) -> Result<(), StdioError> {
     let mut reader = BufReader::new(child_stdout);
     let mut raw_buf = Vec::new();
@@ -147,13 +149,36 @@ pub(super) async fn server_to_agent(
                     JsonRpcMessageKind::Response { id } => {
                         let key = serde_json::to_string(id).unwrap_or_default();
                         let matched = pending.lock().await.outbound.remove(&key);
-                        if let Some(req) = matched {
+                        if let Some(ref req) = matched {
                             tracing::debug!(
                                 server_id,
                                 method = %req.method,
                                 latency_us = req.sent_at.elapsed().as_micros() as u64,
                                 "response matched outbound request"
                             );
+
+                            // Gate 1: Filter list responses by visibility.
+                            // Apply the same filtering the HTTP proxy uses so
+                            // agents only see tools/resources/prompts they are
+                            // allowed to access.
+                            if is_list_method(&req.method) {
+                                if let Some(ref cfg) = config {
+                                    if let Some(filtered_line) =
+                                        filter_list_response(&buf, &req.method, cfg, &server_id)
+                                    {
+                                        tracing::debug!(
+                                            server_id,
+                                            method = %req.method,
+                                            "filtered list response by visibility"
+                                        );
+                                        write_stdout(&agent_stdout, filtered_line.as_bytes())
+                                            .await
+                                            .map_err(StdioError::StdioIo)?;
+                                        continue;
+                                    }
+                                    // Parsing failed — fall through to forward raw.
+                                }
+                            }
                         }
                     }
                     JsonRpcMessageKind::Request { id, method: m } => {

@@ -8,7 +8,11 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, Stdout};
 use tokio::sync::{Mutex, watch};
 
+use thoughtgate_core::config::Config;
 use thoughtgate_core::governance::api::{ApprovalOutcome, MessageType, TaskStatusResponse};
+use thoughtgate_core::governance::list_filtering::{
+    filter_and_annotate_tools, filter_prompts_by_visibility, filter_resources_by_visibility,
+};
 use thoughtgate_core::jsonrpc::{JsonRpcId, JsonRpcMessageKind};
 use thoughtgate_core::profile::Profile;
 
@@ -284,6 +288,61 @@ pub(super) fn rebuild_message_with_params(
         serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".to_string());
     json.push('\n');
     json
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// List Response Filtering (Gate 1: Visibility)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Filter a tools/list, resources/list, or prompts/list response by visibility.
+///
+/// Parses the JSON-RPC response, applies the same Gate 1 visibility filtering
+/// that the HTTP proxy uses, and returns the filtered NDJSON line. Returns
+/// `None` if the response cannot be parsed or the method is not a list method,
+/// in which case the caller should forward the raw bytes unchanged.
+///
+/// Implements: REQ-CORE-003/F-003 (Gate 1: Visibility Filtering)
+pub(super) fn filter_list_response(
+    raw_json: &str,
+    method: &str,
+    config: &Config,
+    source_id: &str,
+) -> Option<String> {
+    let mut response: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+
+    // Only filter successful responses (those with a "result" field).
+    let result = response.get_mut("result")?;
+
+    match method {
+        "tools/list" => {
+            let tools = result.get_mut("tools")?.as_array_mut()?;
+            let mut tools_vec: Vec<serde_json::Value> = std::mem::take(tools);
+            filter_and_annotate_tools(&mut tools_vec, config, source_id);
+            *tools = tools_vec;
+        }
+        "resources/list" => {
+            let resources = result.get_mut("resources")?.as_array_mut()?;
+            let mut resources_vec: Vec<serde_json::Value> = std::mem::take(resources);
+            filter_resources_by_visibility(&mut resources_vec, config, source_id);
+            *resources = resources_vec;
+        }
+        "prompts/list" => {
+            let prompts = result.get_mut("prompts")?.as_array_mut()?;
+            let mut prompts_vec: Vec<serde_json::Value> = std::mem::take(prompts);
+            filter_prompts_by_visibility(&mut prompts_vec, config, source_id);
+            *prompts = prompts_vec;
+        }
+        _ => return None,
+    }
+
+    let mut line = serde_json::to_string(&response).ok()?;
+    line.push('\n');
+    Some(line)
+}
+
+/// Check if a method is a list method that requires response filtering.
+pub(super) fn is_list_method(method: &str) -> bool {
+    matches!(method, "tools/list" | "resources/list" | "prompts/list")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -885,5 +944,95 @@ mod tests {
         assert_eq!(parsed["method"], "initialized");
         assert!(parsed.get("id").is_none());
         assert!(parsed.get("params").is_none());
+    }
+
+    // ── filter_list_response ────────────────────────────────────────
+
+    fn make_filter_config(allowed_tools: &[&str]) -> Config {
+        let tools: Vec<serde_json::Value> =
+            allowed_tools.iter().map(|t| serde_json::json!(t)).collect();
+        let json = serde_json::json!({
+            "schema": 1,
+            "sources": [{
+                "id": "test-server",
+                "kind": "mcp",
+                "url": "http://localhost:3000",
+                "expose": {
+                    "mode": "allowlist",
+                    "tools": tools
+                }
+            }],
+            "governance": {
+                "defaults": { "action": "forward" },
+                "rules": [{ "match": "*", "action": "forward" }]
+            }
+        });
+        let mut config: Config = serde_json::from_value(json).unwrap();
+        config.compile_patterns().unwrap();
+        config
+    }
+
+    #[test]
+    fn test_filter_list_response_tools_filtered() {
+        let config = make_filter_config(&["allowed_tool"]);
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {"name": "allowed_tool", "description": "ok"},
+                    {"name": "hidden_tool", "description": "nope"},
+                ]
+            }
+        });
+        let raw = serde_json::to_string(&response).unwrap();
+
+        let filtered = filter_list_response(&raw, "tools/list", &config, "test-server");
+        assert!(filtered.is_some());
+
+        let parsed: serde_json::Value = serde_json::from_str(filtered.unwrap().trim()).unwrap();
+        let tools = parsed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "allowed_tool");
+    }
+
+    #[test]
+    fn test_filter_list_response_non_list_returns_none() {
+        let config = make_filter_config(&["tool"]);
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"mock": "response"}
+        });
+        let raw = serde_json::to_string(&response).unwrap();
+
+        let filtered = filter_list_response(&raw, "tools/call", &config, "test-server");
+        assert!(filtered.is_none());
+    }
+
+    #[test]
+    fn test_filter_list_response_error_response_returns_none() {
+        let config = make_filter_config(&["tool"]);
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32600, "message": "bad"}
+        });
+        let raw = serde_json::to_string(&response).unwrap();
+
+        // Error responses have no "result" key, so filtering returns None.
+        let filtered = filter_list_response(&raw, "tools/list", &config, "test-server");
+        assert!(filtered.is_none());
+    }
+
+    // ── is_list_method ──────────────────────────────────────────────
+
+    #[test]
+    fn test_is_list_method() {
+        assert!(is_list_method("tools/list"));
+        assert!(is_list_method("resources/list"));
+        assert!(is_list_method("prompts/list"));
+        assert!(!is_list_method("tools/call"));
+        assert!(!is_list_method("initialize"));
     }
 }

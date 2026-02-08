@@ -72,6 +72,7 @@ async fn run_shim_from_args(args: ShimArgs) -> i32 {
         server_id: args.server_id,
         governance_endpoint: args.governance_endpoint,
         profile,
+        config_path: None, // Loaded from THOUGHTGATE_CONFIG env var in run_shim()
     };
 
     if args.command.is_empty() {
