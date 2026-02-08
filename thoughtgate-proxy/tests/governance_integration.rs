@@ -28,6 +28,7 @@ use thoughtgate_core::governance::{
     ApprovalDecision, Principal, TaskHandler, TaskId, TaskStatus, TaskStore, TaskStoreConfig,
     TimeoutAction, ToolCallRequest,
 };
+use thoughtgate_core::profile::Profile;
 
 // ============================================================================
 // Task Store Integration Tests
@@ -747,6 +748,7 @@ async fn test_gate2_forward_action_passthrough() {
         None, // No YAML config = Cedar-only mode (default forward)
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // Send a tools/call request
@@ -836,6 +838,7 @@ async fn test_gate2_deny_action_rejects() {
         Some(Arc::new(config)),
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // Send a tools/call request for the denied tool
@@ -912,6 +915,7 @@ async fn test_gate3_cedar_permit_continues() {
         None, // Cedar-only mode
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     let request = json!({
@@ -996,6 +1000,7 @@ async fn test_non_tool_methods_bypass_governance() {
         Some(Arc::new(config)),
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // tools/list should bypass governance even with deny-all config
@@ -1090,6 +1095,7 @@ async fn test_task_methods_handled_locally() {
         None, // No YAML config
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // tasks/get should be handled locally
@@ -1172,6 +1178,7 @@ async fn test_batch_requests_processed_correctly() {
         None, // No YAML config
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // Batch with multiple request types
@@ -1258,6 +1265,7 @@ async fn test_invalid_json_returns_parse_error() {
         None, // No YAML config
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // Send invalid JSON

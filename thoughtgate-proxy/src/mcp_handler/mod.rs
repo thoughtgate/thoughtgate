@@ -95,6 +95,8 @@ pub struct McpState {
     pub evaluator: Option<Arc<GovernanceEvaluator>>,
     /// Global fallback timeout (seconds) for blocking approval mode.
     pub blocking_approval_timeout_secs: u64,
+    /// Governance profile (production or development).
+    pub profile: Profile,
 }
 
 /// MCP request handler for direct invocation.
@@ -163,6 +165,7 @@ impl McpHandler {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: config.blocking_approval_timeout_secs,
+            profile: Profile::Production,
         });
 
         Self { state }
@@ -191,6 +194,7 @@ impl McpHandler {
     /// - Implements: REQ-GOV-002 (Governance Pipeline)
     /// - Implements: REQ-OBS-002 §6 (Prometheus Metrics)
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_governance(
         upstream: Arc<dyn UpstreamForwarder>,
         cedar_engine: Arc<CedarEngine>,
@@ -199,6 +203,7 @@ impl McpHandler {
         yaml_config: Option<Arc<Config>>,
         approval_engine: Option<Arc<ApprovalEngine>>,
         tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+        profile: Profile,
     ) -> Self {
         let task_handler = TaskHandler::new(task_store.clone());
         let semaphore = Arc::new(Semaphore::new(handler_config.max_concurrent_requests));
@@ -213,7 +218,7 @@ impl McpHandler {
                 Some(cedar_engine.clone()),
                 task_store,
                 principal,
-                Profile::Production,
+                profile,
             );
             if let Some(ref metrics) = tg_metrics {
                 eval = eval.with_metrics(metrics.clone());
@@ -240,6 +245,7 @@ impl McpHandler {
             tg_metrics,
             evaluator,
             blocking_approval_timeout_secs: handler_config.blocking_approval_timeout_secs,
+            profile,
         });
 
         Self { state }
@@ -428,6 +434,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         })
     }
 
@@ -605,6 +612,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         });
 
         let router = Router::new()
@@ -655,6 +663,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         });
 
         // Router with DefaultBodyLimit disabled - we check size manually and return JSON-RPC error
@@ -990,6 +999,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         })
     }
 
@@ -1249,6 +1259,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         })
     }
 
@@ -1429,5 +1440,36 @@ mod tests {
 
         // ID should be preserved
         assert_eq!(parsed["id"], "init-123");
+    }
+
+    // ========================================================================
+    // Profile Configuration Tests
+    // ========================================================================
+
+    /// Verifies: Default profile is Production when no flag is passed.
+    #[test]
+    fn test_default_profile_is_production() {
+        let state = create_test_state();
+        assert_eq!(state.profile, Profile::Production);
+    }
+
+    /// Verifies: Profile is threaded through with_governance() to the evaluator.
+    #[tokio::test]
+    async fn test_profile_passed_to_governance() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let cedar_engine = Arc::new(CedarEngine::new().expect("Failed to create Cedar engine"));
+
+        let handler = McpHandler::with_governance(
+            Arc::new(MockUpstream),
+            cedar_engine,
+            task_store,
+            McpHandlerConfig::default(),
+            None,
+            None,
+            None,
+            Profile::Development,
+        );
+
+        assert_eq!(handler.state().profile, Profile::Development);
     }
 }

@@ -11,7 +11,6 @@ use thoughtgate_core::governance::evaluator::DenySource;
 use thoughtgate_core::governance::evaluator::{extract_arguments, extract_resource_name};
 use thoughtgate_core::governance::{GovernanceDecision, Principal, ToolCallRequest};
 use thoughtgate_core::policy::principal::{infer_principal_optional, infer_principal_or_error};
-use thoughtgate_core::profile::Profile;
 use thoughtgate_core::telemetry::{
     GateOutcomes, GatewayDecisionSpanData, finish_gateway_decision_span,
     start_gateway_decision_span,
@@ -160,7 +159,7 @@ pub(crate) async fn route_through_gates(state: &McpState, mut request: McpReques
         id: request.id.clone(),
         params: request.params.as_deref().cloned(),
         message_type: MessageType::Request,
-        profile: Profile::Production,
+        profile: state.profile,
     };
 
     let (resp, trace) = evaluator

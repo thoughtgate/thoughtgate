@@ -13,7 +13,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
@@ -84,6 +84,36 @@ struct Config {
     /// If not specified, searches: THOUGHTGATE_CONFIG env, /etc/thoughtgate/config.yaml, ./config.yaml
     #[arg(long, env = "THOUGHTGATE_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Governance profile (production or development).
+    /// Development mode auto-forwards Cedar denials and approval workflows.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "production",
+        env = "THOUGHTGATE_PROFILE"
+    )]
+    profile: CliProfile,
+}
+
+/// CLI-level profile selection.
+///
+/// Maps 1:1 to `thoughtgate_core::profile::Profile`.
+#[derive(Clone, Debug, ValueEnum)]
+enum CliProfile {
+    /// All governance decisions are enforcing.
+    Production,
+    /// Governance decisions are logged but not enforced.
+    Development,
+}
+
+impl From<CliProfile> for thoughtgate_core::profile::Profile {
+    fn from(p: CliProfile) -> Self {
+        match p {
+            CliProfile::Production => thoughtgate_core::profile::Profile::Production,
+            CliProfile::Development => thoughtgate_core::profile::Profile::Development,
+        }
+    }
 }
 
 /// Main entry point for the ThoughtGate proxy.
@@ -125,6 +155,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(msg) = thoughtgate_core::lifecycle::validate_environment() {
         error!(reason = %msg, "Unsafe configuration detected — refusing to start");
         std::process::exit(1);
+    }
+
+    // Validate --profile development against THOUGHTGATE_ENVIRONMENT
+    let profile: thoughtgate_core::profile::Profile = cli_config.profile.clone().into();
+    if profile == thoughtgate_core::profile::Profile::Development {
+        let environment =
+            std::env::var("THOUGHTGATE_ENVIRONMENT").unwrap_or_else(|_| "production".to_string());
+        let is_production = matches!(environment.as_str(), "production" | "prod" | "");
+        if is_production {
+            error!(
+                "--profile development is not allowed when THOUGHTGATE_ENVIRONMENT is production. \
+                 Set THOUGHTGATE_ENVIRONMENT=development to use development profile."
+            );
+            std::process::exit(1);
+        }
+        warn!(
+            "SECURITY: Development profile active — Cedar denials and approval workflows will be bypassed"
+        );
     }
 
     // Phase 2: Initialize lifecycle manager
@@ -305,11 +353,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Arc::new(config.clone())),
             approval_engine,
             Some(tg_metrics.clone()), // Prometheus metrics (REQ-OBS-002 §6)
+            profile,
         );
 
         info!(
             requires_approval = config.requires_approval_engine(),
             rules_count = config.governance.rules.len(),
+            profile = ?profile,
             "MCP governance enabled (4-gate model)"
         );
 
