@@ -443,15 +443,20 @@ impl JsonRpcResponse {
         task_id: String,
         status: String,
         poll_interval: std::time::Duration,
+        status_message: Option<&str>,
     ) -> Self {
+        let mut result = serde_json::json!({
+            "taskId": task_id,
+            "status": status,
+            "pollInterval": poll_interval.as_millis(),
+        });
+        if let Some(msg) = status_message {
+            result["statusMessage"] = serde_json::Value::String(msg.to_string());
+        }
         Self {
             jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             id,
-            result: Some(serde_json::json!({
-                "taskId": task_id,
-                "status": status,
-                "pollInterval": poll_interval.as_millis(),
-            })),
+            result: Some(result),
             error: None,
         }
     }

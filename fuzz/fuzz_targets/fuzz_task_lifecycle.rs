@@ -119,6 +119,7 @@ async fn fuzz_task_lifecycle(input: FuzzTaskInput) {
         cleanup_interval: Duration::from_secs(60),
         max_pending_per_principal: 100,
         max_pending_global: 1000,
+        max_pending_bytes: 100 * 1024 * 1024,
         terminal_grace_period: Duration::from_secs(300),
     };
 

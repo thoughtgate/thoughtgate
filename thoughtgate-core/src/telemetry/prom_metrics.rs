@@ -244,6 +244,33 @@ pub struct StdioServerStateLabels {
 // Governance Pipeline Labels (REQ-GOV-002)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Labels for lifecycle state gauge (info-style enum metric).
+///
+/// Implements: REQ-CORE-005/NFR-001
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LifecycleStateLabels {
+    /// Lifecycle state: "starting", "ready", "shutting_down", "stopped"
+    pub state: Cow<'static, str>,
+}
+
+/// Labels for cedar reload counter.
+///
+/// Implements: REQ-POL-001/NFR-001
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StatusLabels {
+    /// Outcome: "success" or "error"
+    pub status: Cow<'static, str>,
+}
+
+/// Labels for governance rule match counter.
+///
+/// Implements: REQ-CFG-001/NFR-001
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RuleMatchLabels {
+    /// Matched action: "forward", "deny", "approve", "policy"
+    pub action: Cow<'static, str>,
+}
+
 /// Labels for blocking approval metrics.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct BlockingApprovalLabels {
@@ -480,6 +507,44 @@ pub struct ThoughtGateMetrics {
     ///
     /// Implements: REQ-CORE-005/NFR-001
     pub drain_timeout_total: Counter,
+
+    /// Current lifecycle state (info-style enum gauge).
+    ///
+    /// Wired: lifecycle/mod.rs on state transitions.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub lifecycle_state: Family<LifecycleStateLabels, Gauge>,
+
+    /// Time spent in graceful shutdown (seconds).
+    ///
+    /// Wired: proxy main.rs graceful_shutdown().
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub shutdown_duration_seconds: Gauge,
+
+    /// Approvals cancelled during shutdown.
+    ///
+    /// Wired: governance/task/store.rs fail_all_pending().
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub approvals_cancelled_shutdown: Counter,
+
+    /// Cedar policy reload attempts by status (success/error).
+    ///
+    /// Wired: policy/engine.rs apply_reload() and reload() error path.
+    ///
+    /// Implements: REQ-POL-001/NFR-001
+    pub cedar_reload_total: Family<StatusLabels, Counter>,
+
+    /// Configuration load attempts by status (success/error).
+    ///
+    /// Implements: REQ-CFG-001/NFR-001
+    pub config_load_total: Family<StatusLabels, Counter>,
+
+    /// Governance rule match counts by action.
+    ///
+    /// Implements: REQ-CFG-001/NFR-001
+    pub rule_matches_total: Family<RuleMatchLabels, Counter>,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Stdio Transport Metrics (REQ-CORE-008)
@@ -749,6 +814,48 @@ impl ThoughtGateMetrics {
             drain_timeout_total.clone(),
         );
 
+        let lifecycle_state = Family::<LifecycleStateLabels, Gauge>::default();
+        registry.register(
+            "thoughtgate_lifecycle_state",
+            "Current lifecycle state (1 = active state)",
+            lifecycle_state.clone(),
+        );
+
+        let shutdown_duration_seconds = Gauge::default();
+        registry.register(
+            "thoughtgate_shutdown_duration_seconds",
+            "Time spent in graceful shutdown",
+            shutdown_duration_seconds.clone(),
+        );
+
+        let approvals_cancelled_shutdown = Counter::default();
+        registry.register(
+            "thoughtgate_approvals_cancelled_shutdown",
+            "Approvals cancelled during shutdown",
+            approvals_cancelled_shutdown.clone(),
+        );
+
+        let cedar_reload_total = Family::<StatusLabels, Counter>::default();
+        registry.register(
+            "thoughtgate_cedar_reload_total",
+            "Cedar policy reload attempts",
+            cedar_reload_total.clone(),
+        );
+
+        let config_load_total = Family::<StatusLabels, Counter>::default();
+        registry.register(
+            "thoughtgate_config_load_total",
+            "Configuration load attempts",
+            config_load_total.clone(),
+        );
+
+        let rule_matches_total = Family::<RuleMatchLabels, Counter>::default();
+        registry.register(
+            "thoughtgate_rule_matches_total",
+            "Governance rule match counts",
+            rule_matches_total.clone(),
+        );
+
         // ─────────────────────────────────────────────────────────────────────
         // Stdio Transport Metrics (REQ-CORE-008)
         // ─────────────────────────────────────────────────────────────────────
@@ -841,6 +948,12 @@ impl ThoughtGateMetrics {
             startup_duration_seconds,
             active_requests,
             drain_timeout_total,
+            lifecycle_state,
+            shutdown_duration_seconds,
+            approvals_cancelled_shutdown,
+            cedar_reload_total,
+            config_load_total,
+            rule_matches_total,
             // Stdio
             stdio_messages_total,
             stdio_governance_decisions_total,
@@ -1162,6 +1275,86 @@ impl ThoughtGateMetrics {
     /// Implements: REQ-CORE-005/NFR-001
     pub fn record_drain_timeout(&self) {
         self.drain_timeout_total.inc();
+    }
+
+    /// Set the current lifecycle state.
+    ///
+    /// Uses the info-style enum pattern: sets the active state to 1, the others to 0.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn set_lifecycle_state(&self, state: &str) {
+        let all_states = ["starting", "ready", "shutting_down", "stopped"];
+        for s in &all_states {
+            let val = if *s == state { 1 } else { 0 };
+            self.lifecycle_state
+                .get_or_create(&LifecycleStateLabels {
+                    state: Cow::Borrowed(s),
+                })
+                .set(val);
+        }
+    }
+
+    /// Record shutdown duration in seconds.
+    ///
+    /// Call once when graceful shutdown completes.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn record_shutdown_duration(&self, seconds: f64) {
+        self.shutdown_duration_seconds.set(seconds as i64);
+    }
+
+    /// Record approvals cancelled during shutdown.
+    ///
+    /// Call with the count returned by `fail_all_pending()`.
+    ///
+    /// Implements: REQ-CORE-005/NFR-001
+    pub fn record_approvals_cancelled_shutdown(&self, count: u64) {
+        self.approvals_cancelled_shutdown.inc_by(count);
+    }
+
+    /// Record a Cedar policy reload attempt.
+    ///
+    /// # Arguments
+    ///
+    /// * `status` - "success" or "error"
+    ///
+    /// Implements: REQ-POL-001/NFR-001
+    pub fn record_cedar_reload(&self, status: &'static str) {
+        self.cedar_reload_total
+            .get_or_create(&StatusLabels {
+                status: Cow::Borrowed(status),
+            })
+            .inc();
+    }
+
+    /// Record a configuration load attempt.
+    ///
+    /// # Arguments
+    ///
+    /// * `status` - "success" or "error"
+    ///
+    /// Implements: REQ-CFG-001/NFR-001
+    pub fn record_config_load(&self, status: &'static str) {
+        self.config_load_total
+            .get_or_create(&StatusLabels {
+                status: Cow::Borrowed(status),
+            })
+            .inc();
+    }
+
+    /// Record a governance rule match.
+    ///
+    /// # Arguments
+    ///
+    /// * `action` - Matched action: "forward", "deny", "approve", "policy"
+    ///
+    /// Implements: REQ-CFG-001/NFR-001
+    pub fn record_rule_match(&self, action: &'static str) {
+        self.rule_matches_total
+            .get_or_create(&RuleMatchLabels {
+                action: Cow::Borrowed(action),
+            })
+            .inc();
     }
 
     // ─────────────────────────────────────────────────────────────────────────

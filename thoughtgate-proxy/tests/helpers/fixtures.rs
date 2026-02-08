@@ -291,24 +291,22 @@ pub mod error_codes {
     /// Policy denied (Gate 3)
     pub const POLICY_DENIED: i32 = -32003;
 
-    /// Method not allowed (Gate 2 deny)
-    pub const METHOD_NOT_ALLOWED: i32 = -32006;
-
     /// Approval rejected (Gate 4)
     pub const APPROVAL_REJECTED: i32 = -32007;
     /// Approval timeout (Gate 4)
     pub const APPROVAL_TIMEOUT: i32 = -32008;
 
-    /// Task not found
-    pub const TASK_NOT_FOUND: i32 = -32010;
-    /// Task result not ready
-    pub const TASK_NOT_READY: i32 = -32011;
-
     /// Rate limited
-    pub const RATE_LIMITED: i32 = -32013;
+    pub const RATE_LIMITED: i32 = -32009;
+
+    /// Policy drift (post-approval)
+    pub const POLICY_DRIFT: i32 = -32011;
 
     /// Governance rule denied (Gate 2)
     pub const GOVERNANCE_RULE_DENIED: i32 = -32014;
+
+    /// Task result not ready
+    pub const TASK_NOT_READY: i32 = -32020;
 
     /// Tool not exposed (Gate 1)
     pub const TOOL_NOT_EXPOSED: i32 = -32015;

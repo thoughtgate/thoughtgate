@@ -150,7 +150,12 @@ pub(super) async fn handle_list_method(
                 Some(arr) => arr,
                 None => return Ok(response),
             };
-            list_filtering::filter_and_annotate_tools(tools_arr, config, source_id);
+            list_filtering::filter_and_annotate_tools(
+                tools_arr,
+                config,
+                source_id,
+                state.capability_cache.upstream_supports_tasks(),
+            );
             Ok(JsonRpcResponse::success(response.id, new_result))
         }
         "resources/list" => {

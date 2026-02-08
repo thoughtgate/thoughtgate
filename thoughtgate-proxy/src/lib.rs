@@ -14,5 +14,6 @@ pub mod ports;
 pub mod proxy_body;
 pub mod proxy_config;
 pub mod proxy_service;
+pub mod rate_limiter;
 pub mod timeout;
 pub mod traffic;

@@ -76,3 +76,136 @@ pub(super) fn error_bytes(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn make_request(method: &str, params: Option<serde_json::Value>) -> McpRequest {
+        McpRequest {
+            id: Some(JsonRpcId::Number(1)),
+            method: method.to_string(),
+            params: params.map(Arc::new),
+            task_metadata: None,
+            received_at: Instant::now(),
+            correlation_id: uuid::Uuid::nil(),
+        }
+    }
+
+    // ── is_list_method ────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_list_method_tools_list() {
+        assert!(is_list_method("tools/list"));
+    }
+
+    #[test]
+    fn test_is_list_method_resources_list() {
+        assert!(is_list_method("resources/list"));
+    }
+
+    #[test]
+    fn test_is_list_method_prompts_list() {
+        assert!(is_list_method("prompts/list"));
+    }
+
+    #[test]
+    fn test_is_list_method_tools_call() {
+        assert!(!is_list_method("tools/call"));
+    }
+
+    #[test]
+    fn test_is_list_method_arbitrary() {
+        assert!(!is_list_method("custom/method"));
+    }
+
+    // ── extract_tool_name ─────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_tool_name_valid() {
+        let request = make_request(
+            "tools/call",
+            Some(serde_json::json!({"name": "delete_user", "arguments": {}})),
+        );
+        assert_eq!(extract_tool_name(&request), Some("delete_user"));
+    }
+
+    #[test]
+    fn test_extract_tool_name_not_tools_call() {
+        let request = make_request(
+            "resources/read",
+            Some(serde_json::json!({"name": "my_resource"})),
+        );
+        assert_eq!(extract_tool_name(&request), None);
+    }
+
+    #[test]
+    fn test_extract_tool_name_no_params() {
+        let request = make_request("tools/call", None);
+        assert_eq!(extract_tool_name(&request), None);
+    }
+
+    #[test]
+    fn test_extract_tool_name_missing_name_field() {
+        let request = make_request("tools/call", Some(serde_json::json!({"arguments": {}})));
+        assert_eq!(extract_tool_name(&request), None);
+    }
+
+    // ── BufferGuard ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_buffer_guard_decrements_on_drop() {
+        let counter = AtomicUsize::new(100);
+        {
+            let _guard = BufferGuard {
+                counter: &counter,
+                size: 42,
+            };
+            assert_eq!(counter.load(Ordering::Acquire), 100);
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 58);
+    }
+
+    // ── json_bytes ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_json_bytes_success_response() {
+        let response =
+            JsonRpcResponse::success(Some(JsonRpcId::Number(1)), serde_json::json!("ok"));
+        let (status, bytes) = json_bytes(&response);
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["id"], 1);
+        assert_eq!(parsed["result"], "ok");
+    }
+
+    // ── error_bytes ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_error_bytes_returns_200_with_jsonrpc_error() {
+        let error = ThoughtGateError::PolicyDenied {
+            tool: "test_tool".to_string(),
+            policy_id: Some("policy-1".to_string()),
+            reason: Some("forbidden".to_string()),
+        };
+        let (status, bytes) = error_bytes(Some(JsonRpcId::Number(42)), &error, "corr-123");
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(parsed["error"]["code"], -32003);
+    }
+
+    #[test]
+    fn test_error_bytes_with_null_id() {
+        let error = ThoughtGateError::ParseError {
+            details: "bad json".to_string(),
+        };
+        let (status, bytes) = error_bytes(None, &error, "corr-456");
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(parsed["id"].is_null());
+        assert_eq!(parsed["error"]["code"], -32700);
+    }
+}

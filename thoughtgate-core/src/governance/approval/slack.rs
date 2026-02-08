@@ -190,8 +190,11 @@ impl SlackAdapter {
     ///
     /// Implements: REQ-GOV-003/F-006.2
     fn build_approval_blocks(&self, request: &ApprovalRequest) -> serde_json::Value {
-        let args_pretty = serde_json::to_string_pretty(&request.tool_arguments)
-            .unwrap_or_else(|_| request.tool_arguments.to_string());
+        // Apply field redaction before rendering (H-001 mitigation)
+        let display_args =
+            super::redact::redact_fields(&request.tool_arguments, &request.redact_fields);
+        let args_pretty = serde_json::to_string_pretty(&display_args)
+            .unwrap_or_else(|_| display_args.to_string());
 
         serde_json::json!([
             {
@@ -309,9 +312,20 @@ impl SlackAdapter {
             })
             .unwrap_or_else(|| user_id.to_string());
 
-        // Cache the result (with bounded size to prevent unbounded growth)
+        // Cache the result (with bounded size to prevent unbounded growth).
+        // Evict ~25% of entries randomly instead of clearing the entire cache,
+        // which avoids a thundering-herd of misses after eviction.
         if self.user_cache.len() >= MAX_USER_CACHE_SIZE {
-            self.user_cache.clear();
+            let to_evict = self.user_cache.len() / 4;
+            let keys: Vec<String> = self
+                .user_cache
+                .iter()
+                .take(to_evict)
+                .map(|entry| entry.key().clone())
+                .collect();
+            for key in keys {
+                self.user_cache.remove(&key);
+            }
         }
         self.user_cache
             .insert(user_id.to_string(), display_name.clone());
@@ -815,6 +829,7 @@ mod tests {
             created_at: Utc::now(),
             correlation_id: "test-correlation".to_string(),
             request_span_context: None, // No span context for basic tests
+            redact_fields: Vec::new(),
         }
     }
 

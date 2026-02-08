@@ -35,6 +35,7 @@ use tokio::io::Stdout;
 use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 
+use thoughtgate_core::config::Config;
 use thoughtgate_core::telemetry::ThoughtGateMetrics;
 
 use crate::error::StdioError;
@@ -120,6 +121,31 @@ pub async fn run_shim(
             reason: format!("failed to build HTTP client: {e}"),
         })?;
 
+    // ── Load ThoughtGate config for list response filtering ─────────────
+    let tg_config: Option<Arc<Config>> =
+        std::env::var("THOUGHTGATE_CONFIG")
+            .ok()
+            .and_then(|path_str| {
+                let path = std::path::Path::new(&path_str);
+                if !path.exists() {
+                    tracing::debug!(path = %path_str, "THOUGHTGATE_CONFIG path not found");
+                    return None;
+                }
+                match thoughtgate_core::config::load_and_validate(
+                    path,
+                    thoughtgate_core::config::Version::V0_2,
+                ) {
+                    Ok((config, _)) => {
+                        tracing::debug!(path = %path_str, "loaded config for list filtering");
+                        Some(Arc::new(config))
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "failed to load config for list filtering");
+                        None
+                    }
+                }
+            });
+
     // ── F-016a: Poll governance /healthz ─────────────────────────────────
     poll_governance_healthz(&client, &governance_endpoint).await?;
 
@@ -185,6 +211,7 @@ pub async fn run_shim(
         let mut shutdown_rx = shutdown_rx.clone();
         let pending = pending.clone();
         let agent_stdout = agent_stdout.clone();
+        let tg_config = tg_config.clone();
 
         tokio::spawn(async move {
             server_to_agent(
@@ -194,6 +221,7 @@ pub async fn run_shim(
                 agent_stdout,
                 &mut shutdown_rx,
                 pending,
+                tg_config,
             )
             .await
         })

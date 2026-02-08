@@ -4,7 +4,7 @@
 |----------|-------|
 | **Title** | System Architecture & Integration |
 | **Status** | Draft |
-| **Version** | v0.2 |
+| **Version** | v0.4 |
 | **Tags** | `#architecture` `#integration` `#overview` `#mcp` `#hitl` `#4-gate` |
 
 ## 1. Purpose
@@ -159,11 +159,14 @@ Not all gates are executed for every request:
 │      • Parse method and params                                                  │
 │                                                                                 │
 │   2. Method Routing                                                             │
+│      • initialize    → InitializeHandler (capability negotiation)               │
 │      • tools/call    → 4-Gate Decision Flow                                     │
 │      • tools/list    → Filter by visibility (Gate 1), annotate taskSupport      │
 │      • resources/list → Filter by visibility (Gate 1)                           │
 │      • prompts/list  → Filter by visibility (Gate 1)                            │
 │      • tasks/*       → Task Manager (SEP-1686)                                  │
+│      • tg_tasks/*    → Task Manager (prefixed aliases: tg_tasks/get,            │
+│                        tg_tasks/result, tg_tasks/list)                          │
 │      • other         → Pass through to upstream                                 │
 │                                                                                 │
 │   3. Gate 1: Visibility Check                                                   │
@@ -587,7 +590,7 @@ Environment variables can override specific settings but cannot define complex s
 | Single upstream | Can't route to multiple MCP servers | Deploy multiple instances |
 | Per-component metrics | No unified tracing | Correlation IDs in logs |
 | Slack rate limits | Burst approval requests queue | Outbound rate limiter |
-| HTTP blocking mode has no heartbeats | Intermediary proxies (nginx 60s, ALB 60s, Cloudflare 100s) may kill idle connections during approval holds | Configure `proxy_read_timeout 600s` on reverse proxies. Stdio transport emits `notifications/progress` every 15s. HTTP SSE streaming planned for future release. |
+| HTTP blocking mode keepalive | Intermediary proxies (nginx 60s, ALB 60s, Cloudflare 100s) may kill idle connections during approval holds | Chunked transfer-encoding keepalive is now implemented for blocking approval mode, sending periodic whitespace chunks to prevent proxy timeouts. Stdio transport emits `notifications/progress` every 15s. Configure `proxy_read_timeout 600s` on reverse proxies for additional safety. |
 
 ## 8. Deployment Architecture
 
@@ -865,20 +868,19 @@ All metrics follow the pattern: `thoughtgate_<component>_<metric>_<unit>`
 | -32700 | Parse error | — | Invalid JSON | REQ-CORE-003 |
 | -32600 | Invalid Request | — | Invalid JSON-RPC | REQ-CORE-003 |
 | -32601 | Method not found | — | Unknown method | REQ-CORE-004 |
-| -32602 | Invalid params | — | Invalid method params | REQ-CORE-004 |
+| -32602 | Invalid params | — | Invalid method params; also used for unknown task ID (taskId is a param) | REQ-CORE-004, REQ-GOV-001 |
 | -32603 | Internal error | — | Server error / panic | REQ-CORE-004 |
 | **ThoughtGate Custom** |||||
 | -32000 | Connection failed | — | Upstream unreachable | REQ-CORE-004 |
 | -32001 | Timeout | — | Upstream timeout | REQ-CORE-004 |
 | -32002 | Upstream error | — | Upstream returned error | REQ-CORE-004 |
 | -32003 | Policy denied | 3 | Cedar policy forbid | REQ-POL-001 |
-| -32004 | Task not found | — | Unknown task ID | REQ-GOV-001 |
 | -32005 | Task expired | — | Task TTL exceeded | REQ-GOV-001 |
 | -32006 | Task cancelled | — | Task was cancelled | REQ-GOV-001 |
 | -32007 | Approval rejected | 4 | Approver rejected request | REQ-GOV-003 |
 | -32008 | Approval timeout | 4 | Approval window closed | REQ-GOV-003 |
 | -32009 | Rate limited | — | Too many requests | REQ-GOV-001 |
-| -32010 | Inspection failed | — | Inspector rejected | REQ-CORE-002 |
+| -32010 | *(reserved/deferred)* | — | Inspection failed (deferred to v0.3+, unused) | REQ-CORE-002 |
 | -32011 | Policy drift | — | Policy changed post-approval | REQ-GOV-002 |
 | -32012 | Transform drift | — | Request changed post-approval | REQ-GOV-002 |
 | -32013 | Service unavailable | — | Capacity/concurrency limit | REQ-CORE-005 |
@@ -886,6 +888,7 @@ All metrics follow the pattern: `thoughtgate_<component>_<metric>_<unit>`
 | -32015 | Tool not exposed | 1 | Tool hidden by `expose` config | REQ-CFG-001 |
 | -32016 | Configuration error | — | Invalid configuration | REQ-CFG-001 |
 | -32017 | Workflow not found | 4 | Approval workflow not defined | REQ-GOV-003 |
+| -32020 | Task result not ready | — | Task exists but result not yet available | REQ-GOV-001 |
 
 ## 12. Cross-Cutting Concerns
 

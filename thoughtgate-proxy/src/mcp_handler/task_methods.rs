@@ -257,3 +257,68 @@ fn task_error_to_thoughtgate(error: thoughtgate_core::governance::TaskError) -> 
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thoughtgate_core::governance::{TaskError, TaskId, TaskStatus};
+
+    #[test]
+    fn test_not_found_maps_to_task_not_found() {
+        let task_id = TaskId::new();
+        let err = task_error_to_thoughtgate(TaskError::NotFound {
+            task_id: task_id.clone(),
+        });
+        assert!(matches!(err, ThoughtGateError::TaskNotFound { .. }));
+    }
+
+    #[test]
+    fn test_expired_maps_to_task_expired() {
+        let task_id = TaskId::new();
+        let err = task_error_to_thoughtgate(TaskError::Expired {
+            task_id: task_id.clone(),
+        });
+        assert!(matches!(err, ThoughtGateError::TaskExpired { .. }));
+    }
+
+    #[test]
+    fn test_already_terminal_maps_to_invalid_params() {
+        let task_id = TaskId::new();
+        let err = task_error_to_thoughtgate(TaskError::AlreadyTerminal {
+            task_id,
+            status: TaskStatus::Completed,
+        });
+        assert!(matches!(err, ThoughtGateError::InvalidParams { .. }));
+    }
+
+    #[test]
+    fn test_rate_limited_maps_to_rate_limited() {
+        let err = task_error_to_thoughtgate(TaskError::RateLimited {
+            principal: "test-principal".to_string(),
+            retry_after: std::time::Duration::from_secs(5),
+        });
+        match err {
+            ThoughtGateError::RateLimited {
+                retry_after_secs, ..
+            } => {
+                assert_eq!(retry_after_secs, Some(5));
+            }
+            other => panic!("Expected RateLimited, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_result_not_ready_maps_correctly() {
+        let task_id = TaskId::new();
+        let err = task_error_to_thoughtgate(TaskError::ResultNotReady {
+            task_id: task_id.clone(),
+        });
+        assert!(matches!(err, ThoughtGateError::TaskResultNotReady { .. }));
+    }
+
+    #[test]
+    fn test_capacity_exceeded_maps_to_service_unavailable() {
+        let err = task_error_to_thoughtgate(TaskError::CapacityExceeded);
+        assert!(matches!(err, ThoughtGateError::ServiceUnavailable { .. }));
+    }
+}

@@ -68,6 +68,10 @@ axum.workspace = true
 # HTTP client for upstream MCP server
 reqwest = { workspace = true, features = ["json"] }
 
+# Per-client rate limiting (REQ-CORE-005)
+governor = "0.10"
+dashmap = "6"
+
 # CLI and config
 clap = { version = "4", features = ["derive", "env"] }
 

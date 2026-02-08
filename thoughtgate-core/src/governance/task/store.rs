@@ -37,10 +37,19 @@ pub struct TaskStoreConfig {
     pub max_pending_global: usize,
     /// Grace period after terminal before removal
     pub terminal_grace_period: Duration,
+    /// Maximum total bytes for pending task arguments (H-004).
+    /// Prevents memory exhaustion from tasks with large tool_arguments.
+    /// Default: 256 MB.
+    pub max_pending_bytes: usize,
 }
 
 impl Default for TaskStoreConfig {
     fn default() -> Self {
+        let max_pending_bytes: usize = std::env::var("THOUGHTGATE_MAX_PENDING_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256 * 1024 * 1024); // 256 MB
+
         Self {
             default_ttl: Duration::from_secs(600),     // 10 minutes
             max_ttl: Duration::from_secs(86400),       // 24 hours
@@ -49,6 +58,7 @@ impl Default for TaskStoreConfig {
             max_pending_per_principal: 10,
             max_pending_global: 1000,
             terminal_grace_period: Duration::from_secs(3600), // 1 hour
+            max_pending_bytes,
         }
     }
 }
@@ -70,6 +80,8 @@ struct TaskEntry {
     terminal_at: Option<DateTime<Utc>>,
     /// Notifier for waiters on this task
     notify: Arc<Notify>,
+    /// Estimated size of this task's arguments in bytes (for byte-level accounting).
+    estimated_bytes: usize,
 }
 
 /// In-memory task store with concurrent access support.
@@ -89,6 +101,8 @@ pub struct TaskStore {
     /// Atomic counter of pending tasks per principal (keyed by rate_limit_key).
     /// Prevents TOCTOU race between count check and insert in `create()`.
     pending_by_principal: DashMap<String, AtomicUsize>,
+    /// Estimated total bytes of pending task arguments (H-004).
+    pending_bytes: AtomicUsize,
     /// Optional Prometheus metrics for gauge updates (REQ-OBS-002 §6.4/MG-002).
     /// When set, the tasks_pending gauge is updated on task creation/completion.
     tg_metrics: Option<Arc<crate::telemetry::ThoughtGateMetrics>>,
@@ -100,6 +114,7 @@ impl std::fmt::Debug for TaskStore {
             .field("tasks_count", &self.tasks.len())
             .field("config", &self.config)
             .field("pending_count", &self.pending_count.load(Ordering::Acquire))
+            .field("pending_bytes", &self.pending_bytes.load(Ordering::Acquire))
             .field("has_metrics", &self.tg_metrics.is_some())
             .finish()
     }
@@ -117,6 +132,7 @@ impl TaskStore {
             config,
             pending_count: AtomicUsize::new(0),
             pending_by_principal: DashMap::new(),
+            pending_bytes: AtomicUsize::new(0),
             tg_metrics: None,
         }
     }
@@ -153,6 +169,7 @@ impl TaskStore {
             config,
             pending_count: AtomicUsize::new(0),
             pending_by_principal: DashMap::new(),
+            pending_bytes: AtomicUsize::new(0),
             tg_metrics: Some(metrics),
         }
     }
@@ -165,7 +182,7 @@ impl TaskStore {
         &self.config
     }
 
-    /// Decrements both global and per-principal pending counters.
+    /// Decrements global count, per-principal count, and pending bytes.
     ///
     /// Must be called exactly once when a task transitions from non-terminal
     /// to terminal. Caller is responsible for ensuring the task was previously
@@ -173,8 +190,10 @@ impl TaskStore {
     ///
     /// Also updates the Prometheus gauge if metrics are configured
     /// (REQ-OBS-002 §6.4/MG-002).
-    fn decrement_pending_counters(&self, task: &Task) {
+    fn decrement_pending_counters(&self, task: &Task, estimated_bytes: usize) {
         let new_count = self.pending_count.fetch_sub(1, Ordering::Release) - 1;
+        self.pending_bytes
+            .fetch_sub(estimated_bytes, Ordering::Release);
 
         // Update Prometheus gauge (REQ-OBS-002 §6.4/MG-002)
         if let Some(ref metrics) = self.tg_metrics {
@@ -213,6 +232,12 @@ impl TaskStore {
     #[must_use]
     pub fn total_count(&self) -> usize {
         self.tasks.len()
+    }
+
+    /// Returns the estimated bytes used by pending task arguments (H-004).
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes.load(Ordering::Acquire)
     }
 
     /// Returns true if the principal index contains the given key.
@@ -295,6 +320,23 @@ impl TaskStore {
             self.pending_count.fetch_sub(1, Ordering::Release);
             TaskError::Internal { details: e }
         })?;
+
+        // H-004: Estimate task memory and check byte-level limit.
+        // Uses JSON serialization length + 200 bytes overhead for metadata.
+        let estimated_bytes =
+            serde_json::to_string(&task.original_request.arguments).map_or(200, |s| s.len()) + 200;
+
+        // Check byte-level capacity (best-effort: no CAS loop needed since
+        // the count-based limit already bounds concurrency)
+        let current_bytes = self.pending_bytes.load(Ordering::Acquire);
+        if current_bytes + estimated_bytes > self.config.max_pending_bytes {
+            principal_counter.fetch_sub(1, Ordering::Release);
+            self.pending_count.fetch_sub(1, Ordering::Release);
+            return Err(TaskError::CapacityExceeded);
+        }
+        self.pending_bytes
+            .fetch_add(estimated_bytes, Ordering::Release);
+
         let task_id = task.id.clone();
         let task_arc = Arc::new(task);
 
@@ -303,6 +345,7 @@ impl TaskStore {
             task: task_arc.clone(),
             terminal_at: None,
             notify: Arc::new(Notify::new()),
+            estimated_bytes,
         };
         self.tasks.insert(task_id.clone(), entry);
 
@@ -360,7 +403,7 @@ impl TaskStore {
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.decrement_pending_counters(&entry.task);
+            self.decrement_pending_counters(&entry.task, entry.estimated_bytes);
             entry.notify.notify_waiters();
         }
 
@@ -390,7 +433,7 @@ impl TaskStore {
         // Track when task became terminal
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.decrement_pending_counters(&entry.task);
+            self.decrement_pending_counters(&entry.task, entry.estimated_bytes);
             entry.notify.notify_waiters();
         }
 
@@ -451,7 +494,7 @@ impl TaskStore {
 
         if !was_terminal && entry.task.status.is_terminal() {
             entry.terminal_at = Some(Utc::now());
-            self.decrement_pending_counters(&entry.task);
+            self.decrement_pending_counters(&entry.task, entry.estimated_bytes);
             entry.notify.notify_waiters();
         }
 
@@ -491,7 +534,7 @@ impl TaskStore {
             )?;
         }
         entry.terminal_at = Some(Utc::now());
-        self.decrement_pending_counters(&entry.task);
+        self.decrement_pending_counters(&entry.task, entry.estimated_bytes);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -554,7 +597,7 @@ impl TaskStore {
         entry.terminal_at = Some(Utc::now());
 
         if !was_terminal {
-            self.decrement_pending_counters(&entry.task);
+            self.decrement_pending_counters(&entry.task, entry.estimated_bytes);
         }
         entry.notify.notify_waiters();
 
@@ -601,7 +644,7 @@ impl TaskStore {
             Some("Cancelled by agent".to_string()),
         )?;
         entry.terminal_at = Some(Utc::now());
-        self.decrement_pending_counters(&entry.task);
+        self.decrement_pending_counters(&entry.task, entry.estimated_bytes);
         entry.notify.notify_waiters();
 
         Ok(entry.task.clone())
@@ -640,7 +683,7 @@ impl TaskStore {
                         .is_ok()
                 {
                     entry.terminal_at = Some(now);
-                    self.decrement_pending_counters(&entry.task);
+                    self.decrement_pending_counters(&entry.task, entry.estimated_bytes);
                     // Record MC-008: tasks_completed_total (prometheus-client) with outcome=expired
                     if let Some(ref metrics) = self.tg_metrics {
                         metrics.record_task_completed("approval", "expired");

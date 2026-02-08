@@ -22,10 +22,13 @@ This requirement defines the **execution pipeline** for approval-required reques
 
 ### 1.2 v0.2: Simplified Pipeline
 
-In v0.2, the execution pipeline is minimal because:
+In v0.2, the execution pipeline is simplified because:
 - REQ-CORE-002 (Buffered Inspection/Amber) is deferred
 - No inspector chain to run
-- No transform drift detection needed
+
+Note: Policy re-evaluation and transform drift detection **are** implemented.
+The pipeline computes a canonical JSON hash of the request at task creation and
+verifies it against a fresh hash during execution.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -216,7 +219,7 @@ The system must additionally:
 |----------|---------|-------------|
 | `THOUGHTGATE_EXECUTION_TIMEOUT_SECS` | `30` | Upstream execution timeout |
 
-### 5.2 v0.3+ Configuration (Future)
+### 5.2 Additional Configuration
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
@@ -224,11 +227,18 @@ The system must additionally:
 | Transform drift mode | strict | `THOUGHTGATE_TRANSFORM_DRIFT_MODE` |
 | Execution timeout | 30s | `THOUGHTGATE_EXECUTION_TIMEOUT_SECS` |
 
-**Transform Drift Modes (v0.3+):**
+**Transform Drift Modes:**
 | Mode | Behavior |
 |------|----------|
-| `strict` | Fail if Post-Approval transform differs from Pre-Approval |
-| `permissive` | Log warning, continue with new transform |
+| `strict` | Fail if post-approval transform differs from pre-approval (default) |
+| `permissive` | Log warning, use original approved request (preserves approval integrity) |
+
+The pipeline checks request hash integrity between approval and execution. A
+canonical JSON hash of the transformed request is stored at task creation and
+compared against a fresh transform during the post-approval amber phase. In
+strict mode, drift causes the task to fail with `FailureStage::TransformDrift`.
+In permissive mode, the originally approved transformation is used to preserve
+what the human approved.
 
 ## 6. Interfaces
 
@@ -247,28 +257,44 @@ pub struct PipelineInput {
     pub upstream_url: String,
 }
 
-/// Result from execution pipeline (v0.2)
+/// Result of executing an approved task through the pipeline.
 pub enum PipelineResult {
-    /// Tool executed successfully
+    /// Execution succeeded
     Success {
-        result: serde_json::Value,
+        /// Tool call result from upstream
+        result: ToolCallResult,
     },
-    /// Approval rejected
-    Rejected {
-        reason: Option<String>,
-        decided_by: String,
+    /// Execution failed at some stage
+    Failure {
+        /// Which stage failed
+        stage: FailureStage,
+        /// Human-readable reason
+        reason: String,
+        /// Whether the operation can be retried
+        retriable: bool,
     },
-    /// Approval timed out
-    Timeout,
-    /// Upstream error
-    UpstreamError {
-        code: i32,
-        message: String,
-    },
-    /// Internal error
-    InternalError {
-        message: String,
-    },
+}
+
+/// Stage at which a task failed.
+pub enum FailureStage {
+    /// Failed during pre-approval inspection
+    PreHitlInspection,
+    /// Approval timeout exceeded
+    ApprovalTimeout,
+    /// Approver rejected the request
+    ApprovalRejected,
+    /// Policy changed between approval and execution
+    PolicyDrift,
+    /// Failed during post-approval inspection
+    PostHitlInspection,
+    /// Request transformed differently than expected
+    TransformDrift,
+    /// Upstream MCP server error
+    UpstreamError,
+    /// Service is shutting down
+    ServiceShutdown,
+    /// Task in unexpected state for the requested operation
+    InvalidTaskState,
 }
 ```
 
@@ -575,35 +601,76 @@ async fn forward_to_upstream(&self, input: &PipelineInput) -> PipelineResult {
 - **F-006.1:** Map `PipelineResult` to JSON-RPC response
 - **F-006.2:** Success → return tool result
 - **F-006.3:** Rejected → return -32007 error
-- **F-006.4:** Timeout → execute `on_timeout` action
-- **F-006.5:** UpstreamError → return appropriate error code
+- **F-006.4:** Timeout → execute `on_timeout` action (`deny` or `approve`)
+- **F-006.5:** Failure → return appropriate error code based on `FailureStage`
 
 ```rust
-fn pipeline_result_to_response(result: PipelineResult, on_timeout: TimeoutAction) -> JsonRpcResponse {
+/// Action to take when approval times out.
+pub enum TimeoutAction {
+    /// Deny the request on timeout (default).
+    Deny,
+    /// Auto-approve on timeout (use with caution).
+    Approve,
+}
+
+fn handle_pipeline_result(result: PipelineResult, on_timeout: TimeoutAction) -> JsonRpcResponse {
     match result {
         PipelineResult::Success { result } => {
             JsonRpcResponse::success(result)
         }
-        PipelineResult::Rejected { reason, .. } => {
-            JsonRpcResponse::error(-32007, "Approval rejected", reason)
-        }
-        PipelineResult::Timeout => {
-            match on_timeout {
-                TimeoutAction::Deny => {
-                    JsonRpcResponse::error(-32008, "Approval timeout", None)
+        PipelineResult::Failure { stage, reason, .. } => {
+            match stage {
+                FailureStage::ApprovalRejected => {
+                    JsonRpcResponse::error(-32007, "Approval rejected", Some(reason))
                 }
-                // Future: TimeoutAction::Escalate, TimeoutAction::AutoApprove
+                FailureStage::ApprovalTimeout => {
+                    match on_timeout {
+                        TimeoutAction::Deny => {
+                            JsonRpcResponse::error(-32008, "Approval timeout", None)
+                        }
+                        TimeoutAction::Approve => {
+                            // Auto-approve: create synthetic approval and execute
+                            // upstream call despite timeout
+                        }
+                    }
+                }
+                FailureStage::PolicyDrift => {
+                    JsonRpcResponse::error(-32011, "Policy drift", Some(reason))
+                }
+                FailureStage::TransformDrift => {
+                    JsonRpcResponse::error(-32012, "Transform drift", Some(reason))
+                }
+                FailureStage::UpstreamError => {
+                    JsonRpcResponse::error(-32002, &reason, None)
+                }
+                FailureStage::ServiceShutdown => {
+                    JsonRpcResponse::error(-32013, "Service unavailable", Some(reason))
+                }
+                _ => {
+                    JsonRpcResponse::error(-32603, "Internal error", Some(reason))
+                }
             }
-        }
-        PipelineResult::UpstreamError { code, message } => {
-            JsonRpcResponse::error(code, &message, None)
-        }
-        PipelineResult::InternalError { message } => {
-            JsonRpcResponse::error(-32603, "Internal error", Some(message))
         }
     }
 }
 ```
+
+**`on_timeout` configuration** is set per-workflow in YAML:
+
+```yaml
+workflows:
+  - match: { tool: "delete_*" }
+    action: approve
+    on_timeout: deny       # default — return -32008 error
+  - match: { tool: "read_*" }
+    action: approve
+    on_timeout: approve    # auto-approve on timeout (use with caution)
+```
+
+When `on_timeout: approve` is configured and the approval times out, the engine
+creates a synthetic approval record and executes the upstream call as if a human
+had approved. This is useful for low-risk tools where blocking indefinitely is
+worse than allowing execution.
 
 ### F-007: Blocking Execution Pipeline
 
@@ -737,6 +804,7 @@ thoughtgate_upstream_duration_seconds
 | Approval approved, upstream succeeds | Return tool result | EC-PIP-001 |
 | Approval rejected | Return -32007 | EC-PIP-002 |
 | Approval timeout (on_timeout: deny) | Return -32008 | EC-PIP-003 |
+| Approval timeout (on_timeout: approve) | Auto-approve, execute upstream, return result | EC-PIP-017 |
 | Task expires during approval (TTL) | Task transitions to `Failed`, no execution | EC-PIP-004 |
 | Client abandons task (never polls result) | Task cleaned up after TTL, no execution | EC-PIP-005 |
 | Slack post fails | Return -32603 | EC-PIP-006 |
@@ -767,11 +835,13 @@ thoughtgate_upstream_duration_seconds
 - `test_full_pipeline_with_slack` — Real Slack integration
 - `test_full_pipeline_with_upstream` — Real upstream MCP server
 
-## 10. v0.3+ Reference: Full Pipeline Specification
+## 10. Full Pipeline Specification
 
-This section documents the full pipeline implementation for future reference. **Not implemented in v0.2.**
+This section documents the full execution pipeline. Policy re-evaluation (10.2)
+and transform drift detection (10.3) are **implemented**. The pre-approval amber
+phase (10.1) runs the inspector chain when inspectors are configured.
 
-### 10.1 Pre-Approval Amber Phase (v0.3+)
+### 10.1 Pre-Approval Amber Phase
 
 ```rust
 async fn pre_approval_amber(
@@ -812,7 +882,7 @@ async fn pre_approval_amber(
 }
 ```
 
-### 10.2 Policy Re-evaluation (v0.3+)
+### 10.2 Policy Re-evaluation (Implemented)
 
 ```rust
 async fn reevaluate_policy(
@@ -845,7 +915,7 @@ async fn reevaluate_policy(
 }
 ```
 
-### 10.3 Transform Drift Detection (v0.3+)
+### 10.3 Transform Drift Detection (Implemented)
 
 ```rust
 async fn check_transform_drift(

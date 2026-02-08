@@ -129,7 +129,7 @@ impl ProxyConfig {
     /// - `THOUGHTGATE_STREAM_READ_TIMEOUT_SECS` (default: 300)
     /// - `THOUGHTGATE_STREAM_WRITE_TIMEOUT_SECS` (default: 300)
     /// - `THOUGHTGATE_STREAM_TOTAL_TIMEOUT_SECS` (default: 3600)
-    /// - `THOUGHTGATE_MAX_CONCURRENT_STREAMS` (default: 10000)
+    /// - `THOUGHTGATE_MAX_CONCURRENT_STREAMS` (default: 10000, range: 1..=100_000)
     /// - `THOUGHTGATE_SOCKET_BUFFER_SIZE` (default: 262144)
     ///
     /// Note: THOUGHTGATE_METRICS_PORT is no longer used. Metrics are served on
@@ -151,6 +151,16 @@ impl ProxyConfig {
     /// - Implements: REQ-CORE-002 Section 3.2 (Config Loading)
     pub fn from_env() -> Self {
         let default = Self::default();
+
+        let max_concurrent_streams = clamp_env_warn(
+            "THOUGHTGATE_MAX_CONCURRENT_STREAMS",
+            parse_env_warn(
+                "THOUGHTGATE_MAX_CONCURRENT_STREAMS",
+                default.max_concurrent_streams,
+            ),
+            1,
+            100_000,
+        );
 
         Self {
             // Green Path configuration
@@ -176,10 +186,7 @@ impl ProxyConfig {
                 default.stream_total_timeout.as_secs(),
             )),
 
-            max_concurrent_streams: parse_env_warn(
-                "THOUGHTGATE_MAX_CONCURRENT_STREAMS",
-                default.max_concurrent_streams,
-            ),
+            max_concurrent_streams,
 
             socket_buffer_size: parse_env_warn(
                 "THOUGHTGATE_SOCKET_BUFFER_SIZE",
@@ -232,6 +239,29 @@ fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(name: &str, default:
     }
 }
 
+/// Clamp a value to a range, logging a warning if the value was out of bounds.
+fn clamp_env_warn(name: &str, value: usize, min: usize, max: usize) -> usize {
+    if value < min {
+        warn!(
+            env_var = name,
+            value,
+            clamped_to = min,
+            "Value below minimum, clamping"
+        );
+        min
+    } else if value > max {
+        warn!(
+            env_var = name,
+            value,
+            clamped_to = max,
+            "Value above maximum, clamping"
+        );
+        max
+    } else {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +306,27 @@ mod tests {
         unsafe {
             std::env::remove_var("THOUGHTGATE_MAX_CONCURRENT_STREAMS");
         }
+    }
+
+    #[test]
+    fn test_clamp_env_warn_within_range() {
+        assert_eq!(clamp_env_warn("TEST", 500, 1, 100_000), 500);
+    }
+
+    #[test]
+    fn test_clamp_env_warn_below_min() {
+        assert_eq!(clamp_env_warn("TEST", 0, 1, 100_000), 1);
+    }
+
+    #[test]
+    fn test_clamp_env_warn_above_max() {
+        assert_eq!(clamp_env_warn("TEST", 200_000, 1, 100_000), 100_000);
+    }
+
+    #[test]
+    fn test_clamp_env_warn_at_boundaries() {
+        assert_eq!(clamp_env_warn("TEST", 1, 1, 100_000), 1);
+        assert_eq!(clamp_env_warn("TEST", 100_000, 1, 100_000), 100_000);
     }
 
     #[test]

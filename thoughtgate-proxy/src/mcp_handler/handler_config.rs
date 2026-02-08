@@ -39,7 +39,8 @@ impl McpHandlerConfig {
     /// # Environment Variables
     ///
     /// - `THOUGHTGATE_MAX_REQUEST_BODY_BYTES` (default: 1048576): Max body size
-    /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000): Max concurrent requests
+    /// - `THOUGHTGATE_MAX_CONCURRENT_REQUESTS` (default: 10000, range: 1..=100_000): Max concurrent requests
+    /// - `THOUGHTGATE_MAX_BATCH_SIZE` (default: 100, range: 1..=10_000): Max JSON-RPC batch size
     /// - `THOUGHTGATE_MAX_AGGREGATE_BUFFER` (default: 536870912 = 512MB): Max aggregate buffered bytes
     pub fn from_env() -> Self {
         let max_body_size: usize = std::env::var("THOUGHTGATE_MAX_REQUEST_BODY_BYTES")
@@ -51,11 +52,18 @@ impl McpHandlerConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
+        let max_concurrent_requests = clamp_warn(
+            "THOUGHTGATE_MAX_CONCURRENT_REQUESTS",
+            max_concurrent_requests,
+            1,
+            100_000,
+        );
 
         let max_batch_size: usize = std::env::var("THOUGHTGATE_MAX_BATCH_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
+        let max_batch_size = clamp_warn("THOUGHTGATE_MAX_BATCH_SIZE", max_batch_size, 1, 10_000);
 
         let max_aggregate_buffer: usize = std::env::var("THOUGHTGATE_MAX_AGGREGATE_BUFFER")
             .ok()
@@ -75,5 +83,66 @@ impl McpHandlerConfig {
             max_aggregate_buffer,
             blocking_approval_timeout_secs,
         }
+    }
+}
+
+/// Clamp a value to a range, logging a warning if the value was out of bounds.
+fn clamp_warn(name: &str, value: usize, min: usize, max: usize) -> usize {
+    use tracing::warn;
+
+    if value < min {
+        warn!(
+            env_var = name,
+            value,
+            clamped_to = min,
+            "Value below minimum, clamping"
+        );
+        min
+    } else if value > max {
+        warn!(
+            env_var = name,
+            value,
+            clamped_to = max,
+            "Value above maximum, clamping"
+        );
+        max
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = McpHandlerConfig::default();
+        assert_eq!(config.max_body_size, 1024 * 1024);
+        assert_eq!(config.max_concurrent_requests, 10000);
+        assert_eq!(config.max_batch_size, 100);
+        assert_eq!(config.max_aggregate_buffer, 512 * 1024 * 1024);
+        assert_eq!(config.blocking_approval_timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_clamp_within_range() {
+        assert_eq!(clamp_warn("TEST", 50, 1, 100), 50);
+    }
+
+    #[test]
+    fn test_clamp_below_min() {
+        assert_eq!(clamp_warn("TEST", 0, 1, 100), 1);
+    }
+
+    #[test]
+    fn test_clamp_above_max() {
+        assert_eq!(clamp_warn("TEST", 200_000, 1, 100_000), 100_000);
+    }
+
+    #[test]
+    fn test_clamp_at_boundaries() {
+        assert_eq!(clamp_warn("TEST", 1, 1, 100_000), 1);
+        assert_eq!(clamp_warn("TEST", 100_000, 1, 100_000), 100_000);
     }
 }

@@ -28,6 +28,7 @@ use thoughtgate_core::governance::{
     ApprovalDecision, Principal, TaskHandler, TaskId, TaskStatus, TaskStore, TaskStoreConfig,
     TimeoutAction, ToolCallRequest,
 };
+use thoughtgate_core::profile::Profile;
 
 // ============================================================================
 // Task Store Integration Tests
@@ -401,6 +402,7 @@ async fn test_mock_adapter_instant_approval() {
         created_at: Utc::now(),
         correlation_id: "test-123".to_string(),
         request_span_context: None,
+        redact_fields: Vec::new(),
     };
 
     // Post request
@@ -441,6 +443,7 @@ async fn test_mock_adapter_delayed_approval() {
         created_at: Utc::now(),
         correlation_id: "test-456".to_string(),
         request_span_context: None,
+        redact_fields: Vec::new(),
     };
 
     let reference = adapter.post_approval_request(&request).await.unwrap();
@@ -745,6 +748,7 @@ async fn test_gate2_forward_action_passthrough() {
         None, // No YAML config = Cedar-only mode (default forward)
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // Send a tools/call request
@@ -758,7 +762,10 @@ async fn test_gate2_forward_action_passthrough() {
         "id": 1
     });
 
-    let (status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK);
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -831,6 +838,7 @@ async fn test_gate2_deny_action_rejects() {
         Some(Arc::new(config)),
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // Send a tools/call request for the denied tool
@@ -844,7 +852,10 @@ async fn test_gate2_deny_action_rejects() {
         "id": 1
     });
 
-    let (status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK); // JSON-RPC errors return 200
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -904,6 +915,7 @@ async fn test_gate3_cedar_permit_continues() {
         None, // Cedar-only mode
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     let request = json!({
@@ -916,7 +928,10 @@ async fn test_gate3_cedar_permit_continues() {
         "id": 1
     });
 
-    let (status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK);
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -985,6 +1000,7 @@ async fn test_non_tool_methods_bypass_governance() {
         Some(Arc::new(config)),
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // tools/list should bypass governance even with deny-all config
@@ -995,7 +1011,10 @@ async fn test_non_tool_methods_bypass_governance() {
         "id": 1
     });
 
-    let (status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK);
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1076,6 +1095,7 @@ async fn test_task_methods_handled_locally() {
         None, // No YAML config
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // tasks/get should be handled locally
@@ -1089,7 +1109,10 @@ async fn test_task_methods_handled_locally() {
         "id": 1
     });
 
-    let (_status, body) = handler.handle(Bytes::from(request.to_string())).await;
+    let (_status, body) = handler
+        .handle(Bytes::from(request.to_string()))
+        .await
+        .into_buffered();
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert!(
@@ -1155,6 +1178,7 @@ async fn test_batch_requests_processed_correctly() {
         None, // No YAML config
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // Batch with multiple request types
@@ -1176,7 +1200,10 @@ async fn test_batch_requests_processed_correctly() {
         }
     ]);
 
-    let (status, body) = handler.handle(Bytes::from(batch.to_string())).await;
+    let (status, body) = handler
+        .handle(Bytes::from(batch.to_string()))
+        .await
+        .into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK);
     let responses: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
@@ -1238,11 +1265,12 @@ async fn test_invalid_json_returns_parse_error() {
         None, // No YAML config
         None, // No approval engine
         None, // No prometheus metrics
+        Profile::Production,
     );
 
     // Send invalid JSON
     let invalid = "{ not valid json }";
-    let (status, body) = handler.handle(Bytes::from(invalid)).await;
+    let (status, body) = handler.handle(Bytes::from(invalid)).await.into_buffered();
 
     assert_eq!(status, axum::http::StatusCode::OK); // JSON-RPC errors return 200
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();

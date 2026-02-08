@@ -29,6 +29,7 @@ pub fn filter_and_annotate_tools(
     tools: &mut Vec<serde_json::Value>,
     config: &Config,
     source_id: &str,
+    upstream_supports_tasks: bool,
 ) -> usize {
     let filtered_count = filter_by_visibility(tools, config, source_id, "name", "tools");
 
@@ -54,8 +55,17 @@ pub fn filter_and_annotate_tools(
                 }
             }
             Action::Forward | Action::Deny => {
-                // Preserve upstream's execution.taskSupport (don't modify).
-                // Note: Deny tools are visible but denied at call-time.
+                // Strip upstream's taskSupport annotation when upstream doesn't
+                // actually support tasks, to avoid misleading the client.
+                if !upstream_supports_tasks {
+                    if let Some(obj) = tool.as_object_mut() {
+                        if let Some(exec) = obj.get_mut("execution") {
+                            if let Some(exec_obj) = exec.as_object_mut() {
+                                exec_obj.remove("taskSupport");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -167,7 +177,7 @@ mod tests {
             serde_json::json!({"name": "allowed_tool", "description": "ok"}),
             serde_json::json!({"name": "hidden_tool", "description": "nope"}),
         ];
-        let filtered = filter_and_annotate_tools(&mut tools, &config, "upstream");
+        let filtered = filter_and_annotate_tools(&mut tools, &config, "upstream", false);
         assert_eq!(filtered, 1);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "allowed_tool");
@@ -191,7 +201,7 @@ mod tests {
     fn test_filter_unknown_source_clears_all() {
         let config = test_config(&["some_tool"]);
         let mut tools = vec![serde_json::json!({"name": "some_tool"})];
-        let filtered = filter_and_annotate_tools(&mut tools, &config, "nonexistent");
+        let filtered = filter_and_annotate_tools(&mut tools, &config, "nonexistent", false);
         assert_eq!(filtered, 1);
         assert!(tools.is_empty());
     }
@@ -203,7 +213,7 @@ mod tests {
             serde_json::json!({"name": "good"}),
             serde_json::json!({"no_name_field": true}),
         ];
-        let filtered = filter_and_annotate_tools(&mut tools, &config, "upstream");
+        let filtered = filter_and_annotate_tools(&mut tools, &config, "upstream", false);
         assert_eq!(filtered, 1); // The nameless entry was removed
         assert_eq!(tools.len(), 1);
     }

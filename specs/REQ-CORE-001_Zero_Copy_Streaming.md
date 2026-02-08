@@ -5,27 +5,37 @@
 | **ID** | `REQ-CORE-001` |
 | **Title** | Zero-Copy Streaming (Green Path) |
 | **Type** | Core Mechanic |
-| **Status** | **DEFERRED (v0.3+)** |
+| **Status** | **Partially Implemented (v0.4)** |
 | **Priority** | Low (deferred) |
 | **Tags** | `#proxy` `#streaming` `#performance` `#latency` `#zero-copy` `#deferred` |
 
-> ## ⚠️ DEFERRED TO FUTURE VERSION
+> ## Partially Implemented (v0.4)
 >
-> **This requirement is deferred from v0.1.** The Green Path was designed for response streaming
-> (LLM token streams, large file responses), but v0.1 does not implement response inspection
-> or require streaming distinction.
+> **Streaming infrastructure is implemented as of v0.4.** The HTTP proxy layer
+> supports zero-copy body forwarding via `ProxyBody`, TCP socket optimization
+> (`TCP_NODELAY`, `SO_KEEPALIVE`), concurrency limiting (semaphore), backpressure
+> propagation, and Prometheus/OTel observability. See Section 10 for detailed
+> implementation status.
 >
-> **v0.1 Simplification:**
-> - All responses are passed through without buffering or streaming distinction
-> - MCP responses are JSON-RPC - complete JSON blobs, not streamed tokens
-> - No LLM token streaming to handle in v0.1
+> **What is implemented (v0.4):**
+> - `ProxyBody` wrapper implementing `http_body::Body` with move semantics
+> - Socket-level optimizations via `socket2`
+> - Concurrency limiting via `tokio::sync::Semaphore`
+> - Backpressure propagation between client and upstream
+> - Prometheus metrics and OTel spans for streaming
 >
-> **When to Reintroduce:**
-> - When response PII detection is needed → Amber Path required
-> - When streaming LLM outputs → Green Path required for memory efficiency
-> - When large file responses need zero-copy → Green Path required
+> **What remains deferred:**
+> - **Policy-driven Green Path selection** -- Cedar `PolicyDecision::Green` routing
+>   that triggers the zero-copy path based on per-request policy evaluation.
+>   Currently all forwarded requests use the same proxy path; there is no
+>   policy-driven distinction between Green (zero-copy) and Amber (buffered
+>   inspection) paths.
+> - **Amber Path buffered inspection** (REQ-CORE-002) -- required before the
+>   Green/Amber distinction is meaningful
+> - **Connection-level timeout** (F-004) -- wrapping `upstream.forward()` in
+>   `tokio::time::timeout()`
 >
-> **See:** `architecture.md` Section 7.2 (Out of Scope)
+> **See:** `architecture.md` Section 7.2 (Out of Scope for policy-driven path selection)
 
 ## 1. Context & Decision Rationale
 

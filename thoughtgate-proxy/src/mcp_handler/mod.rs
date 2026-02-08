@@ -29,25 +29,32 @@ pub(crate) mod task_methods;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use axum::http::StatusCode;
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 
 use thoughtgate_core::config::Config;
-use thoughtgate_core::error::ThoughtGateError;
 use thoughtgate_core::governance::evaluator::GovernanceEvaluator;
 use thoughtgate_core::governance::{ApprovalEngine, Principal, TaskHandler, TaskStore};
 use thoughtgate_core::policy::engine::CedarEngine;
 use thoughtgate_core::profile::Profile;
 use thoughtgate_core::protocol::CapabilityCache;
 use thoughtgate_core::telemetry::ThoughtGateMetrics;
-use thoughtgate_core::transport::jsonrpc::{JsonRpcResponse, McpRequest};
+use thoughtgate_core::transport::jsonrpc::McpRequest;
 use thoughtgate_core::transport::router::{McpRouter, RouteTarget};
 use thoughtgate_core::transport::upstream::UpstreamForwarder;
+
+// Re-exported for tests (used via `use super::*` in mod tests).
+#[cfg(test)]
+pub(crate) use axum::http::StatusCode;
+#[cfg(test)]
+pub(crate) use thoughtgate_core::error::ThoughtGateError;
+#[cfg(test)]
+pub(crate) use thoughtgate_core::transport::jsonrpc::JsonRpcResponse;
 
 // Re-export public API
 pub use factory::create_governance_components_with_metrics;
 pub use handler_config::McpHandlerConfig;
+pub use request::McpResponse;
 
 // Re-export for gate_routing (used via `super::`)
 use capabilities::validate_task_metadata;
@@ -88,6 +95,8 @@ pub struct McpState {
     pub evaluator: Option<Arc<GovernanceEvaluator>>,
     /// Global fallback timeout (seconds) for blocking approval mode.
     pub blocking_approval_timeout_secs: u64,
+    /// Governance profile (production or development).
+    pub profile: Profile,
 }
 
 /// MCP request handler for direct invocation.
@@ -156,6 +165,7 @@ impl McpHandler {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: config.blocking_approval_timeout_secs,
+            profile: Profile::Production,
         });
 
         Self { state }
@@ -184,6 +194,7 @@ impl McpHandler {
     /// - Implements: REQ-GOV-002 (Governance Pipeline)
     /// - Implements: REQ-OBS-002 §6 (Prometheus Metrics)
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_governance(
         upstream: Arc<dyn UpstreamForwarder>,
         cedar_engine: Arc<CedarEngine>,
@@ -192,6 +203,7 @@ impl McpHandler {
         yaml_config: Option<Arc<Config>>,
         approval_engine: Option<Arc<ApprovalEngine>>,
         tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+        profile: Profile,
     ) -> Self {
         let task_handler = TaskHandler::new(task_store.clone());
         let semaphore = Arc::new(Semaphore::new(handler_config.max_concurrent_requests));
@@ -206,7 +218,7 @@ impl McpHandler {
                 Some(cedar_engine.clone()),
                 task_store,
                 principal,
-                Profile::Production,
+                profile,
             );
             if let Some(ref metrics) = tg_metrics {
                 eval = eval.with_metrics(metrics.clone());
@@ -233,6 +245,7 @@ impl McpHandler {
             tg_metrics,
             evaluator,
             blocking_approval_timeout_secs: handler_config.blocking_approval_timeout_secs,
+            profile,
         });
 
         Self { state }
@@ -257,12 +270,12 @@ impl McpHandler {
     ///
     /// # Returns
     ///
-    /// A tuple of (StatusCode, response bytes) for direct use by ProxyService.
-    /// This avoids double-buffering when converting to UnifiedBody.
+    /// An `McpResponse` — either buffered bytes or a streaming body for blocking
+    /// approval mode.
     ///
     /// # Traceability
     /// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
-    pub async fn handle(&self, body: Bytes) -> (StatusCode, Bytes) {
+    pub async fn handle(&self, body: Bytes) -> request::McpResponse {
         request::handle_mcp_body_bytes(&self.state, body, None).await
     }
 
@@ -279,7 +292,8 @@ impl McpHandler {
     ///
     /// # Returns
     ///
-    /// A tuple of (StatusCode, response bytes) for direct use by ProxyService.
+    /// An `McpResponse` — either buffered bytes or a streaming body for blocking
+    /// approval mode.
     ///
     /// # Traceability
     /// - Implements: REQ-CORE-003/§10 (Request Handler Pattern)
@@ -288,7 +302,7 @@ impl McpHandler {
         &self,
         body: Bytes,
         parent_context: opentelemetry::Context,
-    ) -> (StatusCode, Bytes) {
+    ) -> request::McpResponse {
         request::handle_mcp_body_bytes(&self.state, body, Some(parent_context)).await
     }
 
@@ -318,10 +332,8 @@ impl Clone for McpHandler {
 /// Shared routing logic used by both single and batch request handlers.
 /// Dispatches to the 4-gate model, task handler, initialize handler,
 /// or pass-through based on the router's classification.
-async fn route_request(
-    state: &McpState,
-    request: McpRequest,
-) -> Result<JsonRpcResponse, ThoughtGateError> {
+async fn route_request(state: &McpState, request: McpRequest) -> gate_routing::GateResult {
+    use gate_routing::GateResult;
     match state.router.route(request) {
         RouteTarget::PolicyEvaluation { request } => {
             // Apply 4-gate model for governable methods when config is present
@@ -332,24 +344,28 @@ async fn route_request(
                 } else if helpers::is_list_method(&request.method) {
                     // List methods: tools/list, resources/list, prompts/list
                     // Intercept response, apply Gate 1 filter, annotate taskSupport
-                    capabilities::handle_list_method(state, request).await
+                    GateResult::Immediate(capabilities::handle_list_method(state, request).await)
                 } else {
                     // Other methods: forward directly
-                    state.upstream.forward(&request).await
+                    GateResult::Immediate(state.upstream.forward(&request).await)
                 }
             } else {
                 // Legacy mode (no config): direct Cedar evaluation (Gate 3 only)
-                cedar_eval::evaluate_with_cedar(state, request, None, None).await
+                GateResult::Immediate(
+                    cedar_eval::evaluate_with_cedar(state, request, None, None).await,
+                )
             }
         }
         RouteTarget::TaskHandler { method, request } => {
-            task_methods::handle_task_method(state, method, &request).await
+            GateResult::Immediate(task_methods::handle_task_method(state, method, &request).await)
         }
         RouteTarget::InitializeHandler { request } => {
             // Implements: REQ-CORE-007/F-001 (Capability Injection)
-            capabilities::handle_initialize_method(state, request).await
+            GateResult::Immediate(capabilities::handle_initialize_method(state, request).await)
         }
-        RouteTarget::PassThrough { request } => state.upstream.forward(&request).await,
+        RouteTarget::PassThrough { request } => {
+            GateResult::Immediate(state.upstream.forward(&request).await)
+        }
     }
 }
 
@@ -418,6 +434,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         })
     }
 
@@ -595,6 +612,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         });
 
         let router = Router::new()
@@ -645,6 +663,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         });
 
         // Router with DefaultBodyLimit disabled - we check size manually and return JSON-RPC error
@@ -980,6 +999,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         })
     }
 
@@ -1239,6 +1259,7 @@ mod tests {
             tg_metrics: None,
             evaluator: None,
             blocking_approval_timeout_secs: 300,
+            profile: Profile::Production,
         })
     }
 
@@ -1419,5 +1440,36 @@ mod tests {
 
         // ID should be preserved
         assert_eq!(parsed["id"], "init-123");
+    }
+
+    // ========================================================================
+    // Profile Configuration Tests
+    // ========================================================================
+
+    /// Verifies: Default profile is Production when no flag is passed.
+    #[test]
+    fn test_default_profile_is_production() {
+        let state = create_test_state();
+        assert_eq!(state.profile, Profile::Production);
+    }
+
+    /// Verifies: Profile is threaded through with_governance() to the evaluator.
+    #[tokio::test]
+    async fn test_profile_passed_to_governance() {
+        let task_store = Arc::new(TaskStore::with_defaults());
+        let cedar_engine = Arc::new(CedarEngine::new().expect("Failed to create Cedar engine"));
+
+        let handler = McpHandler::with_governance(
+            Arc::new(MockUpstream),
+            cedar_engine,
+            task_store,
+            McpHandlerConfig::default(),
+            None,
+            None,
+            None,
+            Profile::Development,
+        );
+
+        assert_eq!(handler.state().profile, Profile::Development);
     }
 }

@@ -204,7 +204,8 @@ pub enum ApprovalDestination {
 pub enum TimeoutAction {
     #[default]
     Deny,
-    // v0.3+: Escalate, AutoApprove
+    /// Auto-approve on timeout (use with caution).
+    Approve,
 }
 ```
 
@@ -241,8 +242,8 @@ approval:
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
-| Approve reaction | `+1` (👍) | `SLACK_APPROVE_REACTION` |
-| Reject reaction | `-1` (👎) | `SLACK_REJECT_REACTION` |
+| Approve reaction | `+1` (👍) | `THOUGHTGATE_SLACK_APPROVE_REACTION` |
+| Reject reaction | `-1` (👎) | `THOUGHTGATE_SLACK_REJECT_REACTION` |
 
 ### 5.6 Rate Limiting (CRITICAL)
 
@@ -258,6 +259,10 @@ Slack API has strict rate limits (~1 request/second for most endpoints). With ma
 | Backoff | Exponential | 5s → 10s → 20s → 30s max |
 
 **Batch Polling Efficiency:**
+
+> **Note (C-001):** The batch polling optimization described below (`conversations.history`
+> instead of per-task `reactions.get`) is a known gap. The current implementation polls
+> each task individually. Batch polling is tracked for a future fix.
 
 ```rust
 impl SlackAdapter {
@@ -312,9 +317,12 @@ mapping) to avoid repeated `users.info` API calls. The cache is bounded:
 
 | Setting | Value | Behavior |
 |---------|-------|----------|
-| `MAX_USER_CACHE_SIZE` | 1000 | Cache is cleared entirely when limit is reached |
+| `MAX_USER_CACHE_SIZE` | 1000 | ~25% of oldest entries are evicted when limit is reached |
 
-This prevents unbounded memory growth in long-running instances with many unique
+When the cache reaches `MAX_USER_CACHE_SIZE`, approximately 25% of existing entries
+are evicted (oldest-first via iteration order) rather than clearing the entire cache.
+This avoids a thundering-herd of cache misses that would occur with a full clear,
+while still bounding memory growth in long-running instances with many unique
 Slack users approving/rejecting tasks.
 
 ### 5.9 Scheduler Capacity Limit
@@ -580,7 +588,12 @@ async fn poll_for_approval_decision(
                         Some(-32008),
                     ).await;
                 }
-                // v0.3+: Handle escalate, auto-approve
+                TimeoutAction::Approve => {
+                    task_manager.approve_task(
+                        &task_id,
+                        "system:timeout-auto-approve",
+                    ).await;
+                }
             }
             return;
         }
@@ -716,8 +729,8 @@ pub enum AdapterError {
 - **F-006.1:** Read timeout from workflow config
 - **F-006.2:** Read `on_timeout` action from config
 - **F-006.3:** Execute `on_timeout` action when deadline reached
-- **F-006.4:** v0.2: Only `deny` supported
-- **F-006.5:** v0.3+: Support `escalate`, `auto_approve`
+- **F-006.4:** Supported actions: `deny` (default), `approve` (auto-approve on timeout)
+- **F-006.5:** v0.3+: Support `escalate`
 
 ### F-007: Slack Message Format
 
