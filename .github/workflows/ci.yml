@@ -748,10 +748,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write  # Needed for cosign keyless signing via GitHub OIDC
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -788,6 +792,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
       - name: Build and push multi-arch image
+        id: build-push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -800,6 +805,11 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
           sbom: true
+
+      - name: Sign container image with cosign (keyless)
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository }}@${{ steps.build-push.outputs.digest }}
 
       # REQ-OBS-001: Collect Docker image metrics (M-BIN-002 to M-BIN-005)
       - name: Collect Docker image metrics
