@@ -22,9 +22,26 @@
 //! ```
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::runtime::Runtime;
+
+/// Return the workspace root directory.
+///
+/// Cargo sets the CWD of bench binaries to the package root (thoughtgate-proxy/),
+/// not the workspace root. Binary artifacts live under `<workspace>/target/release/`,
+/// so we derive the workspace root from the compile-time `CARGO_MANIFEST_DIR`.
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has no parent")
+}
+
+/// Absolute path to a release binary under the workspace target directory.
+fn release_binary(name: &str) -> PathBuf {
+    workspace_root().join("target/release").join(name)
+}
 
 /// Test environment with mock MCP server and ThoughtGate proxy.
 struct TestEnv {
@@ -40,8 +57,8 @@ impl TestEnv {
     /// If missing, triggers a cargo build. This makes the benchmark
     /// self-sufficient regardless of CI step ordering or profile mismatches.
     fn ensure_binaries() {
-        let mock_path = std::path::Path::new("./target/release/mock_mcp");
-        let proxy_path = std::path::Path::new("./target/release/thoughtgate-proxy");
+        let mock_path = release_binary("mock_mcp");
+        let proxy_path = release_binary("thoughtgate-proxy");
 
         if mock_path.exists() && proxy_path.exists() {
             return;
@@ -61,6 +78,7 @@ impl TestEnv {
                 "--bin",
                 "thoughtgate-proxy",
             ])
+            .current_dir(workspace_root())
             .status()
             .expect("Failed to run cargo build");
         assert!(
@@ -78,7 +96,7 @@ impl TestEnv {
         let admin_port = 19469;
 
         // Start mock MCP server with zero delay for benchmarking
-        let mock_mcp = Command::new("./target/release/mock_mcp")
+        let mock_mcp = Command::new(release_binary("mock_mcp"))
             .env("MOCK_MCP_PORT", mock_port.to_string())
             .env("MOCK_MCP_DELAY_MS", "0")
             .stderr(Stdio::null())
@@ -90,7 +108,7 @@ impl TestEnv {
         std::thread::sleep(Duration::from_millis(500));
 
         // Start ThoughtGate proxy
-        let proxy = Command::new("./target/release/thoughtgate-proxy")
+        let proxy = Command::new(release_binary("thoughtgate-proxy"))
             .env(
                 "THOUGHTGATE_UPSTREAM_URL",
                 format!("http://127.0.0.1:{}", mock_port),
