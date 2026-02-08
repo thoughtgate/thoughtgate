@@ -215,11 +215,16 @@ async fn handle_signal_shutdown(
     gov_state.trigger_shutdown();
 
     // Step 2: POST /governance/shutdown for any external consumers.
-    let client = reqwest::Client::new();
-    let _ = client
-        .post(format!("{governance_endpoint}/governance/shutdown"))
-        .send()
-        .await;
+    // Use a short timeout to avoid blocking shutdown if the endpoint is unresponsive.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build();
+    if let Ok(client) = client {
+        let _ = client
+            .post(format!("{governance_endpoint}/governance/shutdown"))
+            .send()
+            .await;
+    }
 
     // Step 3: Wait for agent to exit (it may handle the signal itself).
     match tokio::time::timeout(
