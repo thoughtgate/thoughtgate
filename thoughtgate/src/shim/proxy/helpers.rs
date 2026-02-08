@@ -317,7 +317,8 @@ pub(super) fn filter_list_response(
         "tools/list" => {
             let tools = result.get_mut("tools")?.as_array_mut()?;
             let mut tools_vec: Vec<serde_json::Value> = std::mem::take(tools);
-            filter_and_annotate_tools(&mut tools_vec, config, source_id);
+            // stdio-wrapped servers don't support MCP Tasks protocol
+            filter_and_annotate_tools(&mut tools_vec, config, source_id, false);
             *tools = tools_vec;
         }
         "resources/list" => {

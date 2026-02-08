@@ -651,11 +651,14 @@ async fn graceful_shutdown(
     telemetry_guard: thoughtgate_core::telemetry::TelemetryGuard,
     tg_metrics: &thoughtgate_core::telemetry::ThoughtGateMetrics,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown_start = std::time::Instant::now();
+
     // Fail all pending tasks before draining
     // Implements: REQ-CORE-005/F-004.2, F-006
     if let Some(ref task_store) = shutdown_task_store {
         let failed_count = task_store.fail_all_pending("service_shutdown");
         if failed_count > 0 {
+            tg_metrics.record_approvals_cancelled_shutdown(failed_count as u64);
             info!(
                 failed_tasks = failed_count,
                 "Transitioned pending tasks to Failed for shutdown"
@@ -676,6 +679,7 @@ async fn graceful_shutdown(
         warn!(error = %e, "Telemetry shutdown error (non-fatal)");
     }
 
+    tg_metrics.record_shutdown_duration(shutdown_start.elapsed().as_secs_f64());
     lifecycle.mark_stopped();
 
     match drain_result {

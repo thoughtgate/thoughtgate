@@ -267,15 +267,17 @@ pub enum LifecycleState {
 pub struct LifecycleManager {
     state: ArcSwap<LifecycleState>,
     started_at: Instant,
-    cancellation_token: CancellationToken,
+    shutdown_token: CancellationToken,
     active_requests: AtomicUsize,
     // Readiness subsystem checks
-    upstream_health: AtomicBool,
+    upstream_health: ArcSwap<UpstreamHealthStatus>,
     config_loaded: AtomicBool,
     approval_store_initialized: AtomicBool,
+    // Configuration
+    config: LifecycleConfig,
     // Metadata
     version: &'static str,
-    tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+    tg_metrics: ArcSwapOption<ThoughtGateMetrics>,
 }
 ```
 
@@ -289,29 +291,34 @@ The system MUST initialize in this order:
 ┌─────────────────────────────────────────────────────────────────┐
 │                    v0.2 STARTUP SEQUENCE                        │
 │                                                                 │
-│  1. Load configuration                                          │
-│     • Parse environment variables                               │
-│     • Load YAML config file (REQ-CFG-001)                       │
-│     • Validate required settings                                │
+│  1. Initialize observability                                    │
+│     • Setup logging (tracing subscriber, JSON format)           │
+│     • Setup metrics (Prometheus registry)                       │
+│     • Validate environment safety (dev mode checks)             │
 │     • Set state: Starting                                       │
 │                                                                 │
-│  2. Initialize observability                                    │
-│     • Setup logging (tracing subscriber)                        │
-│     • Setup metrics (Prometheus registry)                       │
+│  2. Start admin server                                          │
+│     • Start admin server on port 7469 (health/ready/metrics)   │
+│     • Health endpoint available immediately                     │
 │                                                                 │
-│  3. Initialize approval store                                   │
-│     • Create PendingApprovalStore                               │
+│  3. Load configuration                                          │
+│     • Parse environment variables / CLI args                    │
+│     • Load YAML config file (REQ-CFG-001)                       │
+│     • Validate required settings                                │
+│     • Initialize OpenTelemetry tracing (from YAML config)       │
+│                                                                 │
+│  4. Initialize governance components                            │
+│     • Create TaskStore / ApprovalEngine                         │
+│     • Create Cedar policy engine                                │
 │     • Initialize Slack adapter (REQ-GOV-003)                    │
 │                                                                 │
-│  4. Connect to upstream                                         │
+│  5. Connect to upstream                                         │
 │     • Verify upstream is reachable (if required)                │
 │     • Initialize HTTP client                                    │
+│     • Start background health checker                           │
 │                                                                 │
-│  5. Start HTTP servers                                          │
-│     • Start admin server on port 7469 (health/ready/metrics)   │
-│     • Reserve inbound port 7468 (for future callbacks)         │
+│  6. Bind outbound port and mark ready                           │
 │     • Bind outbound port 7467 (MCP traffic)                    │
-│     • Health endpoint available immediately                     │
 │     • Set state: Ready                                          │
 │     • Main endpoints accept traffic                             │
 │                                                                 │
@@ -334,16 +341,16 @@ The system MUST initialize in this order:
 
 | Step | Component | Failure Mode | Recovery |
 |------|-----------|--------------|----------|
-| 1 | Load configuration (REQ-CFG-001) | **FAIL FAST** | Fix config, restart |
-| 2 | Initialize observability | **FAIL FAST** | Check log/metrics config |
-| 3a | Initialize TaskStore (REQ-GOV-001) | Always succeeds | In-memory, no deps |
-| 3b | Initialize Slack adapter (REQ-GOV-003) | **WARNING** | Start without approval capability |
-| 4 | Connect to upstream (REQ-CORE-003) | **WARNING** | Start, but NOT Ready |
-| 5 | Initialize Cedar engine (REQ-POL-001) | **FAIL FAST** (v0.3+) | Fix policies, restart |
-| 6a | Bind admin port 7469 (REQ-CORE-003) | **FAIL FAST** | Check port conflicts |
-| 6b | Reserve inbound port 7468 | **WARN** | Port may already be in use |
-| 6c | Bind outbound port 7467 (REQ-CORE-003) | **FAIL FAST** | Check port conflicts |
-| 7 | Set Ready state | Only after all above | — |
+| 1 | Initialize observability | **FAIL FAST** | Check log/metrics config |
+| 2 | Validate environment safety | **FAIL FAST** | Fix env vars, restart |
+| 3 | Bind admin port 7469 | **FAIL FAST** | Check port conflicts |
+| 4 | Load configuration (REQ-CFG-001) | **FAIL FAST** | Fix config, restart |
+| 5a | Initialize TaskStore (REQ-GOV-001) | Always succeeds | In-memory, no deps |
+| 5b | Initialize Cedar engine (REQ-POL-001) | **FAIL FAST** | Fix policies, restart |
+| 5c | Initialize Slack adapter (REQ-GOV-003) | **WARNING** | Start without approval capability |
+| 6 | Connect to upstream (REQ-CORE-003) | **WARNING** | Start, but NOT Ready |
+| 7 | Bind outbound port 7467 (REQ-CORE-003) | **FAIL FAST** | Check port conflicts |
+| 8 | Set Ready state | Only after all above | — |
 
 **Key Principle:** Components that affect request routing (config, Cedar) must fail fast. Components that affect specific features (Slack, upstream) can degrade gracefully.
 
@@ -575,16 +582,15 @@ async fn check_upstream_health(client: &UpstreamClient) -> bool {
 
 **Metrics:**
 ```
-thoughtgate_lifecycle_state{state="starting|ready|shutting_down"}
+thoughtgate_lifecycle_state{state="starting|ready|shutting_down|stopped"}
 thoughtgate_uptime_seconds
 thoughtgate_startup_duration_seconds
 thoughtgate_shutdown_duration_seconds
 thoughtgate_active_requests
-thoughtgate_pending_approvals              # v0.2
-thoughtgate_pending_tasks                  # v0.3+
+thoughtgate_tasks_pending                  # Gauge: pending tasks (tasks_pending in prometheus-client)
 thoughtgate_upstream_health{status="healthy|unhealthy"}
 thoughtgate_drain_timeout_total
-thoughtgate_approvals_cancelled_shutdown   # v0.2
+thoughtgate_approvals_cancelled_shutdown   # Counter: tasks cancelled during shutdown
 ```
 
 **Logging:**
@@ -631,7 +637,7 @@ thoughtgate_approvals_cancelled_shutdown   # v0.2
 | Drain completes | Exit 0 | EC-OPS-007 |
 | Drain timeout | Force exit, log warning | EC-OPS-008 |
 | Pending approvals at shutdown | Cancel waits, return -32603 | EC-OPS-009 |
-| Health check during startup | Return 503 until ready | EC-OPS-010 |
+| Health check during startup | Return 200 (health = process alive, not stopped; readiness = config loaded + approval store initialized + upstream healthy) | EC-OPS-010 |
 | Upstream becomes unreachable | Readiness fails, health OK | EC-OPS-011 |
 | Rapid restart cycles | No resource leaks | EC-OPS-012 |
 | SIGQUIT received | Immediate shutdown | EC-OPS-013 |
@@ -670,31 +676,40 @@ thoughtgate_approvals_cancelled_shutdown   # v0.2
 ```rust
 pub struct LifecycleManager {
     state: ArcSwap<LifecycleState>,
-    cancellation_token: CancellationToken,
+    shutdown_token: CancellationToken,
     started_at: Instant,
-    active_requests: Arc<AtomicUsize>,
+    active_requests: AtomicUsize,
     // Readiness checks
-    upstream_health: AtomicBool,
+    upstream_health: ArcSwap<UpstreamHealthStatus>,
     config_loaded: AtomicBool,
     approval_store_initialized: AtomicBool,
+    // Configuration
+    config: LifecycleConfig,
     // Metadata
     version: &'static str,
-    tg_metrics: Option<Arc<ThoughtGateMetrics>>,
+    tg_metrics: ArcSwapOption<ThoughtGateMetrics>,
 }
 
 impl LifecycleManager {
-    pub fn new(version: &'static str) -> Self {
+    pub fn new(config: LifecycleConfig) -> Self {
         Self {
             state: ArcSwap::new(Arc::new(LifecycleState::Starting)),
-            cancellation_token: CancellationToken::new(),
+            shutdown_token: CancellationToken::new(),
             started_at: Instant::now(),
-            active_requests: Arc::new(AtomicUsize::new(0)),
-            upstream_health: AtomicBool::new(false),
+            active_requests: AtomicUsize::new(0),
+            upstream_health: ArcSwap::new(Arc::new(UpstreamHealthStatus::default())),
             config_loaded: AtomicBool::new(false),
             approval_store_initialized: AtomicBool::new(false),
-            version,
-            tg_metrics: None,
+            config,
+            version: env!("CARGO_PKG_VERSION"),
+            tg_metrics: ArcSwapOption::empty(),
         }
+    }
+
+    /// Wire Prometheus metrics post-construction (since LifecycleManager
+    /// is typically wrapped in Arc).
+    pub fn set_metrics(&self, metrics: Arc<ThoughtGateMetrics>) {
+        self.tg_metrics.store(Some(metrics));
     }
 
     pub fn is_ready(&self) -> bool {
@@ -710,29 +725,41 @@ impl LifecycleManager {
 
     pub fn begin_shutdown(&self) {
         self.state.store(Arc::new(LifecycleState::ShuttingDown));
-        self.cancellation_token.cancel();
+        self.shutdown_token.cancel();
     }
 
     /// Returns a CancellationToken that components can await for shutdown.
     pub fn shutdown_token(&self) -> CancellationToken {
-        self.cancellation_token.clone()
+        self.shutdown_token.clone()
     }
 
-    pub fn track_request(&self) -> RequestGuard {
-        self.active_requests.fetch_add(1, Ordering::SeqCst);
-        RequestGuard {
-            counter: Arc::clone(&self.active_requests),
+    /// Track an active request (returns RAII guard).
+    ///
+    /// Returns `None` if the service is shutting down (new requests rejected).
+    /// The returned guard holds an `Arc<LifecycleManager>` and automatically
+    /// decrements the counter when dropped.
+    pub fn track_request(self: &Arc<Self>) -> Option<RequestGuard> {
+        if self.is_shutting_down() {
+            return None; // Reject new requests during shutdown
         }
+        self.active_requests.fetch_add(1, Ordering::SeqCst);
+        Some(RequestGuard {
+            manager: Arc::clone(self),
+        })
     }
 }
 
+/// RAII guard for request tracking.
+///
+/// Holds an `Arc<LifecycleManager>` so it can be moved into spawned tasks.
+/// When dropped, the active request counter is decremented.
 pub struct RequestGuard {
-    counter: Arc<AtomicUsize>,
+    manager: Arc<LifecycleManager>,
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
+        self.manager.active_requests.fetch_sub(1, Ordering::SeqCst);
     }
 }
 ```

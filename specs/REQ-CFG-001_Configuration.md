@@ -49,7 +49,7 @@ This requirement defines the **unified configuration schema** for ThoughtGate. T
 
 The system must:
 1. Parse and validate YAML configuration at startup
-2. Support hot-reload of configuration without restart
+2. Support hot-reload of configuration without restart **(DEFERRED to v0.3+)**
 3. Enforce validation rules to fail fast on invalid config
 4. Provide clear error messages for configuration problems
 5. Support environment variable substitution in sensitive fields
@@ -61,17 +61,19 @@ The system must:
 - Single MCP source (static)
 - Governance rules (match, action, source filter)
 - Human approval via Slack
-- Approval timeout and on_timeout behavior
+- Approval timeout and on_timeout behavior (deny and approve)
 - Configuration validation at load time
 - Environment variable substitution
-- Hot-reload via file watching
-- Telemetry configuration (OTel export, Prometheus, sampling)
+- Telemetry configuration (OTel export, sampling)
+- `deny_unknown_fields` on all config structs (catch typos at parse time)
 
 ### 4.2 In Scope (v0.3+)
+- Hot-reload via file watching
 - Multi-source MCP
 - A2A sources and A2A approval
 - Approval chains
-- External approval service
+- External approval service (`type: approval_service`)
+- CLI approval destination (`type: cli`)
 - Audit configuration
 
 ### 4.3 Out of Scope
@@ -105,8 +107,8 @@ Schema 1 is **additive** - new source kinds and features are added without versi
 | `action: approve` | ✅ | Human approval |
 | `action: policy` | ✅ | Cedar evaluation |
 | Human approval (Slack) | ✅ | Async via Slack |
-| Human approval (CLI) | ✅ | Interactive TTY |
-| `type: approval_service` | ⚠️ | **Experimental** - See §8.8 |
+| Human approval (CLI) | ❌ | **Deferred** to v0.3+ |
+| `type: approval_service` | ❌ | **Deferred** to v0.3+ |
 | A2A approval | ❌ | v0.3+ |
 | Approval chains | ❌ | v0.3+ |
 | Audit logging | ❌ | v0.3+ |
@@ -468,20 +470,26 @@ impl Default for ExposeConfig {
 
 ### 7.4 Governance Configuration
 
+> **`deny_unknown_fields` policy:** All configuration structs use `#[serde(deny_unknown_fields)]`.
+> Unknown YAML keys cause a parse error intentionally, to catch typos early.
+> There are no "future slot" fields — adding new fields requires a code change.
+
 ```rust
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Governance {
     pub defaults: GovernanceDefaults,
     #[serde(default)]
     pub rules: Vec<Rule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GovernanceDefaults {
     pub action: Action,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     Forward,
@@ -490,46 +498,40 @@ pub enum Action {
     Policy,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rule {
-    /// Glob pattern for tool name matching
+    /// Glob pattern for tool name matching.
     #[serde(rename = "match")]
     pub pattern: String,
-    
-    /// Action to take when matched
+
+    /// Action to take when matched.
     pub action: Action,
-    
-    /// Filter to specific source(s)
+
+    /// Filter to specific source(s).
     #[serde(default)]
     pub source: Option<SourceFilter>,
-    
-    /// Cedar policy ID (required if action: policy)
+
+    /// Cedar policy ID (required if action: policy).
     #[serde(default)]
     pub policy_id: Option<String>,
-    
-    /// Approval workflow name (for action: approve)
+
+    /// Approval workflow name (for action: approve).
     #[serde(default)]
     pub approval: Option<String>,
-    
-    /// Human-readable description
+
+    /// Human-readable description.
+    /// Reserved for admin UI. Not used at runtime.
     #[serde(default)]
     pub description: Option<String>,
-    
-    // ──────────────────────────────────────────────────────────────
-    // Future slots (v0.3+) - Parsed but ignored in v0.2
-    // This allows v0.3 configs to be parsed by v0.2 binaries
-    // ──────────────────────────────────────────────────────────────
-    
-    /// Rate limiting configuration (v0.3+)
-    #[serde(default)]
-    pub limits: Option<serde_json::Value>,
-    
-    /// Inspector chain for this rule (v0.3+)
-    #[serde(default)]
-    pub inspectors: Option<Vec<String>>,
+
+    /// Pre-compiled glob pattern (populated by `Config::compile_patterns()`).
+    /// Avoids re-parsing the glob on every request evaluation.
+    #[serde(skip)]
+    pub compiled_pattern: Option<glob::Pattern>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum SourceFilter {
     Single(String),
@@ -545,7 +547,8 @@ pub enum SourceFilter {
 /// field is typed inline as `HashMap<String, HumanWorkflow>`.
 pub type ApprovalWorkflows = HashMap<String, HumanWorkflow>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanWorkflow {
     pub destination: ApprovalDestination,
 
@@ -559,9 +562,36 @@ pub struct HumanWorkflow {
 
     #[serde(default)]
     pub on_timeout: Option<TimeoutAction>,
-}
 
-#[derive(Debug, Deserialize)]
+    /// Field names to redact from tool_arguments before sending to Slack.
+    /// Supports dot-notation for nested fields (e.g., "credentials.api_key").
+    /// Values are replaced with "[REDACTED]".
+    #[serde(default)]
+    pub redact_fields: Option<Vec<String>>,
+}
+```
+
+**Example with redaction:**
+```yaml
+approval:
+  default:
+    destination:
+      type: slack
+      channel: "#approvals"
+    timeout: 10m
+    on_timeout: deny
+    redact_fields:
+      - password
+      - credentials.api_key
+      - secret_token
+```
+
+```rust
+/// Destination for approval requests.
+///
+/// v0.2: Only `Slack` is implemented. Webhook, Cli, and ApprovalService
+/// are deferred to v0.3+.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ApprovalDestination {
     #[serde(rename = "slack")]
@@ -572,59 +602,35 @@ pub enum ApprovalDestination {
         #[serde(default)]
         mention: Option<Vec<String>>,
     },
-    
-    #[serde(rename = "webhook")]
-    Webhook {
-        url: String,
-        #[serde(default)]
-        auth: Option<WebhookAuth>,
-    },
-    
-    #[serde(rename = "cli")]
-    Cli,
-    
-    /// External approval service (EXPERIMENTAL - v0.3+)
-    /// Allows integration with enterprise approval systems (ServiceNow, Jira, etc.)
-    /// See Section 8.8 for webhook contract specification.
-    #[serde(rename = "approval_service")]
-    ApprovalService {
-        /// URL of the approval service endpoint
-        url: String,
-        /// Optional authentication configuration
-        #[serde(default)]
-        auth: Option<WebhookAuth>,
-        /// Custom headers to include in requests
-        #[serde(default)]
-        headers: Option<HashMap<String, String>>,
-    },
+    // DEFERRED to v0.3+:
+    // - Webhook { url, auth }
+    // - Cli
+    // - ApprovalService { url, auth, headers }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeoutAction {
+    /// Deny the request on timeout.
     #[default]
     Deny,
-    // v0.3+: Escalate, AutoApprove
-}
-
-#[derive(Debug, Deserialize)]
-pub struct WebhookAuth {
-    #[serde(rename = "type")]
-    pub auth_type: String,  // "bearer" | "basic"
-    #[serde(default)]
-    pub token_env: Option<String>,
+    /// Auto-approve on timeout (use with caution).
+    Approve,
 }
 ```
+
+> **Note:** `WebhookAuth` is deferred to v0.3+ along with the destination types that use it.
 
 ### 7.6 Cedar Configuration
 
 ```rust
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CedarConfig {
-    /// List of Cedar policy file paths
+    /// List of Cedar policy file paths.
     pub policies: Vec<PathBuf>,
-    
-    /// Optional Cedar schema file
+
+    /// Optional Cedar schema file.
     #[serde(default)]
     pub schema: Option<PathBuf>,
 }
@@ -645,20 +651,18 @@ telemetry:
   otlp:
     # OTLP exporter endpoint. Overridden by OTEL_EXPORTER_OTLP_ENDPOINT env var.
     endpoint: "http://otel-collector:4318"  # Default: none (export disabled)
-    
+
     # Export protocol. v0.2 supports http/protobuf only.
     # "grpc" is accepted but falls back to http/protobuf with a warning.
     protocol: http/protobuf  # Default: http/protobuf
-    
+
     # Optional headers for OTLP export (e.g., authentication)
     headers:
       Authorization: "Bearer ${OTEL_AUTH_TOKEN:-}"
-  
-  prometheus:
-    # Enable Prometheus /metrics endpoint on admin port
-    enabled: true  # Default: true
-    # Note: Port is admin port (default 7469), path is always /metrics
-  
+
+  # Note: There is no `prometheus:` sub-section in the YAML schema.
+  # Prometheus /metrics is always enabled on the admin port (default 7469).
+
   sampling:
     # Sampling strategy. v0.2 supports "head" only.
     # "tail" is accepted but falls back to "head" with a warning.
@@ -689,48 +693,76 @@ telemetry:
     deployment.environment: ${DEPLOY_ENV:-development}
     # Kubernetes attributes auto-populated from downward API if available
     # k8s.namespace.name, k8s.pod.name, k8s.node.name
+
+  stdio:
+    # If true, preserve _meta.traceparent and _meta.tracestate when
+    # forwarding to upstream MCP servers via stdio transport.
+    propagate_upstream: false  # Default: false
 ```
 
 #### 7.7.2 Rust Types
 
+> **Implementation note:** The type is named `TelemetryYamlConfig` (not `TelemetryConfig`)
+> to distinguish it from runtime telemetry state. All sub-fields are `Option<T>` —
+> when absent, the sub-section is `None` and telemetry uses hardcoded defaults or is disabled.
+> There is no `PrometheusConfig` in the YAML schema; Prometheus is configured solely via
+> the admin port (`THOUGHTGATE_ADMIN_PORT`, default 7469) and is always enabled.
+
 ```rust
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct TelemetryConfig {
-    /// Master enable/disable for tracing
-    pub enabled: bool,
-    
-    /// OTLP export configuration
-    pub otlp: OtlpConfig,
-    
-    /// Prometheus endpoint configuration
-    pub prometheus: PrometheusConfig,
-    
-    /// Sampling configuration
-    pub sampling: SamplingConfig,
-    
-    /// Batch export configuration
-    pub batch: BatchConfig,
-    
-    /// OTel resource attributes
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryYamlConfig {
+    /// Master enable/disable switch for OTLP trace export.
+    /// Default: false (disabled by default)
     #[serde(default)]
-    pub resource: HashMap<String, String>,
+    pub enabled: bool,
+
+    /// OTLP export configuration.
+    #[serde(default)]
+    pub otlp: Option<OtlpConfig>,
+
+    /// Sampling configuration.
+    #[serde(default)]
+    pub sampling: Option<SamplingConfig>,
+
+    /// Batch processor configuration.
+    #[serde(default)]
+    pub batch: Option<BatchConfig>,
+
+    /// Resource attributes for OTLP export.
+    #[serde(default)]
+    pub resource: Option<HashMap<String, String>>,
+
+    /// Stdio transport telemetry configuration.
+    #[serde(default)]
+    pub stdio: Option<StdioTelemetryConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+/// Stdio transport telemetry configuration.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdioTelemetryConfig {
+    /// If true, preserve `_meta.traceparent` and `_meta.tracestate` when
+    /// forwarding to upstream MCP servers.
+    /// Default: false (strip trace fields to avoid breaking strict schema servers).
+    #[serde(default)]
+    pub propagate_upstream: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OtlpConfig {
-    /// OTLP endpoint URL (e.g., "http://collector:4318").
+    /// OTLP HTTP endpoint (e.g., "http://otel-collector:4318").
     /// Required when telemetry is enabled — export will fail without it.
     pub endpoint: String,
 
-    /// Export protocol: "http/protobuf" or "grpc"
-    /// v0.2: grpc falls back to http/protobuf
+    /// Protocol: only "http/protobuf" supported in v0.2.
+    /// "grpc" is accepted but falls back to http/protobuf with a warning.
     #[serde(default = "default_otlp_protocol")]
     pub protocol: String,
 
-    /// Optional headers for authentication (e.g., Authorization: "Bearer ...")
-    /// Now implemented — headers are passed to the OTLP exporter.
+    /// Custom HTTP headers for OTLP export (e.g., Authorization tokens).
+    /// Values may contain `${ENV_VAR:-default}` references resolved at config load time.
     #[serde(default)]
     pub headers: HashMap<String, String>,
 }
@@ -739,28 +771,25 @@ fn default_otlp_protocol() -> String {
     "http/protobuf".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct PrometheusConfig {
-    /// Enable /metrics endpoint
-    pub enabled: bool,
-}
-
-impl Default for PrometheusConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamplingConfig {
-    /// Sampling strategy: "head" or "tail"
-    /// v0.2: tail falls back to head
+    /// Sampling strategy: "head" only in v0.2.
+    /// "tail" is accepted but falls back to "head" with a warning.
+    #[serde(default = "default_sampling_strategy")]
     pub strategy: String,
-    
-    /// Sample rate for successful requests (0.0 to 1.0)
+
+    /// Sample rate for successful requests (0.0 to 1.0).
+    #[serde(default = "default_sample_rate")]
     pub success_sample_rate: f64,
+}
+
+fn default_sampling_strategy() -> String {
+    "head".to_string()
+}
+
+fn default_sample_rate() -> f64 {
+    1.0
 }
 
 impl Default for SamplingConfig {
@@ -772,21 +801,30 @@ impl Default for SamplingConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchConfig {
-    /// Maximum spans queued before dropping
+    /// Maximum spans in the export queue.
+    #[serde(default = "default_max_queue_size")]
     pub max_queue_size: usize,
-    
-    /// Maximum spans per export batch
+
+    /// Maximum spans per export batch.
+    #[serde(default = "default_max_export_batch_size")]
     pub max_export_batch_size: usize,
-    
-    /// Delay between exports (ms)
+
+    /// Delay between scheduled exports in milliseconds.
+    #[serde(default = "default_scheduled_delay_ms")]
     pub scheduled_delay_ms: u64,
-    
-    /// Export timeout (ms)
+
+    /// Export timeout in milliseconds.
+    #[serde(default = "default_export_timeout_ms")]
     pub export_timeout_ms: u64,
 }
+
+fn default_max_queue_size() -> usize { 2048 }
+fn default_max_export_batch_size() -> usize { 512 }
+fn default_scheduled_delay_ms() -> u64 { 5000 }
+fn default_export_timeout_ms() -> u64 { 30000 }
 
 impl Default for BatchConfig {
     fn default() -> Self {
@@ -816,21 +854,15 @@ Standard OTel environment variables take precedence over YAML config:
 
 #### 7.7.4 Hot-Reload Behavior
 
-| Field | Hot-Reloadable | Notes |
-|-------|----------------|-------|
-| `enabled` | ⚠️ Partial | Disable takes effect immediately; enable requires restart |
-| `otlp.endpoint` | ❌ No | Requires restart (exporter is initialized once) |
-| `prometheus.enabled` | ❌ No | Requires restart |
-| `sampling.success_sample_rate` | ✅ Yes | New rate applies to new spans |
-| `batch.*` | ❌ No | Requires restart |
-| `resource.*` | ❌ No | Requires restart |
+> **DEFERRED to v0.3+.** Configuration hot-reload is not implemented. All telemetry
+> settings are read once at startup. Changes require a process restart.
 
 #### 7.7.5 Behavioral Specifications
 
 | ID | Behavior |
 |----|----------|
 | B-CFG-TEL-001 | When `telemetry.enabled: false`, zero OTLP network traffic is generated |
-| B-CFG-TEL-002 | When `telemetry.enabled: false` AND `prometheus.enabled: true`, the `/metrics` endpoint still works |
+| B-CFG-TEL-002 | When `telemetry.enabled: false`, the `/metrics` Prometheus endpoint still works (Prometheus is always enabled on the admin port) |
 | B-CFG-TEL-003 | When `otlp.protocol: grpc`, log warning "gRPC not supported in v0.2, using http/protobuf" and use http/protobuf |
 | B-CFG-TEL-004 | When `sampling.strategy: tail`, log warning "Tail sampling not supported in v0.2, using head" and use head |
 | B-CFG-TEL-005 | Resource attributes from config are merged with auto-detected K8s attributes (K8s takes precedence on conflict) |
@@ -847,7 +879,7 @@ Standard OTel environment variables take precedence over YAML config:
 | V-004 | `policy_id` requires `action: policy` | `PolicyIdWithoutPolicyAction` | Warning |
 | V-005 | `action: policy` requires `policy_id` | `MissingPolicyId` | Error |
 | V-006 | `approval` workflow must be defined | `UndefinedWorkflow` | Error |
-| V-007 | Duration fields must be valid humantime | `InvalidDuration` | Error |
+| V-007 | Rule source filter references existing source | `UndefinedSourceInRule` | Error |
 | V-008 | `url` fields must be valid URLs | `InvalidUrl` | Error |
 | V-009 | `match` patterns must be valid globs | `InvalidGlobPattern` | Error |
 | V-010 | At least one source must be defined | `NoSourcesDefined` | Error |
@@ -861,6 +893,11 @@ Standard OTel environment variables take precedence over YAML config:
 | V-TEL-004 | `sampling.strategy` must be "head" or "tail" | `UnknownSamplingStrategy` | Error |
 | V-TEL-005 | `batch.max_queue_size` must be > 0 | `InvalidQueueSize` | Error |
 | V-TEL-006 | `batch.scheduled_delay_ms` must be ≥ 100 | `InvalidBatchDelay` | Error |
+| V-TEL-007 | `batch.max_export_batch_size` must be > 0 and ≤ `max_queue_size` | `InvalidExportBatchSize` | Error |
+| V-TEL-008 | `batch.export_timeout_ms` must be ≥ 100 | `InvalidExportTimeout` | Error |
+| V-015 | Workflow timeout must be ≥ 5s | `InvalidWorkflowTimeout` | Error |
+| V-016 | Source ID must be valid (non-empty, valid chars) | `InvalidSourceId` | Error |
+| V-006b | `action: approve` without `approval` field and >1 workflow | `MissingApprovalWorkflow` | Error |
 
 ### 8.2 Validation Implementation
 
@@ -966,61 +1003,127 @@ impl Config {
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("No sources defined")]
+    // ── Source validation (V-001, V-002, V-003, V-010, V-011, V-012) ──
+
+    #[error("no sources defined in configuration")]
     NoSourcesDefined,
-    
-    #[error("v0.2 supports only single source")]
-    V02SingleSourceOnly,
-    
-    #[error("v0.2 supports only kind: mcp")]
-    V02McpOnly,
-    
-    #[error("Duplicate source ID: {0}")]
-    DuplicateSourceId(String),
-    
-    #[error("Reserved prefix in source ID: {id}")]
+
+    #[error("v0.2 supports only a single source, found {count}")]
+    V02SingleSourceOnly { count: usize },
+
+    #[error("v0.2 supports only kind: mcp, found '{kind}'")]
+    V02McpOnly { kind: String },
+
+    #[error("duplicate source ID: '{id}'")]
+    DuplicateSourceId { id: String },
+
+    #[error("source ID '{id}' uses reserved prefix '_'")]
     ReservedPrefix { id: String },
-    
-    #[error("Duplicate prefix: {0}")]
-    DuplicatePrefix(String),
-    
-    #[error("Missing policy_id for action: policy in rule '{pattern}'")]
+
+    #[error("duplicate prefix: '{prefix}'")]
+    DuplicatePrefix { prefix: String },
+
+    // ── Rule validation (V-005, V-006, V-007, V-009) ──
+
+    #[error("missing policy_id for action: policy in rule '{pattern}'")]
     MissingPolicyId { pattern: String },
-    
-    #[error("Undefined workflow '{workflow}' in rule '{pattern}'")]
+
+    #[error("undefined workflow '{workflow}' in rule '{pattern}'")]
     UndefinedWorkflow { workflow: String, pattern: String },
-    
-    #[error("Invalid duration '{value}': {message}")]
-    InvalidDuration { value: String, message: String },
-    
-    #[error("Invalid URL '{url}': {message}")]
-    InvalidUrl { url: String, message: String },
-    
-    #[error("Invalid glob pattern '{pattern}': {message}")]
+
+    #[error("rule '{pattern}' has action: approve but no 'approval' field and \
+             {workflow_count} workflows are defined (implicit selection requires exactly 1)")]
+    MissingApprovalWorkflow { pattern: String, workflow_count: usize },
+
+    #[error("invalid glob pattern '{pattern}': {message}")]
     InvalidGlobPattern { pattern: String, message: String },
-    
-    #[error("Policy file not found: {path}")]
+
+    #[error("rule '{pattern}' references undefined source '{source_id}'")]
+    UndefinedSourceInRule { source_id: String, pattern: String },
+
+    // ── Value validation (V-008, V-013, V-014, V-015, V-016) ──
+
+    #[error("invalid URL '{url}': {message}")]
+    InvalidUrl { url: String, message: String },
+
+    #[error("workflow '{workflow}' has {field} of {duration_secs}s, minimum is 5s")]
+    InvalidWorkflowTimeout { workflow: String, field: String, duration_secs: u64 },
+
+    #[error("source ID '{id}' is invalid: {reason}")]
+    InvalidSourceId { id: String, reason: String },
+
+    #[error("policy file not found: {path}")]
     PolicyFileNotFound { path: PathBuf },
-    
+
+    #[error("environment variable '{var}' not set (required for field '{field}')")]
+    MissingEnvVar { var: String, field: String },
+
+    // ── Telemetry validation (V-TEL-001 through V-TEL-008) ──
+
+    #[error("invalid sample rate {rate}: must be between 0.0 and 1.0")]
+    InvalidSampleRate { rate: f64 },
+
+    #[error("invalid OTLP endpoint '{endpoint}': {message}")]
+    InvalidOtlpEndpoint { endpoint: String, message: String },
+
+    #[error("unknown OTLP protocol '{protocol}': must be \"http/protobuf\" or \"grpc\"")]
+    UnknownOtlpProtocol { protocol: String },
+
+    #[error("unknown sampling strategy '{strategy}': must be \"head\" or \"tail\"")]
+    UnknownSamplingStrategy { strategy: String },
+
+    #[error("invalid max_queue_size {size}: must be > 0")]
+    InvalidQueueSize { size: usize },
+
+    #[error("invalid scheduled_delay_ms {delay_ms}: must be >= 100")]
+    InvalidBatchDelay { delay_ms: u64 },
+
+    #[error("invalid max_export_batch_size {batch_size}: must be > 0 and <= max_queue_size ({queue_size})")]
+    InvalidExportBatchSize { batch_size: usize, queue_size: usize },
+
+    #[error("invalid export_timeout_ms {timeout_ms}: must be >= 100")]
+    InvalidExportTimeout { timeout_ms: u64 },
+
+    // ── Schema validation ──
+
+    #[error("unsupported schema version {version}, expected 1")]
+    UnsupportedSchemaVersion { version: u32 },
+
+    // ── I/O and parsing ──
+
     #[error("YAML parse error: {0}")]
     ParseError(#[from] serde_saphyr::Error),
-    
-    #[error("IO error: {0}")]
+
+    #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
+
+    #[error("configuration file not found (searched: {searched:?})")]
+    ConfigFileNotFound { searched: Vec<PathBuf> },
+
+    #[error("configuration file is empty")]
+    EmptyConfigFile,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationWarning {
+    /// V-004: policy_id specified but action is not policy.
     PolicyIdWithoutPolicyAction { pattern: String },
-    MissingEnvVar { var: String, field: String },
+
+    /// Glob pattern matches zero tools (informational).
+    PatternMatchesNothing { pattern: String },
+
+    /// Per-workflow Slack settings are specified but not yet supported.
+    PerWorkflowSlackNotSupported { workflow: String },
 }
 ```
 
-### 8.8 External Approval Service (EXPERIMENTAL)
+### 8.8 External Approval Service (DEFERRED to v0.3+)
 
-⚠️ **EXPERIMENTAL**: This interface is available in v0.2 but may change. Mark configurations using `approval_service` as experimental.
+> **DEFERRED:** The `approval_service` destination type is not implemented. The YAML schema
+> does not accept `type: approval_service` — it will cause a parse error due to `deny_unknown_fields`
+> on `ApprovalDestination`. The specification below is retained for v0.3+ planning.
 
-This destination type allows ThoughtGate to integrate with enterprise approval systems (ServiceNow, Jira, internal tools) without waiting for native adapters.
+This destination type will allow ThoughtGate to integrate with enterprise approval systems (ServiceNow, Jira, internal tools) without waiting for native adapters.
 
 **Configuration Example:**
 
@@ -1220,61 +1323,16 @@ impl ExposeConfig {
 
 ### 9.4 Hot-Reload
 
+> **DEFERRED to v0.3+.** Configuration hot-reload (`ConfigWatcher`) is not implemented.
+> The `ArcSwap`-based pattern described below is the planned approach for v0.3+.
+> Cedar policy hot-reload via `ArcSwap<PolicySet>` is implemented separately
+> (see REQ-POL-001); this section covers YAML config hot-reload only.
+
 ```rust
+// v0.3+ planned implementation:
 pub struct ConfigWatcher {
     config: ArcSwap<Config>,
     path: PathBuf,
-}
-
-impl ConfigWatcher {
-    pub fn new(path: PathBuf) -> Result<Self, ConfigError> {
-        let config = load_config(&path)?;
-        Ok(Self {
-            config: ArcSwap::new(Arc::new(config)),
-            path,
-        })
-    }
-    
-    /// Start watching for changes
-    pub fn watch(&self) -> Result<(), ConfigError> {
-        let path = self.path.clone();
-        let config = self.config.clone();
-        
-        std::thread::spawn(move || {
-            let mut last_modified = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok();
-            
-            loop {
-                std::thread::sleep(Duration::from_secs(10));
-                
-                let current_modified = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok();
-                
-                if current_modified != last_modified {
-                    match load_config(&path) {
-                        Ok(new_config) => {
-                            info!("Configuration reloaded");
-                            config.store(Arc::new(new_config));
-                            last_modified = current_modified;
-                        }
-                        Err(e) => {
-                            error!("Failed to reload config: {}", e);
-                            // Keep using old config
-                        }
-                    }
-                }
-            }
-        });
-        
-        Ok(())
-    }
-    
-    /// Get current configuration
-    pub fn get(&self) -> Arc<Config> {
-        self.config.load_full()
-    }
 }
 ```
 
@@ -1406,8 +1464,8 @@ if !expose.is_visible(tool_name) {
 
 | Test | Description |
 |------|-------------|
-| `test_hot_reload` | Config changes detected and applied |
-| `test_hot_reload_invalid` | Invalid config keeps old config |
+| ~~`test_hot_reload`~~ | ~~Config changes detected and applied~~ **(DEFERRED to v0.3+)** |
+| ~~`test_hot_reload_invalid`~~ | ~~Invalid config keeps old config~~ **(DEFERRED to v0.3+)** |
 | `test_file_not_found` | Graceful error on missing file |
 | `test_cedar_integration` | Policy paths passed to Cedar engine |
 | `test_approval_integration` | Workflow config used by approval |
@@ -1420,9 +1478,9 @@ if !expose.is_visible(tool_name) {
 | Valid YAML, unsupported schema version | Fail with version error | EC-CFG-002 |
 | Env var undefined, no default (`${MISSING}`) | Fail with env var error | EC-CFG-003 |
 | Env var undefined, has default (`${MISSING:-default}`) | Use default value | EC-CFG-004 |
-| Hot reload during active request | Complete request with old config | EC-CFG-005 |
-| Hot reload with syntax error | Keep old config, log error | EC-CFG-006 |
-| Config file deleted while running | Keep old config, log warning | EC-CFG-007 |
+| Hot reload during active request | Complete request with old config | EC-CFG-005 **(DEFERRED)** |
+| Hot reload with syntax error | Keep old config, log error | EC-CFG-006 **(DEFERRED)** |
+| Config file deleted while running | Keep old config, log warning | EC-CFG-007 **(DEFERRED)** |
 | Glob pattern matches zero tools | Warning, no error | EC-CFG-008 |
 | Rule matches tool that doesn't exist | Warning only, rule still valid | EC-CFG-009 |
 | Duplicate rule patterns | First match wins (no error) | EC-CFG-010 |
@@ -1619,8 +1677,6 @@ telemetry:
   otlp:
     endpoint: "http://otel-collector:4318"
     protocol: http/protobuf
-  prometheus:
-    enabled: true
   sampling:
     strategy: head
     success_sample_rate: 0.10  # Sample 10% of successful requests
@@ -1631,6 +1687,9 @@ telemetry:
     service.name: thoughtgate
     deployment.environment: ${DEPLOY_ENV:-production}
 ```
+
+> **Note:** Prometheus `/metrics` is always available on the admin port (default 7469)
+> and does not need to be configured in the YAML.
 
 **Required environment variables:**
 ```bash
@@ -1682,17 +1741,20 @@ ThoughtGate v0.2 uses a 3-port Envoy-style architecture:
 
 ### 14.2 Experimental Mode
 
-Set `THOUGHTGATE_EXPERIMENTAL=1` to test v0.3+ features:
+> **NOT IMPLEMENTED.** The `THOUGHTGATE_EXPERIMENTAL` environment variable is not
+> recognized by any code path. The feature-gating mechanism described below is
+> planned for v0.3+.
+
+~~Set `THOUGHTGATE_EXPERIMENTAL=1` to test v0.3+ features:~~
 
 ```bash
+# NOT IMPLEMENTED — will have no effect
 THOUGHTGATE_EXPERIMENTAL=1 thoughtgate --config config.yaml
 ```
 
-This allows:
-- Multiple sources (with warning)
-- A2A sources (with warning)
-
-⚠️ Experimental features may change without notice.
+~~This allows:~~
+- ~~Multiple sources (with warning)~~
+- ~~A2A sources (with warning)~~
 
 ## 15. Open Questions
 
@@ -1702,7 +1764,7 @@ This allows:
 | 2 | Should config support TOML alternative? | Yes / No | No (YAML only) |
 | 3 | Should we validate URL connectivity? | Yes / No | No (warning only) |
 | 4 | ~~Support ISO 8601 durations?~~ | Yes / No | **Yes** - Both humantime and ISO 8601 (§5.4) |
-| 5 | ~~Define approval service API in v0.2?~~ | Yes / No | **Yes** - Experimental (§8.8) |
+| 5 | ~~Define approval service API in v0.2?~~ | Yes / No | **Deferred** to v0.3+ — spec retained in §8.8 for planning |
 | 6 | ~~Cedar `advice` block for workflow routing?~~ | Yes / No | **No** - Use `@thoughtgate_approval` annotation (§10.1) |
 
 ---

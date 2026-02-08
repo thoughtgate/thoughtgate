@@ -899,13 +899,13 @@ impl ApprovalEngine {
                 rejected_by: task.approval.as_ref().map(|a| a.decided_by.clone()),
                 workflow: None,
             }),
-            FailureStage::PolicyDrift => Err(ThoughtGateError::PolicyDenied {
+            FailureStage::PolicyDrift => Err(ThoughtGateError::PolicyDrift {
                 tool: tool_name,
-                policy_id: None,
-                reason: Some(reason),
+                task_id: task.id.to_string(),
             }),
-            FailureStage::TransformDrift => Err(ThoughtGateError::ServiceUnavailable {
-                reason: format!("Transform drift: {reason}"),
+            FailureStage::TransformDrift => Err(ThoughtGateError::TransformDrift {
+                tool: tool_name,
+                task_id: task.id.to_string(),
             }),
             FailureStage::UpstreamError => {
                 if reason.contains("timeout") || reason.contains("timed out") {

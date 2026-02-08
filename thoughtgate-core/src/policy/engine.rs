@@ -1004,6 +1004,7 @@ impl CedarEngine {
             .store(Arc::new(Some(std::time::SystemTime::now())));
         if let Some(ref metrics) = self.tg_metrics {
             metrics.cedar_policies_loaded.set(policy_count as i64);
+            metrics.record_cedar_reload("success");
         }
         info!("Policies reloaded successfully");
     }

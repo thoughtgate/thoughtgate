@@ -5,8 +5,8 @@ Human-in-the-loop approval proxy for MCP (Model Context Protocol) agents.
 ## Specs
 
 All requirements are in `specs/`:
-- `ARCHITECTURE.md` - System overview (v0.1 simplified model)
-- `REQ-CORE-001` - Zero-copy streaming (DEFERRED to v0.2+)
+- `ARCHITECTURE.md` - System overview (v0.4)
+- `REQ-CORE-001` - Zero-copy streaming (partially implemented; Green Path selection DEFERRED)
 - `REQ-CORE-002` - Buffered inspection (DEFERRED to v0.2+)
 - `REQ-CORE-003` - MCP transport & routing
 - `REQ-CORE-004` - Error handling
@@ -20,8 +20,6 @@ All requirements are in `specs/`:
 
 ## Project Structure
 
-> **Note:** v0.2 uses a flat `src/` layout. v0.3 restructures into the workspace below.
-
 ```
 Cargo.toml                        # [workspace] with 3 members
 thoughtgate-core/                 # Library: transport-agnostic governance + telemetry
@@ -32,12 +30,16 @@ thoughtgate-core/                 # Library: transport-agnostic governance + tel
 │   ├── config/                   # REQ-CFG-001: YAML config, governance rules
 │   ├── telemetry/                # Spans, metrics, audit, redaction
 │   ├── error/                    # REQ-CORE-004: Error types
+│   ├── protocol/                 # REQ-CORE-007: SEP-1686 capability cache
 │   └── lifecycle/                # REQ-CORE-005: State machine (shared)
 thoughtgate-proxy/                # Binary: HTTP+SSE sidecar for K8s
 ├── src/
 │   ├── main.rs                   # Startup, listener, shutdown
-│   ├── handlers.rs               # Axum request handlers
-│   └── health.rs                 # K8s health/readiness probes
+│   ├── mcp_handler/              # MCP JSON-RPC routing, gate logic, Cedar eval
+│   ├── proxy_service.rs          # Hyper service + forward proxy
+│   ├── admin.rs                  # Admin server (health, readiness, /metrics)
+│   ├── traffic.rs                # MCP vs non-MCP traffic discrimination
+│   └── rate_limiter.rs           # Per-client rate limiting
 thoughtgate/                      # Binary: CLI wrapper for local dev
 └── src/
     ├── main.rs                   # clap dispatch (wrap, shim)
@@ -145,7 +147,7 @@ ThoughtGate uses two observability systems (each for a distinct purpose):
 **Metrics** (`ThoughtGateMetrics` in `prom_metrics.rs`):
 - Counters: `thoughtgate_requests_total`, `thoughtgate_tasks_created_total`, `thoughtgate_tasks_completed_total`
 - Gauges: `thoughtgate_connections_active`, `thoughtgate_tasks_pending`, `thoughtgate_cedar_policies_loaded`, `thoughtgate_uptime_seconds`
-- Histograms: `thoughtgate_request_duration_seconds`, `thoughtgate_upstream_latency_seconds`
+- Histograms: `thoughtgate_request_duration_ms`, `thoughtgate_upstream_duration_ms`, `thoughtgate_cedar_evaluation_duration_ms`
 
 **When adding metrics:**
 1. Add to `prom_metrics.rs`
@@ -207,8 +209,8 @@ cargo fuzz run fuzz_jsonrpc            # Fuzz JSON-RPC parser
 6. `REQ-GOV-002` - Execution pipeline
 7. `REQ-CORE-005` - Lifecycle management
 
-**Deferred to v0.3+:**
-- `REQ-CORE-001` - Green path streaming
+**Deferred:**
+- `REQ-CORE-001` - Green Path policy-driven selection (streaming infrastructure exists)
 - `REQ-CORE-002` - Amber path buffering/inspection
 - `REQ-CFG-002` - Config hot-reload (file watcher + ArcSwap + SIGHUP)
 
@@ -228,7 +230,7 @@ Performance is tracked via Bencher.dev with the following metrics:
 | **Latency** | `latency/p50`, `latency/p95`, `latency/p99` | p50 < 5ms, p95 < 15ms |
 | **Throughput** | `throughput/rps_10vu`, `throughput/rps_constrained` | > 10K RPS, > 5K constrained |
 | **Overhead** | `overhead/latency_p50`, `overhead/percent_p50` | < 2ms, < 10% |
-| **Policy** | `policy/eval_p50`, `policy/eval_p99` | p50 < 100µs, p99 < 500µs |
+| **Policy** | `policy/eval_v2`, `policy/eval_v2_with_args` | p50 < 100µs, p99 < 500µs |
 | **Startup** | `startup/to_healthy`, `startup/to_ready` | < 100ms healthy, < 150ms ready |
 
 ### Benchmarking Commands
@@ -259,7 +261,7 @@ cargo bench --bench policy_eval
 ```
 -32700  ParseError           -32003  PolicyDenied
 -32600  InvalidRequest       -32005  TaskExpired
--32601  MethodNotFound       -32006  TaskCancelled
+-32601  MethodNotFound (*)   -32006  TaskCancelled
 -32602  InvalidParams        -32007  ApprovalRejected
 -32603  InternalError        -32008  ApprovalTimeout
 -32000  UpstreamConnFailed   -32009  RateLimited
@@ -268,8 +270,11 @@ cargo bench --bench policy_eval
                              -32013  ServiceUnavailable
                              -32014  GovernanceRuleDenied
                              -32015  ToolNotExposed
-                             -32016  ConfigurationError
-                             -32017  WorkflowNotFound
+                             -32020  TaskResultNotReady
+
+(*) MethodNotFound comes from upstream, not ThoughtGate.
+    TaskNotFound uses -32602 (InvalidParams) per MCP Tasks spec.
+    -32016 ConfigurationError and -32017 WorkflowNotFound are reserved but not yet implemented.
 ```
 
 ### Environment Variables

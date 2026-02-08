@@ -366,8 +366,8 @@ pub struct ShimOptions {
     /// Active configuration profile.
     pub profile: Profile,
 
-    /// Path to ThoughtGate config file.
-    pub config_path: PathBuf,
+    /// Path to ThoughtGate config file (optional; defaults are used when absent).
+    pub config_path: Option<PathBuf>,
 }
 ```
 
@@ -446,10 +446,8 @@ This type lives in `thoughtgate/src/shim/ndjson.rs`. It wraps the core classific
 pub struct StdioMessage {
     /// Transport-agnostic classification (from thoughtgate-core).
     pub kind: JsonRpcMessageKind,
-    /// Parsed params/result/error for governance inspection.
+    /// Parsed params for governance inspection.
     pub params: Option<serde_json::Value>,
-    pub result: Option<serde_json::Value>,
-    pub error: Option<serde_json::Value>,
     /// Original NDJSON line — forwarded byte-for-byte when permitted.
     pub raw: String,
 }
@@ -475,9 +473,6 @@ pub enum FramingError {
     #[error("Unsupported JSON-RPC version: {version}")]
     UnsupportedVersion { version: String },
 
-    #[error("Pipe closed unexpectedly")]
-    BrokenPipe,
-
     #[error("JSON-RPC batch requests (arrays) are not supported")]
     UnsupportedBatch,
 
@@ -487,6 +482,8 @@ pub enum FramingError {
 ```
 
 ### 6.6 Process Lifecycle Types
+
+> **Implementation note:** `ServerProcessState` is not implemented as a separate enum in runtime code. Instead, server process state is tracked via the `state` label on the `thoughtgate_stdio_server_state` Prometheus gauge (see NFR-002). The enum below represents the conceptual states used as label values.
 
 ```rust
 /// State of a managed MCP server process.
@@ -526,6 +523,8 @@ impl Default for ShutdownRequest {
 ### 6.7 Configuration Profile Types
 
 > **Crate location:** `thoughtgate-core/src/profile.rs`. Profile and ProfileBehaviour are transport-agnostic — development mode's `WOULD_BLOCK` semantics apply identically to HTTP mode. The `--profile` CLI flag in `thoughtgate` passes the parsed `Profile` enum to `thoughtgate-core`'s governance engine.
+>
+> **Implementation note:** `ProfileBehaviour` is not implemented as a standalone struct in the codebase. The `Profile` enum exists as specified, but profile-specific logic (enforcement blocking, auto-approval, log prefixes) is handled via inline checks against the `Profile` variant at each decision point rather than through a `behaviour()` method returning a struct. The struct below represents the conceptual design; the code equivalent is dispersed across call sites.
 
 ```rust
 /// Named configuration profile controlling enforcement behaviour.

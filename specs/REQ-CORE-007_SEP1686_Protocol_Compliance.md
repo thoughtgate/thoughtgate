@@ -115,12 +115,17 @@ The system must:
 
 ### 5.2 Configuration
 
-| Setting | Default | Environment Variable |
-|---------|---------|---------------------|
-| Default TTL | 600000ms (10 min) | `THOUGHTGATE_TASK_DEFAULT_TTL_MS` |
-| Maximum TTL | 86400000ms (24 hr) | `THOUGHTGATE_TASK_MAX_TTL_MS` |
-| Force required tools | (none) | `THOUGHTGATE_TASK_FORCE_REQUIRED` |
-| Sync forward timeout | 60s | `THOUGHTGATE_SYNC_FORWARD_TIMEOUT_SECS` |
+> **Convention:** All duration-based environment variables use the `_SECS` suffix and accept
+> integer seconds (not milliseconds). This is consistent across the entire ThoughtGate
+> configuration surface.
+
+| Setting | Default | Environment Variable | Status |
+|---------|---------|---------------------|--------|
+| Default TTL | 600s (10 min) | `THOUGHTGATE_DEFAULT_TASK_TTL_SECS` | Implemented |
+| Maximum TTL | 86400s (24 hr) | `THOUGHTGATE_MAX_TASK_TTL_SECS` | Implemented |
+| Approval timeout | 600s (10 min) | `THOUGHTGATE_DEFAULT_APPROVAL_TIMEOUT_SECS` | Implemented |
+| Force required tools | (none) | `THOUGHTGATE_TASK_FORCE_REQUIRED` | **DEFERRED** |
+| Sync forward timeout | 30s | `THOUGHTGATE_UPSTREAM_TIMEOUT_SECS` | Implemented (via upstream client timeout) |
 
 **Sync Forward Timeout:**
 
@@ -150,16 +155,21 @@ For Forward path requests (no approval required), if the upstream tool is synchr
 > workflow lifecycle. Sync forward timeout prevents resource leaks on direct 
 > upstream calls that never complete.
 
-**Force Required Configuration:**
-```yaml
-# Environment variable format (comma-separated)
-THOUGHTGATE_TASK_FORCE_REQUIRED=tool1,tool2,tool3
+**Force Required Configuration:** *(DEFERRED)*
 
-# Or config file format
-task_annotation_overrides:
-  force_required:
-    - delete_user
-    - transfer_funds
+> Force-required overrides are not yet implemented. Tools requiring approval are configured
+> via YAML `action: approve` rules in the governance config. The environment variable
+> `THOUGHTGATE_TASK_FORCE_REQUIRED` is reserved for future use.
+
+```yaml
+# DEFERRED: Environment variable format (comma-separated)
+# THOUGHTGATE_TASK_FORCE_REQUIRED=tool1,tool2,tool3
+#
+# DEFERRED: Config file format
+# task_annotation_overrides:
+#   force_required:
+#     - delete_user
+#     - transfer_funds
 ```
 
 ### 5.3 YAML-Based Annotation Computation
@@ -223,7 +233,7 @@ fn upstream_supports_tasks(init_response: &InitializeResponse) -> bool {
 }
 ```
 
-**Critical Constraint:** If upstream does NOT support tasks, ThoughtGate MUST set `taskSupport: "forbidden"` for ALL tools where Cedar analysis indicates approval is NOT possible. This prevents clients from sending task metadata that upstream cannot handle.
+**Critical Constraint:** If upstream does NOT support tasks, ThoughtGate MUST strip `execution.taskSupport` for ALL tools where the YAML action is `forward` or `deny`. This prevents clients from sending task metadata that upstream cannot handle.
 
 **Rationale:**
 
@@ -259,29 +269,44 @@ pub struct CapabilityCache {
     upstream_supports_tasks: AtomicBool,
     /// Whether upstream MCP server supports SSE task notifications
     upstream_supports_task_sse: AtomicBool,
-    /// Timestamp of last initialize (for cache invalidation on reconnect)
-    last_initialize: RwLock<Instant>,
+    /// Whether the initialize handshake has been completed at least once
+    has_initialized: AtomicBool,
 }
 
 impl CapabilityCache {
     pub fn set_upstream_supports_tasks(&self, supports: bool) {
         self.upstream_supports_tasks.store(supports, Ordering::SeqCst);
-        *self.last_initialize.write() = Instant::now();
+        self.has_initialized.store(true, Ordering::Release);
     }
-    
+
     pub fn set_upstream_supports_task_sse(&self, supports: bool) {
         self.upstream_supports_task_sse.store(supports, Ordering::SeqCst);
     }
-    
+
     pub fn upstream_supports_tasks(&self) -> bool {
         self.upstream_supports_tasks.load(Ordering::SeqCst)
     }
-    
+
     pub fn upstream_supports_task_sse(&self) -> bool {
         self.upstream_supports_task_sse.load(Ordering::SeqCst)
     }
+
+    pub fn has_initialized(&self) -> bool {
+        self.has_initialized.load(Ordering::Acquire)
+    }
+
+    /// Invalidates all cached capabilities (e.g., on upstream reconnect).
+    pub fn invalidate(&self) {
+        self.upstream_supports_tasks.store(false, Ordering::SeqCst);
+        self.upstream_supports_task_sse.store(false, Ordering::SeqCst);
+        self.has_initialized.store(false, Ordering::Release);
+    }
 }
 ```
+
+> **Implementation note:** The implementation uses a simple `AtomicBool` flag rather than a
+> `RwLock<Instant>` timestamp. The boolean is sufficient because cache invalidation is triggered
+> explicitly by `invalidate()` on upstream reconnect, not by time-based expiry.
 
 ### 6.1 Initialize Interception
 
@@ -362,7 +387,7 @@ impl CapabilityCache {
       "name": "delete_user",
       "description": "Delete a user account",
       "inputSchema": { ... },
-      "annotations": {
+      "execution": {
         "taskSupport": "optional"
       }
     }
@@ -371,6 +396,10 @@ impl CapabilityCache {
 ```
 
 **Output: Modified response to client**
+
+> **MCP Protocol Revision 2025-11-25:** The `taskSupport` field is nested under `execution`,
+> not `annotations`. The correct field path is `execution.taskSupport`.
+
 ```json
 {
   "tools": [
@@ -378,7 +407,7 @@ impl CapabilityCache {
       "name": "read_file",
       "description": "Read a file",
       "inputSchema": { ... },
-      "annotations": {
+      "execution": {
         "taskSupport": "forbidden"
       }
     },
@@ -386,7 +415,7 @@ impl CapabilityCache {
       "name": "delete_user",
       "description": "Delete a user account",
       "inputSchema": { ... },
-      "annotations": {
+      "execution": {
         "taskSupport": "optional"
       }
     }
@@ -411,52 +440,70 @@ impl CapabilityCache {
 ```
 
 **Validation Result:**
+
+The implementation uses `Result<bool, ThoughtGateError>` rather than a custom enum:
+
 ```rust
-pub enum TaskValidationResult {
-    /// Task metadata present and valid
-    Valid { ttl: Duration },
-    /// Task metadata missing but tool annotation is "required"
-    MissingRequired { tool: String },
-    /// Task metadata present but tool annotation is "forbidden"  
-    ForbiddenPresent { tool: String },
-    /// No task metadata, tool allows sync execution
-    NotRequested,
-}
+/// Returns `Ok(true)` if the request should use blocking approval mode
+/// (no task metadata, but an approval engine is available).
+/// Returns `Ok(false)` for async SEP-1686 mode or non-approval actions.
+/// Returns `Err(ThoughtGateError::TaskRequired { .. })` when task metadata
+/// is required but missing and no approval engine is available.
+pub(super) fn validate_task_metadata(
+    request: &mut McpRequest,
+    action: &Action,
+    tool_name: &str,
+    upstream_supports_tasks: bool,
+    has_approval_engine: bool,
+) -> Result<bool, ThoughtGateError>
 ```
+
+| Return value | Meaning |
+|--------------|---------|
+| `Ok(false)` | Async SEP-1686 mode (task metadata present) or sync forward path |
+| `Ok(true)` | Blocking approval mode (no task metadata, approval engine available) |
+| `Err(TaskRequired)` | Approval-path tool, no task metadata, no approval engine |
+
+For `forward`/`deny` actions, task metadata is silently stripped when upstream does not support tasks.
 
 ### 6.4 Task Ownership Determination
 
-```rust
-pub enum TaskOwnership {
-    /// ThoughtGate owns this task (Cedar returned Approve)
-    ThoughtGate {
-        task_id: TaskId,
-    },
-    /// Upstream owns this task (Cedar returned Forward)
-    Upstream {
-        task_id: TaskId,
-        upstream_url: String,
-    },
-}
-
-pub struct TaskRoutingDecision {
-    pub ownership: TaskOwnership,
-    pub cedar_decision: PolicyAction,
-}
-```
+> **Implementation note:** Task ownership is determined implicitly rather than via a separate
+> `TaskOwnership` enum. Ownership is inferred from the `tg_` prefix on task IDs:
+> - Tasks with `tg_` prefix are ThoughtGate-owned (created by the approval workflow).
+> - All other task IDs are upstream-owned (passed through transparently).
+>
+> The routing decision is made inline by the YAML config action lookup and (optionally)
+> Cedar policy evaluation, without an intermediate `TaskRoutingDecision` struct.
 
 ### 6.5 Task ID Format
 
-ThoughtGate-owned tasks use a distinguishable prefix:
+ThoughtGate-owned tasks use a distinguishable prefix with a 21-character hex body
+derived from a UUID v4:
 
 ```
-tg_<uuid>      → ThoughtGate-owned task
-<any-other>    → Upstream-owned task (passthrough)
+tg_<21-hex-chars>  → ThoughtGate-owned task
+<any-other>        → Upstream-owned task (passthrough)
 ```
+
+The body is the first 21 characters of a UUID v4 in simple (no-dash) hex format.
+This provides sufficient uniqueness (~84 bits of entropy) while keeping IDs compact.
 
 **Examples:**
-- `tg_550e8400-e29b-41d4-a716-446655440000` → Route `tasks/*` to ThoughtGate
+- `tg_a1b2c3d4e5f6a7b8c9d0e` → Route `tasks/*` to ThoughtGate
 - `abc-123-def-456` → Route `tasks/*` to upstream
+
+```rust
+pub const TASK_ID_PREFIX: &str = "tg_";
+pub const TASK_ID_BODY_LENGTH: usize = 21;
+
+impl Sep1686TaskId {
+    pub fn new() -> Self {
+        let body = &uuid::Uuid::new_v4().simple().to_string()[..TASK_ID_BODY_LENGTH];
+        Self(format!("{}{}", TASK_ID_PREFIX, body))
+    }
+}
+```
 
 ### 6.6 Task Response Formats (SEP-1686)
 
@@ -469,19 +516,24 @@ When client sends `tools/call` with task metadata and TG creates a task, the res
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "taskId": "tg_550e8400-e29b-41d4-a716-446655440000",
-    "status": "input_required",
+    "taskId": "tg_a1b2c3d4e5f6a7b8c9d0e",
+    "status": "working",
     "statusMessage": "Awaiting approval",
     "pollInterval": 5000
   }
 }
 ```
 
+> **Implementation note:** Tasks are created with initial status `working` (not `input_required`).
+> The `statusMessage` field is always included in the creation response to provide human-readable
+> context (e.g., "Awaiting approval"). It is conditionally included in subsequent `tasks/get`
+> responses only when a status message is set.
+
 | Field | Type | Description |
 |-------|------|-------------|
-| `taskId` | string | Unique task identifier |
+| `taskId` | string | Unique task identifier (format: `tg_<21-hex-chars>`) |
 | `status` | string | SEP-1686 status: `working`, `input_required`, `completed`, `failed`, `cancelled` |
-| `statusMessage` | string? | Optional human-readable status |
+| `statusMessage` | string? | Human-readable status context; always present in creation response |
 | `pollInterval` | number? | Suggested poll interval in milliseconds |
 
 **`tasks/get` Response:**
@@ -497,8 +549,8 @@ Same format as `tools/call` task response. See REQ-GOV-001 `TasksGetResponse`.
   "result": {
     "tasks": [
       {
-        "taskId": "tg_550e8400-...",
-        "status": "input_required",
+        "taskId": "tg_a1b2c3d4e5f6a7b8c9d0e",
+        "status": "working",
         "createdAt": "2026-01-12T22:30:00Z",
         "toolName": "delete_user"
       }
@@ -521,7 +573,7 @@ Returns the actual tool result (same as sync `tools/call` response). Streamed fo
   "jsonrpc": "2.0",
   "id": 3,
   "result": {
-    "taskId": "tg_550e8400-...",
+    "taskId": "tg_a1b2c3d4e5f6a7b8c...",
     "status": "cancelled"
   }
 }
@@ -533,10 +585,10 @@ SSE notifications use standard `text/event-stream` format:
 
 ```
 event: task_status
-data: {"taskId":"tg_550e8400-...","status":"completed","timestamp":"2026-01-12T22:35:00Z"}
+data: {"taskId":"tg_a1b2c3d4e5f6a7b8c...","status":"completed","timestamp":"2026-01-12T22:35:00Z"}
 
 event: task_status
-data: {"taskId":"tg_550e8400-...","status":"failed","statusMessage":"Upstream error","timestamp":"2026-01-12T22:36:00Z"}
+data: {"taskId":"tg_a1b2c3d4e5f6a7b8c...","status":"failed","statusMessage":"Upstream error","timestamp":"2026-01-12T22:36:00Z"}
 ```
 
 Keep-alive pings:
@@ -549,37 +601,29 @@ See REQ-GOV-004 F-012 for TG-generated SSE events.
 ### 6.8 Error Responses
 
 **TaskRequired Error:**
+
+Per the MCP Tasks Specification, `TaskRequired` uses standard JSON-RPC error code `-32600`
+(InvalidRequest), not a custom code.
+
 ```json
 {
   "jsonrpc": "2.0",
   "id": 1,
   "error": {
-    "code": -32009,
-    "message": "TaskRequired",
+    "code": -32600,
+    "message": "Task metadata required for tool 'delete_user'",
     "data": {
       "tool": "delete_user",
-      "reason": "This operation requires approval and must be called with task metadata",
-      "hint": "Include task field: { \"task\": { \"ttl\": 600000 } }"
+      "hint": "Include params.task per tools/list execution.taskSupport annotation"
     }
   }
 }
 ```
 
-**TaskForbidden Error:**
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "error": {
-    "code": -32010,
-    "message": "TaskForbidden",
-    "data": {
-      "tool": "read_file",
-      "reason": "This tool does not support task-augmented calls"
-    }
-  }
-}
-```
+> **Note:** There is no separate `TaskForbidden` error. When a client sends task metadata for
+> a `forward`/`deny` action tool where upstream does not support tasks, the metadata is silently
+> stripped and the request is forwarded without it. This avoids breaking forward compatibility
+> as upstreams gradually add task support.
 
 ## 7. Functional Requirements
 
@@ -623,12 +667,11 @@ See REQ-GOV-004 F-012 for TG-generated SSE events.
 
 ### F-002: Tool Annotation Computation (YAML-Based)
 
-- **F-002.1:** At config load time, build annotation cache for all upstream tools
-- **F-002.2:** For each tool from upstream `tools/list`:
+- **F-002.1:** For each tool from upstream `tools/list` response, compute annotation inline:
   - Look up YAML action using glob matching (see REQ-CFG-001 §4.4)
   - Apply annotation decision matrix from Section 5.3
-- **F-002.3:** Cache computed annotations in `AnnotationCache`
-- **F-002.4:** Re-compute on config hot-reload or upstream reconnect
+- **F-002.2:** Annotations are computed per-request (no separate cache or startup build step)
+- **F-002.3:** Config hot-reload and upstream reconnect are handled automatically since annotations are always recomputed from current config state
 - **F-002.5:** Log annotation decisions at INFO level:
   ```
   INFO Tool annotation: delete_user -> optional (yaml_action=approve)
@@ -642,48 +685,43 @@ See REQ-GOV-004 F-012 for TG-generated SSE events.
 ### F-003: Tool Annotation Injection
 
 - **F-003.1:** Intercept `tools/list` response from upstream
-- **F-003.2:** For each tool, look up computed annotation from cache
-- **F-003.3:** If tool not in cache (new tool added to upstream), compute on-demand:
-  - Use YAML config to get action
-  - Apply decision matrix
-  - Log warning: `WARN New tool discovered: {tool}, annotation={annotation}`
-- **F-003.4:** Inject `taskSupport` field into each tool's annotations:
+- **F-003.2:** For each tool, compute annotation inline using YAML config action lookup
+- **F-003.3:** Inject `execution.taskSupport` field per MCP Protocol Revision 2025-11-25:
   ```json
   {
     "name": "delete_user",
-    "annotations": {
+    "execution": {
       "taskSupport": "optional"
     }
   }
   ```
-- **F-003.5:** Forward modified response to client
-- **F-003.6:** Cache invalidation triggers:
-  - YAML config reload
-  - Upstream reconnect (capabilities may have changed)
-  - Policy reload (if any rules use `action: policy`)
+- **F-003.4:** Forward modified response to client
+- **F-003.5:** No explicit cache invalidation needed; annotations are recomputed from current config on each interception
 
 ### F-004: Task Metadata Validation
 
 - **F-004.1:** On `tools/call`, extract tool name from params
-- **F-004.2:** Look up cached annotation for tool
+- **F-004.2:** Look up YAML config action for tool
 - **F-004.3:** Check for presence of `task` field in params
 - **F-004.4:** Validate per matrix:
 
-| Annotation | Task Present | Result |
-|------------|--------------|--------|
-| `optional` | No | Blocking mode (if approval engine available) or sync path |
-| `optional` | Yes | Valid, async SEP-1686 path |
-| `forbidden` | No | Valid, sync path |
-| `forbidden` | Yes | Error: TaskForbidden (-32010) |
+| Action | Task Present | Approval Engine | Result |
+|--------|--------------|-----------------|--------|
+| `approve`/`policy` | Yes | Any | Async SEP-1686 path |
+| `approve`/`policy` | No | Yes | Blocking approval mode |
+| `approve`/`policy` | No | No | Error: TaskRequired (-32600) |
+| `forward`/`deny` | Yes (upstream no tasks) | Any | Strip task metadata, forward |
+| `forward`/`deny` | Yes (upstream has tasks) | Any | Forward with task metadata |
+| `forward`/`deny` | No | Any | Sync forward path |
 
 > **Note:** Tools with `action: approve` or `action: policy` are annotated
 > `"optional"` (not `"required"`). When `params.task` is absent, the proxy
 > detects blocking mode and holds the connection open for approval.
 
 - **F-004.5:** If task metadata present, validate TTL:
-  - Must be positive integer (milliseconds)
-  - Cap at `THOUGHTGATE_TASK_MAX_TTL_MS`
-  - Default to `THOUGHTGATE_TASK_DEFAULT_TTL_MS` if not specified
+  - Must be positive integer (milliseconds in the wire format, converted to `Duration` internally)
+  - Cap at `THOUGHTGATE_MAX_TASK_TTL_SECS` (default: 86400s / 24 hours)
+  - Default to `THOUGHTGATE_DEFAULT_TASK_TTL_SECS` (default: 600s / 10 minutes) if not specified
 
 ### F-005: Task Ownership Routing (YAML-First)
 
@@ -772,7 +810,7 @@ When YAML/Cedar decides Forward but client sent task metadata and upstream forbi
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **F-005.4:** For ThoughtGate ownership: generate `tg_<uuid>` task ID
+- **F-005.4:** For ThoughtGate ownership: generate `tg_<21-hex-chars>` task ID
 - **F-005.5:** For upstream ownership: forward request as-is, return upstream's task ID
 - **F-005.6:** For accelerated approve: create TG task in Approved state (skip InputRequired)
 
@@ -783,49 +821,50 @@ When YAML/Cedar decides Forward but client sent task metadata and upstream forbi
 - **F-006.3:** If task ID starts with `tg_`: route to ThoughtGate task manager
 - **F-006.4:** Otherwise: proxy to upstream
 
-**F-006.5: `tasks/list` Merge Behavior**
+**F-006.5: `tasks/list` Behavior**
 
-`tasks/list` returns merged results from both TG and upstream:
+> **DEFERRED to v0.3+:** Merging `tasks/list` results with upstream tasks is deferred.
+> The current implementation only returns ThoughtGate-owned tasks. Upstream task
+> enumeration requires REQ-GOV-004 (Upstream Task Orchestration), which is out of scope.
+
+In the current implementation, `tasks/list` returns only ThoughtGate-owned tasks with
+cursor-based pagination (server-controlled page size of 20):
 
 ```rust
-async fn handle_tasks_list(
+pub fn handle_tasks_list(
     &self,
-    params: TasksListParams,
-    upstream: &UpstreamClient,
-) -> Result<TasksListResponse, McpError> {
-    // Get TG tasks
-    let tg_tasks = self.task_manager.list_tasks(&params);
-    
-    // Get upstream tasks (if upstream supports tasks)
-    let upstream_tasks = if self.upstream_supports_tasks {
-        upstream.tasks_list(&params).await.unwrap_or_default()
-    } else {
-        vec![]
-    };
-    
-    // Merge with TG tasks first (they're ours)
-    let merged = [tg_tasks, upstream_tasks].concat();
-    
-    Ok(TasksListResponse { tasks: merged })
+    req: TasksListRequest,
+    principal: &Principal,
+) -> TasksListResponse {
+    const PAGE_SIZE: usize = 20;
+    let offset = req.cursor.as_ref()
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or(0);
+    let tasks = self.store.list_for_principal(principal, offset, PAGE_SIZE + 1);
+    // ... pagination logic
 }
 ```
 
 **Task ID Convention:**
 - `tg_*` prefix: ThoughtGate-owned tasks (approval workflow)
-- Other IDs: Upstream-owned tasks (passthrough)
+- Other IDs: Upstream-owned tasks (routed to upstream via `tasks/get`, `tasks/result`, `tasks/cancel`)
 
-Clients can filter by prefix if they need to distinguish ownership.
+- **F-006.6:** Pagination: Server-controlled page size (currently 20), cursor-only (no client limit)
 
-- **F-006.6:** Pagination: Apply to merged result (TG tasks + upstream tasks)
+### F-007: Annotation Computation (Inline Per-Request)
 
-### F-007: Annotation Cache Management
+> **Implementation note:** The implementation does NOT use a cached annotation store.
+> Annotations are computed inline on each `tools/list` response interception. This
+> simplifies the design by avoiding cache invalidation complexity (config reload,
+> upstream reconnect, new tools). The cost is negligible since annotation computation
+> is a simple YAML action lookup per tool.
 
-- **F-007.1:** Build annotation cache at startup after policy load and initial `initialize` handshake
-- **F-007.2:** Invalidate and rebuild on policy hot-reload
-- **F-007.3:** Invalidate and rebuild on `tools/list` response (new tools from upstream)
-- **F-007.4:** Invalidate and rebuild on upstream reconnect (capabilities may change)
-- **F-007.5:** Thread-safe access (RwLock or similar)
-- **F-007.6:** Store `upstream_supports_tasks` in capability cache, update on each `initialize`
+- **F-007.1:** Compute `execution.taskSupport` annotations inline when intercepting `tools/list` responses
+- **F-007.2:** For each tool, look up the YAML governance action and apply the annotation decision matrix (Section 5.3)
+- **F-007.3:** For `forward`/`deny` actions when upstream does not support tasks, strip any upstream `execution.taskSupport` annotation
+- **F-007.4:** For `approve`/`policy` actions, set `execution.taskSupport: "optional"`
+- **F-007.5:** Store `upstream_supports_tasks` in `CapabilityCache`, update on each `initialize`
+- **F-007.6:** No explicit cache invalidation needed; annotations are always fresh per-request
 
 ## 8. Non-Functional Requirements
 
@@ -839,8 +878,8 @@ Clients can filter by prefix if they need to distinguish ownership.
 ### NF-002: Reliability
 
 - **NF-002.1:** If YAML config load fails at startup, exit with clear error
-- **NF-002.2:** If upstream `tools/list` fails, return cached annotations if available
-- **NF-002.3:** Annotation cache survives config reload failures (keep previous)
+- **NF-002.2:** If upstream `tools/list` fails, return error to client (no cache to fall back on)
+- **NF-002.3:** Config reload failures do not affect annotation computation (annotations are derived from current config state)
 
 ### NF-003: Observability
 
@@ -850,7 +889,7 @@ Clients can filter by prefix if they need to distinguish ownership.
   INFO Tool annotation: read_file -> optional (yaml_action=forward, upstream_tasks=true)
   ```
 - **NF-003.2:** Metric: `thoughtgate_tools_by_annotation{annotation="required|optional|forbidden"}`
-- **NF-003.3:** Metric: `thoughtgate_task_validation_errors_total{error="required|forbidden"}`
+- **NF-003.3:** Metric: `thoughtgate_task_validation_errors_total{error="required"}`
 
 ## 9. Testing Strategy
 
@@ -872,8 +911,8 @@ Clients can filter by prefix if they need to distinguish ownership.
 | Annotation: forbidden + no approval | Tool with no Cedar approval path | `forbidden` |
 | Annotation: forbidden + approval possible | Tool with Cedar approval path | `required` |
 | Annotation: force_required override | Tool in force_required config | `required` regardless of Cedar |
-| Validation: required + no task | Request without task field | TaskRequired error |
-| Validation: forbidden + task present | Request with task field | TaskForbidden error |
+| Validation: approve action + no task + no engine | Request without task field, no approval engine | TaskRequired error (-32600) |
+| Validation: forward + task + no upstream tasks | Request with task field, upstream no tasks | Task metadata stripped, forward |
 | Task ID routing: tg_ prefix | `tg_abc123` | Route to ThoughtGate |
 | Task ID routing: other | `abc123` | Route to upstream |
 
@@ -889,9 +928,8 @@ Clients can filter by prefix if they need to distinguish ownership.
 | **Forward + task + forbidden** | Cedar Forward, client sends task, upstream forbids | TG creates task, skips approval, Approved state |
 | **Forward + task + optional** | Cedar Forward, client sends task, upstream optional | Passthrough to upstream with task |
 | **Accelerated approve flow** | Forward + task + forbidden → tasks/result | Deferred execution, result streamed |
-| **tasks/list merge** | TG has tasks, upstream has tasks | Merged list, tg_* prefix for TG tasks |
-| **tasks/list TG only** | TG has tasks, upstream no task support | Only TG tasks returned |
-| Upstream reconnect | Upstream restarts with different capabilities | Annotation cache invalidated and rebuilt |
+| **tasks/list** (v0.2) | TG has tasks | Only TG tasks returned (upstream merge deferred to v0.3+) |
+| Upstream reconnect | Upstream restarts with different capabilities | Capability cache invalidated, annotations recomputed on next tools/list |
 | Upstream with SSE | Upstream supports SSE | TG advertises SSE, client can subscribe |
 | Upstream without SSE | Upstream no SSE support | TG does NOT advertise SSE |
 | Upstream SSE changes on reconnect | Upstream gains/loses SSE | Capability cache updated, client sees change |
@@ -935,13 +973,13 @@ Clients can filter by prefix if they need to distinguish ownership.
 
 | Question | Status | Resolution |
 |----------|--------|------------|
-| ~~Should `tasks/list` merge TG and upstream tasks?~~ | Resolved | Yes, merge with `tg_` prefix indicating TG ownership |
+| ~~Should `tasks/list` merge TG and upstream tasks?~~ | Deferred | Planned for v0.3+ (requires REQ-GOV-004). Current implementation returns TG-owned tasks only. |
 | ~~How to handle upstream `tools/list` pagination?~~ | Resolved | Fetch all pages at startup; see Section 10.1 |
 | ~~Cedar `partial-eval` for annotations?~~ | Removed | v0.8: Replaced with YAML-based annotation lookup |
 
 ### 10.1 Upstream `tools/list` Pagination
 
-**Resolution:** Fetch all pages during annotation cache build.
+**Resolution:** Fetch all pages during tools/list interception.
 
 ```rust
 async fn fetch_all_tools(upstream: &UpstreamClient) -> Result<Vec<Tool>, Error> {
@@ -962,14 +1000,17 @@ async fn fetch_all_tools(upstream: &UpstreamClient) -> Result<Vec<Tool>, Error> 
 }
 ```
 
-**Limitation:** For upstreams with many tools (1000+), startup may be slow. This is acceptable because:
-1. Annotation cache is built once at startup
-2. Rebuilt only on config reload or upstream reconnect
-3. Most MCP servers have <100 tools
+**Limitation:** For upstreams with many tools (1000+), tools/list responses may be slow. This is acceptable because:
+1. Annotations are computed inline per-request (no startup cost)
+2. Most MCP servers have <100 tools
+3. Tools/list is called infrequently compared to tools/call
 
-**Configuration:**
-- `THOUGHTGATE_TOOLS_FETCH_TIMEOUT_MS`: Max time to fetch all pages (default: 30000)
-- `THOUGHTGATE_TOOLS_MAX_PAGES`: Safety limit on pagination (default: 100)
+**Configuration:** *(DEFERRED)*
+
+> The following environment variables are reserved for future use when upstream
+> `tools/list` pagination is implemented:
+> - `THOUGHTGATE_TOOLS_FETCH_TIMEOUT_SECS`: Max time to fetch all pages
+> - `THOUGHTGATE_TOOLS_MAX_PAGES`: Safety limit on pagination
 
 ## 11. References
 
@@ -992,3 +1033,4 @@ async fn fetch_all_tools(upstream: &UpstreamClient) -> Result<Vec<Tool>, Error> 
 | 0.6 | 2026-01-12 | - | Added SEP-1686 wire formats: task response, tasks/list pagination, SSE event format. |
 | 0.7 | 2026-01-12 | - | **Grok feedback:** Resolved tools/list pagination (fetch all pages), added partial-eval failure logging. |
 | 0.8 | 2026-01-13 | - | **YAML-first config:** Replaced Cedar partial-eval with YAML-based annotation. Added REQ-CFG-001 dependency. F-002, F-003, F-005 updated. |
+| 0.9 | 2026-02-08 | - | **Align with implementation:** §6.0 `last_initialize` → `has_initialized: AtomicBool`. §6.2 `annotations.taskSupport` → `execution.taskSupport` per MCP 2025-11-25. §6.3 `TaskValidationResult` → `Result<bool, ThoughtGateError>`. §6.4 `TaskOwnership` noted as implicit. §6.5 task ID format `tg_<uuid>` → `tg_<21-hex-chars>`. §6.6 initial status `input_required` → `working`, added `statusMessage`. §6.8 TaskRequired code `-32009` → `-32600`, removed TaskForbidden. F-006.5 tasks/list merge deferred to v0.3+. §5.2 env vars use `_SECS` suffix, marked unimplemented vars. F-007 annotation cache → inline computation per-request. |

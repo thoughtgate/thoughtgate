@@ -113,7 +113,8 @@ The system must:
 |-------|---------|---------|
 | `cedar-policy` | Policy engine | Latest stable |
 | `arc-swap` | Atomic policy swap | 1.x |
-| `notify` or polling | File watching | - |
+| `smallvec` | Inline policy ID vectors | 1.x |
+| `notify` or polling | File watching | - (not yet implemented; see F-006.1) |
 
 ### 5.2 Cedar Schema
 
@@ -201,13 +202,22 @@ cedar:
   schema: /etc/thoughtgate/schema.cedarschema  # Optional
 ```
 
-**Loading Priority (Fallback):**
+**Loading Priority (4-tier fallback):**
+
+Each tier is tried in order. If a configured source exists but is
+unreadable, loading fails hard (fail-closed) instead of falling
+through to a lower tier.
 
 | Priority | Source | Use Case |
 |----------|--------|----------|
-| 1 | YAML config `cedar.policies` | Production (recommended) |
-| 2 | Env var `$THOUGHTGATE_POLICIES` | Simple / CI (< 10KB) |
-| 3 | Embedded defaults | Local dev fallback |
+| 1 | `$THOUGHTGATE_POLICY_FILE` (default: `/etc/thoughtgate/policies.cedar`) | K8s ConfigMap mount |
+| 2 | `$THOUGHTGATE_POLICIES` env var (inline policy text) | Simple / CI (< 10KB) |
+| 3 | YAML config `cedar.policies[]` paths (concatenated) | Production multi-file |
+| 4 | Embedded defaults (compile-time) | Local dev fallback |
+
+> **Note:** Tier 3 is only reached via `CedarEngine::new_with_config()`,
+> which receives paths from the parsed YAML config. The env-var-only
+> constructor `CedarEngine::new()` skips tier 3.
 
 ### 5.4 Identity Inference
 
@@ -253,7 +263,7 @@ identity source provided by the Kubernetes control plane.
 /// Request from Governance Engine to Cedar
 pub struct CedarRequest {
     pub principal: Principal,
-    pub resource: Resource,
+    pub resource: CedarResource,
     pub context: CedarContext,
 }
 
@@ -264,7 +274,7 @@ pub struct Principal {
     pub roles: Vec<String>,
 }
 
-pub enum Resource {
+pub enum CedarResource {
     ToolCall {
         name: String,
         server: String,
@@ -302,9 +312,10 @@ pub enum CedarDecision {
     /// Policy permits the request
     /// ThoughtGate continues to Gate 4 (approval workflow from annotation or YAML)
     Permit {
-        /// Policy IDs that contributed to the permit decision
-        /// Used to look up @thoughtgate_approval annotations
-        determining_policies: Vec<String>,
+        /// Policy IDs that contributed to the permit decision.
+        /// Used to look up @thoughtgate_approval annotations.
+        /// SmallVec avoids heap allocation for the common 0-1 policy case.
+        determining_policies: SmallVec<[String; 1]>,
     },
 
     /// Policy forbids the request
@@ -312,64 +323,92 @@ pub enum CedarDecision {
     Forbid {
         /// Reason for denial (safe for logging)
         reason: String,
-        /// Policy IDs that caused denial
-        policy_ids: Vec<String>,
+        /// Policy IDs that caused the denial.
+        /// SmallVec avoids heap allocation for the common 1-2 policy case.
+        policy_ids: SmallVec<[String; 2]>,
     },
 }
+// Note: `SmallVec` from the `smallvec` crate is used instead of `Vec<String>`
+// to avoid heap allocation in the common case of 0-2 policy IDs per decision.
 ```
 
 > **Note:** There is no "NoDecision" variant. Cedar is default-deny—if no policy explicitly permits, the result is Forbid.
 
 ### 6.3 Cedar Engine Interface
 
+`CedarEngine` is a concrete struct (not a trait). The v0.2 evaluation
+entry point is `evaluate_v2()`; the legacy `evaluate()` method is
+retained for backward compatibility but deprecated.
+
+`reload()` is **synchronous** -- it performs blocking file I/O and
+atomically swaps the policy set via `ArcSwap`. Callers on the Tokio
+runtime should wrap it in `tokio::task::spawn_blocking` if needed.
+
 ```rust
-#[async_trait]
-pub trait CedarEngine: Send + Sync {
-    /// Evaluate a request and return Permit/Forbid
-    fn evaluate(&self, request: &CedarRequest) -> CedarDecision;
-
-    /// Reload policies from configured paths
-    async fn reload(&self) -> Result<(), CedarError>;
-
-    /// Get current policy source info
-    fn policy_info(&self) -> PolicyInfo;
-
-    /// Get evaluation statistics
-    fn stats(&self) -> CedarStats;
+pub struct CedarEngine {
+    authorizer: Authorizer,
+    /// Current policy snapshot (atomic for hot-reload via ArcSwap)
+    snapshot: ArcSwap<PolicySnapshot>,
+    schema: Schema,
+    stats_v2: Arc<StatsV2>,
+    tg_metrics: Option<Arc<ThoughtGateMetrics>>,
 }
 
-pub struct PolicyInfo {
-    pub paths: Vec<PathBuf>,
-    pub policy_count: usize,
-    pub last_reload: Option<DateTime<Utc>>,
-}
+impl CedarEngine {
+    /// Create a new Cedar engine using env vars only.
+    pub fn new() -> Result<Self, PolicyError>;
 
-pub struct CedarStats {
-    pub evaluation_count: u64,
-    pub permit_count: u64,
-    pub forbid_count: u64,
-    pub avg_eval_time_us: u64,
+    /// Create a new Cedar engine with optional YAML config paths.
+    pub fn new_with_config(
+        cedar_config: Option<&CedarConfig>,
+    ) -> Result<Self, PolicyError>;
+
+    /// Evaluate a request and return Permit/Forbid (v0.2 API).
+    pub fn evaluate_v2(&self, request: &CedarRequest) -> CedarDecision;
+
+    /// Reload policies from source (synchronous).
+    /// On success, atomically swaps in new policies.
+    /// On failure, keeps old policies and returns error.
+    pub fn reload(&self) -> Result<(), PolicyError>;
+
+    /// Get policy source information.
+    pub fn policy_source(&self) -> PolicySource;
+
+    /// Set ThoughtGate Prometheus metrics for gauge reporting.
+    pub fn set_metrics(&mut self, metrics: Arc<ThoughtGateMetrics>);
+
+    /// Builder-style method to set metrics.
+    pub fn with_metrics(self, metrics: Arc<ThoughtGateMetrics>) -> Self;
 }
 ```
 
 ### 6.4 Errors
 
+The policy error type is `PolicyError` (defined in `policy/mod.rs`),
+not `CedarError`. It uses `thiserror` for `Display`/`Error` derives.
+
 ```rust
-pub enum CedarError {
-    /// Policy file not found
-    FileNotFound { path: PathBuf },
-    
+#[derive(Debug, Error, Clone)]
+pub enum PolicyError {
     /// Policy syntax error
-    ParseError { path: PathBuf, details: String, line: Option<usize> },
-    
+    #[error("Policy parse error at line {line:?}: {details}")]
+    ParseError { details: String, line: Option<usize> },
+
     /// Schema validation failed
+    #[error("Schema validation failed: {details}")]
     SchemaValidation { details: String },
-    
+
     /// Identity inference failed
+    #[error("Identity error: {details}")]
     IdentityError { details: String },
-    
-    /// Policy evaluation failed (internal error)
-    EvaluationError { details: String },
+
+    /// Cedar engine error (request building, entity creation, etc.)
+    #[error("Cedar engine error: {details}")]
+    CedarError { details: String },
+
+    /// Policy file I/O error (file exists but cannot be read)
+    #[error("failed to load policy from {path}: {reason}")]
+    PolicyLoadError { path: String, reason: String },
 }
 ```
 
@@ -533,11 +572,11 @@ when {
 
 ### F-006: Policy Hot-Reload
 
-- **F-006.1:** Watch policy files for changes
+- **F-006.1:** ~~Watch policy files for changes~~ **DEFERRED** -- `reload()` is implemented and works (called via admin API or programmatically), but there is no automatic file-watching trigger yet. A `notify`/polling-based watcher may be added in a future version.
 - **F-006.2:** Reload policies atomically (no partial updates)
 - **F-006.3:** Log reload success/failure
 - **F-006.4:** Continue with old policies if reload fails
-- **F-006.5:** Emit metric on reload
+- **F-006.5:** Emit metric on reload (`thoughtgate_cedar_reload_total{status}`)
 
 ### F-007: Integration with Governance Engine
 
@@ -559,7 +598,7 @@ match rule_match.action {
         // Invoke Cedar (Gate 3)
         let cedar_request = CedarRequest {
             principal: infer_principal()?,
-            resource: Resource::ToolCall {
+            resource: CedarResource::ToolCall {
                 name: tool_name,
                 server: source_id,
                 arguments: request.params.clone(),
@@ -571,7 +610,7 @@ match rule_match.action {
             },
         };
         
-        match cedar_engine.evaluate(&cedar_request) {
+        match cedar_engine.evaluate_v2(&cedar_request) {
             CedarDecision::Permit { determining_policies } => {
                 // Lookup workflow: annotation → YAML rule → "default"
                 let workflow = policy_annotations
@@ -787,8 +826,8 @@ when {
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `thoughtgate_cedar_evaluations_total` | Counter | `decision`, `policy_id` | Evaluation count |
-| `thoughtgate_cedar_evaluation_duration_seconds` | Histogram | - | Evaluation latency |
-| `thoughtgate_cedar_reload_total` | Counter | `status` | Reload attempts |
+| `thoughtgate_cedar_evaluation_duration_ms` | Histogram | `decision` | Evaluation latency (milliseconds) |
+| `thoughtgate_cedar_reload_total` | Counter | `{status}` | Reload attempts (`status`: `"success"` or `"error"`) |
 | `thoughtgate_cedar_policies_loaded` | Gauge | - | Current policy count |
 | `thoughtgate_policy_evaluation_cache_hits` | Counter | - | Cache effectiveness (v0.3+) |
 

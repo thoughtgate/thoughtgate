@@ -340,6 +340,9 @@ impl LifecycleManager {
     /// Implements: REQ-CORE-005/F-001
     pub fn mark_ready(&self) {
         self.state.store(Arc::new(LifecycleState::Ready));
+        if let Some(metrics) = self.tg_metrics.load().as_ref() {
+            metrics.set_lifecycle_state("ready");
+        }
         info!(
             version = %self.version,
             startup_duration_ms = self.started_at.elapsed().as_millis(),
@@ -396,6 +399,9 @@ impl LifecycleManager {
     /// 3. Logs the shutdown with active request count
     pub fn begin_shutdown(&self) {
         self.state.store(Arc::new(LifecycleState::ShuttingDown));
+        if let Some(metrics) = self.tg_metrics.load().as_ref() {
+            metrics.set_lifecycle_state("shutting_down");
+        }
         self.shutdown_token.cancel();
         info!(
             active_requests = self.active_requests.load(Ordering::SeqCst),
@@ -509,6 +515,9 @@ impl LifecycleManager {
     /// Implements: REQ-CORE-005/F-004
     pub fn mark_stopped(&self) {
         self.state.store(Arc::new(LifecycleState::Stopped));
+        if let Some(metrics) = self.tg_metrics.load().as_ref() {
+            metrics.set_lifecycle_state("stopped");
+        }
     }
 
     /// Spawns a background task that periodically checks upstream health.

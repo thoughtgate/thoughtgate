@@ -262,6 +262,7 @@ pub(crate) async fn route_through_gates(state: &McpState, mut request: McpReques
                     task_id,
                     "working".to_string(),
                     std::time::Duration::from_millis(poll_interval_ms),
+                    Some("Awaiting human approval"),
                 ))
             }
         }
@@ -385,5 +386,6 @@ pub(crate) async fn start_approval_flow(
         result.task_id.to_string(),
         result.status.to_string(),
         result.poll_interval,
+        Some("Awaiting human approval"),
     ))
 }
