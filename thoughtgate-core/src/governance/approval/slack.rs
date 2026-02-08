@@ -309,9 +309,20 @@ impl SlackAdapter {
             })
             .unwrap_or_else(|| user_id.to_string());
 
-        // Cache the result (with bounded size to prevent unbounded growth)
+        // Cache the result (with bounded size to prevent unbounded growth).
+        // Evict ~25% of entries randomly instead of clearing the entire cache,
+        // which avoids a thundering-herd of misses after eviction.
         if self.user_cache.len() >= MAX_USER_CACHE_SIZE {
-            self.user_cache.clear();
+            let to_evict = self.user_cache.len() / 4;
+            let keys: Vec<String> = self
+                .user_cache
+                .iter()
+                .take(to_evict)
+                .map(|entry| entry.key().clone())
+                .collect();
+            for key in keys {
+                self.user_cache.remove(&key);
+            }
         }
         self.user_cache
             .insert(user_id.to_string(), display_name.clone());
