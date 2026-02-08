@@ -170,6 +170,11 @@ The system must:
     err: true  # Fail PR on regression
 ```
 
+> **CI Reproducibility Note:** The examples above use `bencherdev/bencher@main` for
+> brevity. In actual CI workflows (`.github/workflows/ci.yml`), pin to a stable
+> release tag (e.g., `bencherdev/bencher@v0.5.10`) to ensure reproducible builds
+> and avoid unexpected breakage from upstream changes.
+
 **Fork PR Limitation:** External PRs from forks will not have access to `BENCHER_API_TOKEN` (GitHub security policy). Options:
 1. Accept that external contributors won't see benchmark reports on their PRs
 2. Use `pull_request_target` with caution (security implications)
@@ -365,62 +370,65 @@ Criterion benchmark (`benches/ttfb.rs`) tests actual proxy with real HTTP:
 
 ### 8.1 Bencher JSON Schema
 
-**CI output format:** Bencher Metric Format (BMF). Each metric is a named object containing a measure with a numeric value:
+**CI output format:** Bencher Metric Format (BMF). Each metric is a named object
+containing a **Bencher measure name** as the key and a value object. The measure
+name determines which Bencher threshold rules apply (e.g., `latency` uses t-test,
+`file-size` uses percentage):
 
 ```json
 {
   "binary/size": {
-    "bytes": { "value": 8432640 }
+    "file-size": { "value": 8432640 }
   },
   "startup/to_healthy": {
-    "ms": { "value": 45.2 }
+    "latency": { "value": 45.2 }
   },
   "startup/to_ready": {
-    "ms": { "value": 82.5 }
+    "latency": { "value": 82.5 }
   },
   "memory/idle_rss": {
-    "bytes": { "value": 15728640 }
+    "file-size": { "value": 15728640 }
   },
   "memory/under_load_rss": {
-    "bytes": { "value": 52428800 }
+    "file-size": { "value": 52428800 }
   },
   "memory/constrained_rss": {
-    "bytes": { "value": 98566144 }
+    "file-size": { "value": 98566144 }
   },
   "latency/p50": {
-    "ms": { "value": 2.3 }
+    "latency": { "value": 2.3 }
   },
   "latency/p95": {
-    "ms": { "value": 5.1 }
+    "latency": { "value": 5.1 }
   },
   "latency/p99": {
-    "ms": { "value": 12.4 }
+    "latency": { "value": 12.4 }
   },
   "throughput/rps_10vu": {
-    "req/s": { "value": 15420 }
+    "latency": { "value": 15420 }
   },
   "throughput/rps_constrained": {
-    "req/s": { "value": 6850 }
+    "latency": { "value": 6850 }
   },
   "overhead/latency_p50": {
-    "ms": { "value": 0.8 }
+    "latency": { "value": 0.8 }
   },
   "overhead/percent_p50": {
-    "%": { "value": 3.2 }
+    "latency": { "value": 3.2 }
   },
-  "policy/eval_p50": {
-    "µs": { "value": 0.045 }
-  },
-  "policy/eval_p99": {
-    "µs": { "value": 0.12 }
+  "policy/eval_mean": {
+    "latency": { "value": 0.045 }
   }
 }
 ```
 
 > **Note:** The flat array format (`[{"name": ..., "value": ..., "unit": ...}]`)
-> is used as an intermediate representation within collection scripts. The final
-> CI output uses the Bencher BMF format shown above, which is what Bencher.dev
-> consumes via `adapter: json`.
+> is used as an intermediate representation within collection scripts
+> (`collect_metrics.sh`, `measure_overhead.sh`, `measure_constrained.sh`). The CI
+> consolidation step in `ci.yml` converts this into the BMF format shown above,
+> mapping each metric to either the `latency` or `file-size` Bencher measure.
+> This mapping controls which `--threshold-measure` rules apply during regression
+> detection (see Section 6.3).
 
 ### 8.2 Metric Naming Convention
 

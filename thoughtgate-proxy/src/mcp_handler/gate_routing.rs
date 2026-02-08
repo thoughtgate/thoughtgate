@@ -11,7 +11,6 @@ use thoughtgate_core::governance::evaluator::DenySource;
 use thoughtgate_core::governance::evaluator::{extract_arguments, extract_resource_name};
 use thoughtgate_core::governance::{GovernanceDecision, Principal, ToolCallRequest};
 use thoughtgate_core::policy::principal::{infer_principal_optional, infer_principal_or_error};
-use thoughtgate_core::profile::Profile;
 use thoughtgate_core::telemetry::{
     GateOutcomes, GatewayDecisionSpanData, finish_gateway_decision_span,
     start_gateway_decision_span,
@@ -21,6 +20,27 @@ use tracing::{debug, info};
 
 use super::McpState;
 use super::cedar_eval::get_source_id;
+
+/// Result of routing a request through the 4-gate model.
+///
+/// Most paths resolve immediately. Blocking approval mode returns
+/// `BlockingApproval` with the parameters needed to wait-and-execute
+/// in a background task with HTTP keepalive.
+pub(crate) enum GateResult {
+    /// Immediate result (forward, deny, async approval, or completed blocking).
+    Immediate(Result<JsonRpcResponse, ThoughtGateError>),
+    /// Blocking approval: the caller should spawn a keepalive-streaming task.
+    BlockingApproval {
+        approval_engine: std::sync::Arc<thoughtgate_core::governance::ApprovalEngine>,
+        task_id_parsed: thoughtgate_core::governance::TaskId,
+        task_id_str: String,
+        resource_name: String,
+        request_id: Option<thoughtgate_core::transport::jsonrpc::JsonRpcId>,
+        blocking_timeout: std::time::Duration,
+        poll_interval: std::time::Duration,
+        tg_metrics: Option<std::sync::Arc<thoughtgate_core::telemetry::ThoughtGateMetrics>>,
+    },
+}
 
 /// Route a tools/call request through the 4-gate model.
 ///
@@ -46,24 +66,24 @@ use super::cedar_eval::get_source_id;
 /// │ → Upstream     │ → Error -32014 │ → Gate 4       │ → Gate 3       │
 /// └────────────────┴────────────────┴────────────────┴────────────────┘
 /// ```
-pub(crate) async fn route_through_gates(
-    state: &McpState,
-    mut request: McpRequest,
-) -> Result<JsonRpcResponse, ThoughtGateError> {
-    let evaluator =
-        state
-            .evaluator
-            .as_ref()
-            .ok_or_else(|| ThoughtGateError::ServiceUnavailable {
+pub(crate) async fn route_through_gates(state: &McpState, mut request: McpRequest) -> GateResult {
+    let evaluator = match state.evaluator.as_ref() {
+        Some(e) => e,
+        None => {
+            return GateResult::Immediate(Err(ThoughtGateError::ServiceUnavailable {
                 reason: "Evaluator not configured".to_string(),
-            })?;
+            }));
+        }
+    };
 
-    let config = state
-        .config
-        .as_ref()
-        .ok_or_else(|| ThoughtGateError::ServiceUnavailable {
-            reason: "Configuration not loaded".to_string(),
-        })?;
+    let config = match state.config.as_ref() {
+        Some(c) => c,
+        None => {
+            return GateResult::Immediate(Err(ThoughtGateError::ServiceUnavailable {
+                reason: "Configuration not loaded".to_string(),
+            }));
+        }
+    };
 
     // Extract resource name for SEP-1686 validation and logging
     let resource_name = match extract_resource_name(&request.method, request.params.as_deref()) {
@@ -74,12 +94,12 @@ pub(crate) async fn route_through_gates(
                 "resources/read" | "resources/subscribe" => "uri",
                 _ => "identifier",
             };
-            return Err(ThoughtGateError::InvalidParams {
+            return GateResult::Immediate(Err(ThoughtGateError::InvalidParams {
                 details: format!(
                     "Missing required field '{}' in {} params",
                     field, request.method
                 ),
-            });
+            }));
         }
     };
     let source_id = get_source_id(state);
@@ -95,13 +115,16 @@ pub(crate) async fn route_through_gates(
     // SEP-1686: Task Metadata Validation (proxy-specific)
     // ========================================================================
     let match_result = config.governance.evaluate(&resource_name, source_id);
-    let is_blocking_mode = super::validate_task_metadata(
+    let is_blocking_mode = match super::validate_task_metadata(
         &mut request,
         &match_result.action,
         &resource_name,
         state.capability_cache.upstream_supports_tasks(),
         state.approval_engine.is_some(),
-    )?;
+    ) {
+        Ok(b) => b,
+        Err(e) => return GateResult::Immediate(Err(e)),
+    };
 
     // ========================================================================
     // Start Gateway Decision Span (REQ-OBS-002 §5.3)
@@ -136,7 +159,7 @@ pub(crate) async fn route_through_gates(
         id: request.id.clone(),
         params: request.params.as_deref().cloned(),
         message_type: MessageType::Request,
-        profile: Profile::Production,
+        profile: state.profile,
     };
 
     let (resp, trace) = evaluator
@@ -164,7 +187,7 @@ pub(crate) async fn route_through_gates(
             let result = state.upstream.forward(&request).await;
             let upstream_latency_ms = Some(upstream_start.elapsed().as_secs_f64() * 1000.0);
             finish_gateway_decision_span(&mut decision_span, &gate_outcomes, upstream_latency_ms);
-            return result;
+            return GateResult::Immediate(result);
         }
         GovernanceDecision::Deny => Err(match resp.deny_source {
             Some(DenySource::Visibility) => ThoughtGateError::ToolNotExposed {
@@ -191,13 +214,14 @@ pub(crate) async fn route_through_gates(
             let poll_interval_ms = resp.poll_interval_ms.unwrap_or(1000);
 
             if is_blocking_mode {
-                // Blocking mode: hold the connection, wait for approval, execute, return result.
+                // Blocking mode: return BlockingApproval so the caller can spawn
+                // a keepalive-streaming task instead of holding the connection idle.
                 let approval_engine = match state.approval_engine.as_ref() {
                     Some(engine) => engine,
                     None => {
-                        return Err(ThoughtGateError::ServiceUnavailable {
+                        return GateResult::Immediate(Err(ThoughtGateError::ServiceUnavailable {
                             reason: "Approval engine not available for blocking mode".to_string(),
-                        });
+                        }));
                     }
                 };
 
@@ -211,56 +235,26 @@ pub(crate) async fn route_through_gates(
                         std::time::Duration::from_secs(state.blocking_approval_timeout_secs)
                     });
 
-                // Sep1686TaskId::from_str is infallible
                 let task_id_parsed = thoughtgate_core::governance::TaskId::from_raw(&task_id);
 
                 info!(
                     task_id = %task_id,
                     tool = %resource_name,
                     timeout_secs = blocking_timeout.as_secs(),
-                    "Blocking approval mode: holding connection"
+                    "Blocking approval mode: returning streaming response with keepalive"
                 );
 
-                let start = std::time::Instant::now();
-                let result = approval_engine
-                    .wait_and_execute(
-                        &task_id_parsed,
-                        &resource_name,
-                        blocking_timeout,
-                        std::time::Duration::from_millis(poll_interval_ms),
-                        std::time::Duration::from_secs(15),
-                        // Known limitation: no heartbeats during blocking hold.
-                        // The progress_tx parameter is plumbed for future SSE/chunked
-                        // streaming support, but HTTP mode currently returns a single
-                        // JSON body. Without heartbeats, intermediary proxies may time
-                        // out idle connections (nginx 60s, ALB 60s, Cloudflare 100s).
-                        // Workaround: configure `proxy_read_timeout 600s` on reverse
-                        // proxies. TCP keepalive prevents socket death for direct
-                        // connections. TODO: implement SSE streaming for HTTP transport.
-                        None,
-                    )
-                    .await;
-
-                // Record blocking metrics
-                let elapsed = start.elapsed();
-                let outcome = match &result {
-                    Ok(r) if r.is_error => "timeout",
-                    Ok(_) => "approved",
-                    Err(ThoughtGateError::ApprovalRejected { .. }) => "rejected",
-                    Err(_) => "error",
+                finish_gateway_decision_span(&mut decision_span, &gate_outcomes, None);
+                return GateResult::BlockingApproval {
+                    approval_engine: approval_engine.clone(),
+                    task_id_parsed,
+                    task_id_str: task_id,
+                    resource_name,
+                    request_id: request.id.clone(),
+                    blocking_timeout,
+                    poll_interval: std::time::Duration::from_millis(poll_interval_ms),
+                    tg_metrics: state.tg_metrics.clone(),
                 };
-                if let Some(ref metrics) = state.tg_metrics {
-                    metrics.record_blocking_approval_completed(outcome, elapsed);
-                }
-
-                match result {
-                    Ok(tool_result) => {
-                        let response_value = serde_json::to_value(&tool_result)
-                            .unwrap_or(serde_json::json!({"error": "serialization failed"}));
-                        Ok(JsonRpcResponse::success(request.id.clone(), response_value))
-                    }
-                    Err(e) => Err(e),
-                }
             } else {
                 // Async SEP-1686 mode: return task ID immediately
                 Ok(JsonRpcResponse::task_created(
@@ -268,13 +262,14 @@ pub(crate) async fn route_through_gates(
                     task_id,
                     "working".to_string(),
                     std::time::Duration::from_millis(poll_interval_ms),
+                    Some("Awaiting human approval"),
                 ))
             }
         }
     };
 
     finish_gateway_decision_span(&mut decision_span, &gate_outcomes, None);
-    result
+    GateResult::Immediate(result)
 }
 
 /// Start an approval workflow (Gate 4).
@@ -343,6 +338,19 @@ pub(crate) async fn start_approval_flow(
                 .map(|w| w.on_timeout_or_default())
         });
 
+    // Extract redact_fields from workflow config (H-001 mitigation)
+    let redact_fields = match_result
+        .approval_workflow
+        .as_ref()
+        .and_then(|workflow_name| {
+            state
+                .config
+                .as_ref()
+                .and_then(|c| c.get_workflow(workflow_name))
+                .and_then(|w| w.redact_fields.clone())
+        })
+        .unwrap_or_default();
+
     // Start the approval workflow with workflow-specific timeout and on_timeout
     let result = approval_engine
         .start_approval(
@@ -350,6 +358,7 @@ pub(crate) async fn start_approval_flow(
             principal,
             workflow_timeout,
             workflow_on_timeout,
+            redact_fields,
         )
         .await
         .map_err(|e| ThoughtGateError::ServiceUnavailable {
@@ -377,5 +386,6 @@ pub(crate) async fn start_approval_flow(
         result.task_id.to_string(),
         result.status.to_string(),
         result.poll_interval,
+        Some("Awaiting human approval"),
     ))
 }

@@ -128,7 +128,7 @@ The system must:
 | `axum` | HTTP server | 0.8 |
 | `reqwest` | Upstream HTTP client | 0.12 |
 | `serde_json` | JSON parsing | 1.x |
-| `uuid` | Request ID generation | 1.x |
+| `uuid` | Correlation ID type (counter-based generation, not random) | 1.x |
 | `glob` | Pattern matching for rules | 0.3.x |
 
 ### 5.1.1 Environment Variables
@@ -349,7 +349,7 @@ The transport layer MUST parse incoming JSON according to JSON-RPC 2.0:
 - **F-001.4:** Preserve `id` type (string or integer) for response correlation
 - **F-001.5:** Reject malformed JSON with error code -32700
 - **F-001.6:** Reject invalid JSON-RPC structure with error code -32600
-- **F-001.7:** Generate `correlation_id` (UUID v4) for each request
+- **F-001.7:** Generate `correlation_id` for each request (nanoid, counter-based for performance; not UUID v4)
 
 ### F-002: Method Routing
 
@@ -362,10 +362,10 @@ The transport layer MUST route methods to appropriate handlers:
 | `tools/list` | Governance Engine | Gate 1 visibility filtering |
 | `resources/list` | Governance Engine | Gate 1 visibility filtering |
 | `prompts/list` | Governance Engine | Gate 1 visibility filtering |
-| `tasks/get` | Task Handler | SEP-1686 |
-| `tasks/result` | Task Handler | SEP-1686 |
-| `tasks/list` | Task Handler | SEP-1686 |
-| `tasks/cancel` | Task Handler | SEP-1686 |
+| `tg_tasks/get` | Task Handler | SEP-1686 (`tg_` prefix) |
+| `tg_tasks/result` | Task Handler | SEP-1686 (`tg_` prefix) |
+| `tg_tasks/list` | Task Handler | SEP-1686 (`tg_` prefix) |
+| `tg_tasks/cancel` | Task Handler | SEP-1686 (`tg_` prefix) |
 | `resources/*` | Governance Engine | Subject to policy |
 | `prompts/*` | Governance Engine | Subject to policy |
 | `*` (unknown) | Pass Through | Forward to upstream |
@@ -380,7 +380,7 @@ fn check_visibility(tool_name: &str, source: &Source) -> bool {
 ```
 
 - **F-003.1:** Check tool visibility against `expose` config
-- **F-003.2:** Return 404 (-32601) if tool not visible
+- **F-003.2:** Return -32015 (ToolNotExposed) if tool not visible
 - **F-003.3:** `expose: all` makes all tools visible (default)
 - **F-003.4:** `expose: allowlist` shows only matching patterns
 - **F-003.5:** `expose: blocklist` hides matching patterns
@@ -489,7 +489,7 @@ async fn execute_approval(
     
     // Return SEP-1686 task response immediately
     // Client will poll via tasks/get and retrieve result via tasks/result
-    Ok(McpResponse::task_created(task_id, TaskStatus::InputRequired))
+    Ok(McpResponse::task_created(task_id, TaskStatus::Working))
 }
 ```
 
@@ -503,13 +503,18 @@ async fn execute_approval(
 
 - **F-006.1:** Load workflow config from YAML
 - **F-006.2:** Start approval workflow (non-blocking)
-- **F-006.3:** Return Task ID immediately with `input_required` status
+- **F-006.3:** Return Task ID immediately with `working` status
 - **F-006.4:** Background poller updates task state on decision
 - **F-006.5:** Upstream execution triggered by `tasks/result` call (see REQ-GOV-001)
 - **F-006.6:** Blocking mode (no `params.task`):
   - If approval engine available: hold connection, call `wait_and_execute()`
   - Return `CallToolResult` directly (approved) or `isError: true` (timeout)
   - If no approval engine: return `TaskRequired` error (-32009)
+  - **Chunked keepalive:** While blocking, the proxy sends periodic chunked
+    HTTP transfer-encoding keepalive bytes (newlines) to prevent intermediate
+    proxies and load balancers from closing the connection due to idle timeout.
+    The response uses `Transfer-Encoding: chunked` so keepalive frames are
+    transparent to the JSON-RPC payload.
 
 > **Blocking variant:** When `params.task` is absent, steps 1-3 above are
 > replaced by: create task internally → hold connection → poll for approval →
@@ -721,7 +726,7 @@ thoughtgate_upstream_reconnects_total  # Track upstream connection stability
 | Request body exceeds size limit | Return -32600 with size error | EC-MCP-004 |
 | Batch request (array of requests) | Process each, return array | EC-MCP-005 |
 | Batch with mix of valid/invalid | Return mixed results | EC-MCP-006 |
-| Notification (null ID) | Process, no response | EC-MCP-007 |
+| Notification (missing ID) | Process, no response | EC-MCP-007 |
 | SSE connection drops mid-stream | Clean up, log, close upstream | EC-MCP-008 |
 | Upstream unreachable on tools/call | Return -32000 | EC-MCP-009 |
 | Upstream timeout on tools/call | Return -32001 | EC-MCP-010 |

@@ -32,7 +32,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           fetch-depth: 0
 
@@ -49,10 +49,10 @@ jobs:
           fi
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7  # stable
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@v1.17.4
+        uses: cargo-bins/cargo-binstall@ec80feb9e330418e014932e5982599255eff6dbb  # v1.17.4
 
       - name: Install release tools
         run: cargo binstall --no-confirm cargo-release git-cliff

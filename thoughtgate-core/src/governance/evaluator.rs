@@ -602,11 +602,18 @@ impl GovernanceEvaluator {
         let wf = approval_workflow.and_then(|name| self.config.get_workflow(name));
         let wf_timeout = wf.map(|w| w.timeout_or_default());
         let wf_on_timeout = wf.map(|w| w.on_timeout_or_default());
+        let wf_redact_fields = wf.and_then(|w| w.redact_fields.clone()).unwrap_or_default();
 
         // ── Preferred path: delegate to ApprovalEngine ──────────────────
         if let Some(ref engine) = self.approval_engine {
             match engine
-                .start_approval(tool_request, principal.clone(), wf_timeout, wf_on_timeout)
+                .start_approval(
+                    tool_request,
+                    principal.clone(),
+                    wf_timeout,
+                    wf_on_timeout,
+                    wf_redact_fields.clone(),
+                )
                 .await
             {
                 Ok(result) => {
@@ -698,6 +705,7 @@ impl GovernanceEvaluator {
                 created_at: Utc::now(),
                 correlation_id: task_id.to_string(),
                 request_span_context: None,
+                redact_fields: wf_redact_fields.clone(),
             };
 
             if let Err(e) = scheduler.submit(approval_req).await {

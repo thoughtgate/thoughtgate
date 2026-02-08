@@ -191,7 +191,7 @@ The system must additionally:
 
 **Note:** v0.2 uses workflow-level timeout from YAML configuration (REQ-CFG-001), not global task TTL.
 
-### 5.2 v0.3+ Configuration (Future)
+### 5.2 Task Store Configuration
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
@@ -200,8 +200,9 @@ The system must additionally:
 | Cleanup interval | 60s | `THOUGHTGATE_TASK_CLEANUP_INTERVAL_SECS` |
 | Max pending per principal | 10 | `THOUGHTGATE_TASK_MAX_PENDING_PER_PRINCIPAL` |
 | Max pending global | 1000 | `THOUGHTGATE_TASK_MAX_PENDING_GLOBAL` |
+| Max pending bytes | 256 MB | `THOUGHTGATE_MAX_PENDING_BYTES` |
 
-### 5.3 SEP-1686 Task States (v0.3+ Reference)
+### 5.3 SEP-1686 Task States
 
 | State | Meaning | Terminal? |
 |-------|---------|-----------|
@@ -220,14 +221,14 @@ The system must additionally:
 
 ## 6. Interfaces
 
-### 6.1 v0.2: Pending Approval Tracker
+### 6.1 v0.2: Task Structure
 
 ```rust
-/// Internal tracking for pending approvals (v0.2)
-/// Used for SEP-1686 task management and observability
-pub struct PendingApproval {
-    /// Unique identifier (becomes task_id for SEP-1686)
-    pub id: Uuid,
+/// Task structure for SEP-1686 task lifecycle (v0.2)
+/// Used for task management, approval tracking, and observability
+pub struct Task {
+    /// Unique identifier (tg_nanoid format, e.g., `tg_a1b2c3d4e5f6g7h8i9j0k`)
+    pub id: Sep1686TaskId,
     
     /// Original request (for logging/metrics and deferred execution)
     pub tool_name: String,
@@ -242,23 +243,40 @@ pub struct PendingApproval {
     pub timeout: Duration,
     
     /// Current state (SEP-1686 compatible)
-    pub state: ApprovalState,
+    pub status: TaskStatus,
+
+    /// Approval record (populated when decision is made)
+    pub approval: Option<ApprovalRecord>,
 }
 
-/// SEP-1686 compatible approval states
-pub enum ApprovalState {
-    /// Awaiting human decision (maps to SEP-1686 input_required)
+/// SEP-1686 compatible task states
+pub enum TaskStatus {
+    /// Request is being processed (initial state)
+    Working,
+    /// Awaiting external input (approval decision)
     InputRequired,
-    /// Approved, ready for execution (maps to SEP-1686 working)
-    Approved { by: String },
-    /// Rejected by human
-    Rejected { by: String, reason: Option<String> },
-    /// Timed out waiting for decision
-    TimedOut,
-    /// Completed execution
-    Completed { result: serde_json::Value },
-    /// Failed during execution
-    Failed { error: String, code: i32 },
+    /// Executing the approved tool call
+    Executing,
+    /// Completed successfully
+    Completed,
+    /// Error occurred
+    Failed,
+    /// Cancelled by client
+    Cancelled,
+    /// Approver rejected request
+    Rejected,
+    /// TTL exceeded
+    Expired,
+}
+
+/// Record of an approval decision
+pub struct ApprovalRecord {
+    /// The approval decision
+    pub decision: ApprovalDecision,
+    /// Who made the decision
+    pub decided_by: String,
+    /// When the decision was made
+    pub decided_at: DateTime<Utc>,
 }
 
 /// Unified outcome enum for approval decisions
@@ -270,160 +288,132 @@ pub enum ApprovalOutcome {
 }
 ```
 
-### 6.2 v0.2: Approval Store Interface
+### 6.2 v0.2: Task Store Interface
 
 ```rust
-/// Thread-safe store for pending approvals
-pub struct PendingApprovalStore {
-    /// Map of approval ID to approval state
-    approvals: DashMap<Uuid, PendingApproval>,
-    /// Broadcast channel for state changes (multiple subscribers)
-    state_tx: broadcast::Sender<(Uuid, ApprovalState)>,
+/// Thread-safe in-memory store for tasks with concurrent access support.
+///
+/// Uses DashMap for lock-free concurrent access. Each task entry has a
+/// per-entry `tokio::sync::Notify` for efficient wakeup of waiters
+/// (e.g., tasks/result blocking until terminal state).
+pub struct TaskStore {
+    /// Task storage keyed by TaskId
+    tasks: DashMap<TaskId, TaskEntry>,
+    /// Index of task IDs by principal for rate limiting and listing
+    by_principal: DashMap<String, Vec<TaskId>>,
+    /// Configuration
+    config: TaskStoreConfig,
+    /// Counter for pending (non-terminal) tasks
+    pending_count: AtomicUsize,
 }
 
-impl PendingApprovalStore {
-    /// Check if store is initialized and ready for use
-    /// For in-memory store, always returns true after construction
-    pub fn is_initialized(&self) -> bool {
-        true  // In-memory store is always ready
-    }
-    
-    /// Subscribe to state changes for a specific approval
-    pub fn subscribe(&self, id: &Uuid) -> broadcast::Receiver<(Uuid, ApprovalState)> {
-        self.state_tx.subscribe()
-    }
-    
-    /// Update approval state and notify subscribers
-    pub fn update_state(&self, id: &Uuid, state: ApprovalState) {
-        if let Some(mut approval) = self.approvals.get_mut(id) {
-            approval.state = state.clone();
-            let _ = self.state_tx.send((id.clone(), state));
-        }
-    }
+/// Internal task entry with metadata for cleanup.
+struct TaskEntry {
+    /// The task itself (Arc for cheap reads, make_mut for writes)
+    task: Arc<Task>,
+    /// When the task became terminal (for grace period cleanup)
+    terminal_at: Option<DateTime<Utc>>,
+    /// Notifier for waiters on this task (per-entry, not broadcast)
+    notify: Arc<Notify>,
+    /// Estimated size of this task's arguments in bytes
+    estimated_bytes: usize,
 }
 
-#[async_trait]
-pub trait ApprovalWaiter: Send + Sync {
-    /// Await approval decision (async, non-blocking)
-    /// Uses broadcast receiver to get state updates
-    async fn wait_for_outcome(
-        &self,
-        id: &Uuid,
-        timeout: Duration,
-    ) -> ApprovalOutcome;
-    
-    /// Record an approval decision (called by background poller)
-    fn record_outcome(
-        &self,
-        approval_id: Uuid,
-        outcome: ApprovalOutcome,
-    ) -> Result<(), ApprovalError>;
+impl TaskStore {
+    /// Create a new task and store it.
+    /// Enforces max_pending_per_principal and max_pending_global limits.
+    pub fn create(&self, task: Task) -> Result<TaskId, TaskError>;
+
+    /// Get a task by ID (returns Arc<Task> for cheap cloning).
+    pub fn get(&self, id: &TaskId) -> Option<Arc<Task>>;
+
+    /// Transition a task to a new status (validates allowed transitions).
+    /// Notifies waiters via the per-entry Notify.
+    pub fn transition(&self, id: &TaskId, to: TaskStatus) -> Result<Arc<Task>, TaskError>;
+
+    /// Wait for a task to reach a terminal state.
+    /// Uses per-entry tokio::sync::Notify for efficient wakeup.
+    pub async fn wait_for_terminal(&self, id: &TaskId, timeout: Duration) -> Result<Arc<Task>, TaskError>;
+
+    /// List tasks for a principal with offset-based pagination.
+    pub fn list_for_principal(&self, principal: &str, offset: usize, limit: usize) -> Vec<Arc<Task>>;
+
+    /// Remove expired and terminal-grace-period tasks.
+    pub fn cleanup_expired(&self) -> usize;
 }
 ```
 
 > **Note:** The `ApprovalOutcome` enum (defined in §6.1) is used consistently throughout
-> the approval workflow. There is no separate `ApprovalDecision` type.
+> the approval workflow. `ApprovalDecision` and `ApprovalRecord` track the decision details.
 
-### 6.3 v0.2: Pending Approval Store Implementation
+### 6.3 v0.2: Task Store Configuration
 
 ```rust
-/// In-memory store for pending approvals (v0.2)
-/// See §6.2 for the full interface with broadcast channel
-pub struct PendingApprovalStore {
-    /// Map from approval ID to pending approval
-    approvals: DashMap<Uuid, PendingApproval>,
-    /// Broadcast channel for state updates (defined in §6.2)
-    state_tx: broadcast::Sender<(Uuid, ApprovalState)>,
-}
-
-impl PendingApprovalStore {
-    pub fn new() -> Self {
-        Self {
-            approvals: DashMap::new(),
-        }
-    }
-    
-    /// Register a new pending approval
-    pub fn register(&self, approval: PendingApproval) -> Uuid {
-        let id = approval.id;
-        self.approvals.insert(id, approval);
-        id
-    }
-    
-    /// Get pending approval by ID
-    pub fn get(&self, id: Uuid) -> Option<dashmap::mapref::one::Ref<Uuid, PendingApproval>> {
-        self.approvals.get(&id)
-    }
-    
-    /// Remove pending approval (on completion)
-    pub fn remove(&self, id: Uuid) -> Option<PendingApproval> {
-        self.approvals.remove(&id).map(|(_, v)| v)
-    }
-    
-    /// Count pending approvals (for metrics)
-    pub fn count(&self) -> usize {
-        self.approvals.len()
-    }
-    
-    /// Count pending approvals for principal
-    pub fn count_for_principal(&self, principal: &str) -> usize {
-        self.approvals
-            .iter()
-            .filter(|entry| entry.principal.app_name == principal)
-            .count()
-    }
+/// Configuration for the task store.
+///
+/// Implements: REQ-GOV-001/§5.2
+pub struct TaskStoreConfig {
+    /// Default TTL for new tasks
+    pub default_ttl: Duration,            // 600s (10 min)
+    /// Maximum TTL allowed
+    pub max_ttl: Duration,                // 86400s (24 hr)
+    /// Minimum TTL allowed
+    pub min_ttl: Duration,                // 60s (1 min)
+    /// How often to run cleanup
+    pub cleanup_interval: Duration,       // 60s
+    /// Maximum pending tasks per principal
+    pub max_pending_per_principal: usize,  // 10
+    /// Maximum pending tasks globally
+    pub max_pending_global: usize,         // 1000
+    /// Grace period after terminal before removal
+    pub terminal_grace_period: Duration,   // 3600s (1 hr)
+    /// Maximum total bytes for pending task arguments (H-004)
+    pub max_pending_bytes: usize,          // 256 MB
 }
 ```
 
-### 6.4 v0.3+: Full Task Structure (Future Reference)
+### 6.4 Full Task Structure Reference
 
 ```rust
-/// Full task structure for SEP-1686 mode (v0.3+)
+/// Full task structure for SEP-1686 mode.
+/// Note: This is the same Task struct used in v0.2 (§6.1).
+/// TaskId is an alias for Sep1686TaskId (tg_nanoid format).
 pub struct Task {
     // Identity
-    pub id: TaskId,
-    
+    pub id: TaskId,                          // Sep1686TaskId (tg_nanoid)
+
     // Request Data
-    pub original_request: ToolCallRequest,
-    pub request_hash: String,
-    
+    pub original_request: serde_json::Value,
+    pub tool_name: String,
+    pub arguments_hash: String,
+
     // Principal
     pub principal: Principal,
-    
+
     // Timing
     pub created_at: DateTime<Utc>,
     pub ttl: Duration,
     pub expires_at: DateTime<Utc>,
     pub poll_interval: Duration,
-    
+
     // State
     pub status: TaskStatus,
     pub status_message: Option<String>,
     pub transitions: Vec<TaskTransition>,
-    
+
     // Approval
     pub approval: Option<ApprovalRecord>,
-    
+
     // Result
-    pub result: Option<ToolCallResult>,
+    pub result: Option<serde_json::Value>,
     pub failure: Option<FailureInfo>,
+
+    // Timeout behavior
+    pub on_timeout: TimeoutAction,
 }
 
-pub struct TaskId(pub Uuid);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TaskStatus {
-    // SEP-1686 standard states
-    Working,
-    Executing,  // Between approval and completion (maps to "working" in SEP-1686)
-    InputRequired,
-    Completed,
-    Failed,
-    Cancelled,
-    // ThoughtGate extensions
-    Rejected,
-    Expired,
-}
+// TaskId = Sep1686TaskId (re-exported alias)
+pub use crate::protocol::Sep1686TaskId as TaskId;
 ```
 
 ## 7. Behavior Specification
@@ -440,7 +430,7 @@ pub enum TaskStatus {
      ▼
   2. Create Task with SEP-1686 state machine
      │
-     ├─ Generate TaskId (UUID)
+     ├─ Generate Sep1686TaskId (tg_nanoid)
      ├─ Hash arguments for logging
      ├─ Set initial state: Working
      └─ Store in TaskStore
@@ -481,47 +471,47 @@ pub enum TaskStatus {
 
 ### F-001: Pending Approval Registration (v0.2)
 
-- **F-001.1:** Generate UUID for each pending approval (becomes task_id)
+- **F-001.1:** Generate `Sep1686TaskId` (tg_nanoid format) for each task
 - **F-001.2:** Store tool name, arguments hash, and original request
 - **F-001.3:** Record principal for observability
-- **F-001.4:** Initialize state as `InputRequired`
-- **F-001.5:** Register in `PendingApprovalStore`
+- **F-001.4:** Initialize state as `Working`
+- **F-001.5:** Register in `TaskStore`
 
 ### F-002: Background Approval Polling (v0.2)
 
 - **F-002.1:** Spawn background task via `tokio::spawn` (non-blocking)
 - **F-002.2:** Poll Slack adapter for approval decision
 - **F-002.3:** Check for timeout expiration
-- **F-002.4:** Update task state on decision via broadcast channel
-- **F-002.5:** Notify subscribers of state change
+- **F-002.4:** Update task state on decision via `TaskStore::transition()`
+- **F-002.5:** Notify waiters via per-entry `tokio::sync::Notify`
 
 ```rust
 /// Background polling task (spawned, non-blocking)
 async fn poll_for_approval(
-    store: Arc<PendingApprovalStore>,
-    id: Uuid,
+    store: Arc<TaskStore>,
+    id: TaskId,
     adapter: Arc<dyn ApprovalAdapter>,
     reference: ApprovalReference,
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
     let mut poll_interval = Duration::from_secs(5);
-    
+
     loop {
         if Instant::now() >= deadline {
-            store.update_state(&id, ApprovalState::TimedOut);
+            let _ = store.transition(&id, TaskStatus::Expired);
             return;
         }
-        
+
         tokio::time::sleep(poll_interval).await;
-        
+
         match adapter.poll_for_decision(&reference).await {
             Ok(Some(ApprovalOutcome::Approved { by })) => {
-                store.update_state(&id, ApprovalState::Approved { by });
+                let _ = store.transition(&id, TaskStatus::Executing);
                 return;
             }
             Ok(Some(ApprovalOutcome::Rejected { by, reason })) => {
-                store.update_state(&id, ApprovalState::Rejected { by, reason });
+                let _ = store.transition(&id, TaskStatus::Rejected);
                 return;
             }
             Ok(None) => {
@@ -531,19 +521,19 @@ async fn poll_for_approval(
                 tracing::warn!(id = %id, error = %e, "Polling error");
             }
         }
-        
+
         // Exponential backoff
         poll_interval = (poll_interval * 2).min(Duration::from_secs(30));
     }
 }
 ```
 
-### F-003: Task State Subscription (v0.2)
+### F-003: Task State Notification (v0.2)
 
-- **F-003.1:** Use `broadcast::Receiver` to subscribe to state changes
-- **F-003.2:** Filter events for relevant task ID
-- **F-003.3:** Support multiple subscribers per task
-- **F-003.4:** Clean up subscription on task completion
+- **F-003.1:** Use per-entry `tokio::sync::Notify` for efficient wakeup of waiters
+- **F-003.2:** Notify is scoped to a single task (no filtering needed)
+- **F-003.3:** Support multiple waiters per task via `Notify::notify_waiters()`
+- **F-003.4:** Entry cleanup handled by TTL-based expiry and grace period
 
 ### F-004: Timeout Handling (v0.2)
 
@@ -555,7 +545,7 @@ async fn poll_for_approval(
 ### F-005: Approval Decision Recording (v0.2)
 
 - **F-005.1:** Receive decision from REQ-GOV-003 (Slack polling)
-- **F-005.2:** Signal completion via oneshot channel
+- **F-005.2:** Signal completion via per-entry `tokio::sync::Notify`
 - **F-005.3:** If approval not found (expired/cleaned up), log and ignore
 - **F-005.4:** Record decision metadata for audit logging
 
@@ -610,11 +600,10 @@ These features are implemented in v0.2:
 - **F-007:** Dynamic poll interval computation
 - **F-008:** `tasks/get` implementation (status retrieval)
 - **F-009:** `tasks/result` implementation (result streaming)
-- **F-010:** `tasks/list` implementation (simple, no pagination)
+- **F-010:** `tasks/list` implementation (cursor-based pagination, PAGE_SIZE=20)
 - **F-011:** `tasks/cancel` implementation
 
-**Deferred to v0.3+:**
-- **F-012:** Rate limiting and capacity management
+- **F-012:** Rate limiting and capacity management (`max_pending_per_principal`, `max_pending_global`)
 
 See §10 for state machine reference.
 
@@ -741,49 +730,47 @@ This section documents the SEP-1686 state machine. **Implemented in v0.2.**
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 10.2 Task Store Interface (v0.3+)
+### 10.2 Task Store Interface
 
 ```rust
-#[async_trait]
-pub trait TaskStore: Send + Sync {
-    async fn create(&self, task: Task) -> Result<TaskId, TaskError>;
-    async fn get(&self, id: &TaskId) -> Result<Option<Task>, TaskError>;
-    async fn update(&self, id: &TaskId, update: TaskUpdate) -> Result<Task, TaskError>;
-    async fn transition(&self, id: &TaskId, to: TaskStatus, expected: TaskStatus) -> Result<Task, TaskError>;
-    async fn list(&self, principal: &Principal, cursor: Option<String>, limit: usize) -> Result<TaskList, TaskError>;
-    async fn delete(&self, id: &TaskId) -> Result<(), TaskError>;
-    async fn cleanup_expired(&self) -> Result<usize, TaskError>;
+/// Concrete in-memory task store (see §6.2 for full interface).
+/// TaskId = Sep1686TaskId (tg_nanoid format).
+impl TaskStore {
+    fn create(&self, task: Task) -> Result<TaskId, TaskError>;
+    fn get(&self, id: &TaskId) -> Option<Arc<Task>>;
+    fn transition(&self, id: &TaskId, to: TaskStatus) -> Result<Arc<Task>, TaskError>;
+    async fn wait_for_terminal(&self, id: &TaskId, timeout: Duration) -> Result<Arc<Task>, TaskError>;
+    fn list_for_principal(&self, principal: &str, offset: usize, limit: usize) -> Vec<Arc<Task>>;
+    fn cleanup_expired(&self) -> usize;
 }
 ```
 
-### 10.3 SEP-1686 Method Handlers (v0.3+)
+### 10.3 SEP-1686 Method Handlers
 
 ```rust
-// tasks/get
-async fn handle_tasks_get(&self, params: TasksGetParams) -> JsonRpcResponse {
-    let task = self.store.get(&params.task_id).await?;
-    // Map internal states to SEP-1686 visible states
-    // Return task status and timing info
+// tasks/get — returns task status and metadata
+fn handle_tasks_get(&self, params: TasksGetRequest) -> JsonRpcResponse {
+    let task = self.store.get(&params.task_id)?;
+    // Map internal TaskStatus to Sep1686Status
+    // Return Sep1686TaskMetadata with poll_interval
 }
 
-// tasks/result
-async fn handle_tasks_result(&self, params: TasksResultParams) -> JsonRpcResponse {
-    let task = self.store.get(&params.task_id).await?;
-    if task.status.is_terminal() {
-        // Return result or failure
-    } else {
-        // Block until terminal or timeout
-    }
+// tasks/result — blocks until terminal state, returns result
+async fn handle_tasks_result(&self, params: TasksResultRequest) -> JsonRpcResponse {
+    // If already terminal, return result immediately
+    // Otherwise wait_for_terminal with timeout
+    // On approval: forward to upstream, return CallToolResult
 }
 
-// tasks/list
-async fn handle_tasks_list(&self, params: TasksListParams) -> JsonRpcResponse {
+// tasks/list — cursor-based pagination (PAGE_SIZE=20)
+fn handle_tasks_list(&self, params: TasksListRequest) -> JsonRpcResponse {
     // Return paginated list of tasks for principal
+    // Server-controlled page size, cursor-only client pagination
 }
 
-// tasks/cancel
-async fn handle_tasks_cancel(&self, params: TasksCancelParams) -> JsonRpcResponse {
-    // Cancel if in InputRequired state
+// tasks/cancel — cancel if in cancellable state
+fn handle_tasks_cancel(&self, params: TasksCancelRequest) -> JsonRpcResponse {
+    // Cancel if in Working or InputRequired state
     // Return error if already terminal or executing
 }
 ```
@@ -792,8 +779,8 @@ async fn handle_tasks_cancel(&self, params: TasksCancelParams) -> JsonRpcRespons
 
 ### 11.1 v0.2 Definition of Done
 
-- [ ] `Task` struct with SEP-1686 states (`Submitted`, `Working`, `InputRequired`, `Completed`, `Failed`, `Cancelled`)
-- [ ] `TaskStore` with in-memory storage and TTL cleanup
+- [ ] `Task` struct with SEP-1686 states (`Working`, `InputRequired`, `Executing`, `Completed`, `Failed`, `Cancelled`, `Rejected`, `Expired`)
+- [ ] `TaskStore` with in-memory storage, per-entry `Notify`, and TTL cleanup
 - [ ] State machine with valid transitions only
 - [ ] `tasks/get` — return task by ID
 - [ ] `tasks/result` — return result or block until terminal
@@ -809,7 +796,7 @@ async fn handle_tasks_cancel(&self, params: TasksCancelParams) -> JsonRpcRespons
 
 ### 11.2 v0.3+ Definition of Done (Future)
 
-- [ ] `tasks/list` with pagination
-- [ ] Rate limiting enforced
+- [x] `tasks/list` with cursor-based pagination (PAGE_SIZE=20) — implemented in v0.2
+- [x] Rate limiting enforced (`max_pending_per_principal`, `max_pending_global`) — implemented in v0.2
 - [ ] SSE notifications for task state changes
 - [ ] Upstream task orchestration (REQ-GOV-004)

@@ -28,6 +28,7 @@
 //! - `scheduler.rs` - Polling scheduler with rate limiting (uses `governor` crate)
 
 pub mod mock;
+pub mod redact;
 pub mod scheduler;
 pub mod slack;
 
@@ -78,6 +79,9 @@ pub struct ApprovalRequest {
     /// Used to create span links in the approval dispatch span.
     /// Implements: REQ-OBS-002 §5.4.1 (link to parent MCP request)
     pub request_span_context: Option<SpanContext>,
+    /// Field paths to redact from tool_arguments before display (H-001 mitigation).
+    /// Empty means no redaction.
+    pub redact_fields: Vec<String>,
 }
 
 impl std::fmt::Debug for ApprovalRequest {

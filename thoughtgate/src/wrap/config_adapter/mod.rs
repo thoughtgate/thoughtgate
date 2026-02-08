@@ -78,6 +78,10 @@ pub struct ShimOptions {
     pub governance_endpoint: String,
     /// Active configuration profile.
     pub profile: Profile,
+    /// Optional path to the ThoughtGate YAML config file.
+    /// When set, the shim loads the config for list response filtering.
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
 }
 
 /// Errors that can occur during config operations.
@@ -435,6 +439,7 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
+            config_path: None,
         };
 
         let backup = adapter
@@ -467,6 +472,7 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
+            config_path: None,
         };
 
         adapter
@@ -511,6 +517,7 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
+            config_path: None,
         };
 
         adapter
@@ -567,6 +574,7 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
+            config_path: None,
         };
 
         adapter
@@ -623,6 +631,7 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
+            config_path: None,
         };
 
         // First rewrite succeeds.
@@ -651,6 +660,7 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
+            config_path: None,
         };
 
         // First rewrite succeeds.
@@ -701,6 +711,7 @@ mod tests {
             server_id: String::new(),
             governance_endpoint: "http://127.0.0.1:19090".to_string(),
             profile: Profile::Production,
+            config_path: None,
         };
 
         // Rewrite the project-level config.

@@ -169,7 +169,7 @@ Cedar evaluation spans are **child spans** of the MCP request span, recording th
 | `cedar.action` | string | **Required** | Authorized action | `Action::"invoke_tool"` |
 | `cedar.resource.type` | string | **Required** | Resource entity type | `Tool`, `Document` |
 | `cedar.resource.id` | string | **Required** | Resource identifier | `tool::web_search` |
-| `cedar.evaluation.duration_ms` | double | **Required** | Policy evaluation latency in milliseconds | `0.45` |
+| `cedar.duration_ms` | double | **Required** | Policy evaluation latency in milliseconds | `0.45` |
 | `cedar.policy_set.version` | string | **Recommended** | Policy bundle version/hash | `sha256:a1b2c3...` |
 | `cedar.diagnostics.reasons` | string[] | **Optional** | Policy IDs that contributed to decision | `["policy-fin-001"]` |
 
@@ -282,6 +282,14 @@ A2A protocol bridge is deferred to v1.0+ per the roadmap. These attribute defini
 ## 6. Metrics Definitions
 
 All metrics use the `thoughtgate.` prefix namespace. Metrics are exposed via a Prometheus-compatible `/metrics` endpoint and simultaneously exported via OTLP.
+
+> **Naming Convention Note:** The metric names below use dot notation
+> (`thoughtgate.requests.total`) for readability and alignment with OTel semantic
+> conventions. In the actual Prometheus exposition format, the `prometheus-client`
+> crate converts dots to underscores, so `thoughtgate.requests.total` becomes
+> `thoughtgate_requests_total` on the `/metrics` endpoint. This is standard
+> Prometheus behavior -- Prometheus metric names must match `[a-zA-Z_:][a-zA-Z0-9_:]*`.
+> See `prom_metrics.rs` for the canonical underscore-based names used in code.
 
 ### 6.1 Counters
 
@@ -549,6 +557,23 @@ ThoughtGate Sidecar
 
 ### 8.2 Sidecar Export Configuration
 
+> **Implementation Status (v0.2+):**
+>
+> - **OTLP protocol:** Only HTTP/protobuf (`http/protobuf`) is supported. gRPC
+>   is accepted in configuration but falls back to HTTP/protobuf with a warning
+>   log. The `opentelemetry-otlp` HTTP exporter is used (no `tonic` dependency).
+> - **Prometheus `/metrics` endpoint:** Served on the **admin port** (default
+>   `7469`, configured via `THOUGHTGATE_ADMIN_PORT`), not on a separate
+>   Prometheus-dedicated port. The admin server also hosts `/health` and `/ready`.
+> - **Sampling:** Only **head sampling** (`TraceIdRatioBased`) is implemented.
+>   Tail sampling is accepted in configuration but falls back to head sampling
+>   with a warning. Tail sampling is deferred to a future version (requires
+>   in-process span buffering and post-completion decision logic).
+> - **Metric exemplars:** B-OBS2-006 specifies trace ID exemplars on histogram
+>   metrics. This is **blocked on `prometheus-client` crate support** --
+>   `prometheus-client` v0.24.0 does not expose an exemplar API. Exemplars will
+>   be added when upstream support is available.
+
 ```yaml
 # thoughtgate.yaml — telemetry section
 telemetry:
@@ -557,11 +582,9 @@ telemetry:
 
   # OTLP export configuration
   otlp:
-    # gRPC endpoint (preferred — binary protocol, lower overhead)
-    endpoint: "http://otel-collector:4317"
-    # HTTP/protobuf fallback
-    # endpoint: "http://otel-collector:4318"
-    protocol: grpc  # grpc | http/protobuf
+    # HTTP/protobuf endpoint (v0.2+ only supports HTTP/protobuf)
+    endpoint: "http://otel-collector:4318"
+    protocol: http/protobuf  # http/protobuf (supported) | grpc (falls back to http/protobuf)
 
     # TLS configuration (optional)
     tls:
@@ -574,17 +597,18 @@ telemetry:
     headers:
       # Authorization: "Bearer ${OTEL_EXPORTER_TOKEN}"
 
-  # Prometheus endpoint
+  # Prometheus endpoint (served on admin port, default 7469)
   prometheus:
     enabled: true
-    port: 9090
+    # Note: port/path are informational — /metrics is always served on the
+    # admin port (THOUGHTGATE_ADMIN_PORT, default 7469) alongside /health and /ready.
     path: "/metrics"
 
   # Sampling configuration
   sampling:
-    # Default strategy: sample all errors, percentage of successes
-    strategy: "tail"  # tail | head | always_on | always_off
-    error_sample_rate: 1.0     # 100% of errors — always capture failures
+    # v0.2+: Only head sampling is implemented.
+    # Tail sampling is deferred (falls back to head with a warning).
+    strategy: "head"  # head | tail (deferred — falls back to head)
     success_sample_rate: 0.05  # 5% of successes — adjust based on volume
     # Per-method overrides
     overrides:
@@ -868,7 +892,7 @@ let cedar_span = tracer.span_builder("cedar.evaluate")
     .start(&tracer);
 // ... evaluate ...
 cedar_span.set_attribute(KeyValue::new("cedar.decision", "allow"));
-cedar_span.set_attribute(KeyValue::new("cedar.evaluation.duration_ms", eval_duration));
+cedar_span.set_attribute(KeyValue::new("cedar.duration_ms", eval_duration));
 cedar_span.end();
 ```
 

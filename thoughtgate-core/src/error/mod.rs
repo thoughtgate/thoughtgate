@@ -239,6 +239,17 @@ pub enum ThoughtGateError {
         task_id: String,
     },
 
+    /// Request transformed differently between approval and execution.
+    ///
+    /// Implements: REQ-CORE-004/§5.2 (-32012)
+    #[error("Request transform changed since approval for tool '{tool}'")]
+    TransformDrift {
+        /// The tool that was affected
+        tool: String,
+        /// The task ID for the approval
+        task_id: String,
+    },
+
     // ═══════════════════════════════════════════════════════════
     // Operational errors
     // ═══════════════════════════════════════════════════════════
@@ -304,8 +315,9 @@ impl ThoughtGateError {
             Self::ApprovalRejected { .. } => -32007,
             Self::ApprovalTimeout { .. } => -32008,
 
-            // ThoughtGate custom codes: Post-approval drift (-32011)
+            // ThoughtGate custom codes: Post-approval drift (-32011, -32012)
             Self::PolicyDrift { .. } => -32011,
+            Self::TransformDrift { .. } => -32012,
 
             // ThoughtGate custom codes: Rate limiting (-32009)
             Self::RateLimited { .. } => -32009,
@@ -346,6 +358,7 @@ impl ThoughtGateError {
             Self::ApprovalRejected { .. } => "approval_rejected",
             Self::ApprovalTimeout { .. } => "approval_timeout",
             Self::PolicyDrift { .. } => "policy_drift",
+            Self::TransformDrift { .. } => "transform_drift",
             Self::RateLimited { .. } => "rate_limited",
             Self::ServiceUnavailable { .. } => "service_unavailable",
             Self::InternalError { .. } => "internal_error",
@@ -380,8 +393,8 @@ impl ThoughtGateError {
             // Gate 4: Approval
             Self::ApprovalRejected { .. } | Self::ApprovalTimeout { .. } => Some("approval"),
 
-            // Post-approval: Policy Drift
-            Self::PolicyDrift { .. } => Some("policy"),
+            // Post-approval: Drift errors
+            Self::PolicyDrift { .. } | Self::TransformDrift { .. } => Some("policy"),
 
             // Non-gate errors
             _ => None,
@@ -399,6 +412,7 @@ impl ThoughtGateError {
             | Self::ApprovalRejected { tool, .. }
             | Self::ApprovalTimeout { tool, .. }
             | Self::PolicyDrift { tool, .. }
+            | Self::TransformDrift { tool, .. }
             | Self::TaskRequired { tool, .. } => Some(tool),
             _ => None,
         }
@@ -417,7 +431,9 @@ impl ThoughtGateError {
             Self::GovernanceRuleDenied { .. } => None,
 
             // Gate 3: Policy - No details (security: don't expose policy internals)
-            Self::PolicyDenied { .. } | Self::PolicyDrift { .. } => None,
+            Self::PolicyDenied { .. } | Self::PolicyDrift { .. } | Self::TransformDrift { .. } => {
+                None
+            }
 
             // Gate 4: Approval
             Self::ApprovalRejected { rejected_by, .. } => rejected_by

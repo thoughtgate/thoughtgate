@@ -13,7 +13,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
@@ -36,6 +36,7 @@ use thoughtgate_proxy::mcp_handler::{
 use thoughtgate_proxy::ports::{admin_port, outbound_port};
 use thoughtgate_proxy::proxy_config::ProxyConfig;
 use thoughtgate_proxy::proxy_service::ProxyService;
+use thoughtgate_proxy::rate_limiter::{PerIpRateLimiter, RateLimiterConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -67,11 +68,52 @@ struct Config {
     #[arg(long, env = "UPSTREAM_URL")]
     upstream_url: Option<String>,
 
+    /// Bind address for the admin server (health, ready, metrics).
+    /// Defaults to 127.0.0.1 to avoid exposing operational endpoints on the network.
+    /// Set to 0.0.0.0 if external scraping is needed (e.g., Prometheus in a separate pod).
+    #[arg(long, default_value = "127.0.0.1", env = "THOUGHTGATE_ADMIN_BIND")]
+    admin_bind: String,
+
+    /// Enable forward proxy mode (SSRF risk: allows proxying to arbitrary hosts).
+    /// Required when upstream_url is not set.
+    #[arg(long, default_value_t = false)]
+    enable_forward_proxy: bool,
+
     /// Path to YAML configuration file for governance.
     /// Enables the 4-gate governance model (visibility, rules, Cedar policy, approval).
     /// If not specified, searches: THOUGHTGATE_CONFIG env, /etc/thoughtgate/config.yaml, ./config.yaml
     #[arg(long, env = "THOUGHTGATE_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Governance profile (production or development).
+    /// Development mode auto-forwards Cedar denials and approval workflows.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "production",
+        env = "THOUGHTGATE_PROFILE"
+    )]
+    profile: CliProfile,
+}
+
+/// CLI-level profile selection.
+///
+/// Maps 1:1 to `thoughtgate_core::profile::Profile`.
+#[derive(Clone, Debug, ValueEnum)]
+enum CliProfile {
+    /// All governance decisions are enforcing.
+    Production,
+    /// Governance decisions are logged but not enforced.
+    Development,
+}
+
+impl From<CliProfile> for thoughtgate_core::profile::Profile {
+    fn from(p: CliProfile) -> Self {
+        match p {
+            CliProfile::Production => thoughtgate_core::profile::Profile::Production,
+            CliProfile::Development => thoughtgate_core::profile::Profile::Development,
+        }
+    }
 }
 
 /// Main entry point for the ThoughtGate proxy.
@@ -113,6 +155,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(msg) = thoughtgate_core::lifecycle::validate_environment() {
         error!(reason = %msg, "Unsafe configuration detected — refusing to start");
         std::process::exit(1);
+    }
+
+    // Validate --profile development against THOUGHTGATE_ENVIRONMENT
+    let profile: thoughtgate_core::profile::Profile = cli_config.profile.clone().into();
+    if profile == thoughtgate_core::profile::Profile::Development {
+        let environment =
+            std::env::var("THOUGHTGATE_ENVIRONMENT").unwrap_or_else(|_| "production".to_string());
+        let is_production = matches!(environment.as_str(), "production" | "prod" | "");
+        if is_production {
+            error!(
+                "--profile development is not allowed when THOUGHTGATE_ENVIRONMENT is production. \
+                 Set THOUGHTGATE_ENVIRONMENT=development to use development profile."
+            );
+            std::process::exit(1);
+        }
+        warn!(
+            "SECURITY: Development profile active — Cedar denials and approval workflows will be bypassed"
+        );
     }
 
     // Phase 2: Initialize lifecycle manager
@@ -167,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_shutdown = shutdown.clone();
     let admin_lifecycle = lifecycle.clone();
     let admin_prom_registry = prom_registry.clone();
-    let admin_bind = cli_config.bind.clone();
+    let admin_bind = cli_config.admin_bind.clone();
     tokio::spawn(async move {
         let admin_server = AdminServer::with_config(
             admin_lifecycle,
@@ -293,11 +353,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Arc::new(config.clone())),
             approval_engine,
             Some(tg_metrics.clone()), // Prometheus metrics (REQ-OBS-002 §6)
+            profile,
         );
 
         info!(
             requires_approval = config.requires_approval_engine(),
             rules_count = config.governance.rules.len(),
+            profile = ?profile,
             "MCP governance enabled (4-gate model)"
         );
 
@@ -310,6 +372,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 7: Create proxy service
     let mut proxy_service =
         ProxyService::new_with_config(cli_config.upstream_url.clone(), proxy_config.clone())?;
+
+    // Gate forward proxy mode behind explicit opt-in (H-002: SSRF prevention)
+    if cli_config.enable_forward_proxy {
+        proxy_service = proxy_service.with_forward_proxy_enabled();
+        warn!(
+            "Forward proxy mode enabled — requests without upstream_url will be proxied to the target host"
+        );
+    }
 
     // Wire MCP handler if governance is enabled
     if let Some(handler) = mcp_handler {
@@ -353,6 +423,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Record startup duration metric (REQ-CORE-005/NFR-001)
     tg_metrics.record_startup_duration(startup_instant.elapsed().as_secs_f64());
 
+    // Per-client IP rate limiting (REQ-CORE-005 - resource protection)
+    let rate_limiter = Arc::new(PerIpRateLimiter::new(RateLimiterConfig::from_env()));
+    rate_limiter.spawn_cleanup_task(shutdown.clone());
+
     // Per-request timeout for proxy connections
     // Prevents indefinitely hanging connections from leaking resources
     let request_timeout =
@@ -395,6 +469,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         };
+
+                        // Per-client rate limiting check
+                        if !rate_limiter.check(peer_addr.ip()) {
+                            warn!(
+                                peer = %peer_addr,
+                                "Rejected connection: rate limit exceeded"
+                            );
+                            drop(request_guard);
+                            tokio::spawn(async move {
+                                let _ = send_429_response(stream).await;
+                            });
+                            continue;
+                        }
 
                         // Try to acquire semaphore permit (REQ-CORE-001 Section 3.2)
                         let permit = match semaphore.clone().try_acquire_owned() {
@@ -564,11 +651,14 @@ async fn graceful_shutdown(
     telemetry_guard: thoughtgate_core::telemetry::TelemetryGuard,
     tg_metrics: &thoughtgate_core::telemetry::ThoughtGateMetrics,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown_start = std::time::Instant::now();
+
     // Fail all pending tasks before draining
     // Implements: REQ-CORE-005/F-004.2, F-006
     if let Some(ref task_store) = shutdown_task_store {
         let failed_count = task_store.fail_all_pending("service_shutdown");
         if failed_count > 0 {
+            tg_metrics.record_approvals_cancelled_shutdown(failed_count as u64);
             info!(
                 failed_tasks = failed_count,
                 "Transitioned pending tasks to Failed for shutdown"
@@ -589,6 +679,7 @@ async fn graceful_shutdown(
         warn!(error = %e, "Telemetry shutdown error (non-fatal)");
     }
 
+    tg_metrics.record_shutdown_duration(shutdown_start.elapsed().as_secs_f64());
     lifecycle.mark_stopped();
 
     match drain_result {
@@ -807,6 +898,33 @@ fn configure_tcp_stream(stream: &TcpStream, config: &ProxyConfig) -> std::io::Re
     socket.set_recv_buffer_size(config.socket_buffer_size)?;
     socket.set_send_buffer_size(config.socket_buffer_size)?;
 
+    Ok(())
+}
+
+/// Send a 429 Too Many Requests response when per-IP rate limit is exceeded.
+///
+/// # Traceability
+/// - Implements: REQ-CORE-005 (Operational Lifecycle - resource protection)
+async fn send_429_response(mut stream: TcpStream) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let body = "429 Too Many Requests\n\n\
+                ThoughtGate rate limit exceeded for your IP address.\n\
+                Please retry your request in a moment.";
+    let content_length = body.len();
+    let response = format!(
+        "HTTP/1.1 429 Too Many Requests\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Retry-After: 1\r\n\
+         \r\n\
+         {}",
+        content_length, body
+    );
+
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }
 

@@ -101,14 +101,14 @@ The system must:
 | -32007 | Approval Rejected | 4 | Human rejected the request |
 | -32008 | Approval Timeout | 4 | Approval window expired (async mode). Blocking mode returns `CallToolResult` with `isError: true` instead. |
 | -32009 | Rate Limited | - | Too many requests |
-| -32010 | Inspection Failed | - | Amber path inspector rejected |
-| -32011 | Policy Drift | - | Policy changed, denying approved request |
-| -32012 | Transform Drift | - | Request changed during approval |
+| -32010 | Inspection Failed | - | Amber path inspector rejected *(DEFERRED to v0.3+)* |
+| -32011 | Policy Drift | - | Policy changed since approval for tool '{tool}' |
+| -32012 | Transform Drift | - | Request transform changed since approval for tool '{tool}' |
 | -32013 | Service Unavailable | - | ThoughtGate overloaded |
 | -32014 | Governance Rule Denied | 2 | `action: deny` matched in YAML |
 | -32015 | Tool Not Exposed | 1 | Tool hidden by `expose` config |
-| -32016 | Configuration Error | - | Invalid configuration |
-| -32017 | Workflow Not Found | 4 | Approval workflow not defined |
+| -32016 | Configuration Error | - | Invalid configuration *(NOT YET IMPLEMENTED)* |
+| -32017 | Workflow Not Found | 4 | Approval workflow not defined *(NOT YET IMPLEMENTED)* |
 
 ### 5.3 Error Message Guidelines
 
@@ -138,7 +138,8 @@ pub enum ThoughtGateError {
     // ═══════════════════════════════════════════════════════════
     ParseError { details: String },
     InvalidRequest { details: String },
-    MethodNotFound { method: String },
+    // Note: MethodNotFound (-32601) is not defined in ThoughtGateError.
+    // It originates from upstream MCP servers, not from ThoughtGate itself.
     InvalidParams { details: String },
     
     // ═══════════════════════════════════════════════════════════
@@ -183,9 +184,10 @@ pub enum ThoughtGateError {
     // `CallToolResult { isError: true }` (tool-level error), not as JSON-RPC
     // error -32008. This lets the LLM reason about the timeout and decide
     // whether to retry. Error -32008 is reserved for the async SEP-1686 path.
-    WorkflowNotFound {
-        workflow: String,
-    },
+    // NOT YET IMPLEMENTED: WorkflowNotFound (-32017)
+    // WorkflowNotFound {
+    //     workflow: String,
+    // },
     
     // ═══════════════════════════════════════════════════════════
     // Upstream errors (from REQ-CORE-003)
@@ -204,21 +206,23 @@ pub enum ThoughtGateError {
     // ═══════════════════════════════════════════════════════════
     // Pipeline errors (from REQ-GOV-002)
     // ═══════════════════════════════════════════════════════════
-    InspectionFailed { inspector: String, reason: String },
-    PolicyDrift { task_id: String },
-    TransformDrift { task_id: String },
+    // DEFERRED to v0.3+: InspectionFailed (Amber path inspector)
+    // InspectionFailed { inspector: String, reason: String },
+    PolicyDrift { tool: String, task_id: String },
+    TransformDrift { tool: String, task_id: String },
     
     // ═══════════════════════════════════════════════════════════
     // Configuration errors (from REQ-CFG-001)
     // ═══════════════════════════════════════════════════════════
-    ConfigurationError { details: String },
+    // NOT YET IMPLEMENTED: ConfigurationError (-32016)
+    // ConfigurationError { details: String },
     
     // ═══════════════════════════════════════════════════════════
     // Task lifecycle errors (from REQ-GOV-001, MCP Tasks spec)
     // ═══════════════════════════════════════════════════════════
     TaskResultNotReady { task_id: String },    // -32020: Result not yet available
-    TaskRequired { details: String },           // -32600: Per MCP spec, task required
-    TaskForbidden { details: String },          // -32601: Per MCP spec, task forbidden
+    TaskRequired { tool: String, hint: String }, // -32600: Per MCP spec, task required
+    // DEFERRED: TaskForbidden (-32601) - not currently used
 
     // ═══════════════════════════════════════════════════════════
     // Operational errors
@@ -260,14 +264,14 @@ The following table specifies when each `ErrorData` field should be populated:
 | `ApprovalRejected` | `"approval"` | Yes | Rejector identity (if approved by user) |
 | `ApprovalTimeout` | `"approval"` | Yes | Timeout duration |
 | `WorkflowNotFound` | `"approval"` | No | Workflow name |
-| `UpstreamConnectionFailed` | `null` | No | URL (without auth params) |
+| `UpstreamConnectionFailed` | `null` | No | None (security: don't expose internal URLs) |
 | `UpstreamTimeout` | `null` | No | Timeout value |
 | `UpstreamError` | `null` | No | Upstream error message (sanitized) |
 | `TaskNotFound` | `null` | No | No |
 | `TaskExpired` | `null` | No | TTL duration |
 | `TaskCancelled` | `null` | No | No |
 | `RateLimited` | `null` | No | `retry_after` value |
-| `InspectionFailed` | `null` | No | Inspector name (not reason) |
+| `InspectionFailed` | `null` | No | Inspector name (not reason) *(DEFERRED to v0.3+)* |
 | `PolicyDrift` | `null` | No | No (security) |
 | `TransformDrift` | `null` | No | No (security) |
 | `ServiceUnavailable` | `null` | No | Generic reason |
@@ -275,7 +279,6 @@ The following table specifies when each `ErrorData` field should be populated:
 | `InternalError` | `null` | No | No (log correlation_id only) |
 | `ParseError` | `null` | No | Parse location hint |
 | `InvalidRequest` | `null` | No | Validation details |
-| `MethodNotFound` | `null` | No | Requested method name |
 | `InvalidParams` | `null` | No | Parameter validation details |
 
 **Population Guidelines:**
@@ -418,13 +421,12 @@ fn log_error(err: &ThoughtGateError, correlation_id: &str) {
 ### F-004: Error Metrics
 
 ```
-thoughtgate_errors_total{code, gate, category}
-thoughtgate_gate_denials_total{gate, reason}
+thoughtgate_requests_total{error_type, method}
 ```
 
-- **F-004.1:** Count errors by code
-- **F-004.2:** Count errors by gate
-- **F-004.3:** Track denial reasons per gate
+- **F-004.1:** Count errors by error_type (e.g., "policy_denied", "tool_not_exposed")
+- **F-004.2:** Count errors by method (the JSON-RPC method that triggered the error)
+- **F-004.3:** Error types map to gate via `ThoughtGateError::gate()` method
 
 ## 8. Non-Functional Requirements
 
@@ -432,16 +434,12 @@ thoughtgate_gate_denials_total{gate, reason}
 
 **Metrics:**
 ```
-thoughtgate_errors_total{code="-32015", gate="visibility", category="client"}
-thoughtgate_errors_total{code="-32014", gate="governance", category="client"}
-thoughtgate_errors_total{code="-32003", gate="policy", category="client"}
-thoughtgate_errors_total{code="-32007", gate="approval", category="client"}
-thoughtgate_errors_total{code="-32008", gate="approval", category="client"}
-thoughtgate_errors_total{code="-32000", gate="", category="upstream"}
-thoughtgate_gate_denials_total{gate="visibility"}
-thoughtgate_gate_denials_total{gate="governance"}
-thoughtgate_gate_denials_total{gate="policy"}
-thoughtgate_gate_denials_total{gate="approval"}
+thoughtgate_requests_total{error_type="tool_not_exposed", method="tools/call"}
+thoughtgate_requests_total{error_type="governance_rule_denied", method="tools/call"}
+thoughtgate_requests_total{error_type="policy_denied", method="tools/call"}
+thoughtgate_requests_total{error_type="approval_rejected", method="tools/call"}
+thoughtgate_requests_total{error_type="approval_timeout", method="tools/call"}
+thoughtgate_requests_total{error_type="upstream_connection_failed", method="tools/call"}
 ```
 
 **Logging:**

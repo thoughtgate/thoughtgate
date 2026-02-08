@@ -261,7 +261,7 @@ impl ClaudeCodeAdapter {
                 entry_obj.insert("command".to_string(), shim_path.clone().into());
                 entry_obj.insert("args".to_string(), serde_json::Value::Array(shim_args));
 
-                // Add THOUGHTGATE_SERVER_ID to env.
+                // Add THOUGHTGATE_SERVER_ID and THOUGHTGATE_CONFIG to env.
                 let env_obj = entry_obj
                     .entry("env")
                     .or_insert_with(|| serde_json::json!({}));
@@ -270,6 +270,12 @@ impl ClaudeCodeAdapter {
                         "THOUGHTGATE_SERVER_ID".to_string(),
                         server.id.clone().into(),
                     );
+                    if let Some(ref cfg_path) = options.config_path {
+                        env_map.insert(
+                            "THOUGHTGATE_CONFIG".to_string(),
+                            cfg_path.to_string_lossy().into_owned().into(),
+                        );
+                    }
                 }
             }
         }
@@ -671,6 +677,12 @@ impl ConfigAdapter for VsCodeAdapter {
                         "THOUGHTGATE_SERVER_ID".to_string(),
                         server.id.clone().into(),
                     );
+                    if let Some(ref cfg_path) = options.config_path {
+                        env_map.insert(
+                            "THOUGHTGATE_CONFIG".to_string(),
+                            cfg_path.to_string_lossy().into_owned().into(),
+                        );
+                    }
                 }
             }
         }
@@ -893,7 +905,7 @@ impl ConfigAdapter for ZedAdapter {
                     }),
                 );
 
-                // Add THOUGHTGATE_SERVER_ID to env (create env if absent).
+                // Add THOUGHTGATE_SERVER_ID and THOUGHTGATE_CONFIG to env (create env if absent).
                 let env_obj = entry_obj
                     .entry("env")
                     .or_insert_with(|| serde_json::json!({}));
@@ -902,6 +914,12 @@ impl ConfigAdapter for ZedAdapter {
                         "THOUGHTGATE_SERVER_ID".to_string(),
                         server.id.clone().into(),
                     );
+                    if let Some(ref cfg_path) = options.config_path {
+                        env_map.insert(
+                            "THOUGHTGATE_CONFIG".to_string(),
+                            cfg_path.to_string_lossy().into_owned().into(),
+                        );
+                    }
                 }
             }
         }

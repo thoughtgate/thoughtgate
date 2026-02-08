@@ -8,7 +8,11 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, Stdout};
 use tokio::sync::{Mutex, watch};
 
+use thoughtgate_core::config::Config;
 use thoughtgate_core::governance::api::{ApprovalOutcome, MessageType, TaskStatusResponse};
+use thoughtgate_core::governance::list_filtering::{
+    filter_and_annotate_tools, filter_prompts_by_visibility, filter_resources_by_visibility,
+};
 use thoughtgate_core::jsonrpc::{JsonRpcId, JsonRpcMessageKind};
 use thoughtgate_core::profile::Profile;
 
@@ -284,6 +288,62 @@ pub(super) fn rebuild_message_with_params(
         serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".to_string());
     json.push('\n');
     json
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// List Response Filtering (Gate 1: Visibility)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Filter a tools/list, resources/list, or prompts/list response by visibility.
+///
+/// Parses the JSON-RPC response, applies the same Gate 1 visibility filtering
+/// that the HTTP proxy uses, and returns the filtered NDJSON line. Returns
+/// `None` if the response cannot be parsed or the method is not a list method,
+/// in which case the caller should forward the raw bytes unchanged.
+///
+/// Implements: REQ-CORE-003/F-003 (Gate 1: Visibility Filtering)
+pub(super) fn filter_list_response(
+    raw_json: &str,
+    method: &str,
+    config: &Config,
+    source_id: &str,
+) -> Option<String> {
+    let mut response: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+
+    // Only filter successful responses (those with a "result" field).
+    let result = response.get_mut("result")?;
+
+    match method {
+        "tools/list" => {
+            let tools = result.get_mut("tools")?.as_array_mut()?;
+            let mut tools_vec: Vec<serde_json::Value> = std::mem::take(tools);
+            // stdio-wrapped servers don't support MCP Tasks protocol
+            filter_and_annotate_tools(&mut tools_vec, config, source_id, false);
+            *tools = tools_vec;
+        }
+        "resources/list" => {
+            let resources = result.get_mut("resources")?.as_array_mut()?;
+            let mut resources_vec: Vec<serde_json::Value> = std::mem::take(resources);
+            filter_resources_by_visibility(&mut resources_vec, config, source_id);
+            *resources = resources_vec;
+        }
+        "prompts/list" => {
+            let prompts = result.get_mut("prompts")?.as_array_mut()?;
+            let mut prompts_vec: Vec<serde_json::Value> = std::mem::take(prompts);
+            filter_prompts_by_visibility(&mut prompts_vec, config, source_id);
+            *prompts = prompts_vec;
+        }
+        _ => return None,
+    }
+
+    let mut line = serde_json::to_string(&response).ok()?;
+    line.push('\n');
+    Some(line)
+}
+
+/// Check if a method is a list method that requires response filtering.
+pub(super) fn is_list_method(method: &str) -> bool {
+    matches!(method, "tools/list" | "resources/list" | "prompts/list")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -699,5 +759,281 @@ mod tests {
         assert!(line.ends_with('\n'));
         // Exactly one trailing newline
         assert!(!line.ends_with("\n\n"));
+    }
+
+    // ── is_passthrough ────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_passthrough_initialize() {
+        assert!(is_passthrough("initialize"));
+        assert!(is_passthrough("initialized"));
+    }
+
+    #[test]
+    fn test_is_passthrough_notifications() {
+        assert!(is_passthrough("notifications/cancelled"));
+        assert!(is_passthrough("notifications/progress"));
+        assert!(is_passthrough("notifications/resources/list_changed"));
+        assert!(is_passthrough("notifications/tools/list_changed"));
+        assert!(is_passthrough("notifications/prompts/list_changed"));
+    }
+
+    #[test]
+    fn test_is_passthrough_ping_pong() {
+        assert!(is_passthrough("ping"));
+        assert!(is_passthrough("pong"));
+    }
+
+    #[test]
+    fn test_is_passthrough_governable_methods() {
+        assert!(!is_passthrough("tools/call"));
+        assert!(!is_passthrough("tools/list"));
+        assert!(!is_passthrough("resources/read"));
+    }
+
+    // ── method_from_kind ──────────────────────────────────────────────
+
+    #[test]
+    fn test_method_from_kind_request() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(1),
+            method: "tools/call".to_string(),
+        };
+        assert_eq!(method_from_kind(&kind), "tools/call");
+    }
+
+    #[test]
+    fn test_method_from_kind_notification() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "notifications/progress".to_string(),
+        };
+        assert_eq!(method_from_kind(&kind), "notifications/progress");
+    }
+
+    #[test]
+    fn test_method_from_kind_response() {
+        let kind = JsonRpcMessageKind::Response {
+            id: JsonRpcId::Number(1),
+        };
+        assert_eq!(method_from_kind(&kind), "response");
+    }
+
+    // ── id_from_kind ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_id_from_kind_request_has_id() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(42),
+            method: "tools/call".to_string(),
+        };
+        assert!(matches!(id_from_kind(&kind), Some(JsonRpcId::Number(42))));
+    }
+
+    #[test]
+    fn test_id_from_kind_notification_no_id() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "initialized".to_string(),
+        };
+        assert!(id_from_kind(&kind).is_none());
+    }
+
+    // ── message_type_from_kind ────────────────────────────────────────
+
+    #[test]
+    fn test_message_type_from_kind_request() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(1),
+            method: "tools/call".to_string(),
+        };
+        assert!(matches!(
+            message_type_from_kind(&kind),
+            MessageType::Request
+        ));
+    }
+
+    #[test]
+    fn test_message_type_from_kind_notification() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "initialized".to_string(),
+        };
+        assert!(matches!(
+            message_type_from_kind(&kind),
+            MessageType::Notification
+        ));
+    }
+
+    // ── framing_error_type ────────────────────────────────────────────
+
+    #[test]
+    fn test_framing_error_type_labels() {
+        assert_eq!(
+            framing_error_type(&FramingError::MessageTooLarge { max_bytes: 100 }),
+            "message_too_large"
+        );
+        assert_eq!(
+            framing_error_type(&FramingError::MissingVersion),
+            "missing_version"
+        );
+        assert_eq!(
+            framing_error_type(&FramingError::UnsupportedBatch),
+            "unsupported_batch"
+        );
+    }
+
+    // ── extract_tool_name ─────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_tool_name_present() {
+        let params = serde_json::json!({"name": "deploy", "arguments": {}});
+        assert_eq!(extract_tool_name(Some(&params)), Some("deploy".to_string()));
+    }
+
+    #[test]
+    fn test_extract_tool_name_missing() {
+        let params = serde_json::json!({"arguments": {}});
+        assert_eq!(extract_tool_name(Some(&params)), None);
+    }
+
+    #[test]
+    fn test_extract_tool_name_none_params() {
+        assert_eq!(extract_tool_name(None), None);
+    }
+
+    // ── format_timeout_tool_response ──────────────────────────────────
+
+    #[test]
+    fn test_format_timeout_tool_response_structure() {
+        let id = JsonRpcId::Number(99);
+        let line = format_timeout_tool_response(&id, "deploy_service");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["id"], 99);
+        assert!(parsed["result"]["isError"].as_bool().unwrap());
+        assert!(
+            parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("deploy_service")
+        );
+        assert!(line.ends_with('\n'));
+    }
+
+    // ── rebuild_message_with_params ───────────────────────────────────
+
+    #[test]
+    fn test_rebuild_request_with_params() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(7),
+            method: "tools/call".to_string(),
+        };
+        let params = serde_json::json!({"name": "test"});
+        let line = rebuild_message_with_params(&kind, Some(&params));
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 7);
+        assert_eq!(parsed["method"], "tools/call");
+        assert_eq!(parsed["params"]["name"], "test");
+    }
+
+    #[test]
+    fn test_rebuild_notification_without_params() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "initialized".to_string(),
+        };
+        let line = rebuild_message_with_params(&kind, None);
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["method"], "initialized");
+        assert!(parsed.get("id").is_none());
+        assert!(parsed.get("params").is_none());
+    }
+
+    // ── filter_list_response ────────────────────────────────────────
+
+    fn make_filter_config(allowed_tools: &[&str]) -> Config {
+        let tools: Vec<serde_json::Value> =
+            allowed_tools.iter().map(|t| serde_json::json!(t)).collect();
+        let json = serde_json::json!({
+            "schema": 1,
+            "sources": [{
+                "id": "test-server",
+                "kind": "mcp",
+                "url": "http://localhost:3000",
+                "expose": {
+                    "mode": "allowlist",
+                    "tools": tools
+                }
+            }],
+            "governance": {
+                "defaults": { "action": "forward" },
+                "rules": [{ "match": "*", "action": "forward" }]
+            }
+        });
+        let mut config: Config = serde_json::from_value(json).unwrap();
+        config.compile_patterns().unwrap();
+        config
+    }
+
+    #[test]
+    fn test_filter_list_response_tools_filtered() {
+        let config = make_filter_config(&["allowed_tool"]);
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {"name": "allowed_tool", "description": "ok"},
+                    {"name": "hidden_tool", "description": "nope"},
+                ]
+            }
+        });
+        let raw = serde_json::to_string(&response).unwrap();
+
+        let filtered = filter_list_response(&raw, "tools/list", &config, "test-server");
+        assert!(filtered.is_some());
+
+        let parsed: serde_json::Value = serde_json::from_str(filtered.unwrap().trim()).unwrap();
+        let tools = parsed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "allowed_tool");
+    }
+
+    #[test]
+    fn test_filter_list_response_non_list_returns_none() {
+        let config = make_filter_config(&["tool"]);
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"mock": "response"}
+        });
+        let raw = serde_json::to_string(&response).unwrap();
+
+        let filtered = filter_list_response(&raw, "tools/call", &config, "test-server");
+        assert!(filtered.is_none());
+    }
+
+    #[test]
+    fn test_filter_list_response_error_response_returns_none() {
+        let config = make_filter_config(&["tool"]);
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32600, "message": "bad"}
+        });
+        let raw = serde_json::to_string(&response).unwrap();
+
+        // Error responses have no "result" key, so filtering returns None.
+        let filtered = filter_list_response(&raw, "tools/list", &config, "test-server");
+        assert!(filtered.is_none());
+    }
+
+    // ── is_list_method ──────────────────────────────────────────────
+
+    #[test]
+    fn test_is_list_method() {
+        assert!(is_list_method("tools/list"));
+        assert!(is_list_method("resources/list"));
+        assert!(is_list_method("prompts/list"));
+        assert!(!is_list_method("tools/call"));
+        assert!(!is_list_method("initialize"));
     }
 }
