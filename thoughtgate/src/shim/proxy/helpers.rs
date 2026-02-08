@@ -700,4 +700,190 @@ mod tests {
         // Exactly one trailing newline
         assert!(!line.ends_with("\n\n"));
     }
+
+    // ── is_passthrough ────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_passthrough_initialize() {
+        assert!(is_passthrough("initialize"));
+        assert!(is_passthrough("initialized"));
+    }
+
+    #[test]
+    fn test_is_passthrough_notifications() {
+        assert!(is_passthrough("notifications/cancelled"));
+        assert!(is_passthrough("notifications/progress"));
+        assert!(is_passthrough("notifications/resources/list_changed"));
+        assert!(is_passthrough("notifications/tools/list_changed"));
+        assert!(is_passthrough("notifications/prompts/list_changed"));
+    }
+
+    #[test]
+    fn test_is_passthrough_ping_pong() {
+        assert!(is_passthrough("ping"));
+        assert!(is_passthrough("pong"));
+    }
+
+    #[test]
+    fn test_is_passthrough_governable_methods() {
+        assert!(!is_passthrough("tools/call"));
+        assert!(!is_passthrough("tools/list"));
+        assert!(!is_passthrough("resources/read"));
+    }
+
+    // ── method_from_kind ──────────────────────────────────────────────
+
+    #[test]
+    fn test_method_from_kind_request() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(1),
+            method: "tools/call".to_string(),
+        };
+        assert_eq!(method_from_kind(&kind), "tools/call");
+    }
+
+    #[test]
+    fn test_method_from_kind_notification() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "notifications/progress".to_string(),
+        };
+        assert_eq!(method_from_kind(&kind), "notifications/progress");
+    }
+
+    #[test]
+    fn test_method_from_kind_response() {
+        let kind = JsonRpcMessageKind::Response {
+            id: JsonRpcId::Number(1),
+        };
+        assert_eq!(method_from_kind(&kind), "response");
+    }
+
+    // ── id_from_kind ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_id_from_kind_request_has_id() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(42),
+            method: "tools/call".to_string(),
+        };
+        assert!(matches!(id_from_kind(&kind), Some(JsonRpcId::Number(42))));
+    }
+
+    #[test]
+    fn test_id_from_kind_notification_no_id() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "initialized".to_string(),
+        };
+        assert!(id_from_kind(&kind).is_none());
+    }
+
+    // ── message_type_from_kind ────────────────────────────────────────
+
+    #[test]
+    fn test_message_type_from_kind_request() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(1),
+            method: "tools/call".to_string(),
+        };
+        assert!(matches!(
+            message_type_from_kind(&kind),
+            MessageType::Request
+        ));
+    }
+
+    #[test]
+    fn test_message_type_from_kind_notification() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "initialized".to_string(),
+        };
+        assert!(matches!(
+            message_type_from_kind(&kind),
+            MessageType::Notification
+        ));
+    }
+
+    // ── framing_error_type ────────────────────────────────────────────
+
+    #[test]
+    fn test_framing_error_type_labels() {
+        assert_eq!(
+            framing_error_type(&FramingError::MessageTooLarge { max_bytes: 100 }),
+            "message_too_large"
+        );
+        assert_eq!(
+            framing_error_type(&FramingError::MissingVersion),
+            "missing_version"
+        );
+        assert_eq!(
+            framing_error_type(&FramingError::UnsupportedBatch),
+            "unsupported_batch"
+        );
+    }
+
+    // ── extract_tool_name ─────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_tool_name_present() {
+        let params = serde_json::json!({"name": "deploy", "arguments": {}});
+        assert_eq!(extract_tool_name(Some(&params)), Some("deploy".to_string()));
+    }
+
+    #[test]
+    fn test_extract_tool_name_missing() {
+        let params = serde_json::json!({"arguments": {}});
+        assert_eq!(extract_tool_name(Some(&params)), None);
+    }
+
+    #[test]
+    fn test_extract_tool_name_none_params() {
+        assert_eq!(extract_tool_name(None), None);
+    }
+
+    // ── format_timeout_tool_response ──────────────────────────────────
+
+    #[test]
+    fn test_format_timeout_tool_response_structure() {
+        let id = JsonRpcId::Number(99);
+        let line = format_timeout_tool_response(&id, "deploy_service");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["id"], 99);
+        assert!(parsed["result"]["isError"].as_bool().unwrap());
+        assert!(
+            parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("deploy_service")
+        );
+        assert!(line.ends_with('\n'));
+    }
+
+    // ── rebuild_message_with_params ───────────────────────────────────
+
+    #[test]
+    fn test_rebuild_request_with_params() {
+        let kind = JsonRpcMessageKind::Request {
+            id: JsonRpcId::Number(7),
+            method: "tools/call".to_string(),
+        };
+        let params = serde_json::json!({"name": "test"});
+        let line = rebuild_message_with_params(&kind, Some(&params));
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 7);
+        assert_eq!(parsed["method"], "tools/call");
+        assert_eq!(parsed["params"]["name"], "test");
+    }
+
+    #[test]
+    fn test_rebuild_notification_without_params() {
+        let kind = JsonRpcMessageKind::Notification {
+            method: "initialized".to_string(),
+        };
+        let line = rebuild_message_with_params(&kind, None);
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["method"], "initialized");
+        assert!(parsed.get("id").is_none());
+        assert!(parsed.get("params").is_none());
+    }
 }
