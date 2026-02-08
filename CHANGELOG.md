@@ -5,6 +5,55 @@ All notable changes to ThoughtGate will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-02-08
+
+### Features
+
+- Implement blocking approval mode across all crates
+- *(shim)* Use server-side timeout hint for approval polling
+- *(telemetry)* Add outcome-labelled metrics for stdio approval polling
+- *(governance)* Add policy revalidation endpoint for stdio post-approval
+- Extend config env overrides, timeout action re-export, and port helpers
+
+### Bug Fixes
+
+- *(deps)* Pin OpenTelemetry versions in thoughtgate-proxy
+- *(config)* Validate defaults constructed from environment
+- *(shim)* Log killpg errors during server shutdown
+- Tighten resource filter test and reduce visibility of internal fn
+- *(ci)* Configure git identity for automated tag creation
+- *(ci)* Resolve clippy, benchmark, and fuzz CI failures
+- *(shim)* Use correct error codes for approval outcome responses
+- *(proxy)* Use full K8s identity in verify_task_principal
+- *(governance)* Rollback pending counters on Task::new failure
+- *(governance)* Upgrade dev-mode bypass logs from info to warn
+- *(policy)* Fail-closed on policy file I/O errors instead of falling to permit-all
+- *(policy)* Use atomic PolicySnapshot for consistent hot-reload
+- *(cli)* Use atomic temp+rename for config file writes
+
+### Refactoring
+
+- *(core)* Extract list filtering from proxy to core
+- *(proxy)* Split mcp_handler into focused submodules
+- *(core)* Split governance task module into submodules
+- *(cli)* Split config_adapter into submodules
+- *(shim)* Decompose proxy into focused submodules
+- Fix P0-P2 maintainability findings across all crates
+
+### Documentation
+
+- Add missing requirement traceability annotations
+- *(specs)* Update 8 spec files for blocking approval mode
+- *(proxy)* Document HTTP blocking mode heartbeat limitation
+
+### Styling
+
+- *(policy)* Document LazyLock .expect() as accepted safety exception
+
+### Testing
+
+- *(proxy)* Fix governance test to use full K8s identity
+
 ## [0.3.2] - 2026-02-07
 
 ### Features
