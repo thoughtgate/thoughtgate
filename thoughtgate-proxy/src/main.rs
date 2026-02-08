@@ -68,6 +68,12 @@ struct Config {
     #[arg(long, env = "UPSTREAM_URL")]
     upstream_url: Option<String>,
 
+    /// Bind address for the admin server (health, ready, metrics).
+    /// Defaults to 127.0.0.1 to avoid exposing operational endpoints on the network.
+    /// Set to 0.0.0.0 if external scraping is needed (e.g., Prometheus in a separate pod).
+    #[arg(long, default_value = "127.0.0.1", env = "THOUGHTGATE_ADMIN_BIND")]
+    admin_bind: String,
+
     /// Enable forward proxy mode (SSRF risk: allows proxying to arbitrary hosts).
     /// Required when upstream_url is not set.
     #[arg(long, default_value_t = false)]
@@ -173,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_shutdown = shutdown.clone();
     let admin_lifecycle = lifecycle.clone();
     let admin_prom_registry = prom_registry.clone();
-    let admin_bind = cli_config.bind.clone();
+    let admin_bind = cli_config.admin_bind.clone();
     tokio::spawn(async move {
         let admin_server = AdminServer::with_config(
             admin_lifecycle,
