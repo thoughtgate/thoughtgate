@@ -67,6 +67,11 @@ struct Config {
     #[arg(long, env = "UPSTREAM_URL")]
     upstream_url: Option<String>,
 
+    /// Enable forward proxy mode (SSRF risk: allows proxying to arbitrary hosts).
+    /// Required when upstream_url is not set.
+    #[arg(long, default_value_t = false)]
+    enable_forward_proxy: bool,
+
     /// Path to YAML configuration file for governance.
     /// Enables the 4-gate governance model (visibility, rules, Cedar policy, approval).
     /// If not specified, searches: THOUGHTGATE_CONFIG env, /etc/thoughtgate/config.yaml, ./config.yaml
@@ -310,6 +315,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 7: Create proxy service
     let mut proxy_service =
         ProxyService::new_with_config(cli_config.upstream_url.clone(), proxy_config.clone())?;
+
+    // Gate forward proxy mode behind explicit opt-in (H-002: SSRF prevention)
+    if cli_config.enable_forward_proxy {
+        proxy_service = proxy_service.with_forward_proxy_enabled();
+        warn!(
+            "Forward proxy mode enabled — requests without upstream_url will be proxied to the target host"
+        );
+    }
 
     // Wire MCP handler if governance is enabled
     if let Some(handler) = mcp_handler {

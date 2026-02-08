@@ -81,6 +81,9 @@ pub struct ProxyService {
     config: ProxyConfig,
     /// MCP request handler (optional - for MCP traffic routing)
     mcp_handler: Option<Arc<McpHandler>>,
+    /// Whether forward proxy mode is explicitly enabled (H-002: SSRF prevention).
+    /// When false and upstream_url is None, forward proxy requests return an error.
+    forward_proxy_enabled: bool,
 }
 
 impl Clone for ProxyService {
@@ -90,6 +93,7 @@ impl Clone for ProxyService {
             upstream_url: self.upstream_url.clone(),
             config: self.config.clone(),
             mcp_handler: self.mcp_handler.clone(),
+            forward_proxy_enabled: self.forward_proxy_enabled,
         }
     }
 }
@@ -160,7 +164,19 @@ impl ProxyService {
             upstream_url,
             config,
             mcp_handler: None,
+            forward_proxy_enabled: false,
         })
+    }
+
+    /// Enable forward proxy mode (allows proxying to arbitrary hosts).
+    ///
+    /// # Security
+    ///
+    /// Forward proxy mode poses an SSRF risk because the target host is
+    /// derived from the request. Only enable when explicitly needed.
+    pub fn with_forward_proxy_enabled(mut self) -> Self {
+        self.forward_proxy_enabled = true;
+        self
     }
 
     /// Set the MCP handler for this proxy service.
@@ -455,7 +471,14 @@ impl ProxyService {
             });
         }
 
-        // Otherwise, use forward proxy mode
+        // Forward proxy mode requires explicit opt-in (H-002: SSRF prevention)
+        if !self.forward_proxy_enabled {
+            return Err(ProxyError::InvalidUri(
+                "Forward proxy mode is disabled. Use --enable-forward-proxy to allow proxying to arbitrary hosts, or set --upstream-url for reverse proxy mode.".to_string(),
+            ));
+        }
+
+        // Forward proxy mode — derive target from the request
         let uri = req.uri();
 
         // Use absolute URI if present
@@ -645,8 +668,9 @@ mod tests {
     /// Test URI extraction in forward proxy mode
     #[test]
     fn test_uri_extraction_forward_proxy() {
-        let service =
-            ProxyService::new_with_upstream(None).expect("Failed to create proxy service");
+        let service = ProxyService::new_with_upstream(None)
+            .expect("Failed to create proxy service")
+            .with_forward_proxy_enabled();
 
         // Test with absolute URI
         let req = Request::builder()
@@ -663,8 +687,9 @@ mod tests {
     /// Test URI extraction with Host header
     #[test]
     fn test_uri_extraction_with_host_header() {
-        let service =
-            ProxyService::new_with_upstream(None).expect("Failed to create proxy service");
+        let service = ProxyService::new_with_upstream(None)
+            .expect("Failed to create proxy service")
+            .with_forward_proxy_enabled();
 
         // Test with relative URI + Host header
         let req = Request::builder()
@@ -760,8 +785,9 @@ mod tests {
         insta::assert_json_snapshot!(snapshot_data);
 
         // Test Case 2: Forward proxy mode with absolute URI
-        let service_forward =
-            ProxyService::new_with_upstream(None).expect("Failed to create proxy service");
+        let service_forward = ProxyService::new_with_upstream(None)
+            .expect("Failed to create proxy service")
+            .with_forward_proxy_enabled();
 
         let req_forward = Request::builder()
             .method(Method::GET)
@@ -816,8 +842,9 @@ mod tests {
     /// Test error handling for missing URI information
     #[test]
     fn test_uri_extraction_error() {
-        let service =
-            ProxyService::new_with_upstream(None).expect("Failed to create proxy service");
+        let service = ProxyService::new_with_upstream(None)
+            .expect("Failed to create proxy service")
+            .with_forward_proxy_enabled();
 
         // Request with no absolute URI and no Host header
         let req = Request::builder()
@@ -832,6 +859,28 @@ mod tests {
         match result {
             Err(ProxyError::InvalidUri(_)) => {} // Expected
             _ => panic!("Expected InvalidUri error"),
+        }
+    }
+
+    /// Test that forward proxy mode is blocked by default (H-002: SSRF prevention)
+    #[test]
+    fn test_forward_proxy_blocked_by_default() {
+        let service =
+            ProxyService::new_with_upstream(None).expect("Failed to create proxy service");
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/path")
+            .body(())
+            .unwrap();
+
+        let result = service.extract_target_uri(&req);
+        assert!(result.is_err());
+        match result {
+            Err(ProxyError::InvalidUri(msg)) => {
+                assert!(msg.contains("Forward proxy mode is disabled"));
+            }
+            _ => panic!("Expected InvalidUri error about forward proxy"),
         }
     }
 
