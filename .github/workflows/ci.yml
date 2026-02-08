@@ -27,8 +27,8 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3
         id: filter
         with:
           filters: |
@@ -49,21 +49,21 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7  # stable
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
         with:
           shared-key: "ci"
           cache-on-failure: true
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@v1.17.4
+        uses: cargo-bins/cargo-binstall@ec80feb9e330418e014932e5982599255eff6dbb  # v1.17.4
 
       - name: Install cargo-deny
         run: |
@@ -92,13 +92,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7  # stable
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
         with:
           shared-key: "ci"
           cache-on-failure: true
@@ -117,13 +117,58 @@ jobs:
           cargo test -p thoughtgate --all-targets --no-run
 
       - name: Upload binaries as artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: binaries
           path: |
             target/release/thoughtgate-proxy
             target/release/mock_mcp
           retention-days: 7
+
+  # Stage 1b.1: Code Coverage
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7  # stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
+        with:
+          shared-key: "ci"
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@ec80feb9e330418e014932e5982599255eff6dbb  # v1.17.4
+
+      - name: Install cargo-tarpaulin
+        run: cargo binstall --no-confirm cargo-tarpaulin
+
+      - name: Generate coverage
+        run: |
+          cargo tarpaulin --workspace --timeout 300 \
+            --out xml --out html \
+            --output-dir coverage/ \
+            --exclude-files "*/tests/*" "*/benches/*" "fuzz/*" \
+            --engine llvm
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de  # v5
+        with:
+          files: coverage/cobertura.xml
+          fail_ci_if_error: false
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
 
   # Stage 1c: Test Suite (consolidated parallel execution)
   #
@@ -178,15 +223,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7  # stable
 
       # OPTIMIZATION: All test jobs share the same cache key.
       # Since the build job already compiled everything, test jobs get cache hits.
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
         with:
           shared-key: "ci"
           cache-on-failure: true
@@ -216,13 +261,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7  # stable
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
         with:
           shared-key: "ci"
           cache-on-failure: true
@@ -477,7 +522,7 @@ jobs:
           cat bench_metrics.json
 
       - name: Install Bencher CLI
-        uses: bencherdev/bencher@v0.5.10
+        uses: bencherdev/bencher@8151077aa7b1bceaac11c4b308265417cae60e2b  # v0.5.10
 
       - name: Report benchmarks to Bencher (main branch)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -520,7 +565,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: benchmark-results
           path: |
@@ -546,10 +591,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: Generate Docker metadata
         id: meta
@@ -568,7 +613,7 @@ jobs:
           fi
 
       - name: Build Docker image (amd64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6
         with:
           context: .
           # Use Dockerfile.test for K8s integration tests (includes mock_mcp)
@@ -580,7 +625,7 @@ jobs:
           outputs: type=docker,dest=/tmp/thoughtgate-image.tar
 
       - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8  # 0.33.1
         with:
           input: /tmp/thoughtgate-image.tar
           severity: 'CRITICAL,HIGH,MEDIUM'
@@ -591,12 +636,12 @@ jobs:
 
       - name: Upload Trivy results to GitHub Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@b5ebac6f4c00c8ccddb7cdcd45fdb248329f808a  # v3
         with:
           sarif_file: 'trivy-results.sarif'
 
       - name: Upload Docker image as artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: docker-image
           path: /tmp/thoughtgate-image.tar
@@ -616,20 +661,20 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7  # stable
 
       # Use shared cache key for consistency with other jobs
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
         with:
           shared-key: "ci"
           cache-on-failure: true
 
       - name: Download Docker image artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7
         with:
           name: docker-image
           path: /tmp
@@ -638,7 +683,7 @@ jobs:
         run: docker load --input /tmp/thoughtgate-image.tar
 
       - name: Create Kind cluster
-        uses: helm/kind-action@v1.13.0
+        uses: helm/kind-action@92086f6be054225fa813e0a4b13787fc9088faab  # v1.13.0
         with:
           cluster_name: kind
           wait: 30s
@@ -667,7 +712,7 @@ jobs:
 
       - name: Install Bencher CLI
         if: always()
-        uses: bencherdev/bencher@v0.5.10
+        uses: bencherdev/bencher@8151077aa7b1bceaac11c4b308265417cae60e2b  # v0.5.10
 
       - name: Report K8s metrics to Bencher (main branch)
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -720,7 +765,7 @@ jobs:
 
       - name: Upload performance metrics
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: k8s-performance-metrics
           path: bench_metrics.json
@@ -752,16 +797,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -776,7 +821,7 @@ jobs:
 
       - name: Generate Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -793,7 +838,7 @@ jobs:
 
       - name: Build and push multi-arch image
         id: build-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6
         with:
           context: .
           file: ./Dockerfile
@@ -858,7 +903,7 @@ jobs:
           cat docker_metrics.json
 
       - name: Install Bencher CLI
-        uses: bencherdev/bencher@v0.5.10
+        uses: bencherdev/bencher@8151077aa7b1bceaac11c4b308265417cae60e2b  # v0.5.10
 
       - name: Report Docker metrics to Bencher
         run: |
@@ -906,14 +951,14 @@ jobs:
           cat release-notes.md
 
       - name: Upload release notes
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: release-notes
           path: release-notes.md
           retention-days: 90
 
       - name: Upload Docker metrics
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
           name: docker-metrics
           path: docker_metrics.json
