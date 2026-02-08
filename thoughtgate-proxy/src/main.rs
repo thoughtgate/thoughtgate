@@ -36,6 +36,7 @@ use thoughtgate_proxy::mcp_handler::{
 use thoughtgate_proxy::ports::{admin_port, outbound_port};
 use thoughtgate_proxy::proxy_config::ProxyConfig;
 use thoughtgate_proxy::proxy_service::ProxyService;
+use thoughtgate_proxy::rate_limiter::{PerIpRateLimiter, RateLimiterConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -366,6 +367,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Record startup duration metric (REQ-CORE-005/NFR-001)
     tg_metrics.record_startup_duration(startup_instant.elapsed().as_secs_f64());
 
+    // Per-client IP rate limiting (REQ-CORE-005 - resource protection)
+    let rate_limiter = Arc::new(PerIpRateLimiter::new(RateLimiterConfig::from_env()));
+    rate_limiter.spawn_cleanup_task(shutdown.clone());
+
     // Per-request timeout for proxy connections
     // Prevents indefinitely hanging connections from leaking resources
     let request_timeout =
@@ -408,6 +413,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         };
+
+                        // Per-client rate limiting check
+                        if !rate_limiter.check(peer_addr.ip()) {
+                            warn!(
+                                peer = %peer_addr,
+                                "Rejected connection: rate limit exceeded"
+                            );
+                            drop(request_guard);
+                            tokio::spawn(async move {
+                                let _ = send_429_response(stream).await;
+                            });
+                            continue;
+                        }
 
                         // Try to acquire semaphore permit (REQ-CORE-001 Section 3.2)
                         let permit = match semaphore.clone().try_acquire_owned() {
@@ -820,6 +838,33 @@ fn configure_tcp_stream(stream: &TcpStream, config: &ProxyConfig) -> std::io::Re
     socket.set_recv_buffer_size(config.socket_buffer_size)?;
     socket.set_send_buffer_size(config.socket_buffer_size)?;
 
+    Ok(())
+}
+
+/// Send a 429 Too Many Requests response when per-IP rate limit is exceeded.
+///
+/// # Traceability
+/// - Implements: REQ-CORE-005 (Operational Lifecycle - resource protection)
+async fn send_429_response(mut stream: TcpStream) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let body = "429 Too Many Requests\n\n\
+                ThoughtGate rate limit exceeded for your IP address.\n\
+                Please retry your request in a moment.";
+    let content_length = body.len();
+    let response = format!(
+        "HTTP/1.1 429 Too Many Requests\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Retry-After: 1\r\n\
+         \r\n\
+         {}",
+        content_length, body
+    );
+
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }
 
