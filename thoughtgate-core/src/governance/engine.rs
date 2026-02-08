@@ -395,6 +395,7 @@ impl ApprovalEngine {
         principal: Principal,
         workflow_timeout: Option<Duration>,
         on_timeout_override: Option<TimeoutAction>,
+        redact_fields: Vec<String>,
     ) -> Result<ApprovalStartResult, ApprovalEngineError> {
         let correlation_id = crate::transport::jsonrpc::fast_correlation_id().to_string();
 
@@ -450,7 +451,7 @@ impl ApprovalEngine {
             created_at: task.created_at,
             correlation_id: correlation_id.clone(),
             request_span_context: None, // TODO: Wire span context from request handler
-            redact_fields: Vec::new(),
+            redact_fields,
         };
 
         // F-002.2: Submit to scheduler (posts to Slack and starts polling)
@@ -1142,7 +1143,7 @@ mod tests {
         );
 
         let result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await;
 
         assert!(result.is_ok(), "start_approval should succeed");
@@ -1210,7 +1211,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1249,7 +1250,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1305,7 +1306,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1348,7 +1349,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1389,7 +1390,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1444,7 +1445,7 @@ mod tests {
         );
 
         let result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1510,7 +1511,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1562,7 +1563,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1620,7 +1621,7 @@ mod tests {
 
         // Start approval
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1679,7 +1680,7 @@ mod tests {
 
         // Start approval but never approve
         let start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
@@ -1736,7 +1737,7 @@ mod tests {
 
         // Start approval but never approve
         let _start_result = engine
-            .start_approval(test_request(), test_principal(), None, None)
+            .start_approval(test_request(), test_principal(), None, None, Vec::new())
             .await
             .unwrap();
 
