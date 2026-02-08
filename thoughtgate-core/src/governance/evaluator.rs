@@ -698,6 +698,7 @@ impl GovernanceEvaluator {
                 created_at: Utc::now(),
                 correlation_id: task_id.to_string(),
                 request_span_context: None,
+                redact_fields: Vec::new(),
             };
 
             if let Err(e) = scheduler.submit(approval_req).await {

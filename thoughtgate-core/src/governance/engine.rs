@@ -450,6 +450,7 @@ impl ApprovalEngine {
             created_at: task.created_at,
             correlation_id: correlation_id.clone(),
             request_span_context: None, // TODO: Wire span context from request handler
+            redact_fields: Vec::new(),
         };
 
         // F-002.2: Submit to scheduler (posts to Slack and starts polling)

@@ -401,6 +401,7 @@ async fn test_mock_adapter_instant_approval() {
         created_at: Utc::now(),
         correlation_id: "test-123".to_string(),
         request_span_context: None,
+        redact_fields: Vec::new(),
     };
 
     // Post request
@@ -441,6 +442,7 @@ async fn test_mock_adapter_delayed_approval() {
         created_at: Utc::now(),
         correlation_id: "test-456".to_string(),
         request_span_context: None,
+        redact_fields: Vec::new(),
     };
 
     let reference = adapter.post_approval_request(&request).await.unwrap();

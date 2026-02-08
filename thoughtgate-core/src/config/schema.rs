@@ -543,6 +543,12 @@ pub struct HumanWorkflow {
         skip_serializing_if = "Option::is_none"
     )]
     pub blocking_timeout: Option<Duration>,
+
+    /// Field names to redact from tool_arguments before sending to Slack.
+    /// Supports dot-notation for nested fields (e.g., "credentials.api_key").
+    /// Values are replaced with "[REDACTED]".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redact_fields: Option<Vec<String>>,
 }
 
 impl HumanWorkflow {

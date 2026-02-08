@@ -245,6 +245,7 @@ mod tests {
             created_at: Utc::now(),
             correlation_id: "test-123".to_string(),
             request_span_context: None,
+            redact_fields: Vec::new(),
         }
     }
 

@@ -643,6 +643,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             correlation_id: "test-correlation".to_string(),
             request_span_context: None,
+            redact_fields: Vec::new(),
         }
     }
 
