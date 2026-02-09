@@ -112,7 +112,7 @@ chrono.workspace = true
 serde-saphyr.workspace = true
 
 # Testing utilities
-rand = "0.9"
+rand = "0.10"
 serial_test.workspace = true
 uuid.workspace = true
 insta = { version = "1.46.1", features = ["json"] }

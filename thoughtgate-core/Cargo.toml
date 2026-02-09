@@ -79,7 +79,7 @@ parking_lot = "0.12"
 smallvec = "1"
 
 # Cryptographically secure random number generation (trace/span ID generation)
-rand = "0.9"
+rand = "0.10"
 
 [dev-dependencies]
 proptest = "1.0"
