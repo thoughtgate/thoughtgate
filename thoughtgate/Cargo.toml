@@ -41,7 +41,7 @@ opentelemetry_sdk.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-proptest = "1.0"
+proptest = "1.10"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
