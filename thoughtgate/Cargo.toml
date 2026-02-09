@@ -45,4 +45,4 @@ proptest = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process"] }
